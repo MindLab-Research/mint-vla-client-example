@@ -1050,13 +1050,17 @@ async def asample(
             request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
         )
 
+    prompt_token_count: int | None = None
+    max_tokens = int(request.sampling_params.max_tokens)
+    num_samples = int(request.num_samples)
+
     # Preflight prompt length gate from TaskStateStore-backed sampling state before enqueuing work.
     if snapshot is not None and snapshot.uses_multi_lora:
         base_model = snapshot.base_model
         if not base_model:
             raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
         token_ids = request.prompt.to_token_ids()
-        max_tokens = int(request.sampling_params.max_tokens)
+        prompt_token_count = len(token_ids)
         from ..backend.model_registry import get_model_config
 
         try:
@@ -1069,7 +1073,7 @@ async def asample(
                     f"{type(e).__name__}: {e}"
                 ),
             )
-        total_len = len(token_ids) + max_tokens
+        total_len = prompt_token_count + max_tokens
         if total_len > max_model_len:
             raise HTTPException(
                 status_code=400,
@@ -1111,8 +1115,10 @@ async def asample(
     set_request_id(request_id)
     logger.info(f"asample request received: session_id={session_id}, seq_id={request.seq_id}")
 
-    scheduler_append_confirmed = False
     try:
+        if prompt_token_count is None:
+            prompt_token_count = len(request.prompt.to_token_ids())
+        token_cost = max(1, (prompt_token_count + max_tokens) * num_samples)
         domain_key = _model_work_domain_key(str(base_model))
         affinity_group = _model_work_affinity_group(snapshot)
         ordering_key = f"session:{session_id}"
@@ -1127,6 +1133,10 @@ async def asample(
             "affinity_group": affinity_group,
             "ordering_key": ordering_key,
             "model_work_attempt_id": model_work_attempt_id,
+            "prompt_tokens": prompt_token_count,
+            "max_tokens": max_tokens,
+            "num_samples": num_samples,
+            "token_cost": token_cost,
         }
         enqueue_extra = merge_queue_priority_extra(
             {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
@@ -1143,10 +1153,7 @@ async def asample(
             domain_key=domain_key,
             affinity_group=affinity_group,
             ordering_key=ordering_key,
-            token_cost=max(
-                1,
-                int(request.sampling_params.max_tokens) * int(request.num_samples),
-            ),
+            token_cost=token_cost,
             assign=True,
             assign_max_items=1,
             extra={
@@ -1164,18 +1171,6 @@ async def asample(
                 "base_model": base_model,
             },
         )
-        scheduler_result = admission.scheduler_result
-        scheduler_append_confirmed = bool(scheduler_result.get("ok"))
-        if scheduler_result.get("scheduler_instance_id"):
-            await task_futures.async_update_meta(
-                request_id,
-                {
-                    "model_work_scheduler_instance_id": str(
-                        scheduler_result["scheduler_instance_id"]
-                    ),
-                    "model_work_attempt_id": model_work_attempt_id,
-                },
-            )
     except ModelWorkSchedulerConflictError:
         if request.seq_id is None:
             logger.exception(
@@ -1224,18 +1219,6 @@ async def asample(
             type(e).__name__,
             str(e),
         )
-        if scheduler_append_confirmed:
-            try:
-                from ..backend.model_work_scheduler import model_work_scheduler
-
-                await model_work_scheduler.cancel_request(
-                    request_id=request_id,
-                    reason="asample_enqueue_failed",
-                )
-            except Exception:
-                pass
-        if scheduler_append_confirmed:
-            await task_futures.async_cleanup(request_id)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
     record_sampling_admission_metric(

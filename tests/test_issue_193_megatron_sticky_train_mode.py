@@ -1,20 +1,18 @@
+import builtins
 import inspect
 import logging
-import time
 import sys
-import builtins
+import time
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend.megatron_distributed import (
-    DistributedConfig,
-    MegatronRankWorker,
-    MegatronWorkerGroup,
-    _GRADIENTS_CONSUMED,
-)
+from mint_server.backend.megatron_distributed import (_GRADIENTS_CONSUMED,
+                                                      DistributedConfig,
+                                                      MegatronRankWorker,
+                                                      MegatronWorkerGroup)
 
 
 class _FakeTrainMode:
@@ -170,8 +168,10 @@ class _FakeInnerOptimizer:
         self.state = {}
         self.param_groups = [{"params": [], "lr": 1.0}]
         self.load_calls = 0
+        self.state_dict_calls = 0
 
     def state_dict(self):
+        self.state_dict_calls += 1
         return {
             "state": {"param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}},
             "param_groups": [{"params": [0], "lr": self.param_groups[0]["lr"]}],
@@ -183,16 +183,24 @@ class _FakeInnerOptimizer:
         self.param_groups = state_dict["param_groups"]
 
 
-class _FakeMegatronOptimizerWrapper:
+class _FakeMegatronDistributedOptimizer:
     def __init__(self):
         self.optimizer = _FakeInnerOptimizer()
         self.wrapper_counter = 0
         self.grad_scaler = {"scale": 1.0}
         self.load_calls = 0
+        self.state_dict_calls = 0
 
     def state_dict(self):
+        self.state_dict_calls += 1
+        inner_state = self.optimizer.state_dict()
         return {
-            "optimizer": {"param_groups": [{"lr": self.optimizer.param_groups[0]["lr"]}]},
+            "optimizer": {
+                "param_groups": [
+                    {"lr": group["lr"]}
+                    for group in inner_state.get("param_groups", [])
+                ]
+            },
             "grad_scaler": {"scale": self.grad_scaler["scale"]},
             "wrapper_counter": self.wrapper_counter,
         }
@@ -201,6 +209,10 @@ class _FakeMegatronOptimizerWrapper:
         self.load_calls += 1
         self.wrapper_counter = state_dict["wrapper_counter"]
         self.grad_scaler = state_dict["grad_scaler"]
+
+
+class _FakeMegatronOptimizerWrapper(_FakeMegatronDistributedOptimizer):
+    pass
 
 
 def _make_worker(
@@ -726,15 +738,25 @@ def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
     fake_core = types.ModuleType("megatron.core")
     fake_optimizer_module = types.ModuleType("megatron.core.optimizer")
     fake_optimizer_module.ChainedOptimizer = type("ChainedOptimizer", (), {})
+    fake_distrib_optimizer_module = types.ModuleType("megatron.core.optimizer.distrib_optimizer")
+    fake_distrib_optimizer_module.DistributedOptimizer = _FakeMegatronDistributedOptimizer
     monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
     monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
     monkeypatch.setitem(sys.modules, "megatron.core.optimizer", fake_optimizer_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer.distrib_optimizer",
+        fake_distrib_optimizer_module,
+    )
 
     worker.engine.optimizer.wrapper_counter = 11
     worker.engine.optimizer.grad_scaler["scale"] = 7.5
     worker.engine.optimizer.optimizer.param_groups[0]["lr"] = 0.123
 
     snapshot = worker._capture_optimizer_state()
+
+    assert worker.engine.optimizer.state_dict_calls == 1
+    assert worker.engine.optimizer.optimizer.state_dict_calls == 1
 
     worker.engine.optimizer.wrapper_counter = 99
     worker.engine.optimizer.grad_scaler["scale"] = 42.0
@@ -751,6 +773,48 @@ def test_issue_193_capture_restore_optimizer_wrapper_state(monkeypatch):
         "param_0": {"exp_avg": 3.0, "exp_avg_sq": 5.0}
     }
     assert worker.engine.optimizer.optimizer.param_groups == [{"params": [0], "lr": 0.123}]
+
+
+def test_issue_193_restore_optimizer_inner_state_without_deepcopy(monkeypatch):
+    import types
+
+    worker, _ = _make_worker(monkeypatch)
+    worker.engine.optimizer = _FakeMegatronOptimizerWrapper()
+
+    fake_megatron = types.ModuleType("megatron")
+    fake_core = types.ModuleType("megatron.core")
+    fake_optimizer_module = types.ModuleType("megatron.core.optimizer")
+    fake_optimizer_module.ChainedOptimizer = type("ChainedOptimizer", (), {})
+    fake_distrib_optimizer_module = types.ModuleType("megatron.core.optimizer.distrib_optimizer")
+    fake_distrib_optimizer_module.DistributedOptimizer = _FakeMegatronDistributedOptimizer
+    monkeypatch.setitem(sys.modules, "megatron", fake_megatron)
+    monkeypatch.setitem(sys.modules, "megatron.core", fake_core)
+    monkeypatch.setitem(sys.modules, "megatron.core.optimizer", fake_optimizer_module)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.optimizer.distrib_optimizer",
+        fake_distrib_optimizer_module,
+    )
+
+    inner_state = {
+        "state": {"param_0": {"exp_avg": object(), "exp_avg_sq": object()}},
+        "param_groups": [{"params": [0], "lr": 0.4}],
+    }
+    snapshot = {
+        "optimizer_0": {
+            "wrapper_state_dict": {
+                "optimizer": {"param_groups": [{"lr": 0.4}]},
+                "grad_scaler": {"scale": 3.0},
+                "wrapper_counter": 6,
+            },
+            "inner_state_dict": inner_state,
+        }
+    }
+
+    worker._restore_optimizer_state(snapshot)
+
+    assert worker.engine.optimizer.optimizer.state is inner_state["state"]
+    assert worker.engine.optimizer.optimizer.param_groups is inner_state["param_groups"]
 
 
 def test_issue_193_clear_session_state_clears_lr_scheduler_cache(monkeypatch):
@@ -2209,7 +2273,8 @@ def test_issue_417_failed_explicit_load_leaves_session_unknown(tmp_path, monkeyp
 
 
 def test_issue_417_failed_explicit_load_preserves_target_actor_authority(tmp_path, monkeypatch):
-    from mint_server.backend.megatron_distributed import MegatronSessionStateManager
+    from mint_server.backend.megatron_distributed import \
+        MegatronSessionStateManager
 
     manager = MegatronSessionStateManager(base_path=str(tmp_path / "session_store"))
     target_path = tmp_path / "target_checkpoint"
@@ -2795,6 +2860,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
 
 def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkeypatch, tmp_path):
     import json
+
     import ray as ray_module
 
     ckpt_dir = tmp_path / "recovery_ckpt"
@@ -2904,6 +2970,7 @@ def test_issue_193_partial_swap_explicit_session_recovers_load_checkpoint(monkey
 
 def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_requested(monkeypatch, tmp_path):
     import json
+
     import ray as ray_module
 
     ckpt_dir = tmp_path / "same_path_ckpt"
@@ -3020,8 +3087,9 @@ def test_issue_193_same_path_fast_path_requires_checkpoint_optimizer_when_reques
 
 
 def test_issue_193_get_lora_state_dict_releases_sticky_before_eval_mode(monkeypatch):
-    import torch
     from types import SimpleNamespace
+
+    import torch
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
     worker.engine.module = object()
@@ -3170,6 +3238,7 @@ def test_issue_467_get_lora_state_dict_allows_moe_mlp_export_without_layout_flag
 
 def test_issue_482_save_lora_weights_writes_unembed_target_modules(monkeypatch, tmp_path):
     import json
+
     import torch
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
@@ -3217,9 +3286,10 @@ def test_issue_467_get_lora_state_dict_fails_when_bridge_export_is_missing(monke
 
 
 def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
-    import torch
     import types
     from types import SimpleNamespace
+
+    import torch
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
     worker.engine.module = object()
@@ -3305,9 +3375,10 @@ def test_issue_489_get_lora_state_dict_patches_cpu_ep_gather(monkeypatch):
 
 
 def test_issue_495_get_lora_state_dict_single_pp_path_restores_bridge_patch(monkeypatch):
-    import torch
     import types
     from types import SimpleNamespace
+
+    import torch
 
     worker, _ = _make_worker(monkeypatch, close_on_optim="0")
     worker.engine.module = object()

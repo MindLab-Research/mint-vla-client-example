@@ -240,6 +240,9 @@ def actor_runtime_env_vars(
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
+    supervisor_actor_name = _env_nonempty(os.environ, "MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME")
+    if supervisor_actor_name is not None:
+        out["MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME"] = supervisor_actor_name
     config_path = _env_nonempty(os.environ, "MINT_CONFIG_PATH")
     if config_path is not None:
         out["MINT_CONFIG_PATH"] = config_path

@@ -119,7 +119,11 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     assert call["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert call["affinity_group"] == "lora:session-a:generation:7"
     assert call["ordering_key"] == "session:session-a"
-    assert call["token_cost"] == 12
+    assert call["token_cost"] == 21
+    assert call["extra"]["prompt_tokens"] == 3
+    assert call["extra"]["max_tokens"] == 4
+    assert call["extra"]["num_samples"] == 3
+    assert call["extra"]["token_cost"] == 21
     assert call["assign"] is True
     assert call["assign_max_items"] == 1
     assert call["extra"]["model_work_scheduler"] is True
@@ -131,18 +135,10 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     assert call["extra"]["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert isinstance(call["extra"]["payload_hash"], str)
     assert call["extra"]["payload_hash"]
-    assert stub_fs.updated == [
-        (
-            out.request_id,
-            {
-                "model_work_scheduler_instance_id": "scheduler-instance-a",
-                "model_work_attempt_id": call["extra"]["model_work_attempt_id"],
-            },
-        )
-    ]
+    assert stub_fs.updated == []
 
 
-def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fails(monkeypatch):
+def test_issue_593_asample_does_not_mutate_future_meta_after_scheduler_append(monkeypatch):
     stub_fs = _StubTaskFutureService(fail_update_meta=True)
     scheduler = _CaptureModelWorkScheduler()
 
@@ -162,19 +158,13 @@ def test_issue_593_asample_cancels_scheduler_item_if_post_append_meta_update_fai
         sampling_params=SamplingParams(max_tokens=4),
     )
 
-    try:
-        anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
-    except Exception:
-        pass
+    out = anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
 
+    assert isinstance(out.request_id, str) and out.request_id
     assert len(scheduler.calls) == 1
-    assert scheduler.cancelled == [
-        {
-            "request_id": scheduler.calls[0]["request_id"],
-            "reason": "asample_enqueue_failed",
-        }
-    ]
-    assert stub_fs.cleaned == [scheduler.calls[0]["request_id"]]
+    assert scheduler.cancelled == []
+    assert stub_fs.updated == []
+    assert stub_fs.cleaned == []
 
 
 def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(monkeypatch):

@@ -707,6 +707,200 @@ async def test_issue_656_stale_recovered_generation_fails_without_executor() -> 
 
 
 @pytest.mark.anyio
+async def test_issue_648_vllm_runtime_uses_dynamic_token_budget_for_claim() -> None:
+    lease = _lease("runtime-vllm-budget")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    task_state_store = _FakeTaskStateStore()
+    budget_calls = 0
+
+    async def _token_budget_provider() -> int:
+        nonlocal budget_calls
+        budget_calls += 1
+        return 604124
+
+    async def _executor(_lease: dict) -> None:
+        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        replica_id="replica-0",
+        actor_generation=3,
+        max_claim=64,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        task_state_store_client=task_state_store,
+        executor=_executor,
+        token_budget_provider=_token_budget_provider,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert budget_calls == 1
+    assert scheduler.claim_calls[0]["max_items"] == 64
+    assert scheduler.claim_calls[0]["token_budget"] == 604124
+    assert actor.health_snapshot()["dynamic_token_budget"] == 604124
+
+
+@pytest.mark.anyio
+async def test_issue_648_vllm_runtime_falls_back_to_single_claim_without_budget() -> None:
+    scheduler = _FakeScheduler()
+
+    async def _token_budget_provider() -> None:
+        return None
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        max_claim=64,
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        executor=lambda _lease: asyncio.sleep(0),
+        token_budget_provider=_token_budget_provider,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+    assert scheduler.claim_calls[0]["max_items"] == 1
+    assert scheduler.claim_calls[0]["token_budget"] is None
+
+
+@pytest.mark.anyio
+async def test_issue_648_default_token_budget_provider_uses_kv_debug_fallback(monkeypatch) -> None:
+    class _RemoteResult:
+        def __init__(self, value):
+            self.value = value
+
+    class _RemoteMethod:
+        def __init__(self, value):
+            self.value = value
+
+        def __call__(self):
+            return None
+
+        def remote(self):
+            return _RemoteResult(self.value)
+
+    class _VllmActor:
+        get_observability_binding = _RemoteMethod({})
+        get_kv_debug_info = _RemoteMethod({"kv_cache_capacity_tokens": 1000})
+
+    class _Ray:
+        @staticmethod
+        def get_actor(name, namespace=None):
+            assert name == "mint_vllm_model-a"
+            assert namespace is not None
+            return _VllmActor()
+
+    async def _async_get_ray_ref(ref, timeout_s=None):
+        _ = timeout_s
+        return ref.value
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.async_get_ray_ref",
+        _async_get_ray_ref,
+    )
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=_FakeScheduler(),
+        task_futures_client=_FakeTaskFutureService(),
+        executor=lambda _lease: asyncio.sleep(0),
+    )
+
+    assert await actor._default_token_budget_provider() == 950
+    snapshot = actor.health_snapshot()
+    assert snapshot["dynamic_token_capacity_tokens"] == 1000
+    assert snapshot["dynamic_token_budget_ratio"] == 0.95
+
+
+@pytest.mark.anyio
+async def test_issue_648_model_runtime_executes_claimed_vllm_leases_concurrently() -> None:
+    lease_a = _lease("runtime-vllm-concurrent-a")
+    lease_b = _lease("runtime-vllm-concurrent-b")
+    scheduler = _FakeScheduler(claims=[[lease_a, lease_b]])
+    task_futures = _FakeTaskFutureService(
+        statuses={
+            lease_a["item"]["request_id"]: FutureStatus.PENDING,
+            lease_b["item"]["request_id"]: FutureStatus.PENDING,
+        }
+    )
+    task_state_store = _FakeTaskStateStore()
+    started: list[str] = []
+    release = asyncio.Event()
+
+    async def _executor(lease: dict) -> None:
+        started.append(lease["item"]["request_id"])
+        if len(started) == 2:
+            release.set()
+        await asyncio.wait_for(release.wait(), timeout=1)
+        await task_futures.async_resolve(lease["item"]["request_id"], {"ok": True})
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        max_claim=64,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        task_state_store_client=task_state_store,
+        executor=_executor,
+        token_budget_provider=lambda: asyncio.sleep(0, result=1000),
+    )
+
+    assert await actor.run_once() == {"claimed": 2, "executed": 2}
+    assert sorted(started) == [
+        lease_a["item"]["request_id"],
+        lease_b["item"]["request_id"],
+    ]
+    assert len(scheduler.completed) == 2
+    assert actor.health_snapshot()["active_lease_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_model_runtime_renews_pending_sequential_leases() -> None:
+    lease_a = _lease("runtime-train-sequential-a")
+    lease_b = _lease("runtime-train-sequential-b")
+    scheduler = _FakeScheduler(claims=[[lease_a, lease_b]])
+    task_futures = _FakeTaskFutureService(
+        statuses={
+            lease_a["item"]["request_id"]: FutureStatus.PENDING,
+            lease_b["item"]["request_id"]: FutureStatus.PENDING,
+        }
+    )
+    task_state_store = _FakeTaskStateStore()
+    started: list[str] = []
+
+    async def _executor(lease: dict) -> None:
+        started.append(lease["item"]["request_id"])
+        await asyncio.sleep(0.16)
+        await task_futures.async_resolve(lease["item"]["request_id"], {"ok": True})
+
+    actor = ModelRuntimeActor(
+        domain_key="bumblebee:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        max_claim=16,
+        lease_ttl_s=0.3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        task_state_store_client=task_state_store,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 2, "executed": 2}
+    assert started == [
+        lease_a["item"]["request_id"],
+        lease_b["item"]["request_id"],
+    ]
+    renewed_lease_ids = [call["lease_id"] for call in scheduler.renewed]
+    assert lease_b["lease_id"] in renewed_lease_ids
+    assert len(scheduler.completed) == 2
+
+
+@pytest.mark.anyio
 async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() -> None:
     lease = _lease("runtime-req-finalized-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
@@ -1311,3 +1505,77 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
     assert out == {"created": True}
     assert killed and killed[0][1] is True
     assert created[-1]["kwargs"]["actor_generation"] == 3
+
+
+def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> None:
+    killed: list[object] = []
+    created: list[dict] = []
+
+    class _RemoteResult:
+        def __init__(self, value):
+            self.value = value
+
+    class _ExistingActor:
+        class _Health:
+            @staticmethod
+            def remote():
+                return _RemoteResult(
+                    {
+                        "domain_key": "vllm:model-a",
+                        "replica_id": "replica-0",
+                        "actor_generation": 3,
+                        "max_claim": 1,
+                        "token_budget": None,
+                    }
+                )
+
+        health_snapshot = _Health()
+
+    class _RemoteClass:
+        def options(self, **options):
+            created.append({"options": dict(options)})
+            return self
+
+        def remote(self, **kwargs):
+            created[-1]["kwargs"] = dict(kwargs)
+            return {"created": True}
+
+    class _Ray:
+        @staticmethod
+        def get_actor(_name, namespace=None):
+            _ = namespace
+            return _ExistingActor()
+
+        @staticmethod
+        def kill(actor, no_restart=True):
+            killed.append((actor, no_restart))
+
+        @staticmethod
+        def remote(**_kwargs):
+            return lambda _cls: _RemoteClass()
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
+        lambda ref, timeout_s=None: ref.value,
+    )
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        lambda **_kwargs: {},
+    )
+
+    out = get_or_create_model_runtime_actor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="actor-a",
+        actor_generation=3,
+        max_claim=64,
+    )
+
+    assert out == {"created": True}
+    assert killed and killed[0][1] is True
+    assert created[-1]["kwargs"]["max_claim"] == 64

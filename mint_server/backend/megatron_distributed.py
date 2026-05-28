@@ -9,12 +9,12 @@ Shared loss functions and Tinker Datum conversion utilities live in megatron_tra
 from __future__ import annotations  # Allow forward references in type hints
 
 import copy
-import os
-import json
-import math
 import hashlib
-import socket
+import json
 import logging
+import math
+import os
+import socket
 import sys
 import threading
 import time
@@ -26,37 +26,35 @@ if TYPE_CHECKING:
     import torch
 
 import ray
+
+from mint_server.backend.model_registry import get_model_config
+from mint_server.backend.node_placement import (ModelGpuPlacement,
+                                                assert_node_ip_capacity,
+                                                parse_model_gpu_placement)
+from mint_server.backend.ray_placement_groups import (
+    PlacementGroupMismatchError, get_named_placement_group)
+# Import centralized PFS paths from config
+from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE
+from mint_server.config import config as server_config
+from mint_server.model_input_utils import flatten_encoded_text_chunks
+from mint_server.ray_utils import init_ray
+
+from ..logging_context import (get_current_traceparent, get_request_id,
+                               init_actor_observability,
+                               restore_trace_id_from_traceparent,
+                               start_as_current_span,
+                               start_as_current_span_from_traceparent)
+from . import ray_kill
+from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
+from .runtime_actor_metrics import (current_ray_actor_name,
+                                    init_megatron_group_runtime_otel_metrics,
+                                    init_megatron_rank_runtime_otel_metrics)
+
 # NOTE: torch and tensordict imports are LAZY - done inside MegatronRankWorker.__init__
 # to ensure CUDA_VISIBLE_DEVICES is set before torch initializes CUDA
 # (tensordict imports torch internally)
 
-from . import ray_kill
-from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
-from .runtime_actor_metrics import (
-    current_ray_actor_name,
-    init_megatron_group_runtime_otel_metrics,
-    init_megatron_rank_runtime_otel_metrics,
-)
-from ..logging_context import (
-    get_current_traceparent,
-    get_request_id,
-    init_actor_observability,
-    restore_trace_id_from_traceparent,
-    start_as_current_span,
-    start_as_current_span_from_traceparent,
-)
 
-# Import centralized PFS paths from config
-from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE, config as server_config
-from mint_server.backend.model_registry import get_model_config
-from mint_server.ray_utils import init_ray
-from mint_server.model_input_utils import flatten_encoded_text_chunks
-from mint_server.backend.node_placement import (
-    assert_node_ip_capacity,
-    ModelGpuPlacement,
-    parse_model_gpu_placement,
-)
-from mint_server.backend.ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
 
 logger = logging.getLogger(__name__)
 
@@ -315,6 +313,7 @@ def _megatron_attention_backend() -> str:
 
     try:
         from importlib.metadata import version
+
         from packaging.version import Version
 
         flash_attn_version = Version(version("flash-attn"))
@@ -342,14 +341,47 @@ def _megatron_attention_backend() -> str:
     return "unfused"
 
 
+def _megatron_attention_backend_enum() -> object:
+    """Return Megatron's AttnBackend enum for config overrides."""
+    attention_backend = _megatron_attention_backend()
+    from megatron.core.transformer.enums import AttnBackend
+
+    return AttnBackend[attention_backend]
+
+
+def _megatron_disable_window_size() -> bool:
+    value = os.environ.get("MINT_MEGATRON_DISABLE_WINDOW_SIZE", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _explicit_megatron_attention_backend_env_vars() -> dict[str, str]:
+    """Return process-start env vars for an explicit Megatron attention backend override."""
+    out: dict[str, str] = {}
+    if os.environ.get("MINT_MEGATRON_ATTENTION_BACKEND", "").strip():
+        attention_backend = _megatron_attention_backend()
+        out["MINT_MEGATRON_ATTENTION_BACKEND"] = attention_backend
+        if attention_backend in {"flash", "fused", "unfused", "local"}:
+            out.update(
+                {
+                    "NVTE_FLASH_ATTN": "1" if attention_backend == "flash" else "0",
+                    "NVTE_FUSED_ATTN": "1" if attention_backend == "fused" else "0",
+                    "NVTE_UNFUSED_ATTN": "1" if attention_backend == "unfused" else "0",
+                }
+            )
+    disable_window_size = os.environ.get("MINT_MEGATRON_DISABLE_WINDOW_SIZE")
+    if disable_window_size is not None:
+        out["MINT_MEGATRON_DISABLE_WINDOW_SIZE"] = disable_window_size
+    return out
+
+
 def _disable_te_flash_attention_backend() -> None:
     """Prevent Transformer Engine from instantiating incompatible flash-attn."""
     try:
         from packaging.version import Version
-        from transformer_engine.pytorch.attention.dot_product_attention import (
-            backends as dpa_backends,
-            utils as dpa_utils,
-        )
+        from transformer_engine.pytorch.attention.dot_product_attention import \
+            backends as dpa_backends
+        from transformer_engine.pytorch.attention.dot_product_attention import \
+            utils as dpa_utils
 
         dpa_utils._NVTE_FLASH_ATTN = 0
         for flash_utils in (dpa_utils.FlashAttentionUtils, dpa_backends.fa_utils):
@@ -723,6 +755,7 @@ def get_node_ip_and_free_port() -> tuple[str, int]:
     Self-contained to avoid module import issues on Ray workers.
     """
     import ray
+
     # Use Ray's IP detection which respects --node-ip-address and finds the correct interface
     ip = ray.util.get_node_ip_address()
     # Get free port inline
@@ -1311,6 +1344,7 @@ class MegatronRankWorker:
         Must be called while in train_mode context (gradients on GPU).
         """
         import logging
+
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         grads = []
@@ -1342,6 +1376,7 @@ class MegatronRankWorker:
             grads: List of CPU tensors from _capture_gradients.
         """
         import logging
+
         from megatron.core.distributed import DistributedDataParallel as DDP
 
         idx = 0
@@ -1433,10 +1468,15 @@ class MegatronRankWorker:
         """
         import torch
         from megatron.core.optimizer import ChainedOptimizer
+        try:
+            from megatron.core.optimizer.distrib_optimizer import \
+                DistributedOptimizer as MegatronDistributedOptimizer
+        except Exception:
+            MegatronDistributedOptimizer = None
 
         def clone_to_cpu(value):
             if isinstance(value, torch.Tensor):
-                return value.detach().cpu().clone()
+                return value.detach().to(device="cpu", copy=True)
             if isinstance(value, dict):
                 return {k: clone_to_cpu(v) for k, v in value.items()}
             if isinstance(value, list):
@@ -1444,6 +1484,48 @@ class MegatronRankWorker:
             if isinstance(value, tuple):
                 return tuple(clone_to_cpu(v) for v in value)
             return copy.deepcopy(value)
+
+        def wrapper_safe_inner_state(inner_state: dict) -> dict:
+            """Return an inner optimizer state view safe for wrapper metadata extraction."""
+            safe_state = {}
+            for key, value in inner_state.items():
+                if key == "param_groups" and isinstance(value, list):
+                    safe_state[key] = [copy.deepcopy(group) for group in value]
+                else:
+                    # Wrapper state_dict implementations only read tensor state to
+                    # derive metadata such as the common step. Avoid copying the
+                    # large tensor payload here; it is copied to CPU once below.
+                    safe_state[key] = value
+            return safe_state
+
+        def call_wrapper_state_dict_with_cached_inner(opt, inner_opt, inner_state):
+            if inner_opt is None or inner_state is None:
+                return opt.state_dict()
+            original_state_dict = getattr(inner_opt, "state_dict", None)
+            if not callable(original_state_dict):
+                return opt.state_dict()
+
+            def cached_state_dict():
+                return wrapper_safe_inner_state(inner_state)
+
+            try:
+                setattr(inner_opt, "state_dict", cached_state_dict)
+            except Exception:
+                return opt.state_dict()
+
+            try:
+                return opt.state_dict()
+            finally:
+                try:
+                    setattr(inner_opt, "state_dict", original_state_dict)
+                except Exception:
+                    logger.warning(
+                        "[Rank %s] Failed to restore inner optimizer state_dict method after capture",
+                        self.rank,
+                    )
+
+        def is_megatron_distributed_optimizer(opt) -> bool:
+            return MegatronDistributedOptimizer is not None and isinstance(opt, MegatronDistributedOptimizer)
 
         state_dict = {}
         optimizer = self.engine.optimizer
@@ -1458,9 +1540,28 @@ class MegatronRankWorker:
 
         for i, _opt in enumerate(iter_optimizers(optimizer)):
             entry = {}
+            inner_opt = getattr(_opt, "optimizer", None)
+            inner_state = None
+            use_cached_inner_state = is_megatron_distributed_optimizer(_opt)
+            if use_cached_inner_state and inner_opt is not None and hasattr(inner_opt, "state_dict"):
+                try:
+                    inner_state = inner_opt.state_dict()
+                except Exception as e:
+                    logger.warning(
+                        "[Rank %s] Failed to capture inner optimizer state for opt[%s]: %s: %s",
+                        self.rank,
+                        i,
+                        type(e).__name__,
+                        e,
+                    )
+
             if hasattr(_opt, "state_dict"):
                 try:
-                    entry["wrapper_state_dict"] = clone_to_cpu(_opt.state_dict())
+                    if use_cached_inner_state:
+                        wrapper_state = call_wrapper_state_dict_with_cached_inner(_opt, inner_opt, inner_state)
+                    else:
+                        wrapper_state = _opt.state_dict()
+                    entry["wrapper_state_dict"] = clone_to_cpu(wrapper_state)
                 except Exception as e:
                     logger.warning(
                         "[Rank %s] Failed to capture wrapper optimizer state for opt[%s]: %s: %s",
@@ -1470,10 +1571,9 @@ class MegatronRankWorker:
                         e,
                     )
 
-            inner_opt = getattr(_opt, "optimizer", None)
-            if inner_opt is not None and hasattr(inner_opt, "state_dict"):
+            if not use_cached_inner_state and inner_opt is not None and hasattr(inner_opt, "state_dict"):
                 try:
-                    entry["inner_state_dict"] = clone_to_cpu(inner_opt.state_dict())
+                    inner_state = inner_opt.state_dict()
                 except Exception as e:
                     logger.warning(
                         "[Rank %s] Failed to capture inner optimizer state for opt[%s]: %s: %s",
@@ -1482,6 +1582,9 @@ class MegatronRankWorker:
                         type(e).__name__,
                         e,
                     )
+
+            if inner_state is not None:
+                entry["inner_state_dict"] = clone_to_cpu(inner_state)
 
             if entry:
                 state_dict[f"optimizer_{i}"] = entry
@@ -1532,6 +1635,11 @@ class MegatronRankWorker:
             state_dict: Dict from _capture_optimizer_state. May be empty for new sessions.
         """
         from megatron.core.optimizer import ChainedOptimizer
+        try:
+            from megatron.core.optimizer.distrib_optimizer import \
+                DistributedOptimizer as MegatronDistributedOptimizer
+        except Exception:
+            MegatronDistributedOptimizer = None
 
         optimizer = self.engine.optimizer
         if optimizer is None:
@@ -1541,6 +1649,9 @@ class MegatronRankWorker:
             if isinstance(opt, ChainedOptimizer):
                 return opt.chained_optimizers
             return [opt]
+
+        def is_megatron_distributed_optimizer(opt) -> bool:
+            return MegatronDistributedOptimizer is not None and isinstance(opt, MegatronDistributedOptimizer)
 
         for i, _opt in enumerate(iter_optimizers(optimizer)):
             entry = state_dict.get(f"optimizer_{i}", {}) if isinstance(state_dict, dict) else {}
@@ -1562,7 +1673,10 @@ class MegatronRankWorker:
 
             inner_state = entry.get("inner_state_dict") if isinstance(entry, dict) else None
             if isinstance(inner_state, dict) and inner_opt is not None and hasattr(inner_opt, "load_state_dict"):
-                inner_opt.load_state_dict(copy.deepcopy(inner_state))
+                if is_megatron_distributed_optimizer(_opt):
+                    inner_opt.load_state_dict(inner_state)
+                else:
+                    inner_opt.load_state_dict(copy.deepcopy(inner_state))
 
         logger.debug(f"[Rank {self.rank}] Restored optimizer state (cleared first)")
 
@@ -2180,7 +2294,8 @@ class MegatronRankWorker:
         return int(rank)
 
     def _zero_lora_rank_tail(self, model=None, actual_rank: int | None = None, *, zero_grads: bool = True) -> dict[str, int]:
-        from mint_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+        from mint_server.backend.lora_utils import \
+            zero_lora_rank_tail_named_parameters
 
         effective_rank = self._resolve_actual_rank(actual_rank)
         if effective_rank == self.lora_rank:
@@ -2310,8 +2425,9 @@ class MegatronRankWorker:
 
     def _initialize_distributed(self):
         """Initialize torch.distributed with NCCL backend."""
-        import torch
         from datetime import timedelta
+
+        import torch
 
         logger.info(f"[Rank {self.rank}] _initialize_distributed starting...")
 
@@ -2374,7 +2490,8 @@ class MegatronRankWorker:
                 _disable_te_flash_attention_backend()
             logger.info(f"[Rank {self.rank}] Megatron attention_backend={attention_backend}")
 
-            from mint_server.backend.verl_patches import _enable_megatron_determinism
+            from mint_server.backend.verl_patches import \
+                _enable_megatron_determinism
             _patch_flash_attn_compat()
             _enable_megatron_determinism(seed=42)
             if attention_backend != "flash":
@@ -2398,15 +2515,13 @@ class MegatronRankWorker:
             except Exception as e:
                 logger.warning(f"[Rank {self.rank}] Could not apply verl patches: {e}")
 
-        from verl.workers.engine.megatron.transformer_impl import MegatronEngineWithLMHead
-        from verl.workers.config import (
-            HFModelConfig,
-            McoreEngineConfig,
-            McoreOptimizerConfig,
-        )
+        from transformers import AutoConfig
         from verl.trainer.config import CheckpointConfig
         from verl.utils.fs import copy_to_local
-        from transformers import AutoConfig
+        from verl.workers.config import (HFModelConfig, McoreEngineConfig,
+                                         McoreOptimizerConfig)
+        from verl.workers.engine.megatron.transformer_impl import \
+            MegatronEngineWithLMHead
 
         with start_as_current_span(
             "training.create_model.megatron.rank_worker.load_model_config",
@@ -2616,7 +2731,10 @@ class MegatronRankWorker:
         head_dim_qk = qk_nope + qk_rope
         has_mla_attention = head_dim_qk > 0
         attention_backend = _megatron_attention_backend()
-        override_tf_config["attention_backend"] = attention_backend
+        override_tf_config["attention_backend"] = _megatron_attention_backend_enum()
+        if _megatron_disable_window_size():
+            override_tf_config["window_size"] = None
+            logger.info(f"[Rank {self.rank}] Megatron sliding-window attention disabled by env override.")
         if has_mla_attention:
             logger.info(
                 f"[Rank {self.rank}] MLA attention detected: head_dim_qk={head_dim_qk} "
@@ -2693,12 +2811,14 @@ class MegatronRankWorker:
             if "router_replay" in engine_fields:
                 router_replay_cfg = None
                 try:
-                    from verl.workers.config.engine import EngineRouterReplayConfig
+                    from verl.workers.config.engine import \
+                        EngineRouterReplayConfig
 
                     router_replay_cfg = EngineRouterReplayConfig(mode=self.config.router_replay_mode)
                 except Exception:
                     try:
-                        from verl.workers.config.actor import RouterReplayConfig
+                        from verl.workers.config.actor import \
+                            RouterReplayConfig
 
                         router_replay_cfg = RouterReplayConfig(mode=self.config.router_replay_mode)
                     except Exception as e:
@@ -2870,9 +2990,10 @@ class MegatronRankWorker:
         Returns:
             dict with reset counts (only from rank 0)
         """
-        import torch
         import sys
         import time
+
+        import torch
 
         self._bind_traceparent(traceparent)
 
@@ -2933,9 +3054,10 @@ class MegatronRankWorker:
         Returns:
             dict with determinism status info (only from rank 0)
         """
-        import torch
-        import os
         import glob
+        import os
+
+        import torch
 
         status = {
             "rank": self.rank,
@@ -2987,9 +3109,12 @@ class MegatronRankWorker:
         serialization issues that cause CUDA memory corruption.
         """
         import torch
+
         from mint_server.backend.megatron_training import (
             benchmark_debug_input_entries,
-            create_sft_loss_fn, create_ppo_loss_fn, mint_datum_to_tensordict
+            create_ppo_loss_fn,
+            create_sft_loss_fn,
+            mint_datum_to_tensordict,
         )
 
         self._bind_traceparent(traceparent)
@@ -3472,7 +3597,9 @@ class MegatronRankWorker:
                 This ensures logprobs match vLLM (which always has bias=0).
         """
         import torch
-        from mint_server.backend.megatron_training import mint_datum_to_tensordict
+
+        from mint_server.backend.megatron_training import \
+            mint_datum_to_tensordict
 
         self._bind_traceparent(traceparent)
         reset_bias = self._resolve_reset_bias(reset_bias, default=True)
@@ -3498,7 +3625,8 @@ class MegatronRankWorker:
         data = mint_datum_to_tensordict(data_items, max_token_len_per_gpu=max_token_len, device=f"cuda:{device}")
 
         # Use logprob extractor to get per-token log probabilities
-        from mint_server.backend.megatron_training import create_logprob_extractor_fn
+        from mint_server.backend.megatron_training import \
+            create_logprob_extractor_fn
         loss_function = create_logprob_extractor_fn()
 
         # Use eval_mode context to load model from CPU to GPU (required for param_offload)
@@ -3631,14 +3759,15 @@ class MegatronRankWorker:
     ) -> dict:
         """Run reverse-KL distillation loss against a fixed reference adapter checkpoint."""
         import torch
+        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+
         from mint_server.backend.megatron_training import (
             create_reverse_kl_loss_fn,
             create_vocab_parallel_logits_extractor_fn,
-            mint_datum_to_tensordict,
-        )
-        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
+            mint_datum_to_tensordict)
 
-        from .mintx_ops import build_scoring_sequence, vocab_parallel_log_probs_from_logits_no_grad
+        from .mintx_ops import (build_scoring_sequence,
+                                vocab_parallel_log_probs_from_logits_no_grad)
 
         self._bind_traceparent(traceparent)
         if temperature <= 0:
@@ -3902,10 +4031,10 @@ class MegatronRankWorker:
     ) -> dict:
         """Compute full-vocab teacher log-probs on masked completion tokens only."""
         import torch
+
         from mint_server.backend.megatron_training import (
             create_vocab_parallel_logits_extractor_fn,
-            mint_datum_to_tensordict,
-        )
+            mint_datum_to_tensordict)
 
         from .mintx_ops import vocab_parallel_log_probs_from_logits_no_grad
 
@@ -4212,7 +4341,8 @@ class MegatronRankWorker:
         restore_bridge_patch = None
         peft_bridge_cls = None
         if use_bridge_internal_patches and pipeline_world_size == 1:
-            from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
+            from megatron.bridge.models.conversion import \
+                model_bridge as bridge_dispatch
 
             bridge_impl = bridge_dispatch.get_model_bridge(bridge._causal_lm_architecture)
             bridge_cls = type(bridge_impl)
@@ -4225,10 +4355,13 @@ class MegatronRankWorker:
                 )
             import itertools
 
-            from megatron.bridge.models.conversion.model_bridge import _megatron_local_name_to_global
-            from megatron.bridge.models.conversion.utils import extract_sort_key, persistent_buffers
+            from megatron.bridge.models.conversion.model_bridge import \
+                _megatron_local_name_to_global
+            from megatron.bridge.models.conversion.utils import (
+                extract_sort_key, persistent_buffers)
             from megatron.bridge.peft.canonical_lora import ModuleDict
-            from megatron.bridge.peft.utils import ParallelLinearAdapter, get_adapter_attributes_from_linear
+            from megatron.bridge.peft.utils import (
+                ParallelLinearAdapter, get_adapter_attributes_from_linear)
             from megatron.core.utils import get_pg_rank, unwrap_model
 
             _missing = object()
@@ -4365,7 +4498,8 @@ class MegatronRankWorker:
             restore_bridge_patch = _restore_bridge_patch
         elif use_bridge_internal_patches:
             try:
-                from megatron.bridge.models.conversion import model_bridge as bridge_dispatch
+                from megatron.bridge.models.conversion import \
+                    model_bridge as bridge_dispatch
             except ImportError:
                 bridge_dispatch = None
             if bridge_dispatch is not None and hasattr(bridge, "_causal_lm_architecture"):
@@ -4377,10 +4511,12 @@ class MegatronRankWorker:
         gloo_debug = _env_flag("MINT_MBRIDGE_EXPORT_GATHER_DEBUG", False)
         gloo_barrier_debug = _env_flag("MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG", gloo_debug)
         if use_bridge_internal_patches:
-            import torch
             from datetime import timedelta
-            from megatron.bridge.models.conversion import param_mapping as bridge_param_mapping
+
+            import torch
             import torch.distributed as dist
+            from megatron.bridge.models.conversion import \
+                param_mapping as bridge_param_mapping
 
             restore_tp_gather = bridge_param_mapping.MegatronParamMapping.gather_from_tp_ranks
             gloo_tp_groups: dict[tuple[int, ...], object] = {}
@@ -5317,10 +5453,11 @@ class MegatronRankWorker:
         traceparent: str | None = None,
         use_per_expert_lora: bool = False,
     ) -> dict:
-        """Save checkpoint: LoRA weights + config + training metadata.
+        """Save training checkpoint: distributed LoRA adapter shards + optimizer + metadata.
 
-        IMPORTANT: ALL ranks must call this method because get_lora_state_dict()
-        uses NCCL collectives. Only rank 0 saves to disk.
+        IMPORTANT: ALL ranks must call this method because save_adapter_state()
+        uses Megatron collectives. Each rank writes its local adapter/optimizer
+        shard; only rank 0 writes small metadata files.
 
         Args:
             save_path: Directory path to save checkpoint files.
@@ -5332,23 +5469,30 @@ class MegatronRankWorker:
         """
         self._bind_traceparent(traceparent)
         import os
-        import torch
 
-        from safetensors.torch import save_file
-        from mint_server.backend.lora_utils import truncate_lora_state_dict
+        import torch
         from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path
 
         effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        effective_train_attn = True if train_attn is None else bool(train_attn)
+        effective_train_mlp = True if train_mlp is None else bool(train_mlp)
+        effective_train_unembed = True if train_unembed is None else bool(train_unembed)
         with self.engine.train_mode():
             self._zero_lora_rank_tail(actual_rank=effective_rank, zero_grads=True)
 
-        # ALL ranks must call get_lora_state_dict - it uses NCCL collectives
-        # Only rank 0 gets actual data, others get empty dict
-        state_dict = self.get_lora_state_dict(
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
-        )
+        # Training save_state should be adapter+optimizer only. Exporting a PEFT
+        # safetensors copy duplicates the distributed adapter shards and adds a
+        # large rank0 all-gather. Keep it behind an explicit compatibility flag.
+        export_peft_adapter = _env_flag("MINT_MEGATRON_SAVE_STATE_EXPORT_PEFT", False)
+        peft_state_dict = None
+        if export_peft_adapter:
+            # ALL ranks must call get_lora_state_dict - it uses NCCL collectives.
+            # Only rank 0 gets actual data, others get empty dict.
+            peft_state_dict = self.get_lora_state_dict(
+                train_attn=effective_train_attn,
+                train_mlp=effective_train_mlp,
+                train_unembed=effective_train_unembed,
+            )
 
         os.makedirs(save_path, exist_ok=True)
 
@@ -5366,15 +5510,23 @@ class MegatronRankWorker:
         optimizer_file = rank_path + "_optimizer.pt"
         torch.save(self._capture_optimizer_state(), optimizer_file)
 
-        # Only rank 0 saves PEFT-format artifacts used by vLLM.
+        # Only rank 0 writes global metadata and optional compatibility exports.
         if self.rank != 0:
             return {}
 
-        # 1. LoRA weights (PEFT format)
-        state_dict = truncate_lora_state_dict(state_dict, self.lora_rank, effective_rank)
-        save_file(state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+        if export_peft_adapter:
+            from safetensors.torch import save_file
 
-        # 2. LoRA config
+            from mint_server.backend.lora_utils import truncate_lora_state_dict
+
+            peft_state_dict = truncate_lora_state_dict(
+                peft_state_dict or {},
+                self.lora_rank,
+                effective_rank,
+            )
+            save_file(peft_state_dict, os.path.join(save_path, "adapter_model.safetensors"))
+
+        # 1. LoRA config
         # Use actual session rank (Phase 7) or fall back to max_lora_rank
         try:
             cfg = get_model_config(self.base_model)
@@ -5383,10 +5535,10 @@ class MegatronRankWorker:
             model_is_mla = False
         target_modules = self._target_modules_for_export(
             model_is_mla=model_is_mla,
-            train_attn=train_attn,
-            train_mlp=train_mlp,
-            train_unembed=train_unembed,
-            state_dict=state_dict,
+            train_attn=effective_train_attn,
+            train_mlp=effective_train_mlp,
+            train_unembed=effective_train_unembed,
+            state_dict=peft_state_dict or {},
         )
         # Include attention modules; add MLP modules only when trained
         config = {
@@ -5400,7 +5552,7 @@ class MegatronRankWorker:
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
             json.dump(config, f, indent=2)
 
-        # 3. Training metadata
+        # 2. Training metadata
         meta = {
             "current_step": step_count,
             "learning_rate": self.learning_rate,
@@ -5436,6 +5588,7 @@ class MegatronRankWorker:
         import os
 
         from safetensors.torch import save_file
+
         from mint_server.backend.lora_utils import truncate_lora_state_dict
 
         effective_rank = actual_rank if actual_rank is not None else self.lora_rank
@@ -5615,13 +5768,13 @@ class MegatronRankWorker:
             Dict with status info (rank 0 only returns meaningful data).
         """
         self._bind_traceparent(traceparent)
+        import importlib
         import os
 
         import torch
 
-        import importlib
-
-        from mint_server.backend.lora_utils import fit_lora_state_dict_to_reference, pad_lora_state_dict
+        from mint_server.backend.lora_utils import (
+            fit_lora_state_dict_to_reference, pad_lora_state_dict)
         peft_utils = importlib.import_module("verl.utils.megatron_peft_utils")
 
         self._release_sticky_for_aux_mode_transition(
@@ -5792,8 +5945,8 @@ class MegatronRankWorker:
         from pathlib import Path
 
         import torch
-
-        from verl.utils.megatron_peft_utils import _get_rank_checkpoint_path, get_adapter_state_dict
+        from verl.utils.megatron_peft_utils import (_get_rank_checkpoint_path,
+                                                    get_adapter_state_dict)
 
         os.makedirs(checkpoint_path, exist_ok=True)
         self._release_sticky_for_aux_mode_transition(
@@ -7264,7 +7417,8 @@ class MegatronWorkerGroup:
 
         allowed_ips = parse_csv(os.environ.get("MINT_MEGATRON_NODE_IPS_CSV", ""))
         if allowed_ips:
-            from .node_placement import build_node_affinity_gpu_bundles, select_free_nodes_from_allowed_ips
+            from .node_placement import (build_node_affinity_gpu_bundles,
+                                         select_free_nodes_from_allowed_ips)
 
             node_ips, gpus_per_node = select_free_nodes_from_allowed_ips(
                 allowed_node_ips=allowed_ips,
@@ -7377,6 +7531,7 @@ class MegatronWorkerGroup:
                 "NVTE_DEBUG": "1",
                 "NVTE_DEBUG_LEVEL": "2",
                 **otel_env_vars(),
+                **_explicit_megatron_attention_backend_env_vars(),
                 },
             ),
         }
@@ -7401,6 +7556,7 @@ class MegatronWorkerGroup:
             "MINT_MEGATRON_ATTENTION_BACKEND",
             "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
             "MINT_MEGATRON_STACK_DUMP_LIMIT",
+            "MINT_MEGATRON_ATTENTION_BACKEND",
             "MINT_MEGATRON_ENABLE_DEEPEP",
             "MINT_MEGATRON_MOE_TOKEN_DISPATCHER_TYPE",
             "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
@@ -9753,7 +9909,14 @@ class MegatronWorkerGroup:
         hot_infos: list[dict] = []
         if self.workers:
             try:
-                hot_infos = ray.get([w.get_hot_cache_info.remote() for w in self.workers])
+                timeout_s = max(
+                    0.1,
+                    _env_float("MINT_MEGATRON_CACHE_DIAGNOSTICS_TIMEOUT_S", 2.0),
+                )
+                hot_infos = ray.get(
+                    [w.get_hot_cache_info.remote() for w in self.workers],
+                    timeout=timeout_s,
+                )
             except Exception as e:
                 logger.warning(
                     "[MegatronWorkerGroup] Failed to query hot cache diagnostics: %s: %s",
@@ -10510,9 +10673,8 @@ def get_or_create_megatron_worker_group(
     """
     from mint_server.backend.model_actor_inventory import ActorType
     from mint_server.backend.model_actor_publication import (
-        BackendModelActorLaunch,
-        publish_backend_model_actor,
-    )
+        BackendModelActorLaunch, publish_backend_model_actor)
+
     from .model_registry import is_topology_desired_model
 
     config = distributed_config or DistributedConfig()
@@ -10784,7 +10946,8 @@ def get_or_create_megatron_worker_group(
                 ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
             )
 
-        from ..config import actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
+        from ..config import (actor_runtime_env_vars,
+                              apply_detached_actor_resources, otel_env_vars)
 
         # Runtime env for PFS code access
         runtime_env = {
@@ -10800,6 +10963,7 @@ def get_or_create_megatron_worker_group(
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",  # Reduce memory fragmentation
                     **otel_env_vars(),
+                    **_explicit_megatron_attention_backend_env_vars(),
                 },
             )
         }
@@ -10832,6 +10996,7 @@ def get_or_create_megatron_worker_group(
             "MINT_MEGATRON_ATTENTION_BACKEND",
             "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
             "MINT_MEGATRON_STACK_DUMP_LIMIT",
+            "MINT_MEGATRON_ATTENTION_BACKEND",
             "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
             "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
             "MINT_BENCH_RECORD_LOGITS",
@@ -10991,7 +11156,8 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
     Returns:
         True if any actor was killed, False if none found.
     """
-    from mint_server.backend.model_actor_supervisor import get_model_actor_supervisor, ActorType
+    from mint_server.backend.model_actor_supervisor import (
+        ActorType, get_model_actor_supervisor)
 
     if not ray.is_initialized():
         init_ray(
@@ -11104,7 +11270,8 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
             return False
     else:
         # Check for any Megatron actor from model actor registry
-        from mint_server.backend.model_actor_supervisor import get_model_actor_supervisor, ActorType
+        from mint_server.backend.model_actor_supervisor import (
+            ActorType, get_model_actor_supervisor)
         model_actor_supervisor = get_model_actor_supervisor()
         for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:

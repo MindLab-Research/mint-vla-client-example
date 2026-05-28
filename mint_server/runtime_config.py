@@ -55,6 +55,7 @@ ACTOR_CREATION_INPUT_KEYS = frozenset(
     {
         "MINT_CONFIG_ACTOR_NAME",
         "MINT_MEGATRON_NODE_IPS_CSV",
+        "MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME",
         "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME",
         "MINT_MAINTENANCE_CRON_ACTOR_NAME",
     }
@@ -100,6 +101,10 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_MEGATRON_STICKY_TIMING_DIAG",
         "MINT_MEGATRON_STACK_DUMP_TIMEOUT_S",
         "MINT_MEGATRON_STACK_DUMP_LIMIT",
+        "MINT_MEGATRON_ATTENTION_BACKEND",
+        "MINT_MEGATRON_DISABLE_WINDOW_SIZE",
+        "MINT_MEGATRON_CACHE_DIAGNOSTICS_TIMEOUT_S",
+        "MINT_MODEL_ACTOR_SUPERVISOR_REMOTE_CALL_TIMEOUT_S",
         "MINT_MBRIDGE_EXPORT_GLOO_TIMEOUT_S",
         "MINT_MBRIDGE_EXPORT_GATHER_DEBUG",
         "MINT_MBRIDGE_EXPORT_GLOO_BARRIER_DEBUG",
@@ -110,6 +115,9 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
         "MINT_NCCL_IB_DISABLE",
         "MINT_TIMING_DIAG",
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
         "MINT_SUPPORTED_MODELS",
         "MINT_GATEWAY_CONFIG_JSON",
         "MINT_MAINTENANCE_REAP_INTERVAL_S",
@@ -118,6 +126,14 @@ SNAPSHOT_CONFIG_ENV_KEYS = frozenset(
         "MINT_TOPOLOGY_STATE_PATH",
         "MINT_MODEL_RUNTIME_POLL_INTERVAL_S",
         "MINT_MODEL_RUNTIME_LEASE_TTL_S",
+        "MINT_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MODEL_WORK_CLAIM_SAME_AFFINITY_DOMAINS",
         "MINT_TRAINING_HEARTBEAT_STALE_S",
         "MINT_SUPERVISOR_STATE_BACKEND",
         "MINT_SUPERVISOR_STATE_DB_PATH",
@@ -304,6 +320,18 @@ CONFIG_ACTOR_ENV_EXCLUDED_KEYS = frozenset(
         "MINT_MODEL_ACTOR_REPLICA_ID",
     }
 )
+CONFIG_ACTOR_HYDRATION_EXCLUDED_KEYS = frozenset(
+    {
+        "MINT_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM",
+        "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MODEL_WORK_CLAIM_SAME_AFFINITY_DOMAINS",
+    }
+)
 CONFIG_ACTOR_HYDRATION_PREFIXES = ("OTEL_",)
 
 
@@ -348,7 +376,11 @@ def classify_env(environ: Mapping[str, str]) -> dict[str, dict[str, str]]:
 def _redact_config_value(key: str, value: object) -> object:
     upper = key.upper()
     parts = {part for part in re.split(r"[^A-Z0-9]+", upper) if part}
-    if any(marker in upper for marker in SECRET_MARKERS) or parts.intersection(SECRET_PARTS):
+    has_secret_marker = any(marker in upper for marker in SECRET_MARKERS)
+    secret_parts = parts.intersection(SECRET_PARTS)
+    if secret_parts == {"TOKEN"} and "BUDGET" in parts and not has_secret_marker:
+        return value
+    if has_secret_marker or secret_parts:
         return REDACTED_VALUE
     return value
 
@@ -369,6 +401,8 @@ def actor_env_from_environ(environ: Mapping[str, str]) -> dict[str, str]:
         if canonical_key != key and canonical_key in environ:
             continue
         if canonical_key in CONFIG_ACTOR_ENV_EXCLUDED_KEYS:
+            continue
+        if canonical_key in CONFIG_ACTOR_HYDRATION_EXCLUDED_KEYS:
             continue
         config_class = classify_env_key(canonical_key)
         if config_class in {

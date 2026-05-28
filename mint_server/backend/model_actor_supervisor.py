@@ -859,8 +859,15 @@ def default_control_plane_dependencies() -> list[ControlPlaneDependency]:
 
 
 async def _maybe_await(value: Any) -> Any:
+    timeout_s = 10.0
+    raw_timeout = os.environ.get("MINT_MODEL_ACTOR_SUPERVISOR_REMOTE_CALL_TIMEOUT_S")
+    if raw_timeout:
+        try:
+            timeout_s = max(1.0, float(raw_timeout))
+        except (TypeError, ValueError):
+            timeout_s = 10.0
     try:
-        return await async_get_ray_ref(value, timeout_s=10.0)
+        return await async_get_ray_ref(value, timeout_s=timeout_s)
     except TypeError:
         if inspect.isawaitable(value):
             return await value

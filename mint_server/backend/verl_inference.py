@@ -59,6 +59,7 @@ if TYPE_CHECKING:
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
 logger = logging.getLogger(__name__)
+VLLM_TOKEN_BUDGET_RATIO = 0.95
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -809,6 +810,7 @@ def _create_extended_server_class(
                         )
             super(ExtendedVLLMHttpServer, self).__init__(*args, **call_kwargs)
             self._vllm_stats_observer = VllmStatsObserver()
+            self._kv_cache_observability: dict[str, int] = {}
             self._otel_runtime_metrics_enabled = init_vllm_runtime_otel_metrics(
                 snapshot_fn=self._vllm_stats_observer.snapshot,
                 actor_name=current_ray_actor_name("unknown"),
@@ -960,6 +962,7 @@ def _create_extended_server_class(
                 "gpu_indices": [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding],
                 "gpu_bindings": gpu_bindings,
                 **self._vllm_stats_observer.snapshot(),
+                **self._kv_cache_observability,
             }
 
         async def is_engine_ready(self) -> bool:
@@ -1049,11 +1052,34 @@ def _create_extended_server_class(
             install_vllm_iteration_observability_patches()
             attach_vllm_stats_logger(engine, self._vllm_stats_observer)
 
+        async def _refresh_kv_cache_observability(self) -> None:
+            try:
+                info = await self.get_kv_debug_info()
+                capacity = int(info.get("kv_cache_capacity_tokens") or 0)
+                if capacity <= 0:
+                    return
+                self._kv_cache_observability = {
+                    "kv_cache_capacity_tokens": capacity,
+                    "kv_cache_token_budget": max(
+                        1,
+                        int(math.floor(float(capacity) * VLLM_TOKEN_BUDGET_RATIO)),
+                    ),
+                }
+                block_size = int(info.get("kv_cache_block_size") or 0)
+                if block_size > 0:
+                    self._kv_cache_observability["kv_cache_block_size"] = block_size
+                num_blocks = int(info.get("min_kv_cache_num_blocks") or 0)
+                if num_blocks > 0:
+                    self._kv_cache_observability["kv_cache_num_blocks"] = num_blocks
+            except Exception:
+                logger.warning("vllm_kv_cache_observability_refresh_failed", exc_info=True)
+
         async def run_server(self, args):
             """Override to inject multi-LoRA config (rank-0 node)."""
             self._patch_lora_args(args)
             out = await super().run_server(args)
             self._attach_stats_logger_if_ready()
+            await self._refresh_kv_cache_observability()
             return out
 
         async def run_headless(self, args):
@@ -1061,6 +1087,7 @@ def _create_extended_server_class(
             self._patch_lora_args(args)
             out = await super().run_headless(args)
             self._attach_stats_logger_if_ready()
+            await self._refresh_kv_cache_observability()
             return out
 
         async def add_lora(self, lora_request) -> None:
@@ -2495,6 +2522,26 @@ def _create_extended_server_class(
                 target = worker if worker is not None else worker_wrapper
                 model_runner = getattr(target, "model_runner", None)
                 kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                groups = getattr(kv_cfg, "kv_cache_groups", []) or []
+                block_sizes = []
+                for group in groups:
+                    spec = getattr(group, "kv_cache_spec", None)
+                    block_size = getattr(spec, "block_size", 0) if spec is not None else 0
+                    try:
+                        if int(block_size) > 0:
+                            block_sizes.append(int(block_size))
+                    except (TypeError, ValueError):
+                        pass
+                if not block_sizes:
+                    cache_config = getattr(target, "cache_config", None)
+                    block_size = getattr(cache_config, "block_size", 0) if cache_config is not None else 0
+                    try:
+                        if int(block_size) > 0:
+                            block_sizes.append(int(block_size))
+                    except (TypeError, ValueError):
+                        pass
+                block_size = min(block_sizes) if block_sizes else 0
+                num_blocks = int(getattr(kv_cfg, "num_blocks", 0) or 0) if kv_cfg is not None else 0
                 return {
                     "available_kv_cache_memory_bytes": int(
                         getattr(target, "available_kv_cache_memory_bytes", 0) or 0
@@ -2508,15 +2555,16 @@ def _create_extended_server_class(
                     "peak_activation_memory_bytes": int(
                         getattr(target, "peak_activation_memory", 0) or 0
                     ),
-                    "kv_cache_num_blocks": int(
-                        getattr(kv_cfg, "num_blocks", 0) or 0
-                    ) if kv_cfg is not None else 0,
-                    "kv_cache_groups": len(
-                        getattr(kv_cfg, "kv_cache_groups", []) or []
-                    ) if kv_cfg is not None else 0,
+                    "kv_cache_num_blocks": num_blocks,
+                    "kv_cache_block_size": block_size,
+                    "kv_cache_capacity_tokens": num_blocks * block_size if num_blocks > 0 and block_size > 0 else 0,
+                    "kv_cache_groups": len(groups),
                 }
 
             infos = await self.engine.collective_rpc(_collect_kv_info)
+            capacities = [int(x.get("kv_cache_capacity_tokens", 0) or 0) for x in infos]
+            block_sizes = [int(x.get("kv_cache_block_size", 0) or 0) for x in infos]
+            num_blocks = [int(x.get("kv_cache_num_blocks", 0) or 0) for x in infos]
             return {
                 "per_worker": infos,
                 "min_available_kv_cache_memory_bytes": min(
@@ -2525,6 +2573,10 @@ def _create_extended_server_class(
                 "max_available_kv_cache_memory_bytes": max(
                     int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
                 ) if infos else 0,
+                "kv_cache_capacity_tokens": min((x for x in capacities if x > 0), default=0),
+                "kv_cache_block_size": min((x for x in block_sizes if x > 0), default=0),
+                "min_kv_cache_num_blocks": min((x for x in num_blocks if x > 0), default=0),
+                "max_kv_cache_num_blocks": max(num_blocks) if num_blocks else 0,
             }
 
 

@@ -1062,6 +1062,8 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_MODEL_CONFIG_OVERRIDES_JSON": '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}',
             "MINT_VLLM_MAX_NUM_SEQS": "32",
             "MINT_VLLM_MAX_NUM_BATCHED_TOKENS": "2048",
+            "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM": "64",
+            "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM": "16",
             "MINT_VLLM_MAX_LORAS": "4",
             "MINT_VLLM_MAX_CPU_LORAS": "8",
             "MINT_VLLM_MAX_LORA_RANK": "16",
@@ -1074,12 +1076,16 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     actor_env = payload["actor_env"]
     assert data["MINT_CONFIG_ACTOR_HYDRATE"] == "1"
     assert "MINT_VLLM_MAX_NUM_SEQS" not in data
+    assert "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" not in data
+    assert "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM" not in data
     assert actor_env["MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE"] == "1"
     assert actor_env["MINT_VLLM_REQUEST_TIMING"] == "0"
     assert actor_env["MINT_VLLM_ENABLE_SLEEP_MODE"] == "1"
     assert actor_env["MINT_MODEL_CONFIG_OVERRIDES_JSON"] == '{"Qwen/Qwen3-0.6B":{"gpu_memory_utilization":0.75}}'
     assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
     assert actor_env["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "2048"
+    assert "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" not in actor_env
+    assert "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM" not in actor_env
     assert actor_env["MINT_VLLM_MAX_LORAS"] == "4"
     assert actor_env["MINT_VLLM_MAX_CPU_LORAS"] == "8"
     assert actor_env["MINT_VLLM_MAX_LORA_RANK"] == "16"
