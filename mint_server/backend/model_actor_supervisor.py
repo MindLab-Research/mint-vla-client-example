@@ -1483,6 +1483,24 @@ class ModelActorSupervisorCore:
     def clear(self, kill_actors: bool = True) -> int:
         return self._inventory.clear(kill_actors=kill_actors)
 
+    def _reconcile_protected_actor_names(self, desired: dict[tuple[str, str], ModelActorSpec]) -> set[str]:
+        protected = {
+            str(spec.normalized_actor_name())
+            for spec in desired.values()
+            if bool(getattr(spec, "enabled", True)) and str(spec.normalized_actor_name()).strip()
+        }
+        protected.update(
+            str(entry.actor_name)
+            for entry in self._inventory.iter_entries(prune_stale=False)
+            if str(entry.actor_name).strip()
+        )
+        protected.update(
+            str(state.get("actor_name") or "")
+            for state in self._node_metric_states.values()
+            if str(state.get("actor_name") or "").strip()
+        )
+        return protected
+
     def set_desired(self, spec: ModelActorSpec) -> None:
         if not spec.domain_key:
             raise ValueError("domain_key is required")
@@ -2042,7 +2060,17 @@ class ModelActorSupervisorCore:
         placement_out: dict[str, Any] = {}
         if self._placement_reconciler is not None:
             try:
-                candidate = await _maybe_await(self._placement_reconciler(dict(resolved_desired)))
+                protected_actor_names = self._reconcile_protected_actor_names(resolved_desired)
+                try:
+                    candidate = self._placement_reconciler(
+                        dict(resolved_desired),
+                        protected_actor_names=protected_actor_names,
+                    )
+                except TypeError as e:
+                    if "protected_actor_names" not in str(e):
+                        raise
+                    candidate = self._placement_reconciler(dict(resolved_desired))
+                candidate = await _maybe_await(candidate)
                 placement_out = candidate if isinstance(candidate, dict) else {"ok": True, "result": candidate}
                 self._last_placement_reconcile = dict(placement_out)
                 self._placement_reclaimed_total += int(placement_out.get("reclaimed_total") or 0)
