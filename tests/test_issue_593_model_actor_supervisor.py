@@ -1787,6 +1787,80 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
     ]
 
 
+def test_issue_593_placement_reconciler_kills_orphan_mint_gpu_actor() -> None:
+    killed: list[tuple[str, str, str]] = []
+
+    reconciler = ModelActorPlacementReconciler(
+        namespace="mint",
+        actor_exists=lambda _name, _namespace: False,
+        gpu_actor_killer=lambda actor, reason: killed.append(
+            (str(actor["name"]), str(actor.get("namespace") or "mint"), reason)
+        )
+        or True,
+        actor_lister=lambda: [],
+        gpu_actor_lister=lambda: [
+            {
+                "name": "mint_openpi_shared_deadbeef",
+                "namespace": "mint",
+                "node_ip": "10.0.0.8",
+                "gpu": 1,
+            },
+            {
+                "name": "mint_openpi_shared_registered",
+                "namespace": "mint",
+                "node_ip": "10.0.0.8",
+                "gpu": 1,
+            },
+            {
+                "name": "foreign_actor",
+                "namespace": "mint",
+                "node_ip": "10.0.0.8",
+                "gpu": 1,
+            },
+        ],
+        placement_group_remover=lambda _name, _namespace: False,
+    )
+
+    out = reconciler(
+        {},
+        protected_actor_names={"mint_openpi_shared_registered"},
+    )
+
+    assert out["cleaned_gpu_actor_names"] == ["mint_openpi_shared_deadbeef"]
+    assert killed == [
+        (
+            "mint_openpi_shared_deadbeef",
+            "mint",
+            "model_actor_supervisor_undesired_gpu_actor",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_passes_inventory_actor_names_to_placement_reconciler() -> None:
+    captured: dict[str, set[str]] = {}
+
+    def _placement(_desired, *, protected_actor_names):
+        captured["protected"] = set(protected_actor_names)
+        return {"ok": True, "reclaimed_total": 0}
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        scheduler_sync=lambda _registrations: None,
+        placement_reconciler=_placement,
+        **_disabled_control_plane_kwargs(),
+    )
+    supervisor.register(
+        actor_name="mint_openpi_shared_registered",
+        actor_type=ActorType.OPENPI,
+        num_gpus=1,
+    )
+
+    await supervisor.reconcile_once()
+
+    assert "mint_openpi_shared_registered" in captured["protected"]
+
+
 def test_issue_593_placement_reconciler_evicts_foreign_blockers_when_target_absent() -> None:
     capacity_checks: list[dict[str, object]] = []
     removed_pgs: list[tuple[str, str]] = []
