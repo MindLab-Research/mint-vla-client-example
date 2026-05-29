@@ -107,6 +107,20 @@ when they are no longer needed. Only clean namespaces that are clearly yours,
 for example a prefix containing the issue/PR and your user name. Never clean
 shared namespaces such as `tinker_leixiang` or another user's namespace.
 
+Also stop local issue-scoped API servers or TermDeck-backed tasks that you
+started once the validation is finished or blocked. Before stopping a process,
+verify all of the following:
+
+- the process cwd, listening port, log path, or TermDeck session name matches
+  your issue-scoped run
+- `/api/v1/server_info` or the startup log identifies the expected local
+  process, port, branch/SHA, and namespace
+- no paired validation command is still running against that port
+
+Use `SIGTERM` or TermDeck control input first, then confirm the port is no
+longer listening. Do not kill shared dev API processes or another user's
+server just because they are old.
+
 Before killing anything, list exact targets and verify the namespace prefix:
 
 ```bash

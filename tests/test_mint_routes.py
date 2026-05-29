@@ -76,13 +76,22 @@ class _StubTaskFutureService:
 
 
 class _StubModelWorkScheduler:
-    def __init__(self, *, fail: bool = False) -> None:
+    def __init__(self, *, fail: bool = False, task_futures: _StubTaskFutureService | None = None) -> None:
         self.calls: list[dict] = []
         self.cancelled: list[dict] = []
         self.fail = bool(fail)
+        self.task_futures = task_futures
 
     async def append(self, **kwargs) -> dict:
         self.calls.append(dict(kwargs))
+        if self.task_futures is not None:
+            await self.task_futures.async_create_model_work_with_id(
+                kwargs["request_id"],
+                op=kwargs.get("op"),
+                domain_key=kwargs.get("domain_key"),
+                request_json=kwargs.get("request_json"),
+                meta=kwargs.get("extra"),
+            )
         if self.fail:
             raise RuntimeError("scheduler unavailable")
         return {"ok": True, "scheduler_instance_id": "scheduler-mint"}
@@ -96,7 +105,7 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
     from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler(fail=True)
+    scheduler = _StubModelWorkScheduler(fail=True, task_futures=task_futures)
 
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
@@ -143,7 +152,7 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
     from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     class _StubActionSessionManager:
         def get_billing_metadata(self, action_session_id: str) -> dict:
@@ -317,7 +326,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     session = SimpleNamespace(
         model_id="model-123",
@@ -509,7 +518,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     async def _fake_route_session_info(model_id: str):
         assert model_id == "model-123"
@@ -691,7 +700,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
@@ -987,7 +996,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     from mint_server.models.mint_types import ForwardBackwardReverseKLRequest
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     class _StubSession:
         base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -1130,7 +1139,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
 
     async def _get_training_route_session_info(model_id: str):
         if model_id == "model-123":
@@ -1237,7 +1246,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
-    scheduler = _StubModelWorkScheduler()
+    scheduler = _StubModelWorkScheduler(task_futures=task_futures)
     protected: list[dict] = []
 
     async def _get_training_route_session_info(model_id: str):
