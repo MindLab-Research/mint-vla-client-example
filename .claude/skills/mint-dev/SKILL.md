@@ -100,6 +100,41 @@ After any code change, restart the server before validating behavior. Python
 servers do not hot-reload. In the Ray-Client-only dev topology, treat shared
 server restart as blocked unless the current API launcher is known.
 
+## Issue-Scoped Cleanup
+
+Clean up detached Ray actors you created for issue-scoped dev/API validation
+when they are no longer needed. Only clean namespaces that are clearly yours,
+for example a prefix containing the issue/PR and your user name. Never clean
+shared namespaces such as `tinker_leixiang` or another user's namespace.
+
+Before killing anything, list exact targets and verify the namespace prefix:
+
+```bash
+HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
+export CLEANUP_NAMESPACE_PREFIX="mint_pr668_"
+RAY_ADDRESS="ray://${HEAD_IP}:10001" \
+/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'
+import os
+import ray
+
+prefix = os.environ["CLEANUP_NAMESPACE_PREFIX"]
+ray.init(address=os.environ["RAY_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
+targets = []
+for actor in ray.util.list_named_actors(all_namespaces=True):
+    namespace = str(actor.get("namespace") or actor.get("ray_namespace") or "")
+    name = str(actor.get("name") or actor.get("actor_name") or "")
+    if namespace.startswith(prefix) and name:
+        targets.append((namespace, name))
+print(targets)
+ray.shutdown()
+PY
+```
+
+If every target is from the issue-scoped namespace you created and the task is
+finished, kill those actors with `ray.kill(..., no_restart=True)` and re-list to
+confirm `remaining=[]`. Remove only placement groups that are named for the same
+issue-scoped actors/namespace. Do not use local `ray` CLI commands.
+
 ## Health And Logs
 
 ```bash
