@@ -48,7 +48,16 @@ def _base_model_from_spec(spec: Any) -> str | None:
 
 def _owned_actor_names_for_spec(spec: Any) -> set[str]:
     name = str(spec.normalized_actor_name())
-    return {name} if name else set()
+    names = {name} if name else set()
+    domain_key = str(getattr(spec, "domain_key", "") or "")
+    if domain_key.startswith("vllm:"):
+        base_model = _base_model_from_spec(spec)
+        if base_model:
+            model_part = base_model.split("/")[-1] if "/" in base_model else base_model
+            legacy_name = f"mint_vllm_{model_part.lower().replace(' ', '_')}".strip()
+            if legacy_name != "mint_vllm_":
+                names.add(legacy_name)
+    return names
 
 
 def _is_supervisor_wrapper_actor_name(name: str) -> bool:
@@ -761,7 +770,7 @@ class ModelActorPlacementReconciler:
         desired_actor_names: set[str] = set()
         for spec in desired.values():
             if bool(getattr(spec, "enabled", True)):
-                desired_actor_names.add(str(spec.normalized_actor_name()))
+                desired_actor_names.update(_owned_actor_names_for_spec(spec))
 
         protected_actor_name_set = {
             str(name).strip()

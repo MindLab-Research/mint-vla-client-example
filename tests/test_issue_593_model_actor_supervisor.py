@@ -1895,6 +1895,7 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
             "context": "model_actor_supervisor placement domain='vllm:Qwen/Test' replica='replica-1'",
             "ignore_pg_names": {
                 "mint_model_runtime_vllm-Qwen-Test_replica-1_pg",
+                "mint_vllm_test_pg",
             },
             "namespace": "mint",
         }
@@ -1948,6 +1949,49 @@ def test_issue_593_placement_reconciler_kills_orphan_mint_gpu_actor() -> None:
             "model_actor_supervisor_undesired_gpu_actor",
         )
     ]
+
+
+def test_issue_593_placement_reconciler_protects_vllm_child_actor_for_desired_runtime() -> None:
+    killed: list[tuple[str, str, str]] = []
+
+    reconciler = ModelActorPlacementReconciler(
+        namespace="mint",
+        actor_exists=lambda _name, _namespace: False,
+        gpu_actor_killer=lambda actor, reason: killed.append(
+            (str(actor["name"]), str(actor.get("namespace") or "mint"), reason)
+        )
+        or True,
+        actor_lister=lambda: [],
+        gpu_actor_lister=lambda: [
+            {
+                "name": "mint_model_runtime_vllm-Qwen-Qwen3-4B-Instruct-2507_replica-0",
+                "namespace": "mint",
+                "node_ip": "10.0.0.8",
+                "gpu": 1,
+            },
+            {
+                "name": "mint_vllm_qwen3-4b-instruct-2507",
+                "namespace": "mint",
+                "node_ip": "10.0.0.8",
+                "gpu": 1,
+            },
+        ],
+        placement_group_remover=lambda _name, _namespace: False,
+    )
+
+    out = reconciler(
+        {
+            ("vllm:Qwen/Qwen3-4B-Instruct-2507", "replica-0"): ModelActorSpec(
+                domain_key="vllm:Qwen/Qwen3-4B-Instruct-2507",
+                replica_id="replica-0",
+                base_model="Qwen/Qwen3-4B-Instruct-2507",
+                gpu_count=1,
+            )
+        }
+    )
+
+    assert out["cleaned_gpu_actor_names"] == []
+    assert killed == []
 
 
 @pytest.mark.anyio
