@@ -1403,26 +1403,39 @@ class BumblebeeWorkerGroup:
         self._current_session: str | None = None
         self._initialize()
 
+    def _assert_rank_workers_ready(self, *, timeout_s: float = 30.0) -> None:
+        if len(self.workers) != int(self.config.world_size):
+            raise RuntimeError(
+                "Bumblebee rank worker count mismatch: "
+                f"expected={int(self.config.world_size)} observed={len(self.workers)}"
+            )
+        ray.get([worker.__ray_ready__.remote() for worker in self.workers], timeout=timeout_s)
+
     def __ray_ready__(self) -> bool:
+        self._assert_rank_workers_ready()
         return True
 
     def heartbeat(self) -> dict[str, Any]:
+        self._assert_rank_workers_ready(timeout_s=10.0)
         return {
             "ok": True,
             "backend": "bumblebee",
             "base_model": self.observability_base_model,
             "world_size": int(self.config.world_size),
+            "rank_workers": len(self.workers),
             "session_id": self._current_session,
             "step": self._step_count,
         }
 
     def get_diagnostics(self) -> dict[str, Any]:
+        self._assert_rank_workers_ready(timeout_s=10.0)
         return {
             "backend": "bumblebee",
             "base_model": self.base_model,
             "observability_base_model": self.observability_base_model,
             "lora_rank": int(self.lora_rank),
             "world_size": int(self.config.world_size),
+            "rank_workers": len(self.workers),
             "step": int(self._step_count),
         }
 
@@ -1844,7 +1857,43 @@ def get_or_create_bumblebee_worker_group(
     with _get_bumblebee_create_lock(actor_name):
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
-            diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=10)
+            try:
+                diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=10)
+            except ray.exceptions.GetTimeoutError:
+                logger.warning(
+                    "Existing detached Bumblebee actor diagnostics timed out; treating actor as busy: actor=%s",
+                    actor_name,
+                )
+                publish_backend_model_actor(
+                    BackendModelActorLaunch(
+                        actor_name=actor_name,
+                        actor_type=ActorType.MEGATRON,
+                        num_gpus=int(config.world_size),
+                        actor_handle=actor,
+                        namespace=PERSISTENT_NAMESPACE,
+                        base_model=observability_model,
+                        protected=is_topology_desired_model(base_model),
+                        metadata=rank_metadata,
+                    )
+                )
+                return actor
+            except Exception as e:
+                logger.warning(
+                    "Existing detached Bumblebee actor failed diagnostics and will be recreated: "
+                    "actor=%s error_type=%s error=%s",
+                    actor_name,
+                    type(e).__name__,
+                    e,
+                )
+                ray_kill.kill(
+                    actor,
+                    reason="bumblebee_actor_rank_worker_unhealthy",
+                    actor_name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    verify_absent=True,
+                )
+                raise ValueError("Bumblebee actor failed diagnostics, will recreate") from e
             observed_rank = diagnostics.get("lora_rank") if isinstance(diagnostics, dict) else None
             if int(observed_rank) != int(lora_rank):
                 ray_kill.kill(

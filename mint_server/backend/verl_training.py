@@ -2384,7 +2384,18 @@ class VerlTrainingEngine:
             return worker
 
         if session.backend == "bumblebee":
-            await self._rebind_bumblebee_worker(session, reason=f"{op}:{type(cause).__name__}")
+            worker = await self._recycle_bumblebee_actor(session, op=op, cause=cause)
+            explicit_checkpoint_reload = (
+                op == "load_weights"
+                and isinstance(explicit_checkpoint_path, str)
+                and os.path.isdir(explicit_checkpoint_path)
+            )
+            if explicit_checkpoint_reload:
+                self._poisoned_sessions[session.model_id] = (
+                    f"[{session.model_id}] bumblebee actor recycled before explicit load_weights; "
+                    "checkpoint reload must complete successfully before training can continue."
+                )
+                return worker
             err = (
                 f"[{session.model_id}] bumblebee actor recycle detected after op={op}; "
                 "operation may have partially executed before the crash; "
@@ -2805,6 +2816,27 @@ class VerlTrainingEngine:
         async with lock:
             self._workers.pop(session.model_id, None)
             return await self._rebind_megatron_worker(
+                session,
+                reason=f"{op}:{type(cause).__name__}",
+                allow_create=True,
+            )
+
+    async def _recycle_bumblebee_actor(
+        self,
+        session: "TrainingSession",
+        *,
+        op: str,
+        cause: BaseException,
+    ) -> ray.actor.ActorHandle:
+        actor_name = self._actor_name_for_session(session)
+        if not actor_name:
+            from .bumblebee_distributed import _make_bumblebee_actor_name
+
+            actor_name = _make_bumblebee_actor_name(session.base_model or "")
+        lock = await self._get_actor_recycle_lock(actor_name)
+        async with lock:
+            self._workers.pop(session.model_id, None)
+            return await self._rebind_bumblebee_worker(
                 session,
                 reason=f"{op}:{type(cause).__name__}",
                 allow_create=True,
@@ -3349,6 +3381,7 @@ class VerlTrainingEngine:
         allow_recover: bool = False,
     ) -> ray.actor.ActorHandle:
         """Return a live worker handle, rebinding dense trainers when evicted."""
+        self._raise_if_session_poisoned(session, op=op)
         model_id = session.model_id
         worker = self._workers.get(model_id)
         authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
@@ -3375,6 +3408,19 @@ class VerlTrainingEngine:
             if session.backend == "peft" and allow_recover:
                 return await self._recover_dense_worker(session, reason=f"{op}:missing_worker")
             raise RuntimeError(f"[{model_id}] missing worker for backend={session.backend}")
+
+        if session.backend == "bumblebee":
+            try:
+                await async_get_ray_ref(worker.heartbeat.remote(), timeout_s=10)
+                return worker
+            except ray.exceptions.GetTimeoutError:
+                self._touch_actor(session)
+                return worker
+            except Exception as e:
+                raise RuntimeError(
+                    f"[{model_id}] missing worker for backend=bumblebee: "
+                    f"rank liveness probe failed before op={op}"
+                ) from e
 
         # Megatron workers are managed by a persistent group; keep existing behavior.
         if session.backend != "peft":
@@ -4110,16 +4156,19 @@ class VerlTrainingEngine:
         Returns:
             Dict with loss_fn_outputs and metrics.
         """
+        self._raise_if_session_poisoned(session, op="forward_backward")
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="forward_backward")
+        worker = None
+        if session.backend != "bumblebee":
+            worker = await self._get_live_worker(session, op="forward_backward")
 
-        # Mark actor as recently used for supervisor inventory and admin visibility.
-        self._touch_actor(session)
-        await self._ensure_megatron_session_guard_clean(
-            session,
-            op="forward_backward",
-            worker=worker,
-        )
+            # Mark actor as recently used for supervisor inventory and admin visibility.
+            self._touch_actor(session)
+            await self._ensure_megatron_session_guard_clean(
+                session,
+                op="forward_backward",
+                worker=worker,
+            )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -4147,36 +4196,56 @@ class VerlTrainingEngine:
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
         traceparent = get_current_traceparent()
 
-        # Remote call - pass session_id for stateless trainer pattern
-        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
-            pending = worker.forward_backward.remote(
-                data_items,
-                loss_fn,
-                loss_fn_config,
-                rollout_correction_config,
-                session.model_id,
-                session.lora_config.rank if session.lora_config else None,
-                traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
+        if session.backend == "bumblebee":
+            result = await self._run_worker_call_with_actor_recycle(
+                session,
+                op="forward_backward",
+                submit_fn=lambda call_worker: call_worker.forward_backward.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    rollout_correction_config,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                ),
+                interval_s=30.0,
             )
         else:
-            pending = worker.forward_backward.remote(
-                data_items,
-                loss_fn,
-                loss_fn_config,
-                session.model_id,
-                session.lora_config.rank if session.lora_config else None,
-                traceparent=traceparent,
+            assert worker is not None
+            # Remote call - pass session_id for stateless trainer pattern
+            if session.backend in _DISTRIBUTED_MOE_BACKENDS:
+                pending = worker.forward_backward.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    rollout_correction_config,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            else:
+                pending = worker.forward_backward.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                )
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="forward_backward",
+                worker=worker,
+                interval_s=30.0,
             )
-        result = await self._await_worker_call(
-            pending,
-            session,
-            op="forward_backward",
-            worker=worker,
-            interval_s=30.0,
-        )
 
         # Update session state
         session.accumulated_gradients += 1
@@ -4457,16 +4526,19 @@ class VerlTrainingEngine:
         Returns:
             Dict with metrics.
         """
+        self._raise_if_session_poisoned(session, op="optim_step")
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="optim_step")
+        worker = None
+        if session.backend != "bumblebee":
+            worker = await self._get_live_worker(session, op="optim_step")
 
-        # Mark actor as recently used for supervisor inventory and admin visibility.
-        self._touch_actor(session)
-        await self._ensure_megatron_session_guard_clean(
-            session,
-            op="optim_step",
-            worker=worker,
-        )
+            # Mark actor as recently used for supervisor inventory and admin visibility.
+            self._touch_actor(session)
+            await self._ensure_megatron_session_guard_clean(
+                session,
+                op="optim_step",
+                worker=worker,
+            )
 
         # Extract learning rate
         lr = request.adam_params.learning_rate if request.adam_params else None
@@ -4479,31 +4551,48 @@ class VerlTrainingEngine:
         train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
         traceparent = get_current_traceparent()
 
-        # Remote call - pass session_id for stateless trainer pattern
-        if session.backend in _DISTRIBUTED_MOE_BACKENDS:
-            pending = worker.optim_step.remote(
-                lr,
-                session.model_id,
-                session.lora_config.rank if session.lora_config else None,
-                traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
+        if session.backend == "bumblebee":
+            result = await self._run_worker_call_with_actor_recycle(
+                session,
+                op="optim_step",
+                submit_fn=lambda call_worker: call_worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                ),
+                interval_s=30.0,
             )
         else:
-            pending = worker.optim_step.remote(
-                lr,
-                session.model_id,
-                session.lora_config.rank if session.lora_config else None,
-                traceparent=traceparent,
+            assert worker is not None
+            # Remote call - pass session_id for stateless trainer pattern
+            if session.backend in _DISTRIBUTED_MOE_BACKENDS:
+                pending = worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            else:
+                pending = worker.optim_step.remote(
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                )
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="optim_step",
+                worker=worker,
+                interval_s=30.0,
             )
-        result = await self._await_worker_call(
-            pending,
-            session,
-            op="optim_step",
-            worker=worker,
-            interval_s=30.0,
-        )
 
         # Update session state
         session.current_step += 1
@@ -4536,16 +4625,19 @@ class VerlTrainingEngine:
         """
         from .model_registry import get_model_config
 
+        self._raise_if_session_poisoned(session, op="train_step")
         model_id = session.model_id
-        worker = await self._get_live_worker(session, op="train_step")
+        worker = None
+        if session.backend != "bumblebee":
+            worker = await self._get_live_worker(session, op="train_step")
 
-        # Mark actor as recently used for supervisor inventory and admin visibility.
-        self._touch_actor(session)
-        await self._ensure_megatron_session_guard_clean(
-            session,
-            op="train_step",
-            worker=worker,
-        )
+            # Mark actor as recently used for supervisor inventory and admin visibility.
+            self._touch_actor(session)
+            await self._ensure_megatron_session_guard_clean(
+                session,
+                op="train_step",
+                worker=worker,
+            )
 
         # Serialize data for Ray
         data_items = [item.model_dump() for item in request.forward_backward_input.data]
@@ -4582,31 +4674,53 @@ class VerlTrainingEngine:
             is_moe = bool(get_model_config(session.base_model or "").is_moe)
         except Exception:
             is_moe = False
-        use_train_step = session.backend in _DISTRIBUTED_MOE_BACKENDS and is_moe
+        use_train_step = session.backend == "bumblebee" or (session.backend in _DISTRIBUTED_MOE_BACKENDS and is_moe)
 
         if use_train_step:
-            # MoE: Use combined train_step to keep gradients in same context
-            pending = worker.train_step.remote(
-                data_items,
-                loss_fn,
-                loss_fn_config,
-                rollout_correction_config,
-                lr,
-                session.model_id,
-                session.lora_config.rank if session.lora_config else None,
-                traceparent=traceparent,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
-            result = await self._await_worker_call(
-                pending,
-                session,
-                op="train_step",
-                worker=worker,
-                interval_s=30.0,
-            )
+            if session.backend == "bumblebee":
+                result = await self._run_worker_call_with_actor_recycle(
+                    session,
+                    op="train_step",
+                    submit_fn=lambda call_worker: call_worker.train_step.remote(
+                        data_items,
+                        loss_fn,
+                        loss_fn_config,
+                        rollout_correction_config,
+                        lr,
+                        session.model_id,
+                        session.lora_config.rank if session.lora_config else None,
+                        traceparent=traceparent,
+                        train_attn=train_attn,
+                        train_mlp=train_mlp,
+                        train_unembed=train_unembed,
+                    ),
+                    interval_s=30.0,
+                )
+            else:
+                assert worker is not None
+                # MoE: Use combined train_step to keep gradients in same context
+                pending = worker.train_step.remote(
+                    data_items,
+                    loss_fn,
+                    loss_fn_config,
+                    rollout_correction_config,
+                    lr,
+                    session.model_id,
+                    session.lora_config.rank if session.lora_config else None,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+                result = await self._await_worker_call(
+                    pending,
+                    session,
+                    op="train_step",
+                    worker=worker,
+                    interval_s=30.0,
+                )
         else:
+            assert worker is not None
             # Dense models: Use separate calls (they don't have param_offload issues)
             # Pass session_id for stateless trainer pattern
             if session.backend in _DISTRIBUTED_MOE_BACKENDS:
