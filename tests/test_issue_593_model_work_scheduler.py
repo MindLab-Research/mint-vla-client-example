@@ -25,6 +25,7 @@ def _work(
     domain_key: str = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
     affinity_group: str | None = "lora:session-a:generation:1",
     token_cost: int = 1,
+    throttle_principal: str | None = "apikey:key-a",
 ) -> dict:
     return {
         "request_id": request_id,
@@ -32,7 +33,7 @@ def _work(
         "request_json": b"{}",
         "user_id": "user-a",
         "apikey_id": "key-a",
-        "throttle_principal": "apikey:key-a",
+        "throttle_principal": throttle_principal,
         "webhook_url": None,
         "extra": {},
         "created_at": 100.0,
@@ -253,6 +254,10 @@ def test_issue_638_scheduler_registers_otel_gauges(monkeypatch: pytest.MonkeyPat
     assert "mint_model_work_scheduler_leases" in gauges
     assert "mint_model_load_pct" in gauges
     assert "mint_model_pending_requests" in gauges
+    assert "mint_sampling_inflight_by_domain" in gauges
+    assert "mint_sampling_inflight_principal_domain_max" in gauges
+    assert "mint_sampling_admission_would_reject_total" in gauges
+    assert "mint_sampling_admission_reject_total" in gauges
 
 
 def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
@@ -312,6 +317,14 @@ def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
     assert inflight_obs[0].attributes["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert inflight_obs[0].attributes["workload"] == "sample"
 
+    sampling_inflight_obs = gauges["mint_sampling_inflight_by_domain"][0](None)
+    assert sampling_inflight_obs[0].value == 1.0
+    assert sampling_inflight_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    principal_max_obs = gauges["mint_sampling_inflight_principal_domain_max"][0](None)
+    assert principal_max_obs[0].value == 1.0
+    assert principal_max_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+
 
 def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
     monkeypatch: pytest.MonkeyPatch,
@@ -360,6 +373,106 @@ def test_scheduler_append_can_assign_immediately() -> None:
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         ]["depth"] == 1
+
+    asyncio.run(_run())
+
+
+def test_sampling_inflight_admission_observe_records_would_reject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "observe")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "1")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-1")))["ok"] is True
+        second = await actor.append(_work("req-2"))
+
+        assert second["ok"] is True
+        assert second["sampling_inflight_admission"]["would_reject"] is True
+        assert second["sampling_inflight_admission"]["reason"] == "principal_domain_inflight_limit_exceeded"
+        stats = actor.stats()
+        domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+        assert stats["sampling_inflight"]["by_domain"][domain] == 2
+        assert stats["sampling_inflight"]["principal_domain_max_by_domain"][domain] == 2
+        assert stats["sampling_admission_counters"]["would_reject"] == [
+            {
+                "domain_key": domain,
+                "reason": "principal_domain_inflight_limit_exceeded",
+                "count": 1,
+            }
+        ]
+
+    asyncio.run(_run())
+
+
+def test_sampling_inflight_admission_enforce_rejects_principal_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "1")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-1")))["ok"] is True
+        rejected = await actor.append(_work("req-2"))
+
+        assert rejected["ok"] is False
+        assert rejected["reason"] == "principal_domain_inflight_limit_exceeded"
+        assert rejected["current"] == 1
+        assert rejected["limit"] == 1
+        assert actor.stats()["backlog_depth"] == 1
+
+    asyncio.run(_run())
+
+
+def test_sampling_inflight_admission_enforce_rejects_domain_total(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "100")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN", "1")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-1", throttle_principal="apikey:key-a")))["ok"] is True
+        rejected = await actor.append(_work("req-2", throttle_principal="apikey:key-b"))
+
+        assert rejected["ok"] is False
+        assert rejected["reason"] == "domain_inflight_limit_exceeded"
+        assert rejected["current"] == 1
+        assert rejected["limit"] == 1
+        domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+        assert actor.stats()["sampling_inflight"]["by_domain"][domain] == 1
+
+    asyncio.run(_run())
+
+
+def test_sampling_inflight_admission_releases_count_after_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "1")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        assert (await actor.append(_work("req-1"), assign=True))["ok"] is True
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        lease_id = str(claimed["leases"][0]["lease_id"])
+        assert (await actor.complete_lease(
+            lease_id=lease_id,
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+        ))["ok"] is True
+        assert (await actor.append(_work("req-2"), assign=True))["ok"] is True
 
     asyncio.run(_run())
 
@@ -823,6 +936,46 @@ def test_scheduler_hydrates_active_task_state_after_restart() -> None:
         )
         assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-restart"]
         assert store.get_task("req-restart")["status"] == "leased"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_scheduler_hydrates_sampling_inflight_counts_from_task_state_store() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+    domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    async def _run() -> None:
+        for request_id, principal in (
+            ("req-hydrate-a", "apikey:key-a"),
+            ("req-hydrate-b", "apikey:key-a"),
+            ("req-hydrate-c", "apikey:key-b"),
+        ):
+            store.create_task(
+                request_id=request_id,
+                op="sampling.asample",
+                domain_key=domain,
+                request_json=b"{}",
+                metadata={
+                    "op": "sampling.asample",
+                    "throttle_principal": principal,
+                    "domain_key": domain,
+                },
+            )
+
+        contains = await actor.contains_request(request_id="req-hydrate-a")
+        assert contains["present"] is True
+        stats = actor.stats()
+        assert stats["sampling_inflight"]["by_domain"][domain] == 3
+        assert stats["sampling_inflight"]["principal_domain_max_by_domain"][domain] == 2
+        assert stats["sampling_inflight"]["active_principals_by_domain"][domain] == 2
 
     try:
         asyncio.run(_run())

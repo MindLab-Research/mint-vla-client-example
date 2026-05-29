@@ -140,6 +140,75 @@ def test_feishu_report_splits_sample_and_eval_throughput():
     assert "gen_tok_s" not in report
 
 
+def test_queue_stage_attribution_aggregates_stable_buckets():
+    train_check = _load_train_check()
+    timing = {
+        "stages": [
+            {
+                "stage": "sample",
+                "queue_stage_timing_s": {
+                    "scheduler_wait_s": 3.0,
+                    "executor_wait_s": 1.0,
+                    "lora_s": 4.0,
+                    "vllm_generate_s": 9.0,
+                    "finalization_s": 0.5,
+                },
+            }
+        ],
+    }
+
+    attribution = train_check.extract_queue_stage_attribution(timing)
+
+    assert attribution == {
+        "scheduler_wait_s": 3.0,
+        "executor_wait_s": 1.0,
+        "lora_s": 4.0,
+        "vllm_generate_s": 9.0,
+        "finalization_s": 0.5,
+    }
+
+
+def test_queue_stage_attribution_prefers_summary_total_over_stage_breakdown():
+    train_check = _load_train_check()
+    timing = {
+        "queue_stage_attribution_s": {"scheduler_wait_s": 2.0},
+        "stages": [{"stage": "sample", "queue_stage_timing_s": {"scheduler_wait_s": 3.0}}],
+    }
+
+    assert train_check.extract_queue_stage_attribution(timing) == {"scheduler_wait_s": 2.0}
+
+
+def test_feishu_report_includes_queue_stage_attribution():
+    train_check = _load_train_check()
+    report = train_check.build_feishu_report(
+        [
+            {
+                "model": "Qwen/Test",
+                "status": "ok",
+                "slowest_stage": "sample",
+                "slowest_max_s": 10.0,
+                "wall_clock_s": 20.0,
+                "timing_degraded": True,
+                "generation_summary": None,
+                "queue_stage_attribution": {
+                    "scheduler_wait_s": 5.0,
+                    "executor_wait_s": 1.0,
+                    "lora_s": 4.0,
+                    "vllm_generate_s": 9.0,
+                    "finalization_s": 0.5,
+                },
+                "degradation_reason": "slowest max 10.0s > 5.0s",
+            }
+        ]
+    )
+
+    assert "scheduler_wait=`5.0s`" in report
+    assert "executor_wait=`1.0s`" in report
+    assert "LoRA=`4.0s`" in report
+    assert "vLLM_generate=`9.0s`" in report
+    assert "finalization=`0.5s`" in report
+
+
 def test_timing_degradation_is_thresholded_for_success_only():
     train_check = _load_train_check()
 

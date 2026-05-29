@@ -37,6 +37,13 @@ _TIMING_SUMMARY_JSON_PATH: Path | None = None
 _TIMING_SUMMARY_MD_PATH: Path | None = None
 _TIMING_REPORT_WRITTEN = False
 _EXPERIMENT_WALL_START = time.time()
+_QUEUE_STAGE_TIMING_FIELDS = (
+    "scheduler_wait_s",
+    "executor_wait_s",
+    "lora_s",
+    "vllm_generate_s",
+    "finalization_s",
+)
 
 
 def _dbg(msg: str) -> None:
@@ -93,12 +100,25 @@ def _numeric_sum(recs: list[dict[str, Any]], key: str) -> float:
     return total
 
 
+def _queue_stage_timing_sum(recs: list[dict[str, Any]]) -> dict[str, float]:
+    totals = {key: 0.0 for key in _QUEUE_STAGE_TIMING_FIELDS}
+    for rec in recs:
+        timing = rec.get("queue_stage_timing")
+        timing_dict = timing if isinstance(timing, dict) else {}
+        for key in _QUEUE_STAGE_TIMING_FIELDS:
+            value = timing_dict.get(key, rec.get(key))
+            if isinstance(value, (int, float)):
+                totals[key] += float(value)
+    return {key: round(value, 3) for key, value in totals.items() if value > 0.0}
+
+
 def _timing_summary() -> dict[str, Any]:
     per_stage: dict[str, list[dict[str, Any]]] = {}
     for rec in _TIMING_EVENTS:
         per_stage.setdefault(str(rec["stage"]), []).append(rec)
 
     stage_summaries: list[dict[str, Any]] = []
+    total_queue_stage_timing = {key: 0.0 for key in _QUEUE_STAGE_TIMING_FIELDS}
     for stage, recs in per_stage.items():
         elapsed = sorted(float(rec["elapsed_s"]) for rec in recs)
         total_s = sum(elapsed)
@@ -127,15 +147,28 @@ def _timing_summary() -> dict[str, Any]:
                     "tokens_per_s": round(output_tokens / total_s, 3) if total_s > 0 else 0.0,
                 }
             )
+        queue_stage_timing = _queue_stage_timing_sum(recs)
+        if queue_stage_timing:
+            summary["queue_stage_timing_s"] = queue_stage_timing
+            for key, value in queue_stage_timing.items():
+                total_queue_stage_timing[key] += float(value)
         stage_summaries.append(summary)
 
     stage_summaries.sort(key=lambda item: (-float(item["total_s"]), str(item["stage"])))
-    return {
+    out = {
         "base_model": globals().get("BASE_MODEL"),
         "event_count": len(_TIMING_EVENTS),
         "wall_clock_s": round(time.time() - _EXPERIMENT_WALL_START, 3),
         "stages": stage_summaries,
     }
+    attribution = {
+        key: round(value, 3)
+        for key, value in total_queue_stage_timing.items()
+        if value > 0.0
+    }
+    if attribution:
+        out["queue_stage_attribution_s"] = attribution
+    return out
 
 
 def _write_timing_reports() -> None:
@@ -304,13 +337,25 @@ def _sample_result_timing_extra(result: Any, *, max_tokens: int) -> dict[str, An
     lengths = [len(getattr(seq, "tokens", []) or []) for seq in sequences]
     output_tokens = sum(lengths)
     hit_max_count = sum(1 for length in lengths if length >= int(max_tokens))
-    return {
+    extra = {
         "sequence_count": len(sequences),
         "output_tokens": int(output_tokens),
         "max_output_tokens": max(lengths) if lengths else 0,
         "hit_max_count": int(hit_max_count),
         "hit_max": bool(hit_max_count),
     }
+    timing = getattr(result, "queue_stage_timing", None)
+    if timing is None and isinstance(result, dict):
+        timing = result.get("queue_stage_timing")
+    if isinstance(timing, dict):
+        stable_timing = {
+            key: float(timing[key])
+            for key in _QUEUE_STAGE_TIMING_FIELDS
+            if isinstance(timing.get(key), (int, float))
+        }
+        if stable_timing:
+            extra["queue_stage_timing"] = stable_timing
+    return extra
 
 
 def _install_tinker_future_debug() -> None:

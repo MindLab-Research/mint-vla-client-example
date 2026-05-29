@@ -15,6 +15,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
+from ..backend.queue_stage_timing import build_queue_stage_timing
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..logging_context import record_retrieve_future_wait_metric
@@ -683,6 +684,10 @@ async def retrieve_future(
             running_for_s = max(0.0, now - float(running_at))
         if isinstance(last_progress_at, (int, float)):
             last_progress_s = max(0.0, now - float(last_progress_at))
+        queue_stage_timing = build_queue_stage_timing(
+            meta if isinstance(meta, dict) else {},
+            now=now,
+        )
 
         def _compute_retry_after_s() -> int:
             if isinstance(estimated_wait_s, (int, float)) and float(estimated_wait_s) > 0:
@@ -735,6 +740,7 @@ async def retrieve_future(
                 "engine_acquire_s": engine_acquire_s,
                 "lora_load_s": lora_load_s,
                 "generate_s": generate_s,
+                "queue_stage_timing": queue_stage_timing,
             }
         )
 

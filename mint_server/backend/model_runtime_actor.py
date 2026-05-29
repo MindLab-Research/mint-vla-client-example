@@ -1060,6 +1060,17 @@ class ModelRuntimeActor:
                 )
             if finalization.kind not in {"resolve", "fail"}:
                 raise RuntimeError(f"unknown model work finalization kind: {finalization.kind!r}")
+            finalization_started_at = time.time()
+            try:
+                await self._task_futures.async_update_meta(
+                    request_id,
+                    {
+                        "stage": "finalizing",
+                        "finalization_started_at": finalization_started_at,
+                    },
+                )
+            except Exception:
+                pass
             begin_finalize = await self._scheduler.begin_finalize_lease(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
@@ -1098,6 +1109,17 @@ class ModelRuntimeActor:
                 return
             task_state_committed = False
             try:
+                finalization_done_at = time.time()
+                try:
+                    await self._task_futures.async_update_meta(
+                        request_id,
+                        {
+                            "finalization_done_at": finalization_done_at,
+                            "finalization_s": max(0.0, finalization_done_at - finalization_started_at),
+                        },
+                    )
+                except Exception:
+                    pass
                 if finalization.kind == "resolve":
                     await self._commit_task_state_success(
                         lease,

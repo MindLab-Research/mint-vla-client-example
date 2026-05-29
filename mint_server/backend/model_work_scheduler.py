@@ -89,6 +89,31 @@ def _same_affinity_multi_claim_domains_from_env() -> tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _sampling_inflight_admission_mode() -> str:
+    raw = (
+        os.environ.get("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE")
+        or str(getattr(server_config, "sampling_inflight_admission_mode", "observe"))
+    )
+    mode = str(raw).strip().lower()
+    if mode in {"0", "false", "disabled", "disable"}:
+        return "off"
+    if mode in {"1", "true", "enabled", "enable"}:
+        return "enforce"
+    if mode in {"off", "observe", "enforce"}:
+        return mode
+    return "observe"
+
+
+def _sampling_inflight_limit(name: str, config_attr: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = getattr(server_config, config_attr, default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return int(default)
+
+
 def _scheduler_domain_base_model(domain_key: object) -> str | None:
     domain = str(domain_key or "").strip()
     if not domain or ":" not in domain:
@@ -331,6 +356,11 @@ class _ModelWorkSchedulerActor:
         self._appended = 0
         self._assigned = 0
         self._claimed = 0
+        self._sampling_inflight_by_domain: dict[str, int] = {}
+        self._sampling_inflight_by_principal_domain: dict[tuple[str, str], int] = {}
+        self._sampling_principal_domain_by_request_id: dict[str, tuple[str, str]] = {}
+        self._sampling_admission_would_reject: dict[tuple[str, str], int] = {}
+        self._sampling_admission_reject: dict[tuple[str, str], int] = {}
         self._assignment_loop_task: asyncio.Task | None = None
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
@@ -508,6 +538,74 @@ class _ModelWorkSchedulerActor:
             _gauge("mint_model_inflight_workers", _sample_model_load("inflight_workers"))
             _gauge("mint_model_capacity_workers", _sample_model_load("capacity_workers"))
 
+            def _sampling_inflight_by_domain(_options):
+                sampling = self._stats_snapshot().get("sampling_inflight")
+                by_domain = sampling.get("by_domain") if isinstance(sampling, dict) else None
+                if not isinstance(by_domain, dict):
+                    return []
+                observations = []
+                for domain_key, count in sorted(by_domain.items()):
+                    value = _metric_number(count)
+                    if value is None:
+                        continue
+                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
+                return observations
+
+            _gauge("mint_sampling_inflight_by_domain", _sampling_inflight_by_domain)
+
+            def _sampling_inflight_principal_domain_max(_options):
+                sampling = self._stats_snapshot().get("sampling_inflight")
+                max_by_domain = sampling.get("principal_domain_max_by_domain") if isinstance(sampling, dict) else None
+                if not isinstance(max_by_domain, dict):
+                    return []
+                observations = []
+                for domain_key, count in sorted(max_by_domain.items()):
+                    value = _metric_number(count)
+                    if value is None:
+                        continue
+                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
+                return observations
+
+            _gauge(
+                "mint_sampling_inflight_principal_domain_max",
+                _sampling_inflight_principal_domain_max,
+            )
+
+            def _sampling_admission_counter(decision: str):
+                def _callback(_options):
+                    stats = self._stats_snapshot().get("sampling_admission_counters")
+                    records = stats.get(decision) if isinstance(stats, dict) else None
+                    if not isinstance(records, list):
+                        return []
+                    observations = []
+                    for record in records:
+                        if not isinstance(record, dict):
+                            continue
+                        value = _metric_number(record.get("count"))
+                        if value is None:
+                            continue
+                        observations.append(
+                            Observation(
+                                value,
+                                _attrs(
+                                    domain_key=record.get("domain_key"),
+                                    reason=record.get("reason"),
+                                ),
+                            )
+                        )
+                    return observations
+
+                return _callback
+
+            _gauge(
+                "mint_sampling_admission_would_reject_total",
+                _sampling_admission_counter("would_reject"),
+            )
+            _gauge(
+                "mint_sampling_admission_reject_total",
+                _sampling_admission_counter("reject"),
+            )
+
             self._otel_enabled = True
         except Exception as e:
             self._otel_error = f"{type(e).__name__}: {e}"
@@ -602,6 +700,124 @@ class _ModelWorkSchedulerActor:
             token_cost=max(1, int(metadata.get("token_cost") or 1)),
         )
 
+    def _is_sampling_inflight_work(self, item: ModelWorkItem) -> bool:
+        return str(item.op) == "sampling.asample"
+
+    def _sampling_principal(self, item: ModelWorkItem) -> str:
+        extra_principal = item.extra.get("sampling_admission_principal")
+        for value in (extra_principal, item.throttle_principal, item.apikey_id, item.user_id):
+            text = str(value or "").strip()
+            if text:
+                return text
+        return "anonymous"
+
+    def _track_sampling_inflight_locked(self, item: ModelWorkItem) -> None:
+        if not self._is_sampling_inflight_work(item):
+            return
+        request_id = str(item.request_id)
+        if request_id in self._sampling_principal_domain_by_request_id:
+            return
+        domain_key = str(item.domain_key)
+        principal = self._sampling_principal(item)
+        key = (principal, domain_key)
+        self._sampling_principal_domain_by_request_id[request_id] = key
+        self._sampling_inflight_by_domain[domain_key] = self._sampling_inflight_by_domain.get(domain_key, 0) + 1
+        self._sampling_inflight_by_principal_domain[key] = (
+            self._sampling_inflight_by_principal_domain.get(key, 0) + 1
+        )
+
+    def _untrack_sampling_inflight_locked(self, request_id: str) -> None:
+        key = self._sampling_principal_domain_by_request_id.pop(str(request_id), None)
+        if key is None:
+            return
+        principal, domain_key = key
+        current_domain = self._sampling_inflight_by_domain.get(domain_key, 0) - 1
+        if current_domain > 0:
+            self._sampling_inflight_by_domain[domain_key] = current_domain
+        else:
+            self._sampling_inflight_by_domain.pop(domain_key, None)
+        current_principal = self._sampling_inflight_by_principal_domain.get((principal, domain_key), 0) - 1
+        if current_principal > 0:
+            self._sampling_inflight_by_principal_domain[(principal, domain_key)] = current_principal
+        else:
+            self._sampling_inflight_by_principal_domain.pop((principal, domain_key), None)
+
+    def _sampling_inflight_limit_decision_locked(self, item: ModelWorkItem) -> dict[str, Any]:
+        mode = _sampling_inflight_admission_mode()
+        if mode == "off" or not self._is_sampling_inflight_work(item):
+            return {"ok": True, "mode": mode}
+        domain_key = str(item.domain_key)
+        principal = self._sampling_principal(item)
+        principal_key = (principal, domain_key)
+        principal_current = int(self._sampling_inflight_by_principal_domain.get(principal_key, 0))
+        domain_current = int(self._sampling_inflight_by_domain.get(domain_key, 0))
+        principal_limit = _sampling_inflight_limit(
+            "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
+            "sampling_max_inflight_per_principal_domain",
+            1024,
+        )
+        domain_limit = _sampling_inflight_limit(
+            "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
+            "sampling_max_inflight_per_domain",
+            10240,
+        )
+        reason: str | None = None
+        current = 0
+        limit = 0
+        if principal_limit > 0 and principal_current >= principal_limit:
+            reason = "principal_domain_inflight_limit_exceeded"
+            current = principal_current
+            limit = principal_limit
+        elif domain_limit > 0 and domain_current >= domain_limit:
+            reason = "domain_inflight_limit_exceeded"
+            current = domain_current
+            limit = domain_limit
+        if reason is None:
+            return {
+                "ok": True,
+                "mode": mode,
+                "domain_key": domain_key,
+                "principal": principal,
+                "principal_current": principal_current,
+                "principal_limit": principal_limit,
+                "domain_current": domain_current,
+                "domain_limit": domain_limit,
+            }
+        counter_key = (domain_key, reason)
+        if mode == "observe":
+            self._sampling_admission_would_reject[counter_key] = (
+                self._sampling_admission_would_reject.get(counter_key, 0) + 1
+            )
+            return {
+                "ok": True,
+                "mode": mode,
+                "would_reject": True,
+                "reason": reason,
+                "domain_key": domain_key,
+                "principal": principal,
+                "current": current,
+                "limit": limit,
+                "principal_current": principal_current,
+                "principal_limit": principal_limit,
+                "domain_current": domain_current,
+                "domain_limit": domain_limit,
+            }
+        self._sampling_admission_reject[counter_key] = self._sampling_admission_reject.get(counter_key, 0) + 1
+        return {
+            "ok": False,
+            "mode": mode,
+            "reason": reason,
+            "domain_key": domain_key,
+            "principal": principal,
+            "current": current,
+            "limit": limit,
+            "principal_current": principal_current,
+            "principal_limit": principal_limit,
+            "domain_current": domain_current,
+            "domain_limit": domain_limit,
+            "retry_after_s": 5,
+        }
+
     async def _persist_requeue_task(self, request_id: str, *, reason: str) -> bool:
         if not self._use_task_state_store:
             return True
@@ -642,6 +858,7 @@ class _ModelWorkSchedulerActor:
                         continue
                 self._backlog(item.domain_key).append(item)
                 self._request_locations[item.request_id] = "backlog"
+                self._track_sampling_inflight_locked(item)
             self._task_state_hydrated = True
         return epoch
 
@@ -729,6 +946,8 @@ class _ModelWorkSchedulerActor:
         if lease_id is not None:
             removed = self._leases_by_id.pop(lease_id, None) is not None or removed
         self._request_locations.pop(request_id, None)
+        if removed:
+            self._untrack_sampling_inflight_locked(request_id)
         return removed
 
     def _claimable_replicas(self, domain_key: str) -> list[ModelReplicaRegistration]:
@@ -786,6 +1005,7 @@ class _ModelWorkSchedulerActor:
     def _remove_request_location(self, request_id: str) -> None:
         self._request_locations.pop(str(request_id), None)
         self._lease_id_by_request_id.pop(str(request_id), None)
+        self._untrack_sampling_inflight_locked(str(request_id))
 
     def _claim_conflict_cause(self, exc: BaseException) -> TaskStateConflictError | None:
         if isinstance(exc, TaskStateConflictError):
@@ -955,6 +1175,13 @@ class _ModelWorkSchedulerActor:
                     "assigned": assigned,
                     "idempotent": True,
                 }
+            admission = self._sampling_inflight_limit_decision_locked(work)
+            if not bool(admission.get("ok")):
+                return {
+                    **admission,
+                    "request_id": work.request_id,
+                    "scheduler_instance_id": self._instance_id,
+                }
             created: dict[str, Any] | None = None
             if self._use_task_state_store:
                 created = await self._task_state_call(
@@ -999,6 +1226,7 @@ class _ModelWorkSchedulerActor:
                     if bool(assign)
                     else {"ok": True, "assigned": 0, "skipped_domains": []}
                 )
+                self._track_sampling_inflight_locked(work)
             except Exception:
                 self._remove_request_from_memory_locked(work.request_id)
                 if self._use_task_state_store and isinstance(created, dict) and bool(created.get("created")):
@@ -1018,6 +1246,7 @@ class _ModelWorkSchedulerActor:
                 "scheduler_instance_id": self._instance_id,
                 "backlog_depth": len(self._backlog(work.domain_key)),
                 "assigned": assigned,
+                "sampling_inflight_admission": admission,
             }
 
     async def cancel_request(self, *, request_id: str, reason: str = "cancelled") -> dict[str, Any]:
@@ -1431,6 +1660,21 @@ class _ModelWorkSchedulerActor:
         backlog_depth_by_domain = {
             domain: len(backlog) for domain, backlog in sorted(self._domain_backlog.items())
         }
+        principal_domain_max_by_domain: dict[str, int] = {}
+        active_principals_by_domain: dict[str, int] = {}
+        for (_principal, domain_key), count in self._sampling_inflight_by_principal_domain.items():
+            principal_domain_max_by_domain[domain_key] = max(
+                principal_domain_max_by_domain.get(domain_key, 0),
+                int(count),
+            )
+            active_principals_by_domain[domain_key] = active_principals_by_domain.get(domain_key, 0) + 1
+
+        def _counter_records(counters: dict[tuple[str, str], int]) -> list[dict[str, Any]]:
+            return [
+                {"domain_key": domain_key, "reason": reason, "count": int(count)}
+                for (domain_key, reason), count in sorted(counters.items())
+            ]
+
         replica_queues = {}
         for key, queue in sorted(self._replica_queues.items()):
             replica = self._replicas.get(key)
@@ -1462,6 +1706,26 @@ class _ModelWorkSchedulerActor:
             "replicas": [replica.to_dict() for _, replica in sorted(self._replicas.items())],
             "replica_queues": replica_queues,
             "leases": [lease.to_dict() for lease in self._leases_by_id.values()],
+            "sampling_inflight": {
+                "mode": _sampling_inflight_admission_mode(),
+                "per_principal_domain_limit": _sampling_inflight_limit(
+                    "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
+                    "sampling_max_inflight_per_principal_domain",
+                    1024,
+                ),
+                "per_domain_limit": _sampling_inflight_limit(
+                    "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
+                    "sampling_max_inflight_per_domain",
+                    10240,
+                ),
+                "by_domain": dict(sorted(self._sampling_inflight_by_domain.items())),
+                "principal_domain_max_by_domain": dict(sorted(principal_domain_max_by_domain.items())),
+                "active_principals_by_domain": dict(sorted(active_principals_by_domain.items())),
+            },
+            "sampling_admission_counters": {
+                "would_reject": _counter_records(self._sampling_admission_would_reject),
+                "reject": _counter_records(self._sampling_admission_reject),
+            },
             "counters": {
                 "appended": self._appended,
                 "assigned": self._assigned,

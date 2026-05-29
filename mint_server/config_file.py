@@ -48,6 +48,9 @@ class _SamplingSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_inflight_sample_tasks: int | None = None
+    max_inflight_per_principal_domain: int | None = None
+    max_inflight_per_domain: int | None = None
+    inflight_admission_mode: str | None = None
     max_concurrent_samples_per_request: int | None = None
 
     sample_coalesce: bool | None = None

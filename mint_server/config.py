@@ -459,6 +459,9 @@ class ServerConfig:
     # Sampling settings (routes/sampling.py)
     sampling_max_inflight_sample_tasks: int = 64
     sampling_max_pending_asample_per_apikey: int = 64
+    sampling_max_inflight_per_principal_domain: int = 1024
+    sampling_max_inflight_per_domain: int = 10240
+    sampling_inflight_admission_mode: str = "observe"
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
     sampling_sample_coalesce_window_ms: float = 50.0
@@ -719,6 +722,21 @@ class ServerConfig:
                 "MINT_MAX_PENDING_ASAMPLE_PER_APIKEY",
                 getattr(file_sampling, "max_pending_asample_per_apikey", None) if file_sampling is not None else None,
                 64,
+            ),
+            sampling_max_inflight_per_principal_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
+                getattr(file_sampling, "max_inflight_per_principal_domain", None) if file_sampling is not None else None,
+                1024,
+            ),
+            sampling_max_inflight_per_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
+                getattr(file_sampling, "max_inflight_per_domain", None) if file_sampling is not None else None,
+                10240,
+            ),
+            sampling_inflight_admission_mode=_pick_str(
+                "MINT_SAMPLING_INFLIGHT_ADMISSION_MODE",
+                getattr(file_sampling, "inflight_admission_mode", None) if file_sampling is not None else None,
+                "observe",
             ),
             sampling_max_concurrent_samples_per_request=_pick_int(
                 "MINT_MAX_CONCURRENT_SAMPLES_PER_REQUEST",

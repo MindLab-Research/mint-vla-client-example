@@ -1068,6 +1068,7 @@ def record_sampling_admission_metric(
     decision: str,
     reason: str,
     scope: str | None = None,
+    domain_key: str | None = None,
 ) -> None:
     if not _OTEL_ENABLED:
         return
@@ -1078,6 +1079,8 @@ def record_sampling_admission_metric(
     }
     if isinstance(scope, str) and scope.strip():
         attrs["scope"] = scope.strip()
+    if isinstance(domain_key, str) and domain_key.strip():
+        attrs["domain_key"] = domain_key.strip()
     try:
         if _SAMPLING_ADMISSION_COUNTER is not None:
             _SAMPLING_ADMISSION_COUNTER.add(1, attributes=attrs)
