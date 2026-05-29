@@ -3632,31 +3632,33 @@ class TaskStateStoreClient:
             raise TaskStateStoreUnavailableError("Ray import failed") from e
         if not ray.is_initialized():
             raise TaskStateStoreUnavailableError("Ray not initialized")
-        if self._ray_actor is not None:
+        actor = self._ray_actor
+        if actor is not None:
             if not require_ready:
-                return self._ray_actor
+                return actor
             try:
-                out = sync_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
+                out = sync_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
-                return self._ray_actor
+                return actor
             except Exception:
                 self._reset_ray_actor()
         actor_name = _ray_task_state_store_actor_name()
         try:
-            self._ray_actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+            actor = ray.get_actor(actor_name, namespace=_ray_namespace())
         except Exception:
             if not create_if_missing:
                 raise TaskStateStoreUnavailableError(
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
                 )
             try:
-                self._ray_actor = _create_ray_actor(require_ready=require_ready)
+                actor = _create_ray_actor(require_ready=require_ready)
             except Exception as e:
                 raise TaskStateStoreUnavailableError(
                     "Failed to get/create detached Ray TaskStateStore actor"
                 ) from e
-        return self._ray_actor
+        self._ray_actor = actor
+        return actor
 
     async def _get_ray_actor_async(self, *, require_ready: bool = True, create_if_missing: bool = False):
         try:
@@ -3665,21 +3667,22 @@ class TaskStateStoreClient:
             raise TaskStateStoreUnavailableError("Ray import failed") from e
         if not ray.is_initialized():
             raise TaskStateStoreUnavailableError("Ray not initialized")
-        if self._ray_actor is not None:
+        actor = self._ray_actor
+        if actor is not None:
             if not require_ready:
-                return self._ray_actor
+                return actor
             try:
-                out = await async_get_ray_ref(self._ray_actor.ping.remote(), timeout_s=1.0)
+                out = await async_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
-                return self._ray_actor
+                return actor
             except Exception:
                 self._reset_ray_actor()
         import ray
 
         actor_name = _ray_task_state_store_actor_name()
         try:
-            self._ray_actor = await asyncio.to_thread(
+            actor = await asyncio.to_thread(
                 ray.get_actor,
                 actor_name,
                 namespace=_ray_namespace(),
@@ -3690,12 +3693,13 @@ class TaskStateStoreClient:
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
                 )
             try:
-                self._ray_actor = _create_ray_actor(require_ready=require_ready)
+                actor = _create_ray_actor(require_ready=require_ready)
             except Exception as e:
                 raise TaskStateStoreUnavailableError(
                     "Failed to get/create detached Ray TaskStateStore actor"
                 ) from e
-        return self._ray_actor
+        self._ray_actor = actor
+        return actor
 
     async def _call(self, method: str, **kwargs: Any) -> Any:
         actor = await self._get_ray_actor_async()
