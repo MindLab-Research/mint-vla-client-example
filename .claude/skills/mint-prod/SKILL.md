@@ -53,8 +53,19 @@ Do not deploy with file sync tools.
 cd /vePFS-Mindverse/share/mint/prod/mint-server
 git fetch origin
 git status --short --branch
-git checkout refactor
-git pull --ff-only origin refactor
+git checkout develop
+git pull --ff-only origin develop
+```
+
+If `develop` is already checked out in another local worktree, do not touch
+that other worktree. Keep the production checkout detached and point it at the
+intended remote commit:
+
+```bash
+cd /vePFS-Mindverse/share/mint/prod/mint-server
+git fetch origin develop
+git checkout --detach origin/develop
+git rev-parse HEAD
 ```
 
 If the local shared path is unavailable or the local git operation fails for an
@@ -62,7 +73,7 @@ environmental reason, fall back to running the same git commands on the driver:
 
 ```bash
 ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git fetch origin && git status --short --branch'
-ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git checkout refactor && git pull --ff-only origin refactor'
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && git checkout --detach origin/develop && git rev-parse HEAD'
 ```
 
 Record the commit SHA before and after a production deploy. Prefer local checks
@@ -103,6 +114,48 @@ chmod +x /vePFS-Mindverse/share/mint/prod/tmp/start_mint_prod.sh'
 Use the exact configured supervisor program or an explicit listener/process
 target for restart. Do not use broad `pkill` patterns in production.
 
+### Control-Plane Actor Refresh After Code Updates
+
+Production startup bootstraps detached CPU/control-plane actors before the API
+listener starts. After code or config changes, an old detached actor can block
+startup with a fingerprint or code-identity mismatch. Typical messages:
+
+- `ConfigActorSnapshotMismatchError: Existing ConfigActor snapshot fingerprint mismatch`
+- `[model_actor_supervisor] killing detached actor reason=model_actor_supervisor_code_mismatch`
+
+Do not restart Ray, do not restart worker nodes, and do not kill GPU training or
+inference actors for this class of failure. First inspect the supervisor log:
+
+```bash
+ssh mint-prod-volcano 'supervisorctl status mint-server-auth; tail -n 120 /tmp/mint_server_auth_supervisor.log'
+```
+
+If the only blocker is `mint_config` snapshot mismatch, rebuild just that
+namespace-local ConfigActor:
+
+```bash
+ssh mint-prod-volcano 'cd /vePFS-Mindverse/share/mint/prod/mint-server && set -a && . /vePFS-Mindverse/share/mint/prod/config/prod.env && set +a && /vePFS-Mindverse/share/mint/prod/runtime/host-venv/bin/python - <<'"'"'PY'"'"'
+import os
+import ray
+
+namespace = os.environ.get("RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "mint"
+address = os.environ.get("RAY_ADDRESS") or "auto"
+ray.init(address=address, namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
+actor = ray.get_actor("mint_config", namespace=namespace)
+ray.kill(actor, no_restart=True)
+print(f"killed mint_config namespace={namespace}")
+ray.shutdown()
+PY'
+```
+
+Then start `mint-server-auth` again. If the bootstrap log reports
+`model_actor_supervisor_code_mismatch`, the startup path may rebuild the
+detached `mint_model_actor_supervisor` control-plane actor. That is expected for
+code identity changes and is still not a GPU node restart. Validate the runtime
+source of truth with `/internal/model_actor_supervisor`; `/internal/actors` is a
+backend publication inventory and can be empty immediately after a supervisor
+control-plane rebuild.
+
 ## Health And Logs
 
 ```bash
@@ -111,14 +164,26 @@ ssh mint-prod-volcano 'tail -n 200 /vePFS-Mindverse/share/mint/prod/logs/mint_se
 ssh mint-prod-volcano 'ps aux | grep "[s]cripts/run_server.py"'
 ```
 
-Authenticated calls must include `X-API-Key`:
+Production `/internal/*` calls require platform-forwarded identity headers,
+not only `X-API-Key`. A plain `X-API-Key` call can return
+`401 {"error":"Missing platform auth headers"}` even when the key is valid.
+Source secrets without printing them, send `X-Internal-Token`, and include a
+synthetic admin identity for operator-only localhost checks:
 
 ```bash
-set -a
-. /vePFS-Mindverse/share/mint/prod/config/secrets.env
-set +a
-curl -H "X-API-Key: $MINT_API_KEY" http://localhost:18000/internal/actors
+ssh mint-prod-volcano 'set -a && . /vePFS-Mindverse/share/mint/prod/config/secrets.env && set +a && /usr/bin/curl -s \
+  -H "X-Internal-Token: ${MINT_INTERNAL_API_TOKEN:-}" \
+  -H "X-MinT-User-Id: 000000000000000000000001" \
+  -H "X-MinT-User-Role: admin" \
+  -H "X-MinT-Account-Id: 000000000000000000000001" \
+  -H "X-MinT-Apikey-Id: 000000000000000000000002" \
+  -H "X-MinT-Request-Id: operator-check" \
+  http://localhost:18000/internal/model_actor_supervisor'
 ```
+
+If `prod.env` was sourced in the current shell and simple commands like `curl`
+or `head` unexpectedly disappear, use absolute tool paths such as `/usr/bin/curl`
+or run a fresh shell. Do not print the token value while debugging auth.
 
 ## Internal Ops
 

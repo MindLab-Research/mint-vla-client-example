@@ -169,11 +169,73 @@ ray.shutdown()
 PY
 ```
 
+For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured,
+`/internal/*` also requires platform-forwarded identity headers. A plain
+`X-API-Key` request can return `401 {"error":"Missing platform auth headers"}`.
+When auth is enabled, source the dev secrets without printing values and send
+the internal token plus a synthetic operator identity:
+
+```bash
+set -a
+. /vePFS-Mindverse/share/mint/dev/config/secrets.env
+set +a
+/usr/bin/curl -s \
+  -H "X-Internal-Token: ${MINT_INTERNAL_API_TOKEN:-}" \
+  -H "X-MinT-User-Id: 000000000000000000000001" \
+  -H "X-MinT-User-Role: admin" \
+  -H "X-MinT-Account-Id: 000000000000000000000001" \
+  -H "X-MinT-Apikey-Id: 000000000000000000000002" \
+  -H "X-MinT-Request-Id: dev-operator-check" \
+  http://localhost:8000/internal/model_actor_supervisor
+```
+
+If the dev server is intentionally running without `MINT_INTERNAL_API_TOKEN`,
+internal routes use local/dev pass-through and do not need these headers. Check
+which mode the target server uses before concluding an endpoint is broken.
+
 ## Internal Ops
 
 For `/internal/*` actor inventory, actor kill, scheduler diagnostics, deep
 health, and Ray diagnostics, read and use the `mint-ops` skill after this one.
 Public `/api/v1/healthz` is only a cheap API-worker health check.
+
+## Control-Plane Actor Refresh
+
+Dev and prod share the same detached control-plane actor pattern. After a code
+or config update, startup can fail because a stale namespace-local control-plane
+actor has an old config fingerprint or code identity. Common messages include
+`ConfigActorSnapshotMismatchError` for `mint_config` and
+`model_actor_supervisor_code_mismatch` for `mint_model_actor_supervisor`.
+
+Do not restart Ray or worker nodes for these failures. In dev, first confirm the
+namespace is yours (`MINT_RAY_NAMESPACE="mint_${USER}"` or an issue-scoped
+namespace). Then kill only the stale control-plane actor in that namespace with
+the project runtime Python and Ray Client:
+
+```bash
+PY=/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python
+HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
+export RAY_ADDRESS="ray://${HEAD_IP}:10001"
+export MINT_RAY_NAMESPACE="mint_${USER}"
+$PY - <<'PY'
+import os
+import ray
+
+namespace = os.environ["MINT_RAY_NAMESPACE"]
+ray.init(address=os.environ["RAY_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
+actor = ray.get_actor("mint_config", namespace=namespace)
+ray.kill(actor, no_restart=True)
+print(f"killed mint_config namespace={namespace}")
+ray.shutdown()
+PY
+```
+
+Restart the issue-scoped API server after the control-plane actor is removed.
+If the namespace is shared or belongs to another user, stop and ask before
+killing anything. `/internal/model_actor_supervisor` is the source of truth for
+topology/runtime health after a supervisor control-plane rebuild; `/internal/actors`
+is a backend publication inventory and may be empty until backend actors publish
+again.
 
 ## Worker Node Lifecycle
 
