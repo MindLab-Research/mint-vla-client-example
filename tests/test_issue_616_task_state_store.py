@@ -67,6 +67,57 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
+def test_task_state_store_client_async_cached_actor_survives_concurrent_reset(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as module
+    import ray
+
+    class _PingRemote:
+        def remote(self) -> dict[str, object]:
+            return {"ok": True}
+
+    class _Actor:
+        ping = _PingRemote()
+
+    async def _fake_async_get_ray_ref(ref, *, timeout_s=10.0):
+        client._reset_ray_actor()
+        return ref
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(module, "async_get_ray_ref", _fake_async_get_ray_ref)
+
+    client = TaskStateStoreClient()
+    actor = _Actor()
+    client._ray_actor = actor
+
+    out = asyncio.run(client._get_ray_actor_async())
+
+    assert out is actor
+    assert client._ray_actor is None
+
+
+def test_task_state_store_client_sync_cached_actor_survives_reset(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as module
+    import ray
+
+    class _Actor:
+        pass
+
+    client = TaskStateStoreClient()
+    actor = _Actor()
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        ray,
+        "get_actor",
+        lambda *args, **kwargs: (client._reset_ray_actor(), actor)[1],
+    )
+
+    out = client._get_ray_actor_sync(require_ready=False, create_if_missing=False)
+
+    assert out is actor
+    assert client._ray_actor is actor
+
+
 def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
     async def _run() -> None:
         actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch.sqlite3"))
