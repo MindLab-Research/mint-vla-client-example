@@ -929,7 +929,6 @@ async def session_heartbeat(
         await async_set_sampling_session_last_activity(request.session_id, time.time())
     except Exception as e:
         logger.warning("[session_heartbeat] sampling session activity update failed for %s: %s", request.session_id, e)
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
     if session_manager is not None:
         # Keep the root session alive and refresh heartbeat-eligible child sampler sessions.
         session_manager.mark_session_inflight(request.session_id, 0)

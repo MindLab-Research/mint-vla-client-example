@@ -2,7 +2,6 @@ import importlib
 from types import SimpleNamespace
 
 import pytest
-from fastapi import HTTPException
 
 from mint_server.backend import sampling_cleanup_executor as cleanup_executor_module
 from mint_server.backend import sampling_session_store as sampling_store_module
@@ -136,7 +135,7 @@ async def test_issue_369_detached_sampling_cleanup_keeps_shared_adapter_loaded(m
 
 
 @pytest.mark.anyio
-async def test_issue_369_sampling_heartbeat_sampling_store_failure_is_503(monkeypatch) -> None:
+async def test_issue_369_sampling_heartbeat_sampling_store_failure_is_best_effort(monkeypatch, caplog) -> None:
     touched = []
 
     class _StubSessionManager:
@@ -154,10 +153,12 @@ async def test_issue_369_sampling_heartbeat_sampling_store_failure_is_503(monkey
     monkeypatch.setattr(sampling_store_module, "async_set_sampling_session_last_activity", _async_set_last_activity)
 
     http_request = SimpleNamespace(state=SimpleNamespace(user_data=None))
-    with pytest.raises(HTTPException, match="Sampling session store unavailable"):
-        await service_route.session_heartbeat(SimpleNamespace(session_id="sess-heartbeat"), http_request)
+    with caplog.at_level("WARNING"):
+        resp = await service_route.session_heartbeat(SimpleNamespace(session_id="sess-heartbeat"), http_request)
 
-    assert touched == [("heartbeat", "sess-heartbeat")]
+    assert resp.type == "session_heartbeat"
+    assert touched == [("heartbeat", "sess-heartbeat"), ("sess-heartbeat", 0)]
+    assert "sampling session activity update failed for sess-heartbeat: store down" in caplog.text
 
 
 @pytest.mark.anyio
