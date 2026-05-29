@@ -232,15 +232,102 @@ future-state actor to kill.
 
 ## Sampling backpressure policy
 
-Sampling route 429s are opt-in client backpressure, not the normal scheduler
-admission path. `/api/v1/asample` and synchronous `sample_once` only return
-HTTP 429 when the caller sends `X-Tinker-Sampling-Backpressure: 1` and the
-local in-process sampling executor is already at
-`MINT_MAX_INFLIGHT_SAMPLE_TASKS`. Requests without that header must continue to
-enter the model-work scheduler and receive a future so the scheduler-owned
-token-budget admission path remains the primary queueing mechanism.
+Local sampling executor backpressure is opt-in client backpressure, not the
+normal scheduler admission path. `/api/v1/asample` and synchronous `sample_once`
+may return HTTP 429 when the caller sends `X-Tinker-Sampling-Backpressure: 1`
+and the local in-process sampling executor is already at
+`MINT_MAX_INFLIGHT_SAMPLE_TASKS`. This local path is only a compatibility
+pressure signal for callers that explicitly opted in.
 
-The 429 body is intentionally plain and retryable:
-`{"detail": "Sampling backpressure: server overloaded"}`. Clients should retry
-with backoff; server-side tests should assert that headerless requests are not
-rejected solely because the local sampling executor is saturated.
+The normal `/api/v1/asample` admission policy should be durable inflight
+admission. Headerless requests should enter the model-work scheduler and receive
+a future unless the durable system-wide inflight commitment exceeds configured
+limits. Ordinary executor saturation is a queueing condition, not a rejection
+condition.
+
+V1 durable inflight admission is count-based. A task counts as inflight while it
+is non-terminal:
+
+- queued
+- assigned
+- leased
+- running
+- finalizing
+
+Terminal statuses do not count:
+
+- done
+- failed
+- cancelled
+- expired
+- retrieved
+- tombstoned or forgotten after retention
+
+Every durable sampling future must carry bounded admission metadata:
+
+- `principal`: stable caller identity from the trusted auth boundary, such as
+  `apikey:<id>`, `internal:<service>`, or `anonymous`
+- `domain_key`: the same scheduler work domain used for model-work scheduling
+
+Admission keeps two rebuildable counter views derived from `TaskStateStore`
+future state:
+
+- `inflight_by_domain[domain_key]`
+- `inflight_by_principal_domain[(principal, domain_key)]`
+
+Counters are incremented only after durable enqueue succeeds and decremented
+only after a terminal state is persisted. On scheduler or admission actor
+restart, the projection is rebuilt from the active future indexes in
+`TaskStateStore`; admission must not full-scan RocksDB per request.
+
+Initial V1 limits are intentionally generous operator defaults:
+
+- `MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN=1024`
+- `MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN=10240`
+- `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=observe`
+
+The admission mode should support an observe-first rollout:
+
+- `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=off`: disabled
+- `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=observe`: record gauges and
+  would-reject counters, but still enqueue
+- `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=enforce`: return structured HTTP 429
+  when a configured limit is exceeded
+
+In `observe` and `enforce`, emit low-cardinality default metrics:
+
+- `mint_sampling_inflight_by_domain{domain_key}`
+- `mint_sampling_inflight_principal_domain_max{domain_key}`
+- `mint_sampling_admission_would_reject_total{reason,domain_key}`
+- `mint_sampling_admission_reject_total{reason,domain_key}`
+
+Do not label default metrics by raw principal. If operators need exact
+per-principal drilldown, add a separate explicitly bounded or hashed diagnostic
+signal. Per-principal detail otherwise belongs in structured logs or sampled
+traces, not default fleet metrics.
+
+Structured 429 responses from durable inflight admission should be retryable and
+machine-readable:
+
+```json
+{
+  "error": "sampling_backpressure",
+  "reason": "domain_inflight_limit_exceeded",
+  "domain": "qwen3-4b-sampling",
+  "principal": "apikey:<redacted>",
+  "current": 10241,
+  "limit": 10240,
+  "retry_after_s": 5
+}
+```
+
+Allowed durable inflight rejection reasons:
+
+- `principal_domain_inflight_limit_exceeded`
+- `domain_inflight_limit_exceeded`
+
+The legacy local executor 429 body remains plain and retryable:
+`{"detail": "Sampling backpressure: server overloaded"}`. Server-side tests
+should distinguish the two paths: local executor saturation only rejects
+opt-in callers, while durable inflight admission may reject headerless callers
+once `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=enforce`.

@@ -29,7 +29,7 @@ from ..backend.task_state_store import (
     billing_observations_from_auth,
     task_futures,
 )
-from ..backend.model_work_admission import enqueue_model_work
+from ..backend.model_work_admission import ModelWorkAdmissionRejectedError, enqueue_model_work
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -956,7 +956,7 @@ def _get_asample_throttle_identity(
     user_id = _get_user_id(request)
     if user_id:
         return f"user:{user_id}", None, "user"
-    return None, None, "anonymous"
+    return "anonymous", None, "anonymous"
 
 
 async def _append_billing_observations(*, observations: list[dict], source: str) -> None:
@@ -1160,6 +1160,7 @@ async def asample(
             extra={
                 **enqueue_extra,
                 "model_work_attempt_id": model_work_attempt_id,
+                "sampling_admission_principal": throttle_principal or "anonymous",
             },
             queued_meta=queued_meta,
             create_future=True,
@@ -1172,6 +1173,26 @@ async def asample(
                 "base_model": base_model,
             },
         )
+    except ModelWorkAdmissionRejectedError as e:
+        result = dict(e.scheduler_result)
+        reason = str(result.get("reason") or "sampling_inflight_limit_exceeded")
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="rejected",
+            reason=reason,
+            scope=throttle_scope,
+            domain_key=domain_key,
+        )
+        detail = {
+            "error": "sampling_backpressure",
+            "reason": reason,
+            "domain": str(result.get("domain_key") or domain_key),
+            "principal": str(result.get("principal") or throttle_principal or "anonymous"),
+            "current": int(result.get("current") or 0),
+            "limit": int(result.get("limit") or 0),
+            "retry_after_s": int(result.get("retry_after_s") or 5),
+        }
+        raise HTTPException(status_code=429, detail=detail)
     except ModelWorkSchedulerConflictError:
         if request.seq_id is None:
             logger.exception(
@@ -1222,11 +1243,21 @@ async def asample(
         )
         raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
 
+    sampling_admission = admission.scheduler_result.get("sampling_inflight_admission")
+    if isinstance(sampling_admission, dict) and bool(sampling_admission.get("would_reject")):
+        record_sampling_admission_metric(
+            route=_ASAMPLE_ROUTE,
+            decision="would_reject",
+            reason=str(sampling_admission.get("reason") or "sampling_inflight_limit_exceeded"),
+            scope=throttle_scope,
+            domain_key=domain_key,
+        )
     record_sampling_admission_metric(
         route=_ASAMPLE_ROUTE,
         decision="accepted",
         reason="queued",
         scope=throttle_scope,
+        domain_key=domain_key,
     )
     return UntypedAPIFuture(request_id=request_id)
 

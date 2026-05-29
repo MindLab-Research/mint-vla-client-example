@@ -12,6 +12,14 @@ class ModelWorkAdmissionResult:
     scheduler_result: dict[str, Any]
 
 
+class ModelWorkAdmissionRejectedError(RuntimeError):
+    def __init__(self, scheduler_result: dict[str, Any]) -> None:
+        self.scheduler_result = dict(scheduler_result)
+        reason = str(self.scheduler_result.get("reason") or "admission_rejected")
+        self.reason = reason
+        super().__init__(reason)
+
+
 async def enqueue_model_work(
     *,
     request_id: str,
@@ -89,6 +97,13 @@ async def enqueue_model_work(
                 enqueue_coro=append_coro,
             )
         scheduler_confirmed = isinstance(out, dict) and bool(out.get("ok"))
+        if isinstance(out, dict) and not scheduler_confirmed:
+            reason = str(out.get("reason") or "")
+            if reason in {
+                "principal_domain_inflight_limit_exceeded",
+                "domain_inflight_limit_exceeded",
+            }:
+                raise ModelWorkAdmissionRejectedError(out)
         return ModelWorkAdmissionResult(
             request_id=request_id,
             scheduler_result=out if isinstance(out, dict) else {},

@@ -4,7 +4,9 @@ import json
 from types import SimpleNamespace
 
 import anyio
+import pytest
 
+from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
 from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
 from mint_server.routes import sampling as sampling_route
 
@@ -197,6 +199,65 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     assert stub_fs.created == []
     assert stub_fs.queued == []
     assert stub_fs.cleaned == []
+
+
+def test_asample_returns_429_for_durable_inflight_admission_rejection(monkeypatch):
+    stub_fs = _StubTaskFutureService()
+    metrics: list[dict] = []
+
+    monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
+    monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    monkeypatch.setattr(
+        sampling_route,
+        "record_sampling_admission_metric",
+        lambda **kwargs: metrics.append(dict(kwargs)),
+    )
+
+    async def _reject(**_kwargs):
+        raise ModelWorkAdmissionRejectedError(
+            {
+                "ok": False,
+                "reason": "domain_inflight_limit_exceeded",
+                "domain_key": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "principal": "apikey:key-a",
+                "current": 10240,
+                "limit": 10240,
+                "retry_after_s": 5,
+            }
+        )
+
+    monkeypatch.setattr(sampling_route, "enqueue_model_work", _reject)
+
+    req = SampleRequest(
+        sampling_session_id="session-a",
+        num_samples=1,
+        prompt=ModelInput.from_ints([1, 2, 3]),
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+
+    with pytest.raises(Exception) as exc:
+        anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
+
+    http_exc = exc.value
+    assert getattr(http_exc, "status_code", None) == 429
+    assert http_exc.detail == {
+        "error": "sampling_backpressure",
+        "reason": "domain_inflight_limit_exceeded",
+        "domain": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "principal": "apikey:key-a",
+        "current": 10240,
+        "limit": 10240,
+        "retry_after_s": 5,
+    }
+    assert metrics == [
+        {
+            "route": "/api/v1/asample",
+            "decision": "rejected",
+            "reason": "domain_inflight_limit_exceeded",
+            "scope": "api_key",
+            "domain_key": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+        }
+    ]
 
 
 def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(monkeypatch):
