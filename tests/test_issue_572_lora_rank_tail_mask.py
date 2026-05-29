@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import json
-import sys
 import asyncio
+import json
+import os
+import sys
 from types import ModuleType
 from types import SimpleNamespace
 
@@ -542,6 +543,55 @@ def test_issue_572_megatron_peft_export_truncates_to_actual_rank(tmp_path, monke
     config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert config["r"] == 16
     assert meta["actual_rank"] == 16
+
+
+def test_issue_572_megatron_save_checkpoint_skips_duplicate_peft_export_by_default(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    ray = pytest.importorskip("ray")
+    if not hasattr(ray, "remote"):
+        pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
+
+    from mint_server.backend import megatron_distributed
+    from mint_server.backend.megatron_distributed import MegatronRankWorker
+
+    peft_utils_mod = ModuleType("verl.utils.megatron_peft_utils")
+    peft_utils_mod._get_rank_checkpoint_path = lambda checkpoint_path: os.path.join(checkpoint_path, "mp_rank_00")
+    monkeypatch.setitem(sys.modules, "verl.utils.megatron_peft_utils", peft_utils_mod)
+    monkeypatch.setattr(megatron_distributed, "get_model_config", lambda _model: SimpleNamespace(is_mla=False))
+
+    class _TrainMode:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    worker_cls = MegatronRankWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.lora_rank = 64
+    worker.learning_rate = 1e-4
+    worker.base_model = "unknown-test-model"
+    worker.engine = SimpleNamespace(train_mode=lambda: _TrainMode())
+    worker._bind_traceparent = lambda traceparent: None
+    worker._zero_lora_rank_tail = lambda *args, **kwargs: {"params": 1, "grads": 0}
+    worker.save_adapter_state = lambda **_kwargs: {"status": "ok"}
+    worker._capture_optimizer_state = lambda: {"state": {}, "param_groups": []}
+
+    def _unexpected_get_lora_state_dict(**_kwargs):
+        raise AssertionError("save_checkpoint should not export PEFT adapter by default")
+
+    worker.get_lora_state_dict = _unexpected_get_lora_state_dict
+
+    meta = worker.save_checkpoint(str(tmp_path), step_count=7, actual_rank=16)
+
+    assert meta == {"current_step": 7, "learning_rate": 1e-4, "actual_rank": 16}
+    assert (tmp_path / "mp_rank_00_optimizer.pt").exists()
+    assert (tmp_path / "adapter_config.json").exists()
+    assert (tmp_path / "training_meta.json").exists()
+    assert not (tmp_path / "adapter_model.safetensors").exists()
 
 
 def test_issue_572_megatron_rank_checkpoint_preserves_tp_local_rank_for_rank32(tmp_path, monkeypatch) -> None:

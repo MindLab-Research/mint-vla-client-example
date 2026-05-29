@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     pass
 
 logger = logging.getLogger(__name__)
+VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_NO_COMPILED_DAG_ENV = "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"
 
 
@@ -702,6 +704,7 @@ def _create_mint_vllm_multinode_actor(
                 "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE", default=False
             )
             self._vllm_stats_observer = VllmStatsObserver()
+            self._kv_cache_observability: dict[str, int] = {}
             self._otel_runtime_metrics_enabled = init_vllm_runtime_otel_metrics(
                 snapshot_fn=self._vllm_stats_observer.snapshot,
                 actor_name=current_ray_actor_name("unknown"),
@@ -749,6 +752,7 @@ def _create_mint_vllm_multinode_actor(
                 "gpu_indices": [binding["gpu_index"] for binding in gpu_bindings if "gpu_index" in binding],
                 "gpu_bindings": gpu_bindings,
                 **self._vllm_stats_observer.snapshot(),
+                **self._kv_cache_observability,
             }
 
         def _bind_traceparent(self, traceparent: str | None) -> None:
@@ -1074,6 +1078,25 @@ def _create_mint_vllm_multinode_actor(
                 engine_args,
                 stat_loggers=[make_vllm_stats_logger_factory(self._vllm_stats_observer)],
             )
+            try:
+                info = await self.get_kv_debug_info()
+                capacity = int(info.get("kv_cache_capacity_tokens") or 0)
+                if capacity > 0:
+                    self._kv_cache_observability = {
+                        "kv_cache_capacity_tokens": capacity,
+                        "kv_cache_token_budget": max(
+                            1,
+                            int(math.floor(float(capacity) * VLLM_TOKEN_BUDGET_RATIO)),
+                        ),
+                    }
+                    block_size = int(info.get("kv_cache_block_size") or 0)
+                    if block_size > 0:
+                        self._kv_cache_observability["kv_cache_block_size"] = block_size
+                    num_blocks = int(info.get("min_kv_cache_num_blocks") or 0)
+                    if num_blocks > 0:
+                        self._kv_cache_observability["kv_cache_num_blocks"] = num_blocks
+            except Exception:
+                logger.warning("vllm_kv_cache_observability_init_failed", exc_info=True)
 
             self._initialized = True
             logger.info("MultiNodeVLLMEngine initialized")
@@ -1283,6 +1306,26 @@ def _create_mint_vllm_multinode_actor(
                 target = worker if worker is not None else worker_wrapper
                 model_runner = getattr(target, "model_runner", None)
                 kv_cfg = getattr(model_runner, "kv_cache_config", None)
+                groups = getattr(kv_cfg, "kv_cache_groups", []) or []
+                block_sizes = []
+                for group in groups:
+                    spec = getattr(group, "kv_cache_spec", None)
+                    block_size = getattr(spec, "block_size", 0) if spec is not None else 0
+                    try:
+                        if int(block_size) > 0:
+                            block_sizes.append(int(block_size))
+                    except (TypeError, ValueError):
+                        pass
+                if not block_sizes:
+                    cache_config = getattr(target, "cache_config", None)
+                    block_size = getattr(cache_config, "block_size", 0) if cache_config is not None else 0
+                    try:
+                        if int(block_size) > 0:
+                            block_sizes.append(int(block_size))
+                    except (TypeError, ValueError):
+                        pass
+                block_size = min(block_sizes) if block_sizes else 0
+                num_blocks = int(getattr(kv_cfg, "num_blocks", 0) or 0) if kv_cfg is not None else 0
                 return {
                     "available_kv_cache_memory_bytes": int(
                         getattr(target, "available_kv_cache_memory_bytes", 0) or 0
@@ -1296,15 +1339,16 @@ def _create_mint_vllm_multinode_actor(
                     "peak_activation_memory_bytes": int(
                         getattr(target, "peak_activation_memory", 0) or 0
                     ),
-                    "kv_cache_num_blocks": int(
-                        getattr(kv_cfg, "num_blocks", 0) or 0
-                    ) if kv_cfg is not None else 0,
-                    "kv_cache_groups": len(
-                        getattr(kv_cfg, "kv_cache_groups", []) or []
-                    ) if kv_cfg is not None else 0,
+                    "kv_cache_num_blocks": num_blocks,
+                    "kv_cache_block_size": block_size,
+                    "kv_cache_capacity_tokens": num_blocks * block_size if num_blocks > 0 and block_size > 0 else 0,
+                    "kv_cache_groups": len(groups),
                 }
 
             infos = await self.engine.collective_rpc(_collect_kv_info)
+            capacities = [int(x.get("kv_cache_capacity_tokens", 0) or 0) for x in infos]
+            block_sizes = [int(x.get("kv_cache_block_size", 0) or 0) for x in infos]
+            num_blocks = [int(x.get("kv_cache_num_blocks", 0) or 0) for x in infos]
             return {
                 "per_worker": infos,
                 "min_available_kv_cache_memory_bytes": min(
@@ -1313,6 +1357,10 @@ def _create_mint_vllm_multinode_actor(
                 "max_available_kv_cache_memory_bytes": max(
                     int(x.get("available_kv_cache_memory_bytes", 0) or 0) for x in infos
                 ) if infos else 0,
+                "kv_cache_capacity_tokens": min((x for x in capacities if x > 0), default=0),
+                "kv_cache_block_size": min((x for x in block_sizes if x > 0), default=0),
+                "min_kv_cache_num_blocks": min((x for x in num_blocks if x > 0), default=0),
+                "max_kv_cache_num_blocks": max(num_blocks) if num_blocks else 0,
             }
 
         async def abort_request(self, request_id: str, traceparent: str | None = None) -> None:

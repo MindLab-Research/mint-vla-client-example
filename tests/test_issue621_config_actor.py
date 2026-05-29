@@ -39,6 +39,14 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_MODEL_ACTOR_REPLICA_ID") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_QWEN3_235B_TRAINING_BACKEND") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_BUMBLEBEE_ATTENTION_BACKEND") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_TOPOLOGY_CONFIG_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_TOPOLOGY_STATE_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
@@ -55,6 +63,12 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "PFS_RUNTIME_ENV_ROOT": "/runtime",
             "MINT_VLLM_MAX_NUM_SEQS": "64",
             "MINT_VLLM_MAX_NUM_BATCHED_TOKENS": "4096",
+            "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM": "64",
+            "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM": "16",
+            "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET": "262144",
+            "MINT_BUMBLEBEE_ATTENTION_BACKEND": "flash",
+            "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH": "/runtime/overlays/flash",
+            "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET": "131072",
             "OTEL_SERVICE_NAME": "mint",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_DEPLOYMENT_ENV": "prod",
@@ -70,6 +84,21 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert grouped[CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV]["PFS_RUNTIME_ENV_ROOT"] == "/runtime"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_SEQS"] == "64"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MAX_NUM_BATCHED_TOKENS"] == "4096"
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] == "64"
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM"] == "16"
+    assert (
+        grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET"]
+        == "262144"
+    )
+    assert (
+        grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET"]
+        == "131072"
+    )
+    assert (
+        grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH"]
+        == "/runtime/overlays/flash"
+    )
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_BUMBLEBEE_ATTENTION_BACKEND"] == "flash"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_SERVICE_NAME"] == "mint"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_EXPORTER_OTLP_HEADERS"] == REDACTED_VALUE
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_DEPLOYMENT_ENV"] == "prod"
@@ -127,6 +156,10 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
             "MINT_VLLM_MAX_NUM_SEQS": "32",
             "MINT_QWEN3_235B_TRAINING_BACKEND": "megatron",
+            "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM": "64",
+            "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM": "16",
+            "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET": "262144",
+            "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET": "131072",
             "MINT_TOPOLOGY_CONFIG_PATH": "/vePFS-Mindverse/share/mint/prod/runtime/topology.yaml",
             "MINT_TOPOLOGY_STATE_PATH": "/vePFS-Mindverse/share/mint/prod/runtime/topology_state.yaml",
             "MINT_DEPLOYMENT_ENV": "prod",
@@ -150,6 +183,10 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert "MINT_MODEL_ACTOR_REPLICA_ID" not in actor_env
     assert actor_env["MINT_VLLM_MAX_NUM_SEQS"] == "32"
     assert actor_env["MINT_QWEN3_235B_TRAINING_BACKEND"] == "megatron"
+    assert "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" not in actor_env
+    assert "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM" not in actor_env
+    assert "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET" not in actor_env
+    assert "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET" not in actor_env
     assert actor_env["MINT_TOPOLOGY_CONFIG_PATH"] == "/vePFS-Mindverse/share/mint/prod/runtime/topology.yaml"
     assert actor_env["MINT_TOPOLOGY_STATE_PATH"] == "/vePFS-Mindverse/share/mint/prod/runtime/topology_state.yaml"
     assert actor_env["MINT_DEPLOYMENT_ENV"] == "prod"

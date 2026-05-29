@@ -4,6 +4,7 @@ import sqlite3
 import sys
 import time
 import types
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -11,6 +12,9 @@ import yaml
 from mint_server.backend.model_actor_inventory import ActorType
 from mint_server.backend.model_actor_launchers import (
     ModelActorLauncherRegistry,
+    _model_runtime_max_claim_for_spec,
+    _model_runtime_token_budget_for_spec,
+    launch_model_runtime_actor,
     placement_env_for_spec,
 )
 from mint_server.backend.model_actor_supervisor import (
@@ -261,6 +265,16 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     assert created["options"]["resources"] == {"node:10.1.2.3": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
     assert actor.calls == [("snapshot", (), {})]
+
+
+def test_issue_593_model_runtime_max_claim_uses_training_override_for_megatron(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "23")
+
+    spec = SimpleNamespace(domain_key="megatron:Qwen/Qwen3-30B-A3B-Instruct-2507")
+
+    assert _model_runtime_max_claim_for_spec(spec) == 23
 
 
 def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1007,6 +1021,89 @@ async def test_issue_593_supervisor_uses_launcher_registry_when_no_factory() -> 
     assert launched[0][0].domain_key == "vllm:model-a"
     snapshot = supervisor.snapshot()["replicas"]
     assert snapshot["vllm:model-a::replica-0"]["launcher_key"] == "test_launcher"
+
+
+def test_issue_648_vllm_runtime_max_claim_is_high_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", raising=False)
+    monkeypatch.delenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", raising=False)
+    monkeypatch.delenv("MINT_MODEL_RUNTIME_MAX_CLAIM", raising=False)
+
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="vllm:model-a")) == 64
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="training:model-a")) == 1
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 16
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="megatron:model-a")) == 16
+
+    monkeypatch.setenv("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", "17")
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="vllm:model-a")) == 17
+    monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "7")
+    assert _model_runtime_max_claim_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 7
+
+
+def test_issue_648_training_runtime_token_budget_uses_backend_then_training_then_generic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for key in (
+        "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
+        "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="vllm:model-a")) is None
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 262144
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="megatron:model-a")) is None
+
+    monkeypatch.setenv("MINT_MODEL_RUNTIME_TOKEN_BUDGET", "1000")
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 1000
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="megatron:model-a")) == 1000
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="training:model-a")) == 1000
+
+    monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET", "2000")
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 2000
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="megatron:model-a")) == 2000
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="training:model-a")) == 1000
+
+    monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET", "262144")
+    monkeypatch.setenv("MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET", "131072")
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 262144
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="megatron:model-a")) == 131072
+
+    monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET", "0")
+    monkeypatch.setenv("MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET", "not-an-int")
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="bumblebee:model-a")) == 2000
+    assert _model_runtime_token_budget_for_spec(ModelActorSpec(domain_key="megatron:model-a")) == 2000
+
+
+@pytest.mark.anyio
+async def test_issue_648_launch_model_runtime_actor_passes_training_token_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_get_or_create_model_runtime_actor(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(ok=True)
+
+    runtime_module = types.ModuleType("mint_server.backend.model_runtime_actor")
+    runtime_module.get_or_create_model_runtime_actor = _fake_get_or_create_model_runtime_actor
+    monkeypatch.setitem(sys.modules, "mint_server.backend.model_runtime_actor", runtime_module)
+    monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET", "262144")
+    monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "16")
+
+    actor = await launch_model_runtime_actor(
+        ModelActorSpec(
+            domain_key="bumblebee:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        ),
+        generation=12,
+    )
+
+    assert actor.ok is True
+    assert captured["max_claim"] == 16
+    assert captured["token_budget"] == 262144
+    assert captured["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
 @pytest.mark.anyio

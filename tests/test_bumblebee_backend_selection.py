@@ -12,14 +12,19 @@ from mint_server.backend.verl_training import (
     _select_moe_training_backend,
 )
 from mint_server.backend.bumblebee_distributed import (
+    BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS,
     BUMBLEBEE_TRAIN_STATE_CHECKPOINT_FORMAT,
     BUMBLEBEE_TRAIN_STATE_FILE,
     BUMBLEBEE_TRAIN_STATE_META_FILE,
     BumblebeeRankWorker,
     BumblebeeWorkerGroup,
     BumblebeeSessionMeta,
+    _bumblebee_attention_backend_override,
+    _bumblebee_flash_attn_overlay_path,
+    _bumblebee_runtime_pythonpath,
     _bumblebee_runtime_etp,
     _coerce_int,
+    _make_bumblebee_pg_name,
     get_or_create_bumblebee_worker_group,
 )
 
@@ -73,6 +78,76 @@ def test_bumblebee_235b_keeps_existing_mint_topology_with_bumblebee_etp(monkeypa
     assert cfg.expert_tensor_parallel_size is None
     assert cfg.world_size == 32
     assert _bumblebee_runtime_etp("Qwen/Qwen3-235B-A22B-Instruct-2507", cfg) == 1
+
+
+def test_bumblebee_placement_group_name_is_namespace_scoped():
+    assert (
+        _make_bumblebee_pg_name("Qwen/Qwen3-30B-A3B-Instruct-2507", namespace="mint")
+        == "mint_bumblebee_qwen3_30b_a3b_instruct_2507_mint_pg"
+    )
+    assert _make_bumblebee_pg_name(
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        namespace="issue648_bumblebee_train9_20260528_102932",
+    ).startswith("mint_bumblebee_qwen3_30b_a3b_instruct_2507_issue648_bumb")
+
+
+def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
+    assert "MINT_BUMBLEBEE_IMPL" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_OPTIMIZER" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_SKIP_HF_LOAD" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_ATTENTION_BACKEND" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "BUMBLEBEE_CKPT_TRACE" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "NVTE_FLASH_ATTN" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "BUMBLEBEE_TE_SDPA_FALLBACK" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+
+
+def test_bumblebee_attention_backend_override_defaults_to_flash(monkeypatch):
+    monkeypatch.delenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", raising=False)
+
+    assert _bumblebee_attention_backend_override() == "flash"
+
+
+def test_bumblebee_attention_backend_override_accepts_unfused(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", "unfused")
+
+    assert _bumblebee_attention_backend_override() == "unfused"
+
+
+def test_bumblebee_attention_backend_override_allows_runtime_default(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", "none")
+
+    assert _bumblebee_attention_backend_override() is None
+
+
+def test_bumblebee_flash_attn_overlay_path_can_be_explicit(monkeypatch, tmp_path):
+    overlay = tmp_path / "flash-overlay"
+    monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
+
+    assert _bumblebee_flash_attn_overlay_path() == str(overlay)
+
+
+def test_bumblebee_flash_attn_overlay_path_auto_detects_runtime_overlay(monkeypatch, tmp_path):
+    overlay = tmp_path / "overlays" / "flash_attn_2_8_3_cu12_torch2_9_cp312"
+    overlay.mkdir(parents=True)
+    monkeypatch.delenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", raising=False)
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(tmp_path))
+
+    assert _bumblebee_flash_attn_overlay_path() == str(overlay)
+
+
+def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tmp_path):
+    overlay = tmp_path / "flash-overlay"
+    repo = tmp_path / "bumblebee"
+    monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
+    monkeypatch.setenv("MINT_BUMBLEBEE_REPO_PATH", str(repo))
+    monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
+
+    assert _bumblebee_runtime_pythonpath().split(":")[:3] == [
+        str(overlay),
+        str(repo),
+        "/runtime/site-packages",
+    ]
 
 
 def test_bumblebee_optimizer_metric_coerces_missing_num_zeros():
@@ -147,13 +222,16 @@ def _make_rank_worker_for_sft_loss_test():
         def forward_backward(self, handle, batches, loss_fn, *, num_microbatches, forward_only=False):
             self.loss_fn = loss_fn
             self.forward_only = forward_only
-            loss, metrics = loss_fn(
-                {"log_probs": torch.tensor([-10.0, -2.0, -4.0])},
-                {"loss_mask": torch.tensor([0.0, 1.0, 1.0])},
-            )
             assert num_microbatches == 1
             assert batches
-            return SimpleNamespace(metrics={**metrics, "loss": float(loss.detach().item())})
+            return SimpleNamespace(
+                metrics={
+                    "loss": 3.0,
+                    "loss:mean": 3.0,
+                    "num_tokens:sum": 2.0,
+                },
+                model_output=SimpleNamespace(log_probs=torch.tensor([-10.0, -2.0, -4.0])),
+            )
 
     runtime = FakeRuntime()
     worker._ensure_session_loaded = MethodType(
@@ -246,6 +324,8 @@ def test_issue_670_bumblebee_group_ready_checks_rank_workers():
     group = object.__new__(group_cls)
     group.config = SimpleNamespace(world_size=2)
     group.workers = [SimpleNamespace(__ray_ready__=SimpleNamespace(remote=lambda: "rank-ready-ref"))]
+    group._initialized = True
+    group._initializing = False
 
     with pytest.raises(RuntimeError, match="rank worker count mismatch"):
         group.__ray_ready__()
@@ -499,32 +579,15 @@ def test_issue_662_bumblebee_rejects_megatron_adapter_rank_mismatch(tmp_path):
         )
 
 
-def test_bumblebee_sft_forward_backward_uses_masked_external_loss(monkeypatch):
+def test_bumblebee_sft_forward_backward_uses_model_masked_loss(monkeypatch):
     worker, runtime = _make_rank_worker_for_sft_loss_test()
 
     class FakeBatch:
         loss_mask = torch.tensor([0.0, 1.0, 1.0])
 
-    def fake_sft_loss_fn():
-        def loss_fn(model_output, batch):
-            loss_mask = batch["loss_mask"]
-            log_probs = model_output["log_probs"]
-            loss_sum = -(log_probs.float() * loss_mask.float()).sum()
-            num_tokens = loss_mask.float().sum()
-            loss = loss_sum / num_tokens
-            return loss, {
-                "loss": float(loss.detach().item()),
-                "loss:mean": float(loss.detach().item()),
-                "sft_loss_sum": float(loss_sum.detach().item()),
-                "num_tokens:sum": float(num_tokens.detach().item()),
-            }
-
-        return loss_fn
-
     mint_module = types.ModuleType("bumblebee.runtime.adapters.mint")
     mint_module.actor_update_output_to_mint_forward_backward = lambda *args, **kwargs: {}
     mint_module.make_mint_actor_loss_fn = lambda *args, **kwargs: None
-    mint_module.make_mint_sft_loss_fn = fake_sft_loss_fn
     mint_module.mint_datums_to_packed_batch = lambda data_items, *, loss_fn, device: FakeBatch()
     monkeypatch.setitem(sys.modules, "bumblebee", types.ModuleType("bumblebee"))
     monkeypatch.setitem(sys.modules, "bumblebee.runtime", types.ModuleType("bumblebee.runtime"))
@@ -543,9 +606,8 @@ def test_bumblebee_sft_forward_backward_uses_masked_external_loss(monkeypatch):
         actual_rank=16,
     )
 
-    assert runtime.loss_fn is not None
+    assert runtime.loss_fn is None
     assert runtime.forward_only is False
     assert payload["loss_fn_outputs"][0]["loss"]["data"] == [3.0]
     assert payload["metrics"]["loss"] == 3.0
-    assert payload["metrics"]["sft_loss_sum"] == 6.0
     assert payload["metrics"]["num_tokens:sum"] == 2.0

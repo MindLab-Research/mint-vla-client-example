@@ -93,6 +93,110 @@ def test_scheduler_assigns_to_registered_replica_queue() -> None:
     asyncio.run(_run())
 
 
+def test_scheduler_claims_first_item_when_it_exceeds_token_budget() -> None:
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        await actor.append(_work("req-expensive", token_cost=100))
+        await actor.append(_work("req-next", token_cost=1))
+        await actor.assign_pending()
+
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=4,
+            token_budget=50,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-expensive"]
+        assert claimed["remaining_queue_depth"] == 1
+
+    asyncio.run(_run())
+
+
+def test_scheduler_multi_claim_for_training_domains_stays_on_same_affinity() -> None:
+    domain_key = "bumblebee:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
+        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="training_session:a"))
+        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="training_session:b"))
+        await actor.append(_work("req-a2", domain_key=domain_key, affinity_group="training_session:a"))
+        await actor.assign_pending()
+
+        claimed = await actor.claim_from_replica_queue(
+            domain_key=domain_key,
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=4,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-a2"]
+        assert claimed["remaining_queue_depth"] == 1
+
+    asyncio.run(_run())
+
+
+def test_scheduler_same_affinity_domains_can_be_disabled_by_constructor() -> None:
+    domain_key = "bumblebee:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    actor = _ModelWorkSchedulerActor(same_affinity_multi_claim_domains=())
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
+        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="training_session:a"))
+        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="training_session:b"))
+        await actor.assign_pending()
+
+        claimed = await actor.claim_from_replica_queue(
+            domain_key=domain_key,
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=2,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-b1"]
+
+    asyncio.run(_run())
+
+
+def test_scheduler_same_affinity_domains_can_be_overridden_from_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_MODEL_WORK_CLAIM_SAME_AFFINITY_DOMAINS", "custom:")
+    domain_key = "custom:model-a"
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
+        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="group-a"))
+        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="group-b"))
+        await actor.append(_work("req-a2", domain_key=domain_key, affinity_group="group-a"))
+        await actor.assign_pending()
+
+        claimed = await actor.claim_from_replica_queue(
+            domain_key=domain_key,
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=4,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-a2"]
+        assert claimed["remaining_queue_depth"] == 1
+
+    asyncio.run(_run())
+
+
 def test_scheduler_default_actor_name_uses_mint_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME", raising=False)
 
@@ -585,6 +689,7 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         assert record["status"] == "assigned"
         assert record["subqueue_id"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         assert record["scheduler_epoch"] == 1
+        assert record["metadata"]["model_work_scheduler_instance_id"] == out["scheduler_instance_id"]
 
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -647,6 +752,38 @@ def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> N
         assert out["ok"] is True
         assert out["idempotent"] is True
         assert store.get_task("req-pre-registered")["status"] == "assigned"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_scheduler_rolls_back_new_task_when_assign_fails_after_create() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+    original_task_state_call = actor._task_state_call
+
+    async def _task_state_call(method: str, **kwargs):
+        if method == "assign_task":
+            raise RuntimeError("assign failed after create")
+        return await original_task_state_call(method, **kwargs)
+
+    actor._task_state_call = _task_state_call  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        with pytest.raises(RuntimeError, match="assign failed after create"):
+            await actor.append(_work("req-assign-fails"), assign=True)
+
+        with pytest.raises(KeyError):
+            store.get_task("req-assign-fails")
+        assert (await actor.contains_request(request_id="req-assign-fails"))["present"] is False
+        assert actor.stats()["backlog_depth"] == 0
 
     try:
         asyncio.run(_run())

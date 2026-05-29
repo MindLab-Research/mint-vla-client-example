@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 CLAIMABLE_REPLICA_STATUSES = frozenset({"healthy", "ready"})
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
+TRAINING_SAME_AFFINITY_MULTI_CLAIM_DOMAINS = ("bumblebee:", "megatron:")
+
 
 class ModelWorkSchedulerUnavailableError(RuntimeError):
     pass
@@ -78,6 +80,13 @@ def _metric_number(value: object) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _same_affinity_multi_claim_domains_from_env() -> tuple[str, ...]:
+    raw = os.environ.get("MINT_MODEL_WORK_CLAIM_SAME_AFFINITY_DOMAINS")
+    if raw is None:
+        return TRAINING_SAME_AFFINITY_MULTI_CLAIM_DOMAINS
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
 def _scheduler_domain_base_model(domain_key: object) -> str | None:
@@ -284,6 +293,7 @@ class _ModelWorkSchedulerActor:
         use_task_state_store: bool = False,
         task_state_store: Any | None = None,
         owner_id: str | None = None,
+        same_affinity_multi_claim_domains: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         try:
             from ..logging_context import init_actor_observability
@@ -296,6 +306,15 @@ class _ModelWorkSchedulerActor:
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
         self._use_task_state_store = bool(use_task_state_store)
         self._task_state_store = task_state_store
+        self._same_affinity_multi_claim_domains = tuple(
+            str(part).strip()
+            for part in (
+                _same_affinity_multi_claim_domains_from_env()
+                if same_affinity_multi_claim_domains is None
+                else same_affinity_multi_claim_domains
+            )
+            if str(part).strip()
+        )
         self._scheduler_epoch: int | None = None
         self._task_state_hydrated = False
         self._domain_backlog: dict[str, deque[ModelWorkItem]] = {}
@@ -664,10 +683,53 @@ class _ModelWorkSchedulerActor:
     def _queue(self, domain_key: str, replica_id: str) -> deque[_AssignedWork]:
         return self._replica_queues.setdefault(_queue_key(domain_key, replica_id), deque())
 
+    def _claim_requires_same_affinity(self, domain_key: str) -> bool:
+        prefixes = self._same_affinity_multi_claim_domains
+        if not prefixes:
+            return False
+        return str(domain_key).startswith(prefixes)
+
+    def _cluster_queue_head_affinity(self, queue: deque[_AssignedWork]) -> None:
+        if not queue:
+            return
+        affinity_group = queue[0].item.affinity_group
+        if affinity_group is None:
+            return
+        same: deque[_AssignedWork] = deque()
+        other: deque[_AssignedWork] = deque()
+        while queue:
+            assigned = queue.popleft()
+            if assigned.item.affinity_group == affinity_group:
+                same.append(assigned)
+            else:
+                other.append(assigned)
+        queue.extend(same)
+        queue.extend(other)
+
     def _drop_empty_backlog(self, domain_key: str) -> None:
         backlog = self._domain_backlog.get(domain_key)
         if backlog is not None and not backlog:
             self._domain_backlog.pop(domain_key, None)
+
+    def _remove_request_from_memory_locked(self, request_id: str) -> bool:
+        request_id = str(request_id)
+        removed = False
+        for domain_key, backlog in list(self._domain_backlog.items()):
+            kept = deque(item for item in backlog if item.request_id != request_id)
+            if len(kept) != len(backlog):
+                removed = True
+                self._domain_backlog[domain_key] = kept
+                self._drop_empty_backlog(domain_key)
+        for key, queue in list(self._replica_queues.items()):
+            kept = deque(assigned for assigned in queue if assigned.item.request_id != request_id)
+            if len(kept) != len(queue):
+                removed = True
+                self._replica_queues[key] = kept
+        lease_id = self._lease_id_by_request_id.pop(request_id, None)
+        if lease_id is not None:
+            removed = self._leases_by_id.pop(lease_id, None) is not None or removed
+        self._request_locations.pop(request_id, None)
+        return removed
 
     def _claimable_replicas(self, domain_key: str) -> list[ModelReplicaRegistration]:
         replicas = [
@@ -911,6 +973,7 @@ class _ModelWorkSchedulerActor:
                         "affinity_group": work.affinity_group,
                         "ordering_key": work.ordering_key,
                         "token_cost": work.token_cost,
+                        "model_work_scheduler_instance_id": self._instance_id,
                     },
                 )
                 if isinstance(created, dict) and not bool(created.get("created", True)):
@@ -927,14 +990,26 @@ class _ModelWorkSchedulerActor:
                             "reason": "duplicate_request_id",
                             "request_id": work.request_id,
                         }
-            self._backlog(work.domain_key).append(work)
-            self._request_locations[work.request_id] = "backlog"
-            self._appended += 1
-            assigned = (
-                await self._assign_pending_locked(max_items=assign_max_items)
-                if bool(assign)
-                else {"ok": True, "assigned": 0, "skipped_domains": []}
-            )
+            try:
+                self._backlog(work.domain_key).append(work)
+                self._request_locations[work.request_id] = "backlog"
+                self._appended += 1
+                assigned = (
+                    await self._assign_pending_locked(max_items=assign_max_items)
+                    if bool(assign)
+                    else {"ok": True, "assigned": 0, "skipped_domains": []}
+                )
+            except Exception:
+                self._remove_request_from_memory_locked(work.request_id)
+                if self._use_task_state_store and isinstance(created, dict) and bool(created.get("created")):
+                    try:
+                        await self._task_state_call("forget_task", request_id=work.request_id)
+                    except Exception:
+                        logger.exception(
+                            "[model_work_scheduler] failed to roll back task after append failure request_id=%s",
+                            work.request_id,
+                        )
+                raise
             self._cv.notify_all()
             return {
                 "ok": True,
@@ -951,22 +1026,8 @@ class _ModelWorkSchedulerActor:
             await self._ensure_task_state_ready()
         removed = False
         async with self._cv:
-            for domain_key, backlog in list(self._domain_backlog.items()):
-                kept = deque(item for item in backlog if item.request_id != request_id)
-                if len(kept) != len(backlog):
-                    removed = True
-                    self._domain_backlog[domain_key] = kept
-                    self._drop_empty_backlog(domain_key)
-            for key, queue in list(self._replica_queues.items()):
-                kept = deque(assigned for assigned in queue if assigned.item.request_id != request_id)
-                if len(kept) != len(queue):
-                    removed = True
-                    self._replica_queues[key] = kept
-            lease_id = self._lease_id_by_request_id.pop(request_id, None)
-            if lease_id is not None:
-                removed = self._leases_by_id.pop(lease_id, None) is not None or removed
+            removed = self._remove_request_from_memory_locked(request_id)
             if removed:
-                self._request_locations.pop(request_id, None)
                 self._failed += 1
                 self._cv.notify_all()
             return {"ok": True, "request_id": request_id, "cancelled": removed, "reason": str(reason)}
@@ -1142,12 +1203,17 @@ class _ModelWorkSchedulerActor:
             queue = self._queue(domain_key, replica_id)
             claimed: list[dict[str, Any]] = []
             spent = 0
+            claim_affinity_group: str | None = None
+            same_affinity_only = self._claim_requires_same_affinity(domain_key)
+            if same_affinity_only and max(1, int(max_items)) > 1:
+                self._cluster_queue_head_affinity(queue)
             while queue and len(claimed) < max(1, int(max_items)):
                 assigned = queue[0]
+                assigned_affinity_group = assigned.item.affinity_group
+                if same_affinity_only and claimed and assigned_affinity_group != claim_affinity_group:
+                    break
                 cost = max(1, int(assigned.item.token_cost))
                 if token_budget is not None and claimed and spent + cost > int(token_budget):
-                    break
-                if token_budget is not None and not claimed and cost > int(token_budget):
                     break
                 lease_id = uuid.uuid4().hex
                 claim_attempt = int(assigned.item.extra.get("claim_attempt") or 0) + 1
@@ -1207,6 +1273,8 @@ class _ModelWorkSchedulerActor:
                 self._lease_id_by_request_id[assigned.item.request_id] = lease_id
                 self._request_locations[assigned.item.request_id] = "leased"
                 claimed.append(lease.to_dict())
+                if claim_affinity_group is None:
+                    claim_affinity_group = assigned_affinity_group
                 spent += cost
             self._claimed += 1
             return {"ok": True, "leases": claimed, "remaining_queue_depth": len(queue)}
@@ -1452,7 +1520,10 @@ def _create_ray_actor(*, require_ready: bool = True):
         def ping(self) -> dict[str, Any]:
             return super().ping()
 
-    actor = _RayModelWorkSchedulerActor.options(**options).remote(use_task_state_store=True)
+    actor = _RayModelWorkSchedulerActor.options(**options).remote(
+        use_task_state_store=True,
+        same_affinity_multi_claim_domains=_same_affinity_multi_claim_domains_from_env(),
+    )
     if require_ready:
         out = _await_ray_ref_sync(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):

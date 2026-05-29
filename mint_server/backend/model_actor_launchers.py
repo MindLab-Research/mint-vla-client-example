@@ -21,6 +21,7 @@ class ModelActorSpecLike(Protocol):
 
 
 ModelActorLauncher = Callable[[ModelActorSpecLike, int], Any | Awaitable[Any]]
+DEFAULT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET = 262144
 
 
 @dataclass(frozen=True)
@@ -134,15 +135,67 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
     }
 
 
+def megatron_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
+    if not str(getattr(spec, "domain_key", "") or "").startswith("megatron:"):
+        return {}
+    out: dict[str, str] = {}
+    for key in (
+        "MINT_MEGATRON_ATTENTION_BACKEND",
+        "MINT_MEGATRON_DISABLE_WINDOW_SIZE",
+        "NVTE_FLASH_ATTN",
+        "NVTE_FUSED_ATTN",
+        "NVTE_UNFUSED_ATTN",
+    ):
+        value = os.environ.get(key)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def _model_runtime_max_claim_for_spec(spec: ModelActorSpecLike) -> int:
+    domain_key = str(getattr(spec, "domain_key", "") or "")
+    if domain_key.startswith("vllm:"):
+        return max(1, int(os.environ.get("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", "64")))
+    if domain_key.startswith(("bumblebee:", "megatron:")):
+        return max(1, int(os.environ.get("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "16")))
+    return max(1, int(os.environ.get("MINT_MODEL_RUNTIME_MAX_CLAIM", "1")))
+
+
+def _positive_env_int(*keys: str) -> int | None:
+    for key in keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
+def _model_runtime_token_budget_for_spec(spec: ModelActorSpecLike) -> int | None:
+    domain_key = str(getattr(spec, "domain_key", "") or "")
+    if domain_key.startswith("vllm:"):
+        return None
+    if domain_key.startswith("bumblebee:"):
+        return _positive_env_int(
+            "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET",
+            "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
+            "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
+        ) or DEFAULT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET
+    if domain_key.startswith("megatron:"):
+        return _positive_env_int(
+            "MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET",
+            "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
+            "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
+        )
+    return _positive_env_int("MINT_MODEL_RUNTIME_TOKEN_BUDGET")
+
+
 async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) -> Any:
     from .model_runtime_actor import get_or_create_model_runtime_actor
-
-    launcher_key = str(getattr(spec, "launcher_key", "") or "")
-    max_claim = (
-        int(os.environ.get("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", "64"))
-        if launcher_key == "vllm"
-        else 1
-    )
 
     return get_or_create_model_runtime_actor(
         domain_key=spec.domain_key,
@@ -150,8 +203,12 @@ async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) 
         actor_name=spec.normalized_actor_name(),
         actor_generation=int(generation),
         base_model=_base_model_from_spec(spec),
-        max_claim=max_claim,
-        runtime_env_extra=placement_env_for_spec(spec),
+        max_claim=_model_runtime_max_claim_for_spec(spec),
+        token_budget=_model_runtime_token_budget_for_spec(spec),
+        runtime_env_extra={
+            **placement_env_for_spec(spec),
+            **megatron_env_for_spec(spec),
+        },
     )
 
 

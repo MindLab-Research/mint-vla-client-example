@@ -457,6 +457,10 @@ def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | Non
         "gpu_memory_fragmentation_bytes",
         "max_lora_rank",
         "actual_rank",
+        "kv_cache_capacity_tokens",
+        "kv_cache_token_budget",
+        "kv_cache_block_size",
+        "kv_cache_num_blocks",
     }
     float_fields = {
         "scheduler_kv_cache_usage_ratio",

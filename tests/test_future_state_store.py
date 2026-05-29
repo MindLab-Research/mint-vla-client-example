@@ -169,7 +169,7 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
     assert future_store.get_task("req-2")["status"] == "retrieved"
 
 
-def test_model_work_admission_registers_future_before_scheduler_append(tmp_path) -> None:
+def test_model_work_admission_delegates_future_creation_to_scheduler_append(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -186,7 +186,17 @@ def test_model_work_admission_registers_future_before_scheduler_append(tmp_path)
             self.seen_status: FutureStatus | None = None
 
         async def append(self, **kwargs):
-            self.seen_status = await service.async_get_status(kwargs["request_id"])
+            try:
+                self.seen_status = await service.async_get_status(kwargs["request_id"])
+            except KeyError:
+                self.seen_status = None
+            await service.async_create_model_work_with_id(
+                kwargs["request_id"],
+                op=kwargs["op"],
+                domain_key=kwargs["domain_key"],
+                request_json=kwargs["request_json"],
+                meta=kwargs["extra"],
+            )
             return {"ok": True, "request_id": kwargs["request_id"]}
 
     scheduler = _Scheduler()
@@ -203,7 +213,7 @@ def test_model_work_admission_registers_future_before_scheduler_append(tmp_path)
         )
     )
 
-    assert scheduler.seen_status == FutureStatus.PENDING
+    assert scheduler.seen_status is None
     assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
     assert future_store.get_task("req-admission")["op"] == "training.create_model"
 

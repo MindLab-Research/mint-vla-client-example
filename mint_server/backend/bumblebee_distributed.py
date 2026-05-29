@@ -24,6 +24,7 @@ from mint_server.backend.megatron_distributed import (
     DistributedConfig,
     _bundle_node_ip,
     _get_or_create_megatron_placement_group,
+    _make_namespace_pg_suffix,
     _node_affinity_resources,
     get_node_ip_and_free_port,
 )
@@ -44,6 +45,45 @@ PERSISTENT_NAMESPACE = RAY_NAMESPACE
 BUMBLEBEE_TRAIN_STATE_CHECKPOINT_FORMAT = "mint_bumblebee_adapter_train_state_checkpoint_v1"
 BUMBLEBEE_TRAIN_STATE_FILE = "adapter_train_state.pt"
 BUMBLEBEE_TRAIN_STATE_META_FILE = "training_meta.json"
+BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
+    "MINT_BUMBLEBEE_REPO_PATH",
+    "MINT_BUMBLEBEE_IMPL",
+    "MINT_BUMBLEBEE_OPTIMIZER",
+    "MINT_BUMBLEBEE_SKIP_HF_LOAD",
+    "MINT_BUMBLEBEE_ATTENTION_BACKEND",
+    "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH",
+    "MINT_BUMBLEBEE_LORA_ALPHA",
+    "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
+    "MINT_MODEL_PLACEMENT_JSON",
+    "BUMBLEBEE_BUILD_TRACE",
+    "BUMBLEBEE_CKPT_TRACE",
+    "BUMBLEBEE_MEMORY_TRACE",
+    "BUMBLEBEE_RL_DEBUG_METRICS",
+    "BUMBLEBEE_LITE_TRACE",
+    "BUMBLEBEE_LITE_TRACE_ALL_RANKS",
+    "BUMBLEBEE_LITE_TRACE_RANKS",
+    "BUMBLEBEE_LITE_TRACE_BY_STEP",
+    "BUMBLEBEE_LITE_TRACE_MAX_SHAPES",
+    "BUMBLEBEE_Q3MOE_GQA_PROBE",
+    "BUMBLEBEE_Q3MOE_GQA_PROBE_ALL_RANKS",
+    "MINT_BENCH_RECORD_LOGPROBS",
+    "MINT_BENCH_RECORD_LOGITS",
+    "MINT_BENCH_RECORD_TOPK",
+    "MINT_BENCH_RECORD_INPUTS",
+    "MINT_BENCH_RECORD_MODEL_STATE",
+    "CUDA_LAUNCH_BLOCKING",
+    "TORCH_DISTRIBUTED_DEBUG",
+    "NCCL_DEBUG",
+    "NCCL_DEBUG_SUBSYS",
+    "NVTE_FLASH_ATTN",
+    "NVTE_FUSED_ATTN",
+    "NVTE_UNFUSED_ATTN",
+    "NVTE_DEBUG",
+    "NVTE_DEBUG_LEVEL",
+    "BUMBLEBEE_TE_SDPA_FALLBACK",
+)
+
+DEFAULT_BUMBLEBEE_FLASH_ATTN_OVERLAY_RELATIVE = "overlays/flash_attn_2_8_3_cu12_torch2_9_cp312"
 
 _bumblebee_create_locks: dict[str, threading.Lock] = {}
 _bumblebee_create_locks_guard = threading.Lock()
@@ -76,6 +116,36 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _prepend_pythonpath_entry(pythonpath: str, entry: str | None) -> str:
+    value = str(entry or "").strip()
+    if not value:
+        return pythonpath
+    parts = [part for part in str(pythonpath or "").split(":") if part]
+    if value in parts:
+        return ":".join([value, *(part for part in parts if part != value)])
+    return ":".join([value, *parts])
+
+
+def _bumblebee_flash_attn_overlay_path() -> str | None:
+    explicit = os.environ.get("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH")
+    if explicit is not None:
+        value = explicit.strip()
+        return value or None
+    runtime_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    if not runtime_root:
+        return None
+    candidate = os.path.join(runtime_root, DEFAULT_BUMBLEBEE_FLASH_ATTN_OVERLAY_RELATIVE)
+    return candidate if os.path.isdir(candidate) else None
+
+
+def _bumblebee_runtime_pythonpath() -> str:
+    runtime_pythonpath = PFS_PYTHONPATH
+    repo = _bumblebee_repo_path()
+    runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, repo)
+    runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, _bumblebee_flash_attn_overlay_path())
+    return runtime_pythonpath
+
+
 def _model_key_from_base_model(base_model: str) -> str:
     import re
 
@@ -95,8 +165,8 @@ def _make_bumblebee_actor_name(base_model: str) -> str:
     return f"mint_bumblebee_{model_name}"
 
 
-def _make_bumblebee_pg_name(base_model: str) -> str:
-    return f"{_make_bumblebee_actor_name(base_model)}_pg"
+def _make_bumblebee_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
+    return f"{_make_bumblebee_actor_name(base_model)}_{_make_namespace_pg_suffix(namespace)}_pg"
 
 
 def _is_qwen3_235b_model(model: str | None) -> bool:
@@ -110,6 +180,16 @@ def _bumblebee_runtime_etp(base_model: str, config: DistributedConfig) -> int | 
     if _is_qwen3_235b_model(_model_key_from_base_model(base_model)):
         return 1
     return None
+
+
+def _bumblebee_attention_backend_override() -> str | None:
+    raw = os.environ.get("MINT_BUMBLEBEE_ATTENTION_BACKEND", "flash").strip().lower()
+    if raw in {"", "none", "default"}:
+        return None
+    allowed = {"auto", "flash", "fused", "unfused", "local"}
+    if raw not in allowed:
+        raise ValueError(f"MINT_BUMBLEBEE_ATTENTION_BACKEND must be one of {sorted(allowed)}, got {raw!r}")
+    return raw
 
 
 def _bumblebee_repo_path() -> str:
@@ -381,49 +461,66 @@ class BumblebeeRankWorker:
         return True
 
     def initialize(self) -> dict[str, Any]:
-        repo = _ensure_bumblebee_repo_importable()
-        os.environ["RANK"] = str(self.rank)
-        os.environ["WORLD_SIZE"] = str(self.world_size)
-        os.environ["MASTER_ADDR"] = self.master_addr
-        os.environ["MASTER_PORT"] = str(self.master_port)
-        os.environ.setdefault("LOCAL_RANK", "0")
-        os.environ.setdefault("HF_HOME", "/vePFS-Mindverse/share/huggingface")
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        try:
+            repo = _ensure_bumblebee_repo_importable()
+            os.environ["RANK"] = str(self.rank)
+            os.environ["WORLD_SIZE"] = str(self.world_size)
+            os.environ["MASTER_ADDR"] = self.master_addr
+            os.environ["MASTER_PORT"] = str(self.master_port)
+            os.environ.setdefault("LOCAL_RANK", "0")
+            os.environ.setdefault("HF_HOME", "/vePFS-Mindverse/share/huggingface")
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+            os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+            logger.info(
+                "Bumblebee rank initialize start: rank=%s world_size=%s master=%s:%s base_model=%s repo=%s",
+                self.rank,
+                self.world_size,
+                self.master_addr,
+                self.master_port,
+                self.base_model,
+                repo,
+            )
 
-        from bumblebee.runtime import RuntimeConfig, create_runtime
-        from bumblebee.runtime.backends.bb.config import BBConfig
-        from bumblebee.runtime.contracts.config import OptimizerConfig, ParallelConfig
+            from bumblebee.runtime import RuntimeConfig, create_runtime
+            from bumblebee.runtime.backends.bb.config import BBConfig
+            from bumblebee.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
-        etp = _bumblebee_runtime_etp(self.base_model, self.config)
-        bb_cfg = BBConfig(
-            model_name="qwen3_moe",
-            impl=os.environ.get("MINT_BUMBLEBEE_IMPL", "lite"),
-            hf_path=self.base_model,
-            parallel=ParallelConfig(
-                tp=int(self.config.tensor_parallel_size),
-                pp=int(self.config.pipeline_parallel_size),
-                ep=int(self.config.expert_parallel_size),
-                cp=int(self.config.context_parallel_size),
-                etp=etp,
-            ),
-            optimizer=OptimizerConfig(lr=float(self.learning_rate)),
-            load_hf_weights=not _env_flag("MINT_BUMBLEBEE_SKIP_HF_LOAD"),
-            impl_cfg={
-                "optimizer": os.environ.get("MINT_BUMBLEBEE_OPTIMIZER", "mc_full"),
-                "use_thd": True,
-                "lora": {
-                    "rank": int(self.lora_rank),
-                    "max_rank": int(self.lora_rank),
-                    "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
-                    "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+            etp = _bumblebee_runtime_etp(self.base_model, self.config)
+            bb_cfg = BBConfig(
+                model_name="qwen3_moe",
+                impl=os.environ.get("MINT_BUMBLEBEE_IMPL", "lite"),
+                hf_path=self.base_model,
+                parallel=ParallelConfig(
+                    tp=int(self.config.tensor_parallel_size),
+                    pp=int(self.config.pipeline_parallel_size),
+                    ep=int(self.config.expert_parallel_size),
+                    cp=int(self.config.context_parallel_size),
+                    etp=etp,
+                ),
+                optimizer=OptimizerConfig(lr=float(self.learning_rate)),
+                attention_backend_override=_bumblebee_attention_backend_override(),
+                load_hf_weights=not _env_flag("MINT_BUMBLEBEE_SKIP_HF_LOAD"),
+                impl_cfg={
+                    "optimizer": os.environ.get("MINT_BUMBLEBEE_OPTIMIZER", "mc_full"),
+                    "use_thd": True,
+                    "lora": {
+                        "rank": int(self.lora_rank),
+                        "max_rank": int(self.lora_rank),
+                        "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+                        "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+                    },
                 },
-            },
-        )
-        self.rt = create_runtime(RuntimeConfig(backend="bb", hf_path=self.base_model, backend_cfg=bb_cfg))
-        self.handle = self.rt.build_model()
-        return {"rank": self.rank, "world_size": self.world_size, "backend": "bumblebee", "bumblebee_repo": repo}
+            )
+            logger.info("Bumblebee rank create_runtime start: rank=%s", self.rank)
+            self.rt = create_runtime(RuntimeConfig(backend="bb", hf_path=self.base_model, backend_cfg=bb_cfg))
+            logger.info("Bumblebee rank build_model start: rank=%s", self.rank)
+            self.handle = self.rt.build_model()
+            logger.info("Bumblebee rank initialize done: rank=%s", self.rank)
+            return {"rank": self.rank, "world_size": self.world_size, "backend": "bumblebee", "bumblebee_repo": repo}
+        except BaseException:
+            logger.exception("Bumblebee rank initialize failed: rank=%s world_size=%s", self.rank, self.world_size)
+            raise
 
     def heartbeat(self) -> dict[str, Any]:
         return {
@@ -763,7 +860,6 @@ class BumblebeeRankWorker:
         from bumblebee.runtime.adapters.mint import (
             actor_update_output_to_mint_forward_backward,
             make_mint_actor_loss_fn,
-            make_mint_sft_loss_fn,
             mint_datums_to_packed_batch,
         )
         from mint_server.backend.megatron_training import benchmark_debug_input_entries
@@ -798,7 +894,7 @@ class BumblebeeRankWorker:
             result = rt.forward_backward(
                 handle,
                 [runtime_batch],
-                make_mint_sft_loss_fn(),
+                None,
                 num_microbatches=1,
             )
             metrics = dict(result.metrics)
@@ -932,14 +1028,14 @@ class BumblebeeRankWorker:
         rt, handle = self._require_runtime()
         switch = self._ensure_session_loaded(session_id, actual_rank)
 
-        from bumblebee.runtime.adapters.mint import make_mint_sft_loss_fn, mint_datums_to_packed_batch
+        from bumblebee.runtime.adapters.mint import mint_datums_to_packed_batch
 
         batch = mint_datums_to_packed_batch(data_items, loss_fn="cross_entropy", device="cuda")
         runtime_batch = self._mint_batch_to_runtime_dict(batch)
         result = rt.forward_backward(
             handle,
             [runtime_batch],
-            make_mint_sft_loss_fn(),
+            None,
             num_microbatches=1,
             forward_only=True,
         )
@@ -1401,7 +1497,8 @@ class BumblebeeWorkerGroup:
         self.placement_group = None
         self._step_count = 0
         self._current_session: str | None = None
-        self._initialize()
+        self._initialized = False
+        self._initializing = False
 
     def _assert_rank_workers_ready(self, *, timeout_s: float = 30.0) -> None:
         if len(self.workers) != int(self.config.world_size):
@@ -1412,6 +1509,7 @@ class BumblebeeWorkerGroup:
         ray.get([worker.__ray_ready__.remote() for worker in self.workers], timeout=timeout_s)
 
     def __ray_ready__(self) -> bool:
+        self._ensure_initialized()
         self._assert_rank_workers_ready()
         return True
 
@@ -1425,6 +1523,7 @@ class BumblebeeWorkerGroup:
             "rank_workers": len(self.workers),
             "session_id": self._current_session,
             "step": self._step_count,
+            "initialized": self._initialized,
         }
 
     def get_diagnostics(self) -> dict[str, Any]:
@@ -1437,6 +1536,7 @@ class BumblebeeWorkerGroup:
             "world_size": int(self.config.world_size),
             "rank_workers": len(self.workers),
             "step": int(self._step_count),
+            "initialized": self._initialized,
         }
 
     def get_observability_binding(self) -> dict[str, Any]:
@@ -1448,6 +1548,7 @@ class BumblebeeWorkerGroup:
         }
 
     def get_tokenizer_info(self) -> dict[str, Any]:
+        self._ensure_initialized()
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(self.base_model, trust_remote_code=True, local_files_only=True)
@@ -1463,6 +1564,49 @@ class BumblebeeWorkerGroup:
             "unk_token": getattr(tokenizer, "unk_token", None),
             "unk_token_id": getattr(tokenizer, "unk_token_id", None),
         }
+
+    def initialize(self) -> dict[str, Any]:
+        self._ensure_initialized()
+        return {
+            "backend": "bumblebee",
+            "base_model": self.observability_base_model,
+            "world_size": int(self.config.world_size),
+            "initialized": self._initialized,
+        }
+
+    def _cleanup_failed_initialize(self) -> None:
+        for worker in self.workers:
+            try:
+                ray_kill.kill(worker, reason="bumblebee_worker_group_initialize_failed", no_restart=True)
+            except Exception:
+                pass
+        self.workers = []
+        if self.placement_group is not None:
+            try:
+                ray.util.remove_placement_group(self.placement_group)
+            except Exception:
+                pass
+        self.placement_group = None
+
+    def _ensure_initialized(self) -> None:
+        if self._initialized:
+            return
+        if self._initializing:
+            raise RuntimeError("Bumblebee worker group initialization is already in progress")
+        self._initializing = True
+        try:
+            self._initialize()
+            self._initialized = True
+        except Exception:
+            logger.exception(
+                "Bumblebee worker group initialize failed: base_model=%s world_size=%s",
+                self.observability_base_model,
+                int(self.config.world_size),
+            )
+            self._cleanup_failed_initialize()
+            raise
+        finally:
+            self._initializing = False
 
     def _initialize(self) -> None:
         world_size = int(self.config.world_size)
@@ -1489,10 +1633,7 @@ class BumblebeeWorkerGroup:
         ray.get(self.placement_group.ready())
         bundle_ips = [_bundle_node_ip(bundle) for bundle in bundles]
 
-        runtime_pythonpath = PFS_PYTHONPATH
-        repo = _bumblebee_repo_path()
-        if repo not in runtime_pythonpath.split(":"):
-            runtime_pythonpath = repo + ":" + runtime_pythonpath
+        runtime_pythonpath = _bumblebee_runtime_pythonpath()
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
@@ -1505,34 +1646,15 @@ class BumblebeeWorkerGroup:
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    "NVTE_FLASH_ATTN": "0",
+                    "NVTE_FUSED_ATTN": "0",
+                    "NVTE_UNFUSED_ATTN": "1",
+                    "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
             )
         }
-        for key in (
-            "MINT_BUMBLEBEE_REPO_PATH",
-            "MINT_BUMBLEBEE_IMPL",
-            "MINT_BUMBLEBEE_OPTIMIZER",
-            "MINT_BUMBLEBEE_SKIP_HF_LOAD",
-            "MINT_BUMBLEBEE_LORA_ALPHA",
-            "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
-            "MINT_MODEL_PLACEMENT_JSON",
-            "BUMBLEBEE_BUILD_TRACE",
-            "BUMBLEBEE_RL_DEBUG_METRICS",
-            "BUMBLEBEE_Q3MOE_GQA_PROBE",
-            "BUMBLEBEE_Q3MOE_GQA_PROBE_ALL_RANKS",
-            "MINT_BENCH_RECORD_LOGPROBS",
-            "MINT_BENCH_RECORD_LOGITS",
-            "MINT_BENCH_RECORD_TOPK",
-            "MINT_BENCH_RECORD_INPUTS",
-            "MINT_BENCH_RECORD_MODEL_STATE",
-            "CUDA_LAUNCH_BLOCKING",
-            "TORCH_DISTRIBUTED_DEBUG",
-            "NCCL_DEBUG",
-            "NCCL_DEBUG_SUBSYS",
-            "NVTE_DEBUG",
-            "NVTE_DEBUG_LEVEL",
-        ):
+        for key in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS:
             value = os.environ.get(key)
             if value is not None:
                 runtime_env["env_vars"][key] = value
@@ -1593,6 +1715,7 @@ class BumblebeeWorkerGroup:
         train_unembed: bool = True,
     ) -> dict[str, Any]:
         del traceparent
+        self._ensure_initialized()
         refs = [
             worker.forward_backward.remote(
                 data_items,
@@ -1623,6 +1746,7 @@ class BumblebeeWorkerGroup:
         train_unembed: bool = True,
     ) -> dict[str, Any]:
         del traceparent
+        self._ensure_initialized()
         refs = [
             worker.forward.remote(
                 data_items,
@@ -1650,6 +1774,7 @@ class BumblebeeWorkerGroup:
         train_unembed: bool = True,
     ) -> dict[str, Any]:
         del traceparent, train_attn, train_mlp, train_unembed
+        self._ensure_initialized()
         refs = [
             worker.optimizer_step.remote(learning_rate, session_id, actual_rank)
             for worker in self.workers
@@ -1711,6 +1836,7 @@ class BumblebeeWorkerGroup:
         train_unembed: bool = True,
     ) -> dict[str, Any]:
         del traceparent, train_attn, train_mlp, train_unembed
+        self._ensure_initialized()
         sid = session_id or self._current_session
         if not sid:
             raise RuntimeError("save_lora_weights requires session_id")
@@ -1740,6 +1866,7 @@ class BumblebeeWorkerGroup:
         include_optimizer: bool = True,
     ) -> dict[str, Any]:
         del traceparent, train_attn, train_mlp, train_unembed
+        self._ensure_initialized()
         sid = session_id or self._current_session
         if not sid:
             raise RuntimeError("save_training_state requires session_id")
@@ -1759,6 +1886,7 @@ class BumblebeeWorkerGroup:
         return self.load_training_state(load_path, load_optimizer=load_optimizer, **kwargs)
 
     def load_training_state(self, load_path: str, load_optimizer: bool = True, **kwargs: Any) -> dict[str, Any]:
+        self._ensure_initialized()
         sid = kwargs.get("session_id") or self._current_session
         if not sid:
             raise RuntimeError("load_training_state requires session_id")
@@ -1777,6 +1905,7 @@ class BumblebeeWorkerGroup:
         return self._merge_rank_payloads(results)
 
     def mark_session_loaded(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
+        self._ensure_initialized()
         refs = [
             worker.mark_session_loaded.remote(session_id, **kwargs)
             for worker in self.workers
@@ -1786,6 +1915,7 @@ class BumblebeeWorkerGroup:
         return {"status": "ok", "backend": "bumblebee"}
 
     def delete_session(self, session_id: str, *, traceparent: str | None = None) -> dict[str, Any]:
+        self._ensure_initialized()
         refs = [
             worker.delete_session.remote(session_id, traceparent=traceparent)
             for worker in self.workers
@@ -1921,10 +2051,7 @@ def get_or_create_bumblebee_worker_group(
         except ValueError:
             logger.info("Creating new detached Bumblebee actor: %s for %s", actor_name, base_model)
 
-        runtime_pythonpath = PFS_PYTHONPATH
-        repo = _bumblebee_repo_path()
-        if repo not in runtime_pythonpath.split(":"):
-            runtime_pythonpath = repo + ":" + runtime_pythonpath
+        runtime_pythonpath = _bumblebee_runtime_pythonpath()
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
@@ -1937,26 +2064,15 @@ def get_or_create_bumblebee_worker_group(
                     "TRANSFORMERS_OFFLINE": "1",
                     "PYTHONDONTWRITEBYTECODE": "1",
                     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                    "NVTE_FLASH_ATTN": "0",
+                    "NVTE_FUSED_ATTN": "0",
+                    "NVTE_UNFUSED_ATTN": "1",
+                    "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
             )
         }
-        for key in (
-            "MINT_BUMBLEBEE_REPO_PATH",
-            "MINT_BUMBLEBEE_LORA_ALPHA",
-            "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
-            "MINT_MODEL_PLACEMENT_JSON",
-            "BUMBLEBEE_RL_DEBUG_METRICS",
-            "BUMBLEBEE_Q3MOE_GQA_PROBE",
-            "BUMBLEBEE_Q3MOE_GQA_PROBE_ALL_RANKS",
-            "MINT_BENCH_RECORD_LOGPROBS",
-            "MINT_BENCH_RECORD_LOGITS",
-            "MINT_BENCH_RECORD_TOPK",
-            "MINT_BENCH_RECORD_INPUTS",
-            "MINT_BENCH_RECORD_MODEL_STATE",
-            "NVTE_DEBUG",
-            "NVTE_DEBUG_LEVEL",
-        ):
+        for key in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS:
             value = os.environ.get(key)
             if value is not None:
                 runtime_env["env_vars"][key] = value

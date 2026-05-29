@@ -20,7 +20,7 @@ from ..logging_context import (
     set_request_id,
     set_trace_id,
 )
-from .async_ray_control import sync_get_ray_ref
+from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
@@ -30,7 +30,11 @@ from .task_state_store import FutureStatus, task_futures, task_state_store
 logger = logging.getLogger(__name__)
 
 ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[None]]
+TokenBudgetProvider = Callable[[], Awaitable[int | None]]
 _EXECUTION_BINDINGS: dict[str, Any] | None = None
+VLLM_TOKEN_BUDGET_RATIO = 0.95
+VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
+VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
 
 
 @dataclass(frozen=True)
@@ -96,19 +100,24 @@ def get_or_create_model_runtime_actor(
     try:
         existing = ray.get_actor(name, namespace=_ray_namespace())
         health = sync_get_ray_ref(existing.health_snapshot.remote(), timeout_s=5.0)
+        expected_token_budget = None if token_budget is None else int(token_budget)
         if (
             isinstance(health, dict)
             and str(health.get("domain_key")) == str(domain_key)
             and str(health.get("replica_id")) == str(replica_id)
             and int(health.get("actor_generation") or -1) == int(actor_generation)
+            and int(health.get("max_claim") or 0) == max(1, int(max_claim))
+            and health.get("token_budget") == expected_token_budget
         ):
             return existing
         logger.warning(
-            "[model_runtime] killing stale detached actor name=%s expected_domain=%s expected_replica=%s expected_generation=%s health=%s",
+            "[model_runtime] killing stale detached actor name=%s expected_domain=%s expected_replica=%s expected_generation=%s expected_max_claim=%s expected_token_budget=%s health=%s",
             name,
             domain_key,
             replica_id,
             actor_generation,
+            max_claim,
+            expected_token_budget,
             health,
         )
         ray.kill(existing, no_restart=True)
@@ -218,6 +227,7 @@ class ModelRuntimeActor:
         task_state_store_client: Any | None = None,
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
+        token_budget_provider: TokenBudgetProvider | None = None,
     ) -> None:
         domain = str(domain_key).strip()
         replica = str(replica_id).strip()
@@ -262,18 +272,27 @@ class ModelRuntimeActor:
         )
         self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
         self._executor = executor if executor is not None else _default_executor
+        self._token_budget_provider = (
+            token_budget_provider if token_budget_provider is not None else self._default_token_budget_provider
+        )
 
         self._running = False
         self._draining = False
         self._loop_task: asyncio.Task | None = None
         self._active_request_id: str | None = None
         self._active_lease_id: str | None = None
+        self._active_leases: dict[str, str] = {}
         self._started_at = time.time()
         self._last_claimed_at: float | None = None
         self._last_completed_at: float | None = None
         self._last_renewed_at: float | None = None
         self._last_error: str | None = None
         self._last_error_traceback: str | None = None
+        self._dynamic_token_budget: int | None = None
+        self._dynamic_token_capacity_tokens: int | None = None
+        self._dynamic_token_budget_ratio: float | None = None
+        self._dynamic_token_budget_updated_at: float | None = None
+        self._dynamic_token_budget_error: str | None = None
         self._processed_total = 0
         self._completed_total = 0
         self._failed_total = 0
@@ -324,6 +343,9 @@ class ModelRuntimeActor:
             "draining": bool(self._draining),
             "active_request_id": self._active_request_id,
             "active_lease_id": self._active_lease_id,
+            "active_request_ids": list(self._active_leases.values()),
+            "active_lease_ids": list(self._active_leases.keys()),
+            "active_lease_count": len(self._active_leases),
             "started_at": float(self._started_at),
             "last_claimed_at": self._last_claimed_at,
             "last_completed_at": self._last_completed_at,
@@ -340,6 +362,11 @@ class ModelRuntimeActor:
             "lease_ttl_s": float(self._config.lease_ttl_s),
             "max_claim": int(self._config.max_claim),
             "token_budget": self._config.token_budget,
+            "dynamic_token_budget": self._dynamic_token_budget,
+            "dynamic_token_capacity_tokens": self._dynamic_token_capacity_tokens,
+            "dynamic_token_budget_ratio": self._dynamic_token_budget_ratio,
+            "dynamic_token_budget_updated_at": self._dynamic_token_budget_updated_at,
+            "dynamic_token_budget_error": self._dynamic_token_budget_error,
             "execution_timeout_s": self._config.execution_timeout_s,
         }
 
@@ -389,13 +416,14 @@ class ModelRuntimeActor:
     async def run_once(self) -> dict[str, Any]:
         if self._draining:
             return {"claimed": 0, "executed": 0, "draining": True}
+        max_items, token_budget = await self._claim_limits()
         claimed = await self._scheduler.claim_from_replica_queue(
             domain_key=self._config.domain_key,
             replica_id=self._config.replica_id,
             consumer_id=self._config.consumer_id,
             consumer_generation=self._config.actor_generation,
-            max_items=self._config.max_claim,
-            token_budget=self._config.token_budget,
+            max_items=max_items,
+            token_budget=token_budget,
             lease_ttl_s=self._config.lease_ttl_s,
         )
         leases = claimed.get("leases") if isinstance(claimed, dict) else None
@@ -405,13 +433,121 @@ class ModelRuntimeActor:
             return {"claimed": 0, "executed": 0}
 
         self._last_claimed_at = time.time()
-        executed = 0
-        for lease in leases:
-            if not isinstance(lease, dict):
-                continue
-            await self._execute_lease(lease)
-            executed += 1
-        return {"claimed": len(leases), "executed": executed}
+        valid_leases = [lease for lease in leases if isinstance(lease, dict)]
+        if len(valid_leases) == 1:
+            await self._execute_lease(valid_leases[0])
+        elif valid_leases and self._executes_leases_concurrently():
+            await asyncio.gather(*(self._execute_lease(lease) for lease in valid_leases))
+        else:
+            await self._execute_leases_sequentially(valid_leases)
+        return {"claimed": len(leases), "executed": len(valid_leases)}
+
+    async def _claim_limits(self) -> tuple[int, int | None]:
+        if self._config.token_budget is not None:
+            return int(self._config.max_claim), int(self._config.token_budget)
+        if not self._is_vllm_domain():
+            return int(self._config.max_claim), None
+        token_budget = await self._refresh_dynamic_token_budget()
+        if token_budget is None:
+            return 1, None
+        return int(self._config.max_claim), int(token_budget)
+
+    def _is_vllm_domain(self) -> bool:
+        return str(self._config.domain_key).startswith("vllm:")
+
+    def _executes_leases_concurrently(self) -> bool:
+        return self._is_vllm_domain()
+
+    async def _execute_leases_sequentially(self, leases: list[dict[str, Any]]) -> None:
+        pending_lease_ids = {
+            str(lease.get("lease_id"))
+            for lease in leases
+            if isinstance(lease, dict) and lease.get("lease_id") is not None
+        }
+        renew_task: asyncio.Task | None = None
+        if len(pending_lease_ids) > 1:
+            renew_task = asyncio.create_task(self._renew_pending_leases_until_done(pending_lease_ids))
+        try:
+            for lease in leases:
+                lease_id = str(lease.get("lease_id"))
+                await self._execute_lease(lease)
+                pending_lease_ids.discard(lease_id)
+        finally:
+            pending_lease_ids.clear()
+            if renew_task is not None:
+                renew_task.cancel()
+                await asyncio.gather(renew_task, return_exceptions=True)
+
+    async def _refresh_dynamic_token_budget(self) -> int | None:
+        now = time.time()
+        if self._dynamic_token_budget is not None and self._dynamic_token_budget_updated_at is not None:
+            if now - float(self._dynamic_token_budget_updated_at) < VLLM_TOKEN_BUDGET_REFRESH_S:
+                return int(self._dynamic_token_budget)
+        try:
+            budget = await self._token_budget_provider()
+        except Exception as e:
+            self._dynamic_token_budget_error = f"{type(e).__name__}: {e}"
+            logger.debug(
+                "[model_runtime] dynamic token budget refresh failed actor=%s domain=%s error=%s",
+                self._config.actor_name,
+                self._config.domain_key,
+                self._dynamic_token_budget_error,
+            )
+            return self._dynamic_token_budget
+        if budget is None:
+            return self._dynamic_token_budget
+        budget_i = max(1, int(budget))
+        self._dynamic_token_budget = budget_i
+        self._dynamic_token_budget_updated_at = now
+        self._dynamic_token_budget_error = None
+        return budget_i
+
+    async def _default_token_budget_provider(self) -> int | None:
+        if not self._is_vllm_domain():
+            return None
+        actor_name = self._vllm_actor_name()
+        if not actor_name:
+            return None
+        import ray
+
+        actor = ray.get_actor(actor_name, namespace=_ray_namespace())
+        getter = getattr(actor, "get_observability_binding", None)
+        if not callable(getter):
+            return None
+        timeout_s = VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S
+        payload = await async_get_ray_ref(getter.remote(), timeout_s=timeout_s)
+        if not isinstance(payload, dict):
+            return None
+        capacity = self._positive_int(payload.get("kv_cache_capacity_tokens"))
+        if capacity is None:
+            kv_debug = getattr(actor, "get_kv_debug_info", None)
+            if callable(kv_debug):
+                payload = await async_get_ray_ref(kv_debug.remote(), timeout_s=timeout_s)
+                if isinstance(payload, dict):
+                    capacity = self._positive_int(payload.get("kv_cache_capacity_tokens"))
+        if capacity is None:
+            return None
+        ratio = VLLM_TOKEN_BUDGET_RATIO
+        self._dynamic_token_capacity_tokens = int(capacity)
+        self._dynamic_token_budget_ratio = float(ratio)
+        return max(1, int(float(capacity) * ratio))
+
+    def _vllm_actor_name(self) -> str | None:
+        base_model = str(self._config.base_model or "").strip()
+        if not base_model and self._is_vllm_domain():
+            base_model = str(self._config.domain_key).removeprefix("vllm:").strip()
+        if not base_model:
+            return None
+        model_part = base_model.split("/")[-1] if "/" in base_model else base_model
+        return f"mint_vllm_{model_part.lower().replace(' ', '_')}"
+
+    @staticmethod
+    def _positive_int(value: Any) -> int | None:
+        try:
+            out = int(value)
+        except (TypeError, ValueError):
+            return None
+        return out if out > 0 else None
 
     def _restore_item_context(self, lease: dict[str, Any]) -> None:
         item = lease.get("item") if isinstance(lease, dict) else {}
@@ -425,6 +561,11 @@ class ModelRuntimeActor:
         request_id = item.get("request_id") if isinstance(item, dict) else None
         if request_id is not None:
             set_request_id(str(request_id))
+
+    def _clear_active_lease(self, lease_id: str) -> None:
+        self._active_leases.pop(str(lease_id), None)
+        self._active_request_id = next(iter(self._active_leases.values()), None)
+        self._active_lease_id = next(iter(self._active_leases.keys()), None)
 
     def _record_error(self, e: BaseException) -> None:
         self._last_error = f"{type(e).__name__}: {e}"
@@ -732,6 +873,32 @@ class ModelRuntimeActor:
                     continue
                 raise RuntimeError(f"model work lease renew failed: {result!r}")
 
+    async def _renew_pending_leases_until_done(self, pending_lease_ids: set[str]) -> None:
+        interval_s = max(0.1, min(float(self._config.lease_ttl_s) / 3.0, 10.0))
+        while pending_lease_ids:
+            await asyncio.sleep(interval_s)
+            for lease_id in list(pending_lease_ids):
+                try:
+                    result = await self._scheduler.renew_lease(
+                        lease_id=lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                        lease_ttl_s=self._config.lease_ttl_s,
+                    )
+                except Exception as e:
+                    self._record_error(e)
+                    logger.warning(
+                        "[model_runtime] pending lease renew failed actor=%s lease_id=%s error_type=%s error=%s",
+                        self._config.actor_name,
+                        lease_id,
+                        type(e).__name__,
+                        e,
+                    )
+                    continue
+                if isinstance(result, dict) and bool(result.get("ok")):
+                    self._last_renewed_at = time.time()
+                    self._renewed_total += 1
+
     async def _run_executor(self, lease: dict[str, Any]) -> None:
         item = lease.get("item") if isinstance(lease, dict) else {}
         tracer = get_otel_tracer()
@@ -776,12 +943,12 @@ class ModelRuntimeActor:
         request_id = str(item["request_id"])
         lease_id = str(lease["lease_id"])
         attempt_id = self._lease_attempt_id(lease)
+        self._active_leases[lease_id] = request_id
         self._active_request_id = request_id
         self._active_lease_id = lease_id
         self._restore_item_context(lease)
         if not await self._status_is_pending(lease):
-            self._active_request_id = None
-            self._active_lease_id = None
+            self._clear_active_lease(lease_id)
             return
 
         try:
@@ -799,8 +966,7 @@ class ModelRuntimeActor:
                 self._requeued_total += 1
             except Exception:
                 pass
-            self._active_request_id = None
-            self._active_lease_id = None
+            self._clear_active_lease(lease_id)
             return
 
         stale_generation_error = self._recovered_stale_generation_error(lease)
@@ -854,8 +1020,7 @@ class ModelRuntimeActor:
                     self._requeued_total += 1
                 except Exception:
                     pass
-            self._active_request_id = None
-            self._active_lease_id = None
+            self._clear_active_lease(lease_id)
             return
 
         task: asyncio.Task | None = None
@@ -1109,5 +1274,4 @@ class ModelRuntimeActor:
             self._processed_total += 1
             self._failed_total += 1
         finally:
-            self._active_request_id = None
-            self._active_lease_id = None
+            self._clear_active_lease(lease_id)
