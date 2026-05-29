@@ -782,12 +782,29 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
     assert current is not None
     assert current.current_session == "session-a"
     assert current.inflight_count == 1
-    listed = supervisor.cached_snapshot()
+    listed = supervisor.list_actors()
     assert any(row["actor_name"] == "vllm-contract-actor" for row in listed)
     assert supervisor.total_gpus_used() >= 1
 
     assert supervisor.clear_session("session-a", actor_type=ActorType.VLLM) == 1
     assert supervisor.unregister("vllm-contract-actor") is True
+
+
+def test_bumblebee_actor_inventory_reports_bumblebee_backend() -> None:
+    supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
+    actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
+
+    supervisor.register(
+        actor_name=actor_name,
+        actor_type=ActorType.MEGATRON,
+        num_gpus=4,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+
+    listed = supervisor.list_actors()
+    row = next(item for item in listed if item["actor_name"] == actor_name)
+    assert row["actor_type"] == "megatron"
+    assert row["backend"] == "bumblebee"
 
 
 def test_issue_593_supervisor_memory_state_backend_owner_and_events() -> None:
