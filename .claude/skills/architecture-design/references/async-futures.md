@@ -229,3 +229,18 @@ validate identity and fail fast. `MaintenanceCronActor` follows the same
 owner-managed lifecycle under the supervisor. Changing the future-state KV
 component requires restarting `TaskStateStore`; there is no separate
 future-state actor to kill.
+
+## Sampling backpressure policy
+
+Sampling route 429s are opt-in client backpressure, not the normal scheduler
+admission path. `/api/v1/asample` and synchronous `sample_once` only return
+HTTP 429 when the caller sends `X-Tinker-Sampling-Backpressure: 1` and the
+local in-process sampling executor is already at
+`MINT_MAX_INFLIGHT_SAMPLE_TASKS`. Requests without that header must continue to
+enter the model-work scheduler and receive a future so the scheduler-owned
+token-budget admission path remains the primary queueing mechanism.
+
+The 429 body is intentionally plain and retryable:
+`{"detail": "Sampling backpressure: server overloaded"}`. Clients should retry
+with backoff; server-side tests should assert that headerless requests are not
+rejected solely because the local sampling executor is saturated.

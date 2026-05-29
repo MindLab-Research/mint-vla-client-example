@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..config import config as server_config
 from ..backend.model_work_scheduler import ModelWorkSchedulerConflictError
+from ..backend.queue_stage_timing import attach_queue_stage_timing, build_queue_stage_timing
 from ..backend.task_state_store import (
     FutureStatus,
     TaskStateStoreUnavailableError,
@@ -1954,9 +1955,24 @@ async def _do_sample(
                 )
             )
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
+            response_payload = response.model_dump(exclude={"type"})
+            try:
+                response_meta = await task_futures.async_get_meta(request_id)
+            except Exception:
+                response_meta = {}
+            response_payload = attach_queue_stage_timing(
+                response_payload,
+                build_queue_stage_timing(
+                    {
+                        **(response_meta if isinstance(response_meta, dict) else {}),
+                        "generate_s": generate_s if "generate_s" in locals() else None,
+                    },
+                    now=time.time(),
+                ),
+            )
             await task_futures.async_resolve(
                 request_id,
-                response.model_dump(exclude={"type"}),
+                response_payload,
                 billing_observations=billing_observations,
             )
             workload_status = "ok"

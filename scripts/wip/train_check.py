@@ -42,6 +42,13 @@ DEFAULT_DEGRADATION_THRESHOLDS = {
     "Qwen/Qwen3-30B-A3B-Instruct-2507": {"wall_clock_s": 1800.0, "slowest_max_s": 900.0},
     "Qwen/Qwen3-235B-A22B-Instruct-2507": {"wall_clock_s": 1500.0, "slowest_max_s": 900.0},
 }
+QUEUE_STAGE_TIMING_FIELDS = (
+    "scheduler_wait_s",
+    "executor_wait_s",
+    "lora_s",
+    "vllm_generate_s",
+    "finalization_s",
+)
 RUNNER = Path(".claude/skills/sanity-check/mint_rl_test_long.py")
 REQUEST_RE = re.compile(r"request_type=([A-Za-z0-9_]+)\s+request_id=([A-Za-z0-9_:-]+)")
 KV_RE = {
@@ -427,6 +434,42 @@ def classify_timing_degradation(
     return "; ".join(reasons) if reasons else None
 
 
+def extract_queue_stage_attribution(timing: dict[str, object] | None) -> dict[str, float] | None:
+    if not timing:
+        return None
+    totals = {key: 0.0 for key in QUEUE_STAGE_TIMING_FIELDS}
+    top_level = timing.get("queue_stage_attribution_s")
+    if isinstance(top_level, dict):
+        out = {}
+        for key in QUEUE_STAGE_TIMING_FIELDS:
+            value = top_level.get(key)
+            if isinstance(value, (int, float)) and float(value) > 0.0:
+                out[key] = round(float(value), 3)
+        if out:
+            return out
+    stages = timing.get("stages", {})
+    if isinstance(stages, dict):
+        iterable = stages.values()
+    elif isinstance(stages, list):
+        iterable = stages
+    else:
+        iterable = []
+    for raw_stage in iterable:
+        if not isinstance(raw_stage, dict):
+            continue
+        stage_timing = raw_stage.get("queue_stage_timing_s")
+        if not isinstance(stage_timing, dict):
+            stage_timing = raw_stage.get("queue_stage_timing")
+        if not isinstance(stage_timing, dict):
+            continue
+        for key in QUEUE_STAGE_TIMING_FIELDS:
+            value = stage_timing.get(key)
+            if isinstance(value, (int, float)):
+                totals[key] += float(value)
+    out = {key: round(value, 3) for key, value in totals.items() if value > 0.0}
+    return out or None
+
+
 def extract_generation_summary(timing: dict[str, object] | None) -> dict[str, object] | None:
     if not timing:
         return None
@@ -499,6 +542,24 @@ def _format_generation_summary(generation: object) -> str:
     return (" " + ", ".join(parts)) if parts else ""
 
 
+def _format_queue_stage_attribution(attribution: object) -> str:
+    if not isinstance(attribution, dict):
+        return ""
+    labels = {
+        "scheduler_wait_s": "scheduler_wait",
+        "executor_wait_s": "executor_wait",
+        "lora_s": "LoRA",
+        "vllm_generate_s": "vLLM_generate",
+        "finalization_s": "finalization",
+    }
+    parts = []
+    for key in QUEUE_STAGE_TIMING_FIELDS:
+        value = attribution.get(key)
+        if isinstance(value, (int, float)) and float(value) > 0.0:
+            parts.append(f"{labels[key]}=`{float(value):.1f}s`")
+    return (" attribution " + ", ".join(parts)) if parts else ""
+
+
 def run_one(run: ModelRun) -> dict[str, object]:
     stdout_path = run.run_dir / "stdout.log"
     stderr_path = run.run_dir / "stderr.log"
@@ -569,6 +630,7 @@ def run_one(run: ModelRun) -> dict[str, object]:
         "slowest_stage": slowest_stage,
         "slowest_max_s": slowest_max_s,
         "generation_summary": extract_generation_summary(timing),
+        "queue_stage_attribution": extract_queue_stage_attribution(timing),
         "timing_degraded": bool(degradation_reason),
         "degradation_reason": degradation_reason,
         "started_at_epoch_s": started_at,
@@ -745,6 +807,7 @@ def preflight_failure_results(models: list[str], message: str) -> list[dict[str,
             "slowest_stage": "preflight",
             "slowest_max_s": 0.0,
             "generation_summary": None,
+            "queue_stage_attribution": None,
             "timing_degraded": False,
             "degradation_reason": None,
             "started_at_epoch_s": time.time(),
@@ -773,12 +836,13 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
         if result.get("status") == "ok":
             label = "DEGRADED" if result.get("timing_degraded") else "PASS"
             gen_text = _format_generation_summary(result.get("generation_summary"))
+            attribution_text = _format_queue_stage_attribution(result.get("queue_stage_attribution"))
             degraded_text = ""
             if result.get("degradation_reason"):
                 degraded_text = f" degradation=`{result['degradation_reason']}`"
             lines.append(
                 f"- {label} `{model}`: slowest=`{slowest}`, max=`{max_s}`, wall=`{wall}`"
-                f"{gen_text}{degraded_text}."
+                f"{gen_text}{attribution_text}{degraded_text}."
             )
         else:
             any_failed = True
@@ -854,6 +918,8 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
             lines.append(f"- timing_degraded: `{result.get('degradation_reason')}`")
         if result.get("generation_summary"):
             lines.append(f"- generation_summary: `{json.dumps(result['generation_summary'], sort_keys=True)}`")
+        if result.get("queue_stage_attribution"):
+            lines.append(f"- queue_stage_attribution: `{json.dumps(result['queue_stage_attribution'], sort_keys=True)}`")
         session_ids = result.get("session_ids") or {}
         request_ids = result.get("request_ids") or {}
         lines.append(f"- session_ids: `{json.dumps(session_ids, sort_keys=True)}`")

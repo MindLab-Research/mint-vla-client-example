@@ -170,6 +170,36 @@ def test_issue_182_pending_payload_progress_headers(monkeypatch):
     assert response.headers.get("X-Queue-Max-Tokens") == "12"
 
 
+def test_issue_648_pending_payload_includes_stable_queue_stage_timing(monkeypatch):
+    meta = {
+        "queue_state": "running",
+        "stage": "decode",
+        "op": "sampling.asample",
+        "queued_at": 10.0,
+        "dequeue_at": 15.0,
+        "executor_started_at": 16.0,
+        "lora_load_s": 2.0,
+        "generate_s": 3.0,
+    }
+    monkeypatch.setattr(futures_route, "task_futures", _StubTaskFutureService(meta))
+    monkeypatch.setattr(futures_route.time, "time", lambda: 20.0)
+
+    body = FutureRetrieveRequest(request_id="rid_issue648_timing")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
+    assert response.status_code == 408
+    assert payload["queue_stage_timing"] == {
+        "schema_version": 1,
+        "scheduler_wait_s": 5.0,
+        "executor_wait_s": 1.0,
+        "lora_s": 2.0,
+        "vllm_generate_s": 3.0,
+        "finalization_s": None,
+        "total_observed_s": 10.0,
+    }
+
+
 def test_issue_182_pending_payload_training_correlation_fields(monkeypatch):
     meta = {
         "queue_state": "queued",
