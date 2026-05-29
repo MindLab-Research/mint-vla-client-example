@@ -100,7 +100,7 @@ CPU-only instances must use CPU queues. GPU instances must use GPU queues. Queue
 
 Workers are named by alias:
 - Desired alias: `mint-worker-{idx}`
-- Provider job name: `mint-{deployment_env}-worker-{idx}`
+- Provider job name: `mint-{deployment_env}-worker-{idx+1}` (`mint-worker-0` becomes `mint-<env>-worker-1`)
 - Runtime debug state: `/vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml`
 
 `topology_state.yaml` is output-only. On restart, the supervisor reads the static topology config and provider/Ray live state, then rewrites the state file. Do not edit `topology_state.yaml` as input.
@@ -235,3 +235,19 @@ cat /vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml
 | Prod | `mint-prod-head.yaml` | `mint-prod-worker.yaml` |
 
 All configs live in `.claude/skills/volcano-cluster/configs/`.
+
+## Shared Node Runtime Assets
+
+The dev/prod templates depend on shared runtime assets under
+`/vePFS-Mindverse/share/mint/runtime`:
+
+- `supervisor/current/bin/mint-ray-node`: starts Ray through Python internals
+  with `/mnt/tmp` for Ray temp/spill/cache paths.
+- `services/{dev,prod}-{head,worker}`: runit service directories for Ray and
+  sshd.
+- `ssh/sshd_config`: shared sshd config using
+  `/vePFS-Mindverse/share/mint/runtime/ssh/authorized_keys`.
+
+The version-controlled source for these scripts is under
+`.claude/skills/volcano-cluster/runtime/`. After changing these files, sync them
+to `/vePFS-Mindverse/share/mint/runtime` before creating or replacing nodes.

@@ -166,7 +166,7 @@ def stable_provider_task_name(deployment_env: str, alias: str) -> str:
     env = str(deployment_env or "").strip()
     if not env:
         raise ValueError("deployment_env is required")
-    idx = alias.rsplit("-", 1)[-1]
+    idx = worker_alias_index(alias) + 1
     return f"mint-{env}-worker-{idx}"
 
 

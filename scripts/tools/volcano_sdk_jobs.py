@@ -25,7 +25,9 @@ from mint_server.backend.topology import (
     _job_state,
     _object_get,
     _task_gpu_count,
+    _volcano_image_type_for_create_job,
     _volcano_sdk_module,
+    _volcano_storage_for_create_job,
     build_volcano_create_job_request,
     load_topology_config,
 )
@@ -117,6 +119,92 @@ def _cmd_submit_topology_node(args: argparse.Namespace) -> None:
     )
 
 
+def _cmd_submit_template(args: argparse.Namespace) -> None:
+    import yaml
+
+    sdk = _volcano_sdk_module()
+    payload = yaml.safe_load(Path(args.template).read_text(encoding="utf-8")) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"template must be a mapping: {args.template}")
+
+    name = str(args.name or payload.get("TaskName") or "").strip()
+    if not name:
+        raise ValueError("template submission requires --name or TaskName")
+
+    queue_id = str(args.resource_queue_id or payload.get("ResourceQueueID") or "").strip()
+    if not queue_id:
+        raise ValueError("template submission requires --resource-queue-id or ResourceQueueID")
+
+    role_specs = []
+    for raw_role in payload.get("TaskRoleSpecs") or []:
+        if not isinstance(raw_role, dict):
+            raise ValueError("TaskRoleSpecs item must be a mapping")
+        role_name = str(raw_role.get("RoleName") or "").strip()
+        replicas = int(raw_role.get("RoleReplicas") or 1)
+        flavor = str(raw_role.get("Flavor") or raw_role.get("ResourceSpecId") or "").strip()
+        if not role_name or not flavor:
+            raise ValueError("TaskRoleSpecs item must include RoleName and Flavor")
+        role_specs.append(
+            sdk.RoleForCreateJobInput(
+                name=role_name,
+                replicas=replicas,
+                resource=sdk.ResourceForCreateJobInput(instance_type_id=flavor),
+            )
+        )
+
+    storage_specs = []
+    uses_tos_storage = False
+    for raw_storage in payload.get("Storages") or []:
+        if not isinstance(raw_storage, dict):
+            raise ValueError("Storages item must be a mapping")
+        raw_storage_type = str(raw_storage.get("Type") or raw_storage.get("type") or "").strip()
+        if raw_storage_type in {"Tos", "TosFuse"}:
+            uses_tos_storage = True
+        storage_specs.append(_volcano_storage_for_create_job(sdk, raw_storage))
+
+    image_url = str(payload.get("ImageUrl") or "").strip()
+    if not image_url:
+        raise ValueError("template must include ImageUrl")
+    command = str(payload.get("Entrypoint") or "").strip()
+    if not command:
+        raise ValueError("template must include Entrypoint")
+
+    request = sdk.CreateJobRequest(
+        name=name,
+        description=str(payload.get("Description") or name),
+        resource_config=sdk.ResourceConfigForCreateJobInput(
+            resource_queue_id=queue_id,
+            max_runtime_seconds=int(payload.get("ActiveDeadlineSeconds") or 0),
+            roles=role_specs,
+        ),
+        runtime_config=sdk.RuntimeConfigForCreateJobInput(
+            command=command,
+            framework=str(payload.get("Framework") or "Custom"),
+            image=sdk.ImageForCreateJobInput(
+                type=_volcano_image_type_for_create_job(payload.get("ImageType"), image_url),
+                url=image_url,
+            ),
+        ),
+        storage_config=sdk.StorageConfigForCreateJobInput(
+            credential=(
+                sdk.ConvertCredentialForCreateJobInput(use_service_linked_role=True)
+                if uses_tos_storage
+                else None
+            ),
+            storages=storage_specs,
+        )
+        if storage_specs
+        else None,
+    )
+    client = _create_volcano_mlplatform_client(
+        region=args.region,
+        connect_timeout=args.connect_timeout,
+        read_timeout=args.read_timeout,
+    )
+    response = client.create_job(request)
+    _print_json({"submitted": True, "job_name": name, "job_id": _object_get(response, "Id", "id", "JobId", "job_id")})
+
+
 def _cmd_stop(args: argparse.Namespace) -> None:
     sdk = _volcano_sdk_module()
     client = _create_volcano_mlplatform_client(
@@ -152,6 +240,12 @@ def main() -> None:
     submit_p.add_argument("--config", required=True)
     submit_p.add_argument("--alias", required=True)
     submit_p.set_defaults(func=_cmd_submit_topology_node)
+
+    submit_tpl_p = sub.add_parser("submit-template", help="Submit one raw Volcano YAML template")
+    submit_tpl_p.add_argument("--template", required=True)
+    submit_tpl_p.add_argument("--name", default="")
+    submit_tpl_p.add_argument("--resource-queue-id", default="")
+    submit_tpl_p.set_defaults(func=_cmd_submit_template)
 
     stop_p = sub.add_parser("stop", help="Stop one job")
     stop_p.add_argument("--job-id", required=True)
