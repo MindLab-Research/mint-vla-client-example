@@ -630,7 +630,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_topology_and_node_daemon_state
                 ProviderTaskState(
                     alias="mint-worker-0",
                     provider="volcano",
-                    task_name="mint-prod-worker-0",
+                    task_name="mint-prod-worker-1",
                     live=True,
                     node_ip="10.0.0.7",
                     gpu_count=8,

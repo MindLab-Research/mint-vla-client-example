@@ -1,0 +1,5 @@
+#!/bin/sh
+set -eu
+mkdir -p /vePFS-Mindverse/share/mint/logs/nodes/dev/head/ray
+exec >> /vePFS-Mindverse/share/mint/logs/nodes/dev/head/ray/current 2>&1
+exec /vePFS-Mindverse/share/mint/runtime/supervisor/current/bin/mint-ray-node

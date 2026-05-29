@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+node_id="${MINT_NODE_ID:-unknown}"
+mkdir -p "/vePFS-Mindverse/share/mint/logs/nodes/dev/worker/${node_id}/ray"
+exec >> "/vePFS-Mindverse/share/mint/logs/nodes/dev/worker/${node_id}/ray/current" 2>&1
+exec /vePFS-Mindverse/share/mint/runtime/supervisor/current/bin/mint-ray-node

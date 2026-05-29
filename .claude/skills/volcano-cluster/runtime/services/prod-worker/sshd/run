@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+node_id="${MINT_NODE_ID:-unknown}"
+mkdir -p "/vePFS-Mindverse/share/mint/logs/nodes/prod/worker/${node_id}/sshd"
+exec >> "/vePFS-Mindverse/share/mint/logs/nodes/prod/worker/${node_id}/sshd/current" 2>&1
+mkdir -p /run/sshd
+export LD_LIBRARY_PATH="/vePFS-Mindverse/share/mint/runtime/supervisor/current/usr/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+exec /vePFS-Mindverse/share/mint/runtime/supervisor/current/usr/sbin/sshd -D -e -f /vePFS-Mindverse/share/mint/runtime/supervisor/current/etc/ssh/sshd_config

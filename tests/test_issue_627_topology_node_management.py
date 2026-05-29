@@ -203,7 +203,7 @@ def test_issue_627_topology_config_parses_stable_worker_task_name(tmp_path) -> N
     config = load_topology_config(_write_topology_config(tmp_path))
 
     assert list(config.nodes) == ["mint-worker-0"]
-    assert stable_provider_task_name(config.deployment_env, "mint-worker-0") == "mint-prod-worker-0"
+    assert stable_provider_task_name(config.deployment_env, "mint-worker-0") == "mint-prod-worker-1"
     assert config.nodes["mint-worker-0"].gpu_count == 8
     assert config.ray_head_ip_path == "/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt"
     assert worker_alias_index("mint-worker-10") == 10
@@ -281,7 +281,7 @@ def test_issue_627_default_volcano_provider_uses_sdk_region_not_cli_args(
         jobs=[
             _SdkModel(
                 id="t-1",
-                name="mint-prod-worker-0",
+                name="mint-prod-worker-1",
                 status=_SdkModel(state="Running"),
             )
         ],
@@ -299,7 +299,7 @@ def test_issue_627_default_volcano_provider_uses_sdk_region_not_cli_args(
     states = list(lister(config))
 
     assert seen_calls == [("cn-beijing", 3.0, 5.0)]
-    assert states[0].task_name == "mint-prod-worker-0"
+    assert states[0].task_name == "mint-prod-worker-1"
     assert states[0].node_ip == "10.0.0.7"
     assert client.list_jobs_requests[0].name_contains == "mint-prod-worker-"
 
@@ -483,7 +483,7 @@ def test_issue_627_topology_manager_writes_ready_state_without_submitting_duplic
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -500,7 +500,7 @@ def test_issue_627_topology_manager_writes_ready_state_without_submitting_duplic
 
     assert state is not None
     assert state.nodes["mint-worker-0"].state == "ready"
-    assert state.nodes["mint-worker-0"].provider_task_name == "mint-prod-worker-0"
+    assert state.nodes["mint-worker-0"].provider_task_name == "mint-prod-worker-1"
     assert manager.resolve_alias("mint-worker-0") == ("10.0.0.7", None)
     assert submitted == []
     written = yaml.safe_load(state_path.read_text(encoding="utf-8"))
@@ -609,7 +609,7 @@ def test_issue_627_topology_manager_can_use_dashboard_nodes_without_ray_init(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -677,7 +677,7 @@ def test_issue_638_topology_marks_head_alias_from_head_ip_path(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -740,9 +740,9 @@ def test_issue_627_topology_manager_submits_all_missing_workers_by_idx_order(tmp
     assert state is not None
     assert set(submitted) == {"mint-worker-0", "mint-worker-1"}
     assert state.nodes["mint-worker-0"].state == "provisioning"
-    assert state.nodes["mint-worker-0"].last_error == "missing provider task mint-prod-worker-0"
+    assert state.nodes["mint-worker-0"].last_error == "missing provider task mint-prod-worker-1"
     assert state.nodes["mint-worker-1"].state == "provisioning"
-    assert state.nodes["mint-worker-1"].last_error == "missing provider task mint-prod-worker-1"
+    assert state.nodes["mint-worker-1"].last_error == "missing provider task mint-prod-worker-2"
 
 
 def test_issue_627_topology_manager_submits_next_idx_after_lower_ready(tmp_path) -> None:
@@ -762,7 +762,7 @@ def test_issue_627_topology_manager_submits_next_idx_after_lower_ready(tmp_path)
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -828,7 +828,7 @@ def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_instance_ip(
         jobs=[
             _SdkModel(
                 id="t-1",
-                name="mint-prod-worker-0",
+                name="mint-prod-worker-1",
                 status=_SdkModel(state="Running"),
                 resource_config=_SdkModel(
                     roles=[
@@ -854,7 +854,7 @@ def test_issue_627_volcano_provider_lists_stable_tasks_and_extracts_instance_ip(
 
     assert len(states) == 1
     assert states[0].alias == "mint-worker-0"
-    assert states[0].task_name == "mint-prod-worker-0"
+    assert states[0].task_name == "mint-prod-worker-1"
     assert states[0].live is True
     assert states[0].node_ip == "10.0.0.7"
     assert states[0].gpu_count == 8
@@ -870,10 +870,10 @@ def test_issue_627_volcano_provider_treats_deploying_as_live_and_dedupes_alias(
     config = load_topology_config(_write_topology_config(tmp_path))
     client = _FakeVolcanoClient(
         jobs=[
-            _SdkModel(id="t-old", name="mint-prod-worker-0", status=_SdkModel(state="Stopped")),
+            _SdkModel(id="t-old", name="mint-prod-worker-1", status=_SdkModel(state="Stopped")),
             _SdkModel(
                 id="t-live-1",
-                name="mint-prod-worker-0",
+                name="mint-prod-worker-1",
                 status=_SdkModel(state="Deploying"),
                 resource_config=_SdkModel(
                     roles=[
@@ -886,7 +886,7 @@ def test_issue_627_volcano_provider_treats_deploying_as_live_and_dedupes_alias(
             ),
             _SdkModel(
                 id="t-live-2",
-                name="mint-prod-worker-0",
+                name="mint-prod-worker-1",
                 status=_SdkModel(state="Queueing"),
                 resource_config=_SdkModel(
                     roles=[
@@ -919,7 +919,7 @@ def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host
         jobs=[
             _SdkModel(
                 id="t-1",
-                name="mint-prod-worker-0",
+                name="mint-prod-worker-1",
                 status=_SdkModel(state="Running"),
                 resource_config=_SdkModel(
                     roles=[
@@ -937,7 +937,7 @@ def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host
 
     states = list(provider.list_tasks(config))
 
-    assert states[0].task_name == "mint-prod-worker-0"
+    assert states[0].task_name == "mint-prod-worker-1"
     assert client.list_jobs_requests[0].page_size == 100
 
 
@@ -1009,7 +1009,7 @@ def test_issue_627_volcano_provider_renders_template_and_submits_sdk_job(
     provider.submit_task(config, config.nodes["mint-worker-0"])
 
     request = client.created_jobs[0]
-    assert request.name == "mint-prod-worker-0"
+    assert request.name == "mint-prod-worker-1"
     assert request.resource_config.resource_queue_id == "rq-a"
     assert request.runtime_config.framework == "Custom"
     assert request.runtime_config.image.type == "Public"
@@ -1235,14 +1235,14 @@ def test_issue_627_render_volcano_template_is_stable(tmp_path) -> None:
 
     rendered = render_volcano_worker_template(
         template_path=template,
-        task_name="mint-prod-worker-0",
+        task_name="mint-prod-worker-1",
         resource_queue_id="q-123",
         worker_alias="mint-worker-0",
         deployment_env="prod",
         cluster_id="volcano",
     )
 
-    assert 'TaskName: "mint-prod-worker-0"' in rendered
+    assert 'TaskName: "mint-prod-worker-1"' in rendered
     assert 'ResourceQueueID: "q-123"' in rendered
     assert "/runtime/workers/mint-worker-0.env" in rendered
 
@@ -1256,7 +1256,7 @@ async def test_issue_627_supervisor_resolves_worker_alias_before_launch_and_sche
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -1324,7 +1324,7 @@ async def test_issue_627_supervisor_reconciles_node_metrics_daemonset_separately
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -1377,7 +1377,7 @@ async def test_issue_638_supervisor_marks_head_node_metrics_daemon_spec(tmp_path
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -1427,7 +1427,7 @@ async def test_issue_638_supervisor_adds_observed_ray_head_node_metrics_daemon(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -1538,7 +1538,7 @@ async def test_issue_638_node_metrics_daemon_recreated_when_spec_changes(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip=current_ray_nodes[0].node_ip,
@@ -1697,7 +1697,7 @@ async def test_issue_627_supervisor_node_metrics_daemonset_enabled_by_default(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -1741,7 +1741,7 @@ async def test_issue_627_supervisor_node_metrics_daemonset_can_be_disabled(
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",
@@ -2111,7 +2111,7 @@ async def test_issue_627_supervisor_blocks_until_worker_alias_ready(tmp_path) ->
             ProviderTaskState(
                 alias="mint-worker-0",
                 provider="volcano",
-                task_name="mint-prod-worker-0",
+                task_name="mint-prod-worker-1",
                 task_id="task-0",
                 live=True,
                 node_ip="10.0.0.7",

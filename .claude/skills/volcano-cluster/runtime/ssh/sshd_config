@@ -1,0 +1,13 @@
+Port 22
+ListenAddress 0.0.0.0
+HostKey /vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_rsa_key
+HostKey /vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ecdsa_key
+HostKey /vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ed25519_key
+AuthorizedKeysFile /vePFS-Mindverse/share/mint/runtime/ssh/authorized_keys
+StrictModes no
+PasswordAuthentication no
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+UsePAM no
+PidFile /tmp/mint-sshd.pid
+Subsystem sftp /vePFS-Mindverse/share/mint/runtime/supervisor/current/usr/lib/openssh/sftp-server

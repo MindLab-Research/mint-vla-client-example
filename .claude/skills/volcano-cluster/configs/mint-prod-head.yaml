@@ -1,6 +1,12 @@
 # MINT Production Ray Head Node - DO NOT MODIFY FOR DEV
 # This cluster is for production deployment only.
 # Head bootstrap is environment-owned. Worker lifecycle is SDK/topology-owned.
+#
+# The node process tree is supervised by the shared runit bundle under the
+# shared Mint runtime. The template intentionally does not inject application
+# code paths; service configs decide what workloads run on the Ray cluster.
+# Ray tmp uses /mnt/tmp, a short Vepfs mount, to avoid Unix socket path length
+# failures without relying on symlinks.
 
 TaskName: "mint-prod-head"
 Description: "MINT PRODUCTION - Ray head node - DO NOT USE FOR DEV"
@@ -8,122 +14,34 @@ Description: "MINT PRODUCTION - Ray head node - DO NOT USE FOR DEV"
 Entrypoint: |
   set -euo pipefail
 
-  # Note: Ray CLI crashes on startup; start Ray via Python internals.
-  # Note: prod keeps dashboard and Ray client disabled on purpose.
-  python3 - <<'PY'
-  import os
-  import shutil
-  import socket
-  import time
+  export MINT_ENV=prod
+  export MINT_NODE_ROLE=head
+  export MINT_TMP_ROOT=/mnt/tmp
+  export MINT_RUNTIME_ROOT=/vePFS-Mindverse/share/mint/runtime
+  export MINT_NODE_SERVICE_DIR="${MINT_RUNTIME_ROOT}/services/${MINT_ENV}-${MINT_NODE_ROLE}"
+  export MINT_NODE_LOCAL_SERVICE_DIR="/tmp/mint-runit/${MINT_ENV}-${MINT_NODE_ROLE}"
+  export PATH="${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin:${PATH}"
+  export MINT_NODE_LOG_ROOT=/vePFS-Mindverse/share/mint/logs/nodes
+  export MINT_NODE_STATE_ROOT=/vePFS-Mindverse/share/mint/prod/runtime/node-state
+  export MINT_RAY_HEAD_IP_PATH=/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
+  export PYTHONDONTWRITEBYTECODE=1
+  export MINT_RAY_INCLUDE_DASHBOARD=0
+  export MINT_RAY_CLIENT_SERVER_PORT=0
 
-  import ray
-  from ray._private.node import Node
-  from ray._private.parameter import RayParams
+  mkdir -p "${MINT_TMP_ROOT}/h" "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}" "${MINT_NODE_STATE_ROOT}"
+  rm -rf "${MINT_NODE_LOCAL_SERVICE_DIR}"
+  mkdir -p "$(dirname "${MINT_NODE_LOCAL_SERVICE_DIR}")"
+  cp -a "${MINT_NODE_SERVICE_DIR}" "${MINT_NODE_LOCAL_SERVICE_DIR}"
+  find "${MINT_NODE_LOCAL_SERVICE_DIR}" -name supervise -type d -prune -exec rm -rf {} +
+  {
+    date -Is
+    echo "entrypoint role=${MINT_NODE_ROLE} service_dir=${MINT_NODE_SERVICE_DIR} local_service_dir=${MINT_NODE_LOCAL_SERVICE_DIR}"
+    ls -la "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_SERVICE_DIR}" "${MINT_NODE_LOCAL_SERVICE_DIR}" || true
+  } >> "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/entrypoint.log" 2>&1
 
-  HEAD_IP_PATH = "/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt"
-  TMP_ROOT = os.environ.get("MINT_TMP_ROOT", "/vePFS-Mindverse/share/mint-data/prod")
-  RAY_TMP_ROOT_REAL = f"{TMP_ROOT}/head"
-  RAY_TMP_LINK = "/tmp/mph"
-  RAY_TEMP_DIR = f"{RAY_TMP_LINK}/t"
-  RAY_OBJECT_SPILLING_DIR = f"{RAY_TMP_LINK}/s"
-  RAY_OS_TMPDIR = f"{RAY_TMP_LINK}/tmp"
-  RAY_XDG_CACHE_HOME = f"{RAY_TMP_LINK}/cache"
-  RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB = "2"
-  RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB = "2"
-  CHECK_INTERVAL_S = 10
-  BACKOFF_INITIAL_S = 5
-  BACKOFF_MAX_S = 60
-  BACKOFF_RESET_AFTER_HEALTHY_CHECKS = 6
-
-
-  def _write_head_ip(ip: str) -> None:
-      os.makedirs(os.path.dirname(HEAD_IP_PATH), exist_ok=True)
-      tmp_path = f"{HEAD_IP_PATH}.tmp"
-      with open(tmp_path, "w") as f:
-          f.write(ip)
-      os.replace(tmp_path, HEAD_IP_PATH)
-
-
-  def _port_open(host: str, port: int) -> bool:
-      sock = socket.socket()
-      sock.settimeout(2)
-      try:
-          sock.connect((host, port))
-          return True
-      except OSError:
-          return False
-      finally:
-          sock.close()
-
-  restart_delay_s = BACKOFF_INITIAL_S
-  while True:
-      ip = ray.util.get_node_ip_address()
-      print(f"Local node IP: {ip}", flush=True)
-      os.makedirs(RAY_TMP_ROOT_REAL, exist_ok=True)
-      if os.path.lexists(RAY_TMP_LINK):
-          if os.path.islink(RAY_TMP_LINK) or os.path.isfile(RAY_TMP_LINK):
-              os.unlink(RAY_TMP_LINK)
-          elif os.path.isdir(RAY_TMP_LINK):
-              shutil.rmtree(RAY_TMP_LINK)
-          else:
-              raise RuntimeError(f"refusing to replace temp path: {RAY_TMP_LINK}")
-      os.symlink(RAY_TMP_ROOT_REAL, RAY_TMP_LINK)
-      if not os.path.islink(RAY_TMP_LINK) or os.path.realpath(RAY_TMP_LINK) != os.path.realpath(RAY_TMP_ROOT_REAL):
-          raise RuntimeError(f"ray temp symlink mismatch: {RAY_TMP_LINK} -> {os.path.realpath(RAY_TMP_LINK)} expected {os.path.realpath(RAY_TMP_ROOT_REAL)}")
-      os.makedirs(RAY_TEMP_DIR, exist_ok=True)
-      os.makedirs(RAY_OBJECT_SPILLING_DIR, exist_ok=True)
-      os.makedirs(RAY_OS_TMPDIR, exist_ok=True)
-      os.makedirs(RAY_XDG_CACHE_HOME, exist_ok=True)
-      os.environ["TMPDIR"] = RAY_OS_TMPDIR
-      os.environ["XDG_CACHE_HOME"] = RAY_XDG_CACHE_HOME
-      os.environ.setdefault("RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB", RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB)
-      os.environ.setdefault("RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB", RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB)
-      print(
-          "mint-prod head using "
-          f"temp_dir={RAY_TEMP_DIR} object_spilling_directory={RAY_OBJECT_SPILLING_DIR} "
-          f"tmpdir={RAY_OS_TMPDIR} xdg_cache_home={RAY_XDG_CACHE_HOME} tmp_root={TMP_ROOT} real_root={RAY_TMP_ROOT_REAL}",
-          flush=True,
-      )
-
-      ray_params = RayParams(
-          num_cpus=4,
-          num_gpus=0,
-          include_dashboard=False,
-          gcs_server_port=6379,
-          temp_dir=RAY_TEMP_DIR,
-          object_spilling_directory=RAY_OBJECT_SPILLING_DIR,
-      )
-      node = None
-      healthy_checks = 0
-      try:
-          node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
-          _write_head_ip(ip)
-          print(f"MINT Production Ray head published IP: {ip}", flush=True)
-          while True:
-              if not _port_open("127.0.0.1", 6379):
-                  print("mint-prod head lost gcs_server on 127.0.0.1:6379; restarting ray head", flush=True)
-                  break
-              dead = node.dead_processes()
-              if dead:
-                  print(f"mint-prod head detected dead ray processes: {dead!r}; restarting ray head", flush=True)
-                  break
-              healthy_checks += 1
-              if healthy_checks >= BACKOFF_RESET_AFTER_HEALTHY_CHECKS and restart_delay_s != BACKOFF_INITIAL_S:
-                  print("mint-prod head reset restart backoff to 5s after stable run", flush=True)
-                  restart_delay_s = BACKOFF_INITIAL_S
-              time.sleep(CHECK_INTERVAL_S)
-      except Exception as e:
-          print(f"mint-prod head wrapper caught exception: {type(e).__name__}: {e}", flush=True)
-      finally:
-          if node is not None:
-              try:
-                  node.kill_all_processes(check_alive=False, allow_graceful=False, wait=True)
-              except Exception as e:
-                  print(f"mint-prod head cleanup failed: {type(e).__name__}: {e}", flush=True)
-          print(f"mint-prod head sleeping {restart_delay_s}s before restart", flush=True)
-          time.sleep(restart_delay_s)
-          restart_delay_s = min(BACKOFF_MAX_S, restart_delay_s * 2)
-  PY
+  exec "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_LOCAL_SERVICE_DIR}"
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
 ResourceQueueID: "q-20251225183621-m2297"  # CPU queue for head node
@@ -132,7 +50,7 @@ Framework: "Custom"
 TaskRoleSpecs:
     - RoleName: "worker"
       RoleReplicas: 1
-      Flavor: "ml.r3i.4xlarge"
+      Flavor: "ml.r3i.4xlarge"  # CPU instance
 
 # No time limit - runs indefinitely
 ActiveDeadlineSeconds: 0
@@ -142,13 +60,13 @@ AccessType: "Private"
 Storages:
     - Type: "Vepfs"
       Id: "vepfs-cnbjecc87dad63ea"
-      MountPath: "/vePFS-Mindverse"
-      SubPath: ""
-      ReadOnly: true
-    - Type: "Vepfs"
-      Id: "vepfs-cnbjecc87dad63ea"
       MountPath: "/vePFS-Mindverse/share"
       SubPath: "share"
+      ReadOnly: false
+    - Type: "Vepfs"
+      Id: "vepfs-cnbjecc87dad63ea"
+      MountPath: "/mnt/tmp"
+      SubPath: "share/mint/prod/tmp/r"
       ReadOnly: false
     - Type: "TosFuse"
       MountPath: "/tos-mindverse"

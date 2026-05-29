@@ -28,6 +28,7 @@ update the skill instead of reviving old deployment paths.
 | API port | `8000` |
 | Code checkout | `/vePFS-Mindverse/share/mint/dev/mint-server` |
 | Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
+| Ray namespace | `mint_${USER}` with a non-root user name |
 | Public config | `/vePFS-Mindverse/share/mint/dev/config/common.env` |
 | Private config | `/vePFS-Mindverse/share/mint/dev/config/secrets.env` |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
@@ -39,6 +40,19 @@ Dev config is split deliberately:
   when needed; never print it, commit it, or paste its contents into logs.
 
 Use `/vePFS-Mindverse/share/mint/dev/config/common.env` as the dev server startup contract.
+
+Dev namespaces are user-scoped. Derive them from the effective non-root user:
+
+```bash
+MINT_DEV_USER="${MINT_DEV_USER:-${USER:-$(id -un)}}"
+if [ -z "${MINT_DEV_USER}" ] || [ "${MINT_DEV_USER}" = "root" ]; then
+  echo "error: dev Ray namespace requires a non-root user name" >&2
+  exit 1
+fi
+export MINT_RAY_NAMESPACE="mint_${MINT_DEV_USER}"
+```
+
+Do not hard-code shared namespaces such as `tinker_leixiang` in dev commands.
 
 ## Code Versioning
 
@@ -71,6 +85,12 @@ if [ -f /vePFS-Mindverse/share/mint/dev/config/secrets.env ]; then
   . /vePFS-Mindverse/share/mint/dev/config/secrets.env
 fi
 set +a
+MINT_DEV_USER="${MINT_DEV_USER:-${USER:-$(id -un)}}"
+if [ -z "${MINT_DEV_USER}" ] || [ "${MINT_DEV_USER}" = "root" ]; then
+  echo "error: dev Ray namespace requires a non-root user name" >&2
+  exit 1
+fi
+export MINT_RAY_NAMESPACE="${MINT_RAY_NAMESPACE:-mint_${MINT_DEV_USER}}"
 exec /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
 SH
 chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_mint_dev.sh

@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+import os
+import socket
+import sys
+import time
+from pathlib import Path
+
+import ray
+from ray._private.node import Node
+from ray._private.parameter import RayParams
+
+
+CHECK_INTERVAL_S = 10
+
+
+def _port_open(address: str) -> bool:
+    host, port_s = address.rsplit(":", 1)
+    sock = socket.socket()
+    sock.settimeout(2)
+    try:
+        sock.connect((host, int(port_s)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _write_text_atomic(path: str, text: str) -> None:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, target)
+
+
+def _read_head(head_ip_path: str) -> str:
+    while True:
+        try:
+            ip = Path(head_ip_path).read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            ip = ""
+        if not ip:
+            print(f"mint ray worker waiting for head IP file: {head_ip_path}", flush=True)
+            time.sleep(5)
+            continue
+        head = f"{ip}:6379"
+        if _port_open(head):
+            return head
+        print(f"mint ray worker sees head file {head}, but gcs port is not reachable yet", flush=True)
+        time.sleep(5)
+
+
+def _prepare_tmp(role: str, node_id: str) -> tuple[str, str, str, str]:
+    tmp_root = os.environ.get("MINT_TMP_ROOT", "/mnt/tmp")
+    if role == "head":
+        base = Path(tmp_root) / "h"
+    else:
+        base = Path(tmp_root) / "w" / node_id
+    temp_dir = base / "t"
+    object_spilling_dir = base / "s"
+    os_tmpdir = base / "tmp"
+    xdg_cache_home = base / "cache"
+    for path in (temp_dir, object_spilling_dir, os_tmpdir, xdg_cache_home):
+        path.mkdir(parents=True, exist_ok=True)
+    os.environ["TMPDIR"] = str(os_tmpdir)
+    os.environ["XDG_CACHE_HOME"] = str(xdg_cache_home)
+    os.environ.setdefault("RAY_RUNTIME_ENV_WORKING_DIR_CACHE_SIZE_GB", "2")
+    os.environ.setdefault("RAY_RUNTIME_ENV_PIP_CACHE_SIZE_GB", "2")
+    print(
+        "mint ray using "
+        f"role={role} temp_dir={temp_dir} object_spilling_directory={object_spilling_dir} "
+        f"tmpdir={os_tmpdir} xdg_cache_home={xdg_cache_home}",
+        flush=True,
+    )
+    return str(temp_dir), str(object_spilling_dir), str(os_tmpdir), str(xdg_cache_home)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    value = value.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def main() -> int:
+    role = os.environ.get("MINT_NODE_ROLE", "").strip()
+    if role not in {"head", "worker"}:
+        print(f"error: MINT_NODE_ROLE must be head or worker, got {role!r}", file=sys.stderr, flush=True)
+        return 2
+
+    ip = ray.util.get_node_ip_address()
+    node_id = os.environ.get("MINT_NODE_ID") or ip.replace(".", "-")
+    head_ip_path = os.environ["MINT_RAY_HEAD_IP_PATH"]
+    temp_dir, object_spilling_dir, _, _ = _prepare_tmp(role, node_id)
+
+    while True:
+        node = None
+        try:
+            if role == "head":
+                print(f"mint ray head starting on {ip}", flush=True)
+                include_dashboard = _env_bool("MINT_RAY_INCLUDE_DASHBOARD", True)
+                ray_client_port = int(os.environ.get("MINT_RAY_CLIENT_SERVER_PORT", "10001") or "0")
+                ray_kwargs = {
+                    "num_cpus": 4,
+                    "num_gpus": 0,
+                    "include_dashboard": include_dashboard,
+                    "gcs_server_port": 6379,
+                    "temp_dir": temp_dir,
+                    "object_spilling_directory": object_spilling_dir,
+                }
+                if include_dashboard:
+                    ray_kwargs["dashboard_host"] = "0.0.0.0"
+                    ray_kwargs["dashboard_port"] = 8265
+                if ray_client_port > 0:
+                    ray_kwargs["ray_client_server_port"] = ray_client_port
+                ray_params = RayParams(**ray_kwargs)
+                node = Node(ray_params, head=True, shutdown_at_exit=False, spawn_reaper=False)
+                _write_text_atomic(head_ip_path, ip)
+                print(f"mint ray head published IP: {ip}", flush=True)
+                health_address = "127.0.0.1:6379"
+            else:
+                head = _read_head(head_ip_path)
+                print(f"mint ray worker connecting to head: {head}", flush=True)
+                ray_params = RayParams(
+                    gcs_address=head,
+                    num_gpus=8,
+                    temp_dir=temp_dir,
+                    object_spilling_directory=object_spilling_dir,
+                )
+                node = Node(ray_params, head=False, shutdown_at_exit=False, spawn_reaper=False)
+                health_address = head
+
+            while True:
+                if not _port_open(health_address):
+                    print(f"mint ray {role} lost connectivity to {health_address}; restarting", flush=True)
+                    break
+                dead = node.dead_processes()
+                if dead:
+                    print(f"mint ray {role} detected dead ray processes: {dead!r}; restarting", flush=True)
+                    break
+                time.sleep(CHECK_INTERVAL_S)
+        except Exception as exc:
+            print(f"mint ray {role} wrapper caught exception: {type(exc).__name__}: {exc}", flush=True)
+        finally:
+            if node is not None:
+                try:
+                    node.kill_all_processes(check_alive=False, allow_graceful=False, wait=True)
+                except Exception as exc:
+                    print(f"mint ray {role} cleanup failed: {type(exc).__name__}: {exc}", flush=True)
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
