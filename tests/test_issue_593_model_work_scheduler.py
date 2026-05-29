@@ -254,6 +254,10 @@ def test_issue_638_scheduler_registers_otel_gauges(monkeypatch: pytest.MonkeyPat
     assert "mint_model_work_scheduler_leases" in gauges
     assert "mint_model_load_pct" in gauges
     assert "mint_model_pending_requests" in gauges
+    assert "mint_sampling_inflight_by_domain" in gauges
+    assert "mint_sampling_inflight_principal_domain_max" in gauges
+    assert "mint_sampling_admission_would_reject_total" in gauges
+    assert "mint_sampling_admission_reject_total" in gauges
 
 
 def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
@@ -312,6 +316,14 @@ def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
     assert inflight_obs[0].value == 1.0
     assert inflight_obs[0].attributes["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
     assert inflight_obs[0].attributes["workload"] == "sample"
+
+    sampling_inflight_obs = gauges["mint_sampling_inflight_by_domain"][0](None)
+    assert sampling_inflight_obs[0].value == 1.0
+    assert sampling_inflight_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    principal_max_obs = gauges["mint_sampling_inflight_principal_domain_max"][0](None)
+    assert principal_max_obs[0].value == 1.0
+    assert principal_max_obs[0].attributes["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
 def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
@@ -924,6 +936,46 @@ def test_scheduler_hydrates_active_task_state_after_restart() -> None:
         )
         assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-restart"]
         assert store.get_task("req-restart")["status"] == "leased"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_scheduler_hydrates_sampling_inflight_counts_from_task_state_store() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+    domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+
+    async def _run() -> None:
+        for request_id, principal in (
+            ("req-hydrate-a", "apikey:key-a"),
+            ("req-hydrate-b", "apikey:key-a"),
+            ("req-hydrate-c", "apikey:key-b"),
+        ):
+            store.create_task(
+                request_id=request_id,
+                op="sampling.asample",
+                domain_key=domain,
+                request_json=b"{}",
+                metadata={
+                    "op": "sampling.asample",
+                    "throttle_principal": principal,
+                    "domain_key": domain,
+                },
+            )
+
+        contains = await actor.contains_request(request_id="req-hydrate-a")
+        assert contains["present"] is True
+        stats = actor.stats()
+        assert stats["sampling_inflight"]["by_domain"][domain] == 3
+        assert stats["sampling_inflight"]["principal_domain_max_by_domain"][domain] == 2
+        assert stats["sampling_inflight"]["active_principals_by_domain"][domain] == 2
 
     try:
         asyncio.run(_run())

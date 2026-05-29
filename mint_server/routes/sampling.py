@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 
 from ..config import config as server_config
 from ..backend.model_work_scheduler import ModelWorkSchedulerConflictError
@@ -1192,7 +1193,11 @@ async def asample(
             "limit": int(result.get("limit") or 0),
             "retry_after_s": int(result.get("retry_after_s") or 5),
         }
-        raise HTTPException(status_code=429, detail=detail)
+        return JSONResponse(
+            status_code=429,
+            content=detail,
+            headers={"Retry-After": str(detail["retry_after_s"])},
+        )
     except ModelWorkSchedulerConflictError:
         if request.seq_id is None:
             logger.exception(

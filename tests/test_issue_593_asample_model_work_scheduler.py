@@ -4,7 +4,6 @@ import json
 from types import SimpleNamespace
 
 import anyio
-import pytest
 
 from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
 from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
@@ -235,12 +234,11 @@ def test_asample_returns_429_for_durable_inflight_admission_rejection(monkeypatc
         sampling_params=SamplingParams(max_tokens=4),
     )
 
-    with pytest.raises(Exception) as exc:
-        anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
+    response = anyio.run(sampling_route.asample, req, _dummy_request("user-a"))
 
-    http_exc = exc.value
-    assert getattr(http_exc, "status_code", None) == 429
-    assert http_exc.detail == {
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "5"
+    assert json.loads(response.body.decode("utf-8")) == {
         "error": "sampling_backpressure",
         "reason": "domain_inflight_limit_exceeded",
         "domain": "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
