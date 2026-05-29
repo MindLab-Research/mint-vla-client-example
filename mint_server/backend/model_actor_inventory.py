@@ -381,7 +381,24 @@ def _record_to_entry(record: dict[str, Any], *, actor_handle: ActorHandle | None
     )
 
 
+def _metadata_backend_label(entry: ActorEntry) -> str | None:
+    metadata = entry.metadata if isinstance(entry.metadata, dict) else {}
+    for key in ("backend", "training_backend", "debug_model_backend", "runtime_backend"):
+        raw = metadata.get(key)
+        if raw is None:
+            continue
+        value = str(raw).strip().lower()
+        if value in {"bumblebee", "megatron", "openpi", "peft", "vllm"}:
+            return value
+    return None
+
+
 def _backend_for_entry(entry: ActorEntry) -> str:
+    metadata_backend = _metadata_backend_label(entry)
+    if metadata_backend == "bumblebee" or "bumblebee" in str(entry.actor_name or "").lower():
+        return "bumblebee"
+    if metadata_backend is not None:
+        return metadata_backend
     if entry.actor_type == ActorType.DENSE:
         return "peft"
     if entry.actor_type == ActorType.OPENPI:
