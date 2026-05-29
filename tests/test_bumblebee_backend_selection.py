@@ -324,6 +324,8 @@ def test_issue_670_bumblebee_group_ready_checks_rank_workers():
     group = object.__new__(group_cls)
     group.config = SimpleNamespace(world_size=2)
     group.workers = [SimpleNamespace(__ray_ready__=SimpleNamespace(remote=lambda: "rank-ready-ref"))]
+    group._initialized = True
+    group._initializing = False
 
     with pytest.raises(RuntimeError, match="rank worker count mismatch"):
         group.__ray_ready__()
