@@ -220,6 +220,492 @@ def test_issue_193_megatron_load_weights_missing_actor_can_recreate_from_checkpo
     ]
 
 
+def test_issue_670_bumblebee_explicit_load_retries_after_rank_worker_death(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_load_recycle"
+    dead_worker = _FakeLoadWorker(ref="dead-load-ref")
+    recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_load_recycle",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    checkpoint_path = tmp_path / "bumblebee-checkpoint"
+    checkpoint_path.mkdir()
+
+    keepalive_calls: list[object] = []
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_get_live_worker(_session, *, op, allow_recover=False):
+        assert _session is session
+        assert op == "load_weights"
+        assert allow_recover is False
+        return engine._workers[model_id]
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert keepalive_session is session
+        keepalive_calls.append(awaitable)
+        if awaitable == "dead-load-ref":
+            raise ray.exceptions.ActorDiedError()
+        if awaitable == "recovered-load-ref":
+            return {"current_step": 78, "learning_rate": 2e-5}
+        raise AssertionError(f"unexpected awaitable: {awaitable!r}")
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        recycle_calls.append((op, type(cause).__name__))
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    meta = asyncio.run(
+        engine.load_weights(
+            session=session,
+            load_path=str(checkpoint_path),
+            load_optimizer=True,
+        )
+    )
+
+    assert meta == {"current_step": 78, "learning_rate": 2e-5}
+    assert session.current_step == 78
+    assert session.learning_rate == pytest.approx(2e-5)
+    assert dead_worker.load_checkpoint.calls == [
+        ((str(checkpoint_path), True), {"traceparent": None, "session_id": model_id})
+    ]
+    assert recovered_worker.load_checkpoint.calls == [
+        ((str(checkpoint_path), True), {"traceparent": None, "session_id": model_id})
+    ]
+    assert recycle_calls == [("load_weights", "ActorDiedError")]
+    assert keepalive_calls == ["dead-load-ref", "recovered-load-ref"]
+    assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_670_bumblebee_explicit_load_keeps_session_poisoned_when_retry_load_fails(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_load_retry_fails"
+    dead_worker = _FakeLoadWorker(ref="dead-load-ref")
+    recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_load_retry_fails",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    checkpoint_path = tmp_path / "bumblebee-checkpoint"
+    checkpoint_path.mkdir()
+
+    async def fake_get_live_worker(_session, *, op, allow_recover=False):
+        assert _session is session
+        assert op == "load_weights"
+        return engine._workers[model_id]
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert keepalive_session is session
+        if awaitable == "dead-load-ref":
+            raise ray.exceptions.ActorDiedError()
+        if awaitable == "recovered-load-ref":
+            raise RuntimeError("corrupt checkpoint")
+        raise AssertionError(f"unexpected awaitable: {awaitable!r}")
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    with pytest.raises(RuntimeError, match="corrupt checkpoint"):
+        asyncio.run(
+            engine.load_weights(
+                session=session,
+                load_path=str(checkpoint_path),
+                load_optimizer=True,
+            )
+        )
+
+    assert "checkpoint reload must complete successfully" in engine._poisoned_sessions[model_id]
+
+    async def _train_after_failed_reload():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward_backward",
+            submit_fn=lambda worker: worker,
+        )
+
+    with pytest.raises(RuntimeError, match="checkpoint reload must complete successfully"):
+        asyncio.run(_train_after_failed_reload())
+
+
+def test_issue_670_bumblebee_explicit_load_recycles_when_rank_liveness_probe_fails(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_load_probe_recycle"
+    dead_worker = _FakeLoadWorker(ref="dead-load-ref")
+    recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_load_probe_recycle",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    checkpoint_path = tmp_path / "bumblebee-checkpoint"
+    checkpoint_path.mkdir()
+
+    heartbeat_refs: list[object] = []
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_async_get_ray_ref(awaitable, timeout_s=None):
+        assert awaitable == "heartbeat-ref"
+        assert timeout_s == 10
+        heartbeat_refs.append(awaitable)
+        if len(heartbeat_refs) == 1:
+            raise ray.exceptions.ActorDiedError()
+        return {"ok": True}
+
+    async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
+        assert keepalive_session is session
+        if awaitable == "recovered-load-ref":
+            return {"current_step": 79, "learning_rate": 3e-5}
+        raise AssertionError(f"unexpected awaitable: {awaitable!r}")
+
+    async def fake_recycle(recycle_session, *, op, cause, request_started=False, explicit_checkpoint_path=None):
+        assert recycle_session is session
+        assert explicit_checkpoint_path == str(checkpoint_path)
+        recycle_calls.append((op, type(cause).__name__))
+        return await VerlTrainingEngine._recycle_worker_after_failure(
+            engine,
+            recycle_session,
+            op=op,
+            cause=cause,
+            request_started=request_started,
+            explicit_checkpoint_path=explicit_checkpoint_path,
+        )
+
+    async def fake_recycle_bumblebee(recycle_session, *, op, cause):
+        assert recycle_session is session
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_worker_after_failure", fake_recycle)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle_bumblebee)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    meta = asyncio.run(
+        engine.load_weights(
+            session=session,
+            load_path=str(checkpoint_path),
+            load_optimizer=True,
+        )
+    )
+
+    assert meta == {"current_step": 79, "learning_rate": 3e-5}
+    assert heartbeat_refs == ["heartbeat-ref", "heartbeat-ref"]
+    assert recycle_calls == [("load_weights", "RuntimeError")]
+    assert dead_worker.load_checkpoint.calls == []
+    assert recovered_worker.load_checkpoint.calls == [
+        ((str(checkpoint_path), True), {"traceparent": None, "session_id": model_id})
+    ]
+    assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_670_bumblebee_training_op_still_fails_closed_after_rank_worker_death(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_train_recycle"
+    dead_worker = object()
+    recovered_worker = object()
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_train_recycle",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+
+    submit_workers: list[object] = []
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_get_live_worker(*args, **kwargs):
+        return dead_worker
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        assert awaitable is dead_worker
+        raise ray.exceptions.ActorDiedError()
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        recycle_calls.append((op, type(cause).__name__))
+        return recovered_worker
+
+    monkeypatch.setattr(engine, "_get_live_worker", fake_get_live_worker)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    async def _run():
+        await engine._run_worker_call_with_actor_recycle(
+            session,
+            op="forward_backward",
+            submit_fn=lambda worker: submit_workers.append(worker) or worker,
+        )
+
+    with pytest.raises(RuntimeError, match="bumblebee actor recycle detected after op=forward_backward"):
+        asyncio.run(_run())
+
+    assert submit_workers == [dead_worker]
+    assert recycle_calls == [("forward_backward", "ActorDiedError")]
+    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+
+
+def _issue_670_training_request() -> SimpleNamespace:
+    return SimpleNamespace(
+        forward_backward_input=SimpleNamespace(
+            data=[SimpleNamespace(model_dump=lambda: {"model_input": {}, "loss_fn_inputs": {}})],
+            loss_fn="cross_entropy",
+            loss_fn_config={},
+        ),
+        adam_params=SimpleNamespace(learning_rate=1e-4),
+    )
+
+
+def test_issue_670_bumblebee_public_forward_backward_recycles_and_poisons(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_public_fb"
+    dead_worker = _FakeWorker(ref="dead-fb-ref")
+    recovered_worker = _FakeWorker(ref="recovered-fb-ref")
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_public_fb",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    request = _issue_670_training_request()
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        if awaitable == "heartbeat-ref":
+            return {"ok": True}
+        assert awaitable == "dead-fb-ref"
+        raise ray.exceptions.ActorDiedError()
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        recycle_calls.append((op, type(cause).__name__))
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    async def fake_async_get_ray_ref(awaitable, timeout_s=None):
+        assert awaitable == "heartbeat-ref"
+        assert timeout_s == 10
+        return {"ok": True}
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    with pytest.raises(RuntimeError, match="bumblebee actor recycle detected after op=forward_backward"):
+        asyncio.run(engine.forward_backward(session, request))
+
+    assert dead_worker.forward_backward.calls == [
+        (
+            ([{"model_input": {}, "loss_fn_inputs": {}}], "cross_entropy", {}, None, model_id, None),
+            {
+                "traceparent": None,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
+            },
+        )
+    ]
+    assert recovered_worker.forward_backward.calls == []
+    assert recycle_calls == [("forward_backward", "ActorDiedError")]
+    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+
+
+@pytest.mark.parametrize(
+    ("method_name", "remote_method_name"),
+    [
+        ("optim_step", "optim_step"),
+        ("train_step", "train_step"),
+    ],
+)
+def test_issue_670_bumblebee_public_training_step_ops_recycle_and_poison(
+    monkeypatch,
+    method_name,
+    remote_method_name,
+):
+    engine = VerlTrainingEngine()
+    model_id = f"model_issue_670_bumblebee_public_{method_name}"
+    ref = f"dead-{method_name}-ref"
+    dead_worker = _FakeWorker(ref=ref)
+    recovered_worker = _FakeWorker(ref=f"recovered-{method_name}-ref")
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+    session = TrainingSession(
+        model_id=model_id,
+        session_id=f"session_issue_670_bumblebee_public_{method_name}",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    request = _issue_670_training_request()
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        assert awaitable == ref
+        raise ray.exceptions.ActorDiedError()
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        assert recycle_session is session
+        recycle_calls.append((op, type(cause).__name__))
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    async def fake_async_get_ray_ref(awaitable, timeout_s=None):
+        assert awaitable == "heartbeat-ref"
+        assert timeout_s == 10
+        return {"ok": True}
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    with pytest.raises(RuntimeError, match=f"bumblebee actor recycle detected after op={method_name}"):
+        asyncio.run(getattr(engine, method_name)(session, request))
+
+    assert getattr(dead_worker, remote_method_name).calls
+    assert getattr(recovered_worker, remote_method_name).calls == []
+    assert recycle_calls == [(method_name, "ActorDiedError")]
+    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+
+
+def test_issue_670_bumblebee_public_training_ops_block_poisoned_session(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_public_poison"
+    worker = _FakeWorker(ref="unused-ref")
+    engine._workers[model_id] = worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+    engine._poisoned_sessions[model_id] = (
+        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
+        "checkpoint reload must complete successfully before training can continue."
+    )
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_public_poison",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    request = _issue_670_training_request()
+    monkeypatch.setattr(
+        "mint_server.backend.model_registry.get_model_config",
+        lambda *_args, **_kwargs: SimpleNamespace(is_moe=True),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint reload must complete successfully"):
+        asyncio.run(engine.forward_backward(session, request))
+    with pytest.raises(RuntimeError, match="checkpoint reload must complete successfully"):
+        asyncio.run(engine.optim_step(session, request))
+    with pytest.raises(RuntimeError, match="checkpoint reload must complete successfully"):
+        asyncio.run(engine.train_step(session, request))
+
+    assert worker.forward_backward.calls == []
+    assert worker.optim_step.calls == []
+    assert worker.train_step.calls == []
+
+
+def test_issue_670_bumblebee_successful_explicit_load_unpoisons_public_training(monkeypatch, tmp_path):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_670_bumblebee_load_unpoison"
+    worker = _FakeLoadWorker(ref="load-ref")
+    worker.forward_backward = _RecordingRemoteMethod("fb-ref")
+    engine._workers[model_id] = worker
+    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
+    engine._poisoned_sessions[model_id] = (
+        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
+        "checkpoint reload must complete successfully before training can continue."
+    )
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_670_bumblebee_load_unpoison",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+    checkpoint_path = tmp_path / "bumblebee-checkpoint"
+    checkpoint_path.mkdir()
+
+    async def fake_keepalive(awaitable, *_args, **_kwargs):
+        if awaitable == "load-ref":
+            return {"current_step": 80, "learning_rate": 4e-5}
+        if awaitable == "fb-ref":
+            return {"metrics": {"loss:mean": 0.1}}
+        if awaitable == "heartbeat-ref":
+            return {"ok": True}
+        raise AssertionError(f"unexpected awaitable: {awaitable!r}")
+
+    async def fake_async_get_ray_ref(awaitable, timeout_s=None):
+        assert awaitable == "heartbeat-ref"
+        assert timeout_s == 10
+        return {"ok": True}
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
+    monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
+
+    meta = asyncio.run(
+        engine.load_weights(
+            session=session,
+            load_path=str(checkpoint_path),
+            load_optimizer=True,
+        )
+    )
+    assert meta == {"current_step": 80, "learning_rate": 4e-5}
+    assert model_id not in engine._poisoned_sessions
+
+    result = asyncio.run(engine.forward_backward(session, _issue_670_training_request()))
+    assert result == {"metrics": {"loss:mean": 0.1}}
+    assert worker.forward_backward.calls == [
+        (
+            ([{"model_input": {}, "loss_fn_inputs": {}}], "cross_entropy", {}, None, model_id, None),
+            {
+                "traceparent": None,
+                "train_attn": True,
+                "train_mlp": True,
+                "train_unembed": True,
+            },
+        )
+    ]
+
+
 def test_issue_193_megatron_load_weights_missing_actor_with_dirty_sibling_fails_closed(monkeypatch):
     engine = VerlTrainingEngine()
     monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")

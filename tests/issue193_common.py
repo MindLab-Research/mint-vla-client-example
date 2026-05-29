@@ -135,6 +135,9 @@ class _FakeWorker(_HeartbeatWorkerMixin):
     def __init__(self, ref: str = "fake-save-checkpoint-ref"):
         super().__init__()
         self.save_checkpoint = _RecordingRemoteMethod(ref)
+        self.forward_backward = _RecordingRemoteMethod(ref)
+        self.optim_step = _RecordingRemoteMethod(ref)
+        self.train_step = _RecordingRemoteMethod(ref)
 
 
 class _FakeSamplerWorker(_HeartbeatWorkerMixin):

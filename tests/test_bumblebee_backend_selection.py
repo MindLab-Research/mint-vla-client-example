@@ -20,6 +20,7 @@ from mint_server.backend.bumblebee_distributed import (
     BumblebeeSessionMeta,
     _bumblebee_runtime_etp,
     _coerce_int,
+    get_or_create_bumblebee_worker_group,
 )
 
 
@@ -238,6 +239,114 @@ def test_bumblebee_worker_group_merges_only_numeric_tinker_metrics():
     )
 
     assert payload["metrics"] == {"loss:mean": 1.25, "num_tokens:sum": 8}
+
+
+def test_issue_670_bumblebee_group_ready_checks_rank_workers():
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    group.config = SimpleNamespace(world_size=2)
+    group.workers = [SimpleNamespace(__ray_ready__=SimpleNamespace(remote=lambda: "rank-ready-ref"))]
+
+    with pytest.raises(RuntimeError, match="rank worker count mismatch"):
+        group.__ray_ready__()
+
+
+def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics_fail(monkeypatch):
+    import mint_server.backend.bumblebee_distributed as bb
+
+    stale_actor = SimpleNamespace()
+    created_actor = object()
+    kill_calls: list[dict] = []
+
+    class _FakeRemoteOptions:
+        def remote(self, **_kwargs):
+            return created_actor
+
+    class _FakeRemoteClass:
+        def options(self, **_kwargs):
+            return _FakeRemoteOptions()
+
+    class _BrokenDiagnostics:
+        def remote(self):
+            return "broken-diagnostics-ref"
+
+    monkeypatch.setattr(bb.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(bb.ray, "get_actor", lambda *_args, **_kwargs: stale_actor)
+
+    def fake_ray_get(ref, timeout=None):
+        assert ref == "broken-diagnostics-ref"
+        assert timeout == 10
+        raise bb.ray.exceptions.ActorDiedError()
+
+    monkeypatch.setattr(bb.ray, "get", fake_ray_get)
+    stale_actor.get_diagnostics = _BrokenDiagnostics()
+    monkeypatch.setattr(bb.ray_kill, "kill", lambda *args, **kwargs: kill_calls.append(kwargs))
+    monkeypatch.setattr(bb, "BumblebeeWorkerGroup", _FakeRemoteClass())
+    monkeypatch.setattr(bb, "actor_runtime_env_vars", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        "mint_server.backend.model_actor_publication.publish_backend_model_actor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bb, "is_topology_desired_model", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bb, "_model_gpu_placement_for_model", lambda *_args, **_kwargs: None)
+
+    actor = get_or_create_bumblebee_worker_group(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        lora_rank=64,
+        learning_rate=1e-4,
+        observability_base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+
+    assert actor is created_actor
+    assert kill_calls == [
+        {
+            "reason": "bumblebee_actor_rank_worker_unhealthy",
+            "actor_name": "mint_bumblebee_qwen3_30b_a3b_instruct_2507",
+            "namespace": bb.PERSISTENT_NAMESPACE,
+            "no_restart": True,
+            "verify_absent": True,
+        }
+    ]
+
+
+def test_issue_670_bumblebee_get_or_create_keeps_actor_when_diagnostics_timeout(monkeypatch):
+    import mint_server.backend.bumblebee_distributed as bb
+
+    busy_actor = SimpleNamespace()
+    kill_calls: list[dict] = []
+    published: list[object] = []
+
+    class _BusyDiagnostics:
+        def remote(self):
+            return "busy-diagnostics-ref"
+
+    monkeypatch.setattr(bb.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(bb.ray, "get_actor", lambda *_args, **_kwargs: busy_actor)
+
+    def fake_ray_get(ref, timeout=None):
+        assert ref == "busy-diagnostics-ref"
+        assert timeout == 10
+        raise bb.ray.exceptions.GetTimeoutError("busy")
+
+    monkeypatch.setattr(bb.ray, "get", fake_ray_get)
+    busy_actor.get_diagnostics = _BusyDiagnostics()
+    monkeypatch.setattr(bb.ray_kill, "kill", lambda *args, **kwargs: kill_calls.append(kwargs))
+    monkeypatch.setattr(
+        "mint_server.backend.model_actor_publication.publish_backend_model_actor",
+        lambda launch, **_kwargs: published.append(launch),
+    )
+    monkeypatch.setattr(bb, "is_topology_desired_model", lambda *_args, **_kwargs: False)
+
+    actor = get_or_create_bumblebee_worker_group(
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        lora_rank=64,
+        learning_rate=1e-4,
+        observability_base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    )
+
+    assert actor is busy_actor
+    assert kill_calls == []
+    assert len(published) == 1
 
 
 def test_bumblebee_checkpoint_save_writes_optimizer_backed_train_state(tmp_path):

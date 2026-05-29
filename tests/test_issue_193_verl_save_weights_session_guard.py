@@ -2417,6 +2417,7 @@ def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
 
 def test_issue_193_megatron_create_training_session_waits_before_marking_ready(monkeypatch):
     engine = VerlTrainingEngine()
+    monkeypatch.setenv("MINT_QWEN3_30B_TRAINING_BACKEND", "megatron")
     model_id = "model_issue_193_megatron_create_ready"
     worker = _FakeLoadWorker(ref="unused-load-ref")
     session = TrainingSession(
