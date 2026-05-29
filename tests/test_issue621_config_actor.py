@@ -45,6 +45,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_BUMBLEBEE_ATTENTION_BACKEND") == CONFIG_CLASS_SNAPSHOT_CONFIG
+    assert classify_env_key("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_MEGATRON_STICKY_IDLE_TIMEOUT_S") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_TOPOLOGY_CONFIG_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("MINT_TOPOLOGY_STATE_PATH") == CONFIG_CLASS_SNAPSHOT_CONFIG
@@ -64,6 +66,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM": "64",
             "MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM": "16",
             "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET": "262144",
+            "MINT_BUMBLEBEE_ATTENTION_BACKEND": "flash",
+            "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH": "/runtime/overlays/flash",
             "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET": "131072",
             "OTEL_SERVICE_NAME": "mint",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
@@ -90,6 +94,11 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
         grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET"]
         == "131072"
     )
+    assert (
+        grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH"]
+        == "/runtime/overlays/flash"
+    )
+    assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["MINT_BUMBLEBEE_ATTENTION_BACKEND"] == "flash"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_SERVICE_NAME"] == "mint"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["OTEL_EXPORTER_OTLP_HEADERS"] == REDACTED_VALUE
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_DEPLOYMENT_ENV"] == "prod"

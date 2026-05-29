@@ -19,6 +19,9 @@ from mint_server.backend.bumblebee_distributed import (
     BumblebeeRankWorker,
     BumblebeeWorkerGroup,
     BumblebeeSessionMeta,
+    _bumblebee_attention_backend_override,
+    _bumblebee_flash_attn_overlay_path,
+    _bumblebee_runtime_pythonpath,
     _bumblebee_runtime_etp,
     _coerce_int,
     _make_bumblebee_pg_name,
@@ -92,9 +95,59 @@ def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
     assert "MINT_BUMBLEBEE_IMPL" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_OPTIMIZER" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_SKIP_HF_LOAD" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_ATTENTION_BACKEND" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "BUMBLEBEE_CKPT_TRACE" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "NVTE_FLASH_ATTN" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "BUMBLEBEE_TE_SDPA_FALLBACK" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+
+
+def test_bumblebee_attention_backend_override_defaults_to_flash(monkeypatch):
+    monkeypatch.delenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", raising=False)
+
+    assert _bumblebee_attention_backend_override() == "flash"
+
+
+def test_bumblebee_attention_backend_override_accepts_unfused(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", "unfused")
+
+    assert _bumblebee_attention_backend_override() == "unfused"
+
+
+def test_bumblebee_attention_backend_override_allows_runtime_default(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_ATTENTION_BACKEND", "none")
+
+    assert _bumblebee_attention_backend_override() is None
+
+
+def test_bumblebee_flash_attn_overlay_path_can_be_explicit(monkeypatch, tmp_path):
+    overlay = tmp_path / "flash-overlay"
+    monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
+
+    assert _bumblebee_flash_attn_overlay_path() == str(overlay)
+
+
+def test_bumblebee_flash_attn_overlay_path_auto_detects_runtime_overlay(monkeypatch, tmp_path):
+    overlay = tmp_path / "overlays" / "flash_attn_2_8_3_cu12_torch2_9_cp312"
+    overlay.mkdir(parents=True)
+    monkeypatch.delenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", raising=False)
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(tmp_path))
+
+    assert _bumblebee_flash_attn_overlay_path() == str(overlay)
+
+
+def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tmp_path):
+    overlay = tmp_path / "flash-overlay"
+    repo = tmp_path / "bumblebee"
+    monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
+    monkeypatch.setenv("MINT_BUMBLEBEE_REPO_PATH", str(repo))
+    monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
+
+    assert _bumblebee_runtime_pythonpath().split(":")[:3] == [
+        str(overlay),
+        str(repo),
+        "/runtime/site-packages",
+    ]
 
 
 def test_bumblebee_optimizer_metric_coerces_missing_num_zeros():

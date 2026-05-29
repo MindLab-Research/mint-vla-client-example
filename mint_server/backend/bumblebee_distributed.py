@@ -50,6 +50,8 @@ BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "MINT_BUMBLEBEE_IMPL",
     "MINT_BUMBLEBEE_OPTIMIZER",
     "MINT_BUMBLEBEE_SKIP_HF_LOAD",
+    "MINT_BUMBLEBEE_ATTENTION_BACKEND",
+    "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH",
     "MINT_BUMBLEBEE_LORA_ALPHA",
     "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
     "MINT_MODEL_PLACEMENT_JSON",
@@ -81,6 +83,8 @@ BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "BUMBLEBEE_TE_SDPA_FALLBACK",
 )
 
+DEFAULT_BUMBLEBEE_FLASH_ATTN_OVERLAY_RELATIVE = "overlays/flash_attn_2_8_3_cu12_torch2_9_cp312"
+
 _bumblebee_create_locks: dict[str, threading.Lock] = {}
 _bumblebee_create_locks_guard = threading.Lock()
 
@@ -110,6 +114,36 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; expected int", name, raw)
         return default
+
+
+def _prepend_pythonpath_entry(pythonpath: str, entry: str | None) -> str:
+    value = str(entry or "").strip()
+    if not value:
+        return pythonpath
+    parts = [part for part in str(pythonpath or "").split(":") if part]
+    if value in parts:
+        return ":".join([value, *(part for part in parts if part != value)])
+    return ":".join([value, *parts])
+
+
+def _bumblebee_flash_attn_overlay_path() -> str | None:
+    explicit = os.environ.get("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH")
+    if explicit is not None:
+        value = explicit.strip()
+        return value or None
+    runtime_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    if not runtime_root:
+        return None
+    candidate = os.path.join(runtime_root, DEFAULT_BUMBLEBEE_FLASH_ATTN_OVERLAY_RELATIVE)
+    return candidate if os.path.isdir(candidate) else None
+
+
+def _bumblebee_runtime_pythonpath() -> str:
+    runtime_pythonpath = PFS_PYTHONPATH
+    repo = _bumblebee_repo_path()
+    runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, repo)
+    runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, _bumblebee_flash_attn_overlay_path())
+    return runtime_pythonpath
 
 
 def _model_key_from_base_model(base_model: str) -> str:
@@ -146,6 +180,16 @@ def _bumblebee_runtime_etp(base_model: str, config: DistributedConfig) -> int | 
     if _is_qwen3_235b_model(_model_key_from_base_model(base_model)):
         return 1
     return None
+
+
+def _bumblebee_attention_backend_override() -> str | None:
+    raw = os.environ.get("MINT_BUMBLEBEE_ATTENTION_BACKEND", "flash").strip().lower()
+    if raw in {"", "none", "default"}:
+        return None
+    allowed = {"auto", "flash", "fused", "unfused", "local"}
+    if raw not in allowed:
+        raise ValueError(f"MINT_BUMBLEBEE_ATTENTION_BACKEND must be one of {sorted(allowed)}, got {raw!r}")
+    return raw
 
 
 def _bumblebee_repo_path() -> str:
@@ -455,6 +499,7 @@ class BumblebeeRankWorker:
                     etp=etp,
                 ),
                 optimizer=OptimizerConfig(lr=float(self.learning_rate)),
+                attention_backend_override=_bumblebee_attention_backend_override(),
                 load_hf_weights=not _env_flag("MINT_BUMBLEBEE_SKIP_HF_LOAD"),
                 impl_cfg={
                     "optimizer": os.environ.get("MINT_BUMBLEBEE_OPTIMIZER", "mc_full"),
@@ -1588,10 +1633,7 @@ class BumblebeeWorkerGroup:
         ray.get(self.placement_group.ready())
         bundle_ips = [_bundle_node_ip(bundle) for bundle in bundles]
 
-        runtime_pythonpath = PFS_PYTHONPATH
-        repo = _bumblebee_repo_path()
-        if repo not in runtime_pythonpath.split(":"):
-            runtime_pythonpath = repo + ":" + runtime_pythonpath
+        runtime_pythonpath = _bumblebee_runtime_pythonpath()
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
@@ -2009,10 +2051,7 @@ def get_or_create_bumblebee_worker_group(
         except ValueError:
             logger.info("Creating new detached Bumblebee actor: %s for %s", actor_name, base_model)
 
-        runtime_pythonpath = PFS_PYTHONPATH
-        repo = _bumblebee_repo_path()
-        if repo not in runtime_pythonpath.split(":"):
-            runtime_pythonpath = repo + ":" + runtime_pythonpath
+        runtime_pythonpath = _bumblebee_runtime_pythonpath()
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
