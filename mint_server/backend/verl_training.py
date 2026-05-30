@@ -2385,6 +2385,30 @@ class VerlTrainingEngine:
 
         if session.backend == "bumblebee":
             worker = await self._recycle_bumblebee_actor(session, op=op, cause=cause)
+            missing_before_request = (
+                not request_started
+                and isinstance(cause, RuntimeError)
+                and "missing worker" in str(cause)
+            )
+            if missing_before_request and not lost_session_ids:
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                return worker
+            if lost_session_ids:
+                joined = ", ".join(lost_session_ids)
+                err = (
+                    f"[{session.model_id}] bumblebee actor recycle detected before op={op}, but "
+                    f"session(s) {joined} had live in-memory state that was never persisted. "
+                    "The request was not retried because that would hide rollback. "
+                    "Reload the lost session from a checkpoint before continuing."
+                )
+                for sid in lost_session_ids:
+                    self._poisoned_sessions[sid] = err
+                if actor_name:
+                    self._actor_loaded_sessions.pop(actor_name, None)
+                    self._actor_volatile_sessions.pop(actor_name, None)
+                raise RuntimeError(err) from cause
             explicit_checkpoint_reload = (
                 op == "load_weights"
                 and isinstance(explicit_checkpoint_path, str)
@@ -3417,10 +3441,18 @@ class VerlTrainingEngine:
                 self._touch_actor(session)
                 return worker
             except Exception as e:
-                raise RuntimeError(
+                missing = RuntimeError(
                     f"[{model_id}] missing worker for backend=bumblebee: "
                     f"rank liveness probe failed before op={op}"
-                ) from e
+                )
+                if op == "load_weights":
+                    raise missing from e
+                return await self._recycle_worker_after_failure(
+                    session,
+                    op=op,
+                    cause=missing,
+                    request_started=False,
+                )
 
         # Megatron workers are managed by a persistent group; keep existing behavior.
         if session.backend != "peft":

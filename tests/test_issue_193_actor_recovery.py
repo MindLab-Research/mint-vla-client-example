@@ -1002,6 +1002,79 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
     assert session_a.model_id in engine._poisoned_sessions
 
 
+def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_679_bumblebee_clean_rebind"
+    actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
+    dead_worker = _FakeSamplerWorker()
+    recovered_worker = _FakeSamplerWorker()
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_679_bumblebee_clean_rebind",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+
+    async def fake_async_get_ray_ref(*_args, **_kwargs):
+        raise RuntimeError("Bumblebee rank worker count mismatch: expected=4 observed=0")
+
+    recycle_calls: list[tuple[str, str]] = []
+
+    async def fake_recycle(recycle_session, *, op, cause):
+        recycle_calls.append((op, type(cause).__name__))
+        engine._workers[model_id] = recovered_worker
+        return recovered_worker
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+
+    async def _run():
+        return await engine._get_live_worker(session, op="save_lora_weights_for_sampler")
+
+    assert asyncio.run(_run()) is recovered_worker
+    assert recycle_calls == [("save_lora_weights_for_sampler", "RuntimeError")]
+    assert model_id not in engine._poisoned_sessions
+
+
+def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(monkeypatch):
+    engine = VerlTrainingEngine()
+    model_id = "model_issue_679_bumblebee_dirty_rebind"
+    actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
+    dead_worker = _FakeSamplerWorker()
+    engine._workers[model_id] = dead_worker
+    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    engine._actor_volatile_sessions[actor_name] = {model_id}
+
+    session = TrainingSession(
+        model_id=model_id,
+        session_id="session_issue_679_bumblebee_dirty_rebind",
+        model_seq_id=0,
+        base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        backend="bumblebee",
+    )
+
+    async def fake_async_get_ray_ref(*_args, **_kwargs):
+        raise RuntimeError("Bumblebee rank worker count mismatch: expected=4 observed=0")
+
+    async def fake_recycle(*_args, **_kwargs):
+        return object()
+
+    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
+
+    async def _run():
+        await engine._get_live_worker(session, op="save_lora_weights_for_sampler")
+
+    with pytest.raises(RuntimeError, match="live in-memory state"):
+        asyncio.run(_run())
+    assert model_id in engine._poisoned_sessions
+    assert engine._actor_volatile_sessions.get(actor_name) is None
+
+
 def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_next_train_step(monkeypatch):
     engine = VerlTrainingEngine()
     model_id = "model_issue_193_megatron_loaded_clean"
