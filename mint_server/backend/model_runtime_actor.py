@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -49,6 +51,7 @@ class ModelRuntimeActorConfig:
     max_claim: int = 1
     token_budget: int | None = None
     execution_timeout_s: float | None = None
+    runtime_env_fingerprint: str | None = None
 
     @property
     def consumer_id(self) -> str:
@@ -80,6 +83,16 @@ def _ray_namespace() -> str:
         return "mint"
 
 
+def _runtime_env_fingerprint(runtime_env_extra: dict[str, str] | None) -> str:
+    payload = {
+        str(key): str(value)
+        for key, value in sorted((runtime_env_extra or {}).items())
+        if value is not None
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def get_or_create_model_runtime_actor(
     *,
     domain_key: str,
@@ -97,6 +110,7 @@ def get_or_create_model_runtime_actor(
     import ray
 
     name = str(actor_name or default_model_runtime_actor_name(domain_key, replica_id))
+    expected_runtime_env_fingerprint = _runtime_env_fingerprint(runtime_env_extra)
     try:
         existing = ray.get_actor(name, namespace=_ray_namespace())
         health = sync_get_ray_ref(existing.health_snapshot.remote(), timeout_s=5.0)
@@ -108,16 +122,18 @@ def get_or_create_model_runtime_actor(
             and int(health.get("actor_generation") or -1) == int(actor_generation)
             and int(health.get("max_claim") or 0) == max(1, int(max_claim))
             and health.get("token_budget") == expected_token_budget
+            and str(health.get("runtime_env_fingerprint") or "") == expected_runtime_env_fingerprint
         ):
             return existing
         logger.warning(
-            "[model_runtime] killing stale detached actor name=%s expected_domain=%s expected_replica=%s expected_generation=%s expected_max_claim=%s expected_token_budget=%s health=%s",
+            "[model_runtime] killing stale detached actor name=%s expected_domain=%s expected_replica=%s expected_generation=%s expected_max_claim=%s expected_token_budget=%s expected_runtime_env_fingerprint=%s health=%s",
             name,
             domain_key,
             replica_id,
             actor_generation,
             max_claim,
             expected_token_budget,
+            expected_runtime_env_fingerprint,
             health,
         )
         ray.kill(existing, no_restart=True)
@@ -165,6 +181,7 @@ def get_or_create_model_runtime_actor(
         max_claim=max_claim,
         token_budget=token_budget,
         execution_timeout_s=execution_timeout_s,
+        runtime_env_fingerprint=expected_runtime_env_fingerprint,
     )
 
 
@@ -222,6 +239,7 @@ class ModelRuntimeActor:
         max_claim: int = 1,
         token_budget: int | None = None,
         execution_timeout_s: float | None = None,
+        runtime_env_fingerprint: str | None = None,
         scheduler_client: ModelWorkSchedulerClient | None = None,
         task_futures_client: Any | None = None,
         task_state_store_client: Any | None = None,
@@ -264,6 +282,7 @@ class ModelRuntimeActor:
                 if execution_timeout_s is not None
                 else os.environ.get("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_S")
             ),
+            runtime_env_fingerprint=runtime_env_fingerprint,
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
         self._task_futures = task_futures_client if task_futures_client is not None else task_futures
@@ -362,6 +381,7 @@ class ModelRuntimeActor:
             "lease_ttl_s": float(self._config.lease_ttl_s),
             "max_claim": int(self._config.max_claim),
             "token_budget": self._config.token_budget,
+            "runtime_env_fingerprint": self._config.runtime_env_fingerprint,
             "dynamic_token_budget": self._dynamic_token_budget,
             "dynamic_token_capacity_tokens": self._dynamic_token_capacity_tokens,
             "dynamic_token_budget_ratio": self._dynamic_token_budget_ratio,

@@ -1579,3 +1579,80 @@ def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> No
     assert out == {"created": True}
     assert killed and killed[0][1] is True
     assert created[-1]["kwargs"]["max_claim"] == 64
+
+
+def test_issue_679_get_or_create_recreates_stale_runtime_env(monkeypatch) -> None:
+    killed: list[object] = []
+    created: list[dict] = []
+
+    class _RemoteResult:
+        def __init__(self, value):
+            self.value = value
+
+    class _ExistingActor:
+        class _Health:
+            @staticmethod
+            def remote():
+                return _RemoteResult(
+                    {
+                        "domain_key": "bumblebee:model-a",
+                        "replica_id": "replica-0",
+                        "actor_generation": 3,
+                        "max_claim": 16,
+                        "token_budget": 262144,
+                        "runtime_env_fingerprint": "old-placement",
+                    }
+                )
+
+        health_snapshot = _Health()
+
+    class _RemoteClass:
+        def options(self, **options):
+            created.append({"options": dict(options)})
+            return self
+
+        def remote(self, **kwargs):
+            created[-1]["kwargs"] = dict(kwargs)
+            return {"created": True}
+
+    class _Ray:
+        @staticmethod
+        def get_actor(_name, namespace=None):
+            _ = namespace
+            return _ExistingActor()
+
+        @staticmethod
+        def kill(actor, no_restart=True):
+            killed.append((actor, no_restart))
+
+        @staticmethod
+        def remote(**_kwargs):
+            return lambda _cls: _RemoteClass()
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
+        lambda ref, timeout_s=None: ref.value,
+    )
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        lambda **_kwargs: {},
+    )
+
+    out = get_or_create_model_runtime_actor(
+        domain_key="bumblebee:model-a",
+        replica_id="replica-0",
+        actor_name="actor-a",
+        actor_generation=3,
+        max_claim=16,
+        token_budget=262144,
+        runtime_env_extra={"MINT_MODEL_PLACEMENT_JSON": '{"model-a":{"node_ip":"10.0.0.7"}}'},
+    )
+
+    assert out == {"created": True}
+    assert killed and killed[0][1] is True
+    assert created[-1]["kwargs"]["runtime_env_fingerprint"]
