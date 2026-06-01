@@ -257,6 +257,21 @@ def validate_peft_adapter_checkpoint_shapes(
     if os.path.isfile(config_path):
         with open(config_path, "r", encoding="utf-8") as handle:
             adapter_config = json.load(handle)
+        if not isinstance(adapter_config, dict):
+            raise ValueError(
+                f"adapter_config.json must contain a JSON object, got {type(adapter_config).__name__}"
+            )
+        peft_type = adapter_config.get("peft_type")
+        if "peft_type" in adapter_config and (peft_type is None or peft_type == ""):
+            raise ValueError(
+                "adapter_config.json missing PEFT adapter type: expected peft_type='LORA'"
+            )
+        if peft_type is not None and not (
+            isinstance(peft_type, str) and peft_type.upper() == "LORA"
+        ):
+            raise ValueError(
+                f"adapter_config.json has unsupported peft_type={peft_type!r}; expected 'LORA'"
+            )
         raw_rank = adapter_config.get("r")
         if isinstance(raw_rank, int) and raw_rank > 0:
             config_rank = raw_rank

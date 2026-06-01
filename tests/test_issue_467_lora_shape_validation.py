@@ -37,6 +37,9 @@ def _write_adapter(tmp_path, tensors, *, rank=3):
                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
                 "bias": "none",
                 "task_type": "CAUSAL_LM",
+                "peft_type": "LORA",
+                "lora_dropout": 0.0,
+                "inference_mode": True,
             }
         ),
         encoding="utf-8",
@@ -75,6 +78,41 @@ def test_issue_467_validate_peft_adapter_checkpoint_shapes_rejects_fused_qkv_dis
 
     with pytest.raises(ValueError, match="lora_B output dim mismatch"):
         validate_peft_adapter_checkpoint_shapes(str(adapter_dir), str(base_dir))
+
+
+def test_validate_peft_adapter_checkpoint_shapes_rejects_missing_peft_type(tmp_path):
+    base_dir = _write_base_model(tmp_path)
+    adapter_dir = _write_adapter(
+        tmp_path,
+        {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros((3, 2)),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros((4, 3)),
+        },
+    )
+    config_path = adapter_dir / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["peft_type"] = None
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="expected peft_type='LORA'"):
+        validate_peft_adapter_checkpoint_shapes(str(adapter_dir), str(base_dir))
+
+
+def test_validate_peft_adapter_checkpoint_shapes_accepts_legacy_config_without_peft_type(tmp_path):
+    base_dir = _write_base_model(tmp_path)
+    adapter_dir = _write_adapter(
+        tmp_path,
+        {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.zeros((3, 2)),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.zeros((4, 3)),
+        },
+    )
+    config_path = adapter_dir / "adapter_config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    del config["peft_type"]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    validate_peft_adapter_checkpoint_shapes(str(adapter_dir), str(base_dir))
 
 
 def test_issue_467_maybe_validate_peft_adapter_checkpoint_shapes_can_be_explicitly_disabled(
