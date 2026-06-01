@@ -25,6 +25,7 @@ from mint_server.backend.bumblebee_distributed import (
     _bumblebee_runtime_etp,
     _coerce_int,
     _make_bumblebee_pg_name,
+    _normalize_bumblebee_peft_adapter_config,
     get_or_create_bumblebee_worker_group,
 )
 
@@ -152,6 +153,64 @@ def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tm
 
 def test_bumblebee_optimizer_metric_coerces_missing_num_zeros():
     assert _coerce_int(None) == 0
+
+
+def test_bumblebee_adapter_config_normalization_writes_peft_lora(tmp_path):
+    config_path = tmp_path / "adapter_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "r": 16,
+                "lora_alpha": 128,
+                "target_modules": ["q_proj"],
+                "bias": "none",
+                "task_type": "CAUSAL_LM",
+                "peft_type": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = _normalize_bumblebee_peft_adapter_config(tmp_path)
+
+    assert config is not None
+    assert config["peft_type"] == "LORA"
+    assert config["lora_dropout"] == 0.0
+    assert config["inference_mode"] is True
+    persisted = json.loads(config_path.read_text(encoding="utf-8"))
+    assert persisted["peft_type"] == "LORA"
+
+
+def test_bumblebee_group_normalizes_adapter_config_after_all_rank_writes(tmp_path):
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    remote = SimpleNamespace(remote=lambda *_args, **_kwargs: object())
+    group.workers = [
+        SimpleNamespace(save_lora_weights=remote),
+        SimpleNamespace(save_lora_weights=remote),
+    ]
+    group._current_session = "session-a"
+    group._ensure_initialized = MethodType(lambda self: None, group)
+
+    def fake_ray_get_group_results(self, refs, *, op):
+        del refs, op
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"r": 16, "peft_type": "LORA"}),
+            encoding="utf-8",
+        )
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"r": 16, "peft_type": None}),
+            encoding="utf-8",
+        )
+        return [{"checkpoint_path": str(tmp_path), "backend": "bumblebee"}]
+
+    group._ray_get_group_results = MethodType(fake_ray_get_group_results, group)
+
+    result = group.save_lora_weights(str(tmp_path), session_id="session-a", actual_rank=16)
+
+    persisted = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert persisted["peft_type"] == "LORA"
+    assert result["adapter_config"]["peft_type"] == "LORA"
 
 
 def _make_rank_worker_for_checkpoint_test():

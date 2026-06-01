@@ -98,6 +98,45 @@ def _get_bumblebee_create_lock(actor_name: str) -> threading.Lock:
         return lock
 
 
+def _normalize_bumblebee_peft_adapter_config(adapter_dir: str | Path) -> dict[str, Any] | None:
+    """Make Bumblebee-exported adapter_config.json consumable by PEFT/vLLM."""
+    config_path = Path(adapter_dir) / "adapter_config.json"
+    if not config_path.is_file():
+        return None
+
+    try:
+        loaded = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"Failed to read Bumblebee adapter_config.json at {config_path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise RuntimeError(
+            f"Bumblebee adapter_config.json must contain a JSON object, got {type(loaded).__name__}"
+        )
+
+    changed = False
+    peft_type = loaded.get("peft_type")
+    if peft_type is None or peft_type == "":
+        loaded["peft_type"] = "LORA"
+        changed = True
+    elif isinstance(peft_type, str) and peft_type.upper() == "LORA":
+        if peft_type != "LORA":
+            loaded["peft_type"] = "LORA"
+            changed = True
+    else:
+        raise RuntimeError(f"Unsupported Bumblebee adapter peft_type in {config_path}: {peft_type!r}")
+
+    if "lora_dropout" not in loaded:
+        loaded["lora_dropout"] = 0.0
+        changed = True
+    if "inference_mode" not in loaded:
+        loaded["inference_mode"] = True
+        changed = True
+
+    if changed:
+        config_path.write_text(json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return loaded
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -1138,7 +1177,7 @@ class BumblebeeRankWorker:
 
         logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
         chunks = handle._extras.get("model_chunks", [handle._model])
-        return save_lora_adapter(
+        meta = save_lora_adapter(
             chunks,
             handle._extras["model_cfg"],
             handle._parallel_state,
@@ -1157,6 +1196,7 @@ class BumblebeeRankWorker:
                 "rank": self.rank,
             },
         )
+        return meta
 
     def save_training_state(
         self,
@@ -1845,10 +1885,16 @@ class BumblebeeWorkerGroup:
             for worker in self.workers
         ]
         results = self._ray_get_group_results(refs, op="save_lora_weights")
+        adapter_config = _normalize_bumblebee_peft_adapter_config(save_path)
         for result in results:
             if isinstance(result, dict) and result.get("adapter_config"):
+                if adapter_config is not None:
+                    result["adapter_config"] = adapter_config
                 return result
-        return {"checkpoint_path": str(Path(save_path).resolve()), "backend": "bumblebee"}
+        result = {"checkpoint_path": str(Path(save_path).resolve()), "backend": "bumblebee"}
+        if adapter_config is not None:
+            result["adapter_config"] = adapter_config
+        return result
 
     def save_checkpoint(self, save_path: str, **kwargs: Any) -> dict[str, Any]:
         return self.save_training_state(save_path, **kwargs)
@@ -1880,7 +1926,11 @@ class BumblebeeWorkerGroup:
             for worker in self.workers
         ]
         results = self._ray_get_group_results(refs, op="save_training_state")
-        return self._merge_rank_payloads(results)
+        merged = self._merge_rank_payloads(results)
+        adapter_config = _normalize_bumblebee_peft_adapter_config(save_path)
+        if adapter_config is not None:
+            merged["adapter_config"] = adapter_config
+        return merged
 
     def load_checkpoint(self, load_path: str, load_optimizer: bool = True, **kwargs: Any) -> dict[str, Any]:
         return self.load_training_state(load_path, load_optimizer=load_optimizer, **kwargs)
