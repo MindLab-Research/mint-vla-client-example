@@ -1906,6 +1906,7 @@ class ModelActorSupervisorCore:
             "last_action_at": time.time(),
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
+            "scheduler_status": "healthy",
         }
         await self._sync_scheduler(raise_on_error=True)
         if self._runtime_factory is not None:
@@ -1973,6 +1974,9 @@ class ModelActorSupervisorCore:
     ) -> ModelReplicaRegistration:
         generation = int(state.get("generation") or self._generations.get(spec.key, 0) or 0)
         status = str(state.get("state") or "starting")
+        scheduler_status = str(state.get("scheduler_status") or "").strip()
+        if scheduler_status and status == "starting":
+            status = scheduler_status
         if status == "running":
             status = "healthy"
         if status in {"blocked", "disabled", "dead", "unhealthy"}:
