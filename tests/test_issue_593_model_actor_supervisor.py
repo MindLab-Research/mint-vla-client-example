@@ -1167,7 +1167,7 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert synced[0][0]["domain_key"] == "vllm:model-a"
     assert synced[0][0]["status"] == "starting"
     assert synced[0][0]["generation"] == 0
-    assert synced[1][0]["status"] == "starting"
+    assert synced[1][0]["status"] == "healthy"
     assert synced[1][0]["generation"] >= 1
     assert synced[1][0]["consumer_id"].endswith(f"generation::{synced[1][0]['generation']}")
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
@@ -1283,6 +1283,50 @@ async def test_issue_593_supervisor_shuts_down_runtime_when_healthy_sync_fails()
     assert out["snapshot"]["scheduler_sync_failures_total"] == 1
     assert out["snapshot"]["replicas"][label]["state"] == "dead"
     assert "healthy sync unavailable" in out["snapshot"]["replicas"][label]["last_error"]
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_does_not_keep_claimable_status_after_start_failure() -> None:
+    synced: list[list[dict]] = []
+
+    class _FailingStartRuntime(_FakeRuntimeActor):
+        def start(self) -> dict:
+            self.start_calls += 1
+            raise RuntimeError("runtime start failed")
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        return _FailingStartRuntime(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+
+    async def _sync(registrations):
+        synced.append([registration.to_dict() for registration in registrations])
+
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:model-a",
+                replica_id="replica-0",
+                base_model="model-a",
+                gpu_count=4,
+            )
+        ],
+        runtime_factory=_factory,
+        scheduler_sync=_sync,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert out["ok"] is True
+    assert synced[1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "dead"
+    assert out["snapshot"]["replicas"][label]["state"] == "dead"
+    assert "runtime start failed" in out["snapshot"]["replicas"][label]["last_error"]
 
 
 @pytest.mark.anyio
