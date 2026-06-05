@@ -1196,6 +1196,7 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_USAGE_BACKEND": "postgres",
             "MINT_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
+            "MINT_USAGE_PG_TABLE": "mint_platform.usage_event",
         },
     )
     data = payload["runtime_env"]
@@ -1203,6 +1204,7 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     assert "MINT_USAGE_BACKEND" not in data
     assert actor_env["MINT_USAGE_BACKEND"] == "postgres"
     assert actor_env["MINT_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
+    assert actor_env["MINT_USAGE_PG_TABLE"] == "mint_platform.usage_event"
 
 
 def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):

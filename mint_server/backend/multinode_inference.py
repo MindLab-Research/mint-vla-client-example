@@ -80,6 +80,36 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def _resolve_fully_sharded_loras_env_value(
+    *,
+    enable_lora: bool,
+    max_lora_rank: int | None,
+    tensor_parallel_size: int,
+) -> str:
+    eligible = (
+        bool(enable_lora)
+        and max_lora_rank is not None
+        and int(tensor_parallel_size) > 1
+        and int(max_lora_rank) % int(tensor_parallel_size) == 0
+    )
+    enabled = _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True) and eligible
+    return "1" if enabled else "0"
+
+
+def _set_multinode_fully_sharded_loras_env(
+    env_vars: dict[str, str],
+    *,
+    enable_lora: bool,
+    max_lora_rank: int | None,
+    tensor_parallel_size: int,
+) -> None:
+    env_vars["MINT_VLLM_FULLY_SHARDED_LORAS"] = _resolve_fully_sharded_loras_env_value(
+        enable_lora=enable_lora,
+        max_lora_rank=max_lora_rank,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+
+
 def _import_vllm_async_engine_components() -> tuple[type[Any], type[Any]]:
     try:
         from vllm import AsyncEngineArgs, AsyncLLMEngine
@@ -950,12 +980,11 @@ def _create_mint_vllm_multinode_actor(
                     f"Invalid MINT_VLLM_DISTRIBUTED_EXECUTOR_BACKEND={distributed_executor_backend!r} "
                     f"(expected 'ray' or 'mp')"
                 )
-            fully_sharded_loras = (
-                _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
-                and self.enable_lora
-                and self.max_lora_rank is not None
-                and self.max_lora_rank % self.tensor_parallel_size == 0
-            )
+            fully_sharded_loras = _resolve_fully_sharded_loras_env_value(
+                enable_lora=self.enable_lora,
+                max_lora_rank=self.max_lora_rank,
+                tensor_parallel_size=self.tensor_parallel_size,
+            ) == "1"
             if fully_sharded_loras:
                 _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
             lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
@@ -1172,13 +1201,11 @@ def _create_mint_vllm_multinode_actor(
                 async with self._lock_write():
                     t1 = time.perf_counter()
                     try:
-                        fully_sharded_loras = (
-                            _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=True)
-                            and self.enable_lora
-                            and self.max_lora_rank is not None
-                            and self.tensor_parallel_size > 1
-                            and self.max_lora_rank % self.tensor_parallel_size == 0
-                        )
+                        fully_sharded_loras = _resolve_fully_sharded_loras_env_value(
+                            enable_lora=self.enable_lora,
+                            max_lora_rank=self.max_lora_rank,
+                            tensor_parallel_size=self.tensor_parallel_size,
+                        ) == "1"
                         maybe_validate_peft_adapter_checkpoint_shapes(
                             lora_path,
                             self.model_path,
@@ -2809,6 +2836,12 @@ class MultiNodeInferenceEngine:
             # Fully sharded LoRAs are the default for multinode MoE actors when
             # max_lora_rank is divisible by TP. Operators can still turn this off via:
             #   export MINT_VLLM_FULLY_SHARDED_LORAS=0
+            _set_multinode_fully_sharded_loras_env(
+                env_vars,
+                enable_lora=self.max_loras > 0,
+                max_lora_rank=self.max_lora_rank,
+                tensor_parallel_size=self.tensor_parallel_size,
+            )
             runtime_env = {"env_vars": env_vars}
             preferred_python = (preferred_vllm_python_executable() or "").strip()
             if preferred_python:
