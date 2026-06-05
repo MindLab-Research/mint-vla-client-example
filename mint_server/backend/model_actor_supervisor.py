@@ -1889,6 +1889,25 @@ class ModelActorSupervisorCore:
     async def _create_runtime(self, spec: ModelActorSpec, *, reason: str) -> Any:
         key = spec.key
         generation = self._next_generation(key)
+        self._generations[key] = generation
+        self._states[key] = {
+            **self._states.get(key, {}),
+            "domain_key": spec.domain_key,
+            "replica_id": spec.replica_id,
+            "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+            "state": "starting",
+            "actor_name": spec.normalized_actor_name(),
+            "launcher_key": spec.launcher_key,
+            "generation": generation,
+            "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
+            "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+            "last_error": None,
+            "last_action": f"reserve:{reason}",
+            "last_action_at": time.time(),
+            "node_pins": spec.normalized_node_pins(),
+            "gpu_count": spec.gpu_count,
+        }
+        await self._sync_scheduler(raise_on_error=True)
         if self._runtime_factory is not None:
             actor = await _maybe_await(self._runtime_factory(spec, generation))
         else:
@@ -1932,6 +1951,19 @@ class ModelActorSupervisorCore:
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
         }
+        try:
+            await self._sync_scheduler(raise_on_error=True)
+        except Exception:
+            try:
+                await _invoke_actor(actor, "shutdown")
+            except Exception as shutdown_error:
+                logger.warning(
+                    "[model_actor_supervisor] runtime shutdown after scheduler sync failure failed: %s: %s",
+                    type(shutdown_error).__name__,
+                    shutdown_error,
+                )
+            self._actors.pop(key, None)
+            raise
         return actor
 
     def _replica_registration_for_state(
@@ -1963,7 +1995,7 @@ class ModelActorSupervisorCore:
             updated_at=float(state.get("last_action_at") or time.time()),
         )
 
-    async def _sync_scheduler(self) -> None:
+    async def _sync_scheduler(self, *, raise_on_error: bool = False) -> bool:
         registrations = [
             self._replica_registration_for_state(
                 self._spec_with_resolved_topology(
@@ -1985,6 +2017,7 @@ class ModelActorSupervisorCore:
             else:
                 await self._scheduler.sync_replicas(registrations)
             self._last_scheduler_sync_at = time.time()
+            return True
         except Exception as e:
             self._scheduler_sync_failures_total += 1
             logger.warning(
@@ -1992,6 +2025,9 @@ class ModelActorSupervisorCore:
                 type(e).__name__,
                 e,
             )
+            if raise_on_error:
+                raise
+            return False
 
     async def sync_replicas(self) -> dict[str, Any]:
         await self._sync_scheduler()
@@ -2097,6 +2133,9 @@ class ModelActorSupervisorCore:
         if not isinstance(placement_node_pins, dict):
             placement_node_pins = {}
 
+        if self._desired:
+            await self._sync_scheduler()
+
         results: dict[str, Any] = {}
         for key, original_spec in sorted(self._desired.items()):
             spec = resolved_desired.get(key, original_spec)
@@ -2177,7 +2216,27 @@ class ModelActorSupervisorCore:
 
             actor = self._actors.get(key)
             if actor is None:
-                await self._create_runtime(spec, reason="missing")
+                try:
+                    await self._create_runtime(spec, reason="missing")
+                except Exception as e:
+                    previous = self._states.get(key, {})
+                    crash_count = int(previous.get("crash_count", 0)) + 1
+                    self._states[key] = {
+                        **previous,
+                        "domain_key": spec.domain_key,
+                        "replica_id": spec.replica_id,
+                        "state": "dead",
+                        "actor_name": spec.normalized_actor_name(),
+                        "crash_count": crash_count,
+                        "last_error": f"{type(e).__name__}: {e}",
+                        "last_action": "create_failed:missing",
+                        "last_action_at": time.time(),
+                        "node_pins": resolved_node_pins,
+                        "worker_aliases": original_spec.normalized_worker_aliases(),
+                        "gpu_count": spec.gpu_count,
+                    }
+                    results[label] = self._states[key]
+                    continue
                 self._states[key]["worker_aliases"] = original_spec.normalized_worker_aliases()
                 results[label] = self._states[key]
                 continue
@@ -2231,8 +2290,24 @@ class ModelActorSupervisorCore:
                         "gpu_count": spec.gpu_count,
                     }
                     self._actors.pop(key, None)
-                    await self._create_runtime(spec, reason="unhealthy")
-                    self._states[key]["crash_count"] = crash_count
+                    try:
+                        await self._create_runtime(spec, reason="unhealthy")
+                        self._states[key]["crash_count"] = crash_count
+                    except Exception as e:
+                        self._states[key] = {
+                            **self._states.get(key, {}),
+                            "domain_key": spec.domain_key,
+                            "replica_id": spec.replica_id,
+                            "state": "dead",
+                            "actor_name": spec.normalized_actor_name(),
+                            "crash_count": crash_count,
+                            "last_error": f"{type(e).__name__}: {e}",
+                            "last_action": "create_failed:unhealthy",
+                            "last_action_at": time.time(),
+                            "node_pins": resolved_node_pins,
+                            "worker_aliases": original_spec.normalized_worker_aliases(),
+                            "gpu_count": spec.gpu_count,
+                        }
                     results[label] = self._states[key]
                     continue
                 self._states[key] = {
@@ -2276,8 +2351,24 @@ class ModelActorSupervisorCore:
                     "gpu_count": spec.gpu_count,
                 }
                 self._actors.pop(key, None)
-                await self._create_runtime(spec, reason="dead")
-                self._states[key]["crash_count"] = crash_count
+                try:
+                    await self._create_runtime(spec, reason="dead")
+                    self._states[key]["crash_count"] = crash_count
+                except Exception as create_error:
+                    self._states[key] = {
+                        **self._states.get(key, {}),
+                        "domain_key": spec.domain_key,
+                        "replica_id": spec.replica_id,
+                        "state": "dead",
+                        "actor_name": spec.normalized_actor_name(),
+                        "crash_count": crash_count,
+                        "last_error": f"{type(create_error).__name__}: {create_error}",
+                        "last_action": "create_failed:dead",
+                        "last_action_at": time.time(),
+                        "node_pins": resolved_node_pins,
+                        "worker_aliases": original_spec.normalized_worker_aliases(),
+                        "gpu_count": spec.gpu_count,
+                    }
                 results[label] = self._states[key]
 
         await self._sync_scheduler()

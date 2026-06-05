@@ -1126,9 +1126,11 @@ async def test_issue_648_launch_model_runtime_actor_passes_training_token_budget
 @pytest.mark.anyio
 async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> None:
     created: list[_FakeRuntimeActor] = []
+    events: list[str] = []
     synced: list[list[dict]] = []
 
     async def _factory(spec: ModelActorSpec, generation: int):
+        events.append("factory")
         actor = _FakeRuntimeActor(
             actor_name=spec.normalized_actor_name(),
             domain_key=spec.domain_key,
@@ -1139,6 +1141,7 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
         return actor
 
     async def _sync(registrations):
+        events.append("sync")
         synced.append([registration.to_dict() for registration in registrations])
 
     supervisor = ModelActorSupervisor(
@@ -1160,6 +1163,13 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert out["ok"] is True
     assert len(created) == 1
     assert created[0].start_calls == 1
+    assert events[:3] == ["sync", "sync", "factory"]
+    assert synced[0][0]["domain_key"] == "vllm:model-a"
+    assert synced[0][0]["status"] == "starting"
+    assert synced[0][0]["generation"] == 0
+    assert synced[1][0]["status"] == "starting"
+    assert synced[1][0]["generation"] >= 1
+    assert synced[1][0]["consumer_id"].endswith(f"generation::{synced[1][0]['generation']}")
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
     assert replica["state"] == "healthy"
     assert replica["generation"] >= 1
@@ -1178,6 +1188,101 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     async_snapshot = await supervisor.async_snapshot()
     assert async_snapshot["replicas"] == supervisor.snapshot()["replicas"]
     assert isinstance(async_snapshot["snapshot_generated_at"], float)
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_does_not_start_runtime_when_reserved_sync_fails() -> None:
+    created: list[_FakeRuntimeActor] = []
+    sync_calls = 0
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    async def _sync(_registrations):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 2:
+            raise RuntimeError("scheduler unavailable")
+
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:model-a",
+                replica_id="replica-0",
+                base_model="model-a",
+                gpu_count=4,
+            )
+        ],
+        runtime_factory=_factory,
+        scheduler_sync=_sync,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert out["ok"] is True
+    assert created == []
+    assert sync_calls == 3
+    assert out["snapshot"]["scheduler_sync_failures_total"] == 1
+    assert out["snapshot"]["replicas"][label]["state"] == "dead"
+    assert "scheduler unavailable" in out["snapshot"]["replicas"][label]["last_error"]
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_shuts_down_runtime_when_healthy_sync_fails() -> None:
+    created: list[_FakeRuntimeActor] = []
+    sync_calls = 0
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    async def _sync(_registrations):
+        nonlocal sync_calls
+        sync_calls += 1
+        if sync_calls == 3:
+            raise RuntimeError("healthy sync unavailable")
+
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:model-a",
+                replica_id="replica-0",
+                base_model="model-a",
+                gpu_count=4,
+            )
+        ],
+        runtime_factory=_factory,
+        scheduler_sync=_sync,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert out["ok"] is True
+    assert len(created) == 1
+    assert created[0].start_calls == 1
+    assert created[0].shutdown_calls == 1
+    assert created[0].running is False
+    assert supervisor._actors == {}
+    assert out["snapshot"]["scheduler_sync_failures_total"] == 1
+    assert out["snapshot"]["replicas"][label]["state"] == "dead"
+    assert "healthy sync unavailable" in out["snapshot"]["replicas"][label]["last_error"]
 
 
 @pytest.mark.anyio
