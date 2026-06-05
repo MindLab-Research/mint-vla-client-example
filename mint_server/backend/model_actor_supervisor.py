@@ -882,6 +882,12 @@ async def _invoke_actor(actor: Any, method_name: str, *args: Any, **kwargs: Any)
     return await _maybe_await(method(*args, **kwargs))
 
 
+def _is_ray_get_timeout_error(exc: BaseException) -> bool:
+    if exc.__class__.__name__ in {"GetTimeoutError", "_GetTimeoutError"}:
+        return True
+    return False
+
+
 class ModelActorSupervisorCore:
     def __init__(
         self,
@@ -947,6 +953,7 @@ class ModelActorSupervisorCore:
         self._control_plane_states: dict[str, dict[str, Any]] = {}
         self._control_plane_ensure_failures_total = 0
         self._actors: dict[tuple[str, str], Any] = {}
+        self._actor_generations: dict[tuple[str, str], int] = {}
         self._generations: dict[tuple[str, str], int] = {}
         self._states: dict[tuple[str, str], dict[str, Any]] = {}
         self._reconcile_total = 0
@@ -1870,6 +1877,29 @@ class ModelActorSupervisorCore:
             raise TypeError(f"runtime actor health_snapshot returned non-dict: {type(out)}")
         return out
 
+    def _actor_generation_matches_current(
+        self,
+        key: tuple[str, str],
+        actor: Any,
+        health: dict[str, Any] | None = None,
+    ) -> bool:
+        expected = int(self._generations.get(key, 0))
+        if expected <= 0:
+            return True
+        candidate: Any = None
+        if isinstance(health, dict):
+            candidate = health.get("actor_generation")
+        if candidate is None:
+            candidate = self._actor_generations.get(key)
+        if candidate is None:
+            candidate = getattr(actor, "generation", None)
+        if candidate is None:
+            return True
+        try:
+            return int(candidate) == expected
+        except (TypeError, ValueError):
+            return False
+
     def _next_generation(self, key: tuple[str, str]) -> int:
         previous = int(self._generations.get(key, 0))
         now = int(time.time())
@@ -1913,10 +1943,53 @@ class ModelActorSupervisorCore:
             actor = await _maybe_await(self._runtime_factory(spec, generation))
         else:
             actor = await self._launcher_registry.launch(spec, generation, launcher_key=spec.launcher_key)
-        start_result = await _invoke_actor(actor, "start")
+        try:
+            start_result = await _invoke_actor(actor, "start")
+        except Exception as e:
+            if not _is_ray_get_timeout_error(e):
+                raise
+            self._actors[key] = actor
+            self._actor_generations[key] = generation
+            self._created_total += 1
+            if reason != "missing":
+                self._restarted_total += 1
+            self._states[key] = {
+                **self._states.get(key, {}),
+                "domain_key": spec.domain_key,
+                "replica_id": spec.replica_id,
+                "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+                "state": "starting",
+                "actor_name": spec.normalized_actor_name(),
+                "launcher_key": spec.launcher_key,
+                "generation": generation,
+                "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
+                "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+                "last_error": f"{type(e).__name__}: {e}",
+                "last_action": f"start_pending:{reason}",
+                "last_action_at": time.time(),
+                "node_pins": spec.normalized_node_pins(),
+                "gpu_count": spec.gpu_count,
+                "scheduler_status": "healthy",
+            }
+            try:
+                await self._sync_scheduler(raise_on_error=True)
+            except Exception:
+                try:
+                    await _invoke_actor(actor, "shutdown")
+                except Exception as shutdown_error:
+                    logger.warning(
+                        "[model_actor_supervisor] runtime shutdown after pending-start scheduler sync failure failed: %s: %s",
+                        type(shutdown_error).__name__,
+                        shutdown_error,
+                    )
+                self._actors.pop(key, None)
+                self._actor_generations.pop(key, None)
+                raise
+            return actor
         if isinstance(start_result, dict) and start_result.get("running") is False:
             raise RuntimeError(f"runtime actor did not start: {start_result!r}")
         self._actors[key] = actor
+        self._actor_generations[key] = generation
         self._generations[key] = generation
         self._created_total += 1
         if reason != "missing":
@@ -1964,6 +2037,7 @@ class ModelActorSupervisorCore:
                     shutdown_error,
                 )
             self._actors.pop(key, None)
+            self._actor_generations.pop(key, None)
             raise
         return actor
 
@@ -2247,6 +2321,11 @@ class ModelActorSupervisorCore:
 
             try:
                 health = await self._actor_health(actor)
+                if not self._actor_generation_matches_current(key, actor, health):
+                    self._actors.pop(key, None)
+                    self._actor_generations.pop(key, None)
+                    results[label] = self._states.get(key, {})
+                    continue
                 runtime_last_error = str(health.get("last_error") or "").strip()
                 runtime_failed_total = int(health.get("failed_total") or 0)
                 runtime_completed_total = int(health.get("completed_total") or 0)
@@ -2294,6 +2373,7 @@ class ModelActorSupervisorCore:
                         "gpu_count": spec.gpu_count,
                     }
                     self._actors.pop(key, None)
+                    self._actor_generations.pop(key, None)
                     try:
                         await self._create_runtime(spec, reason="unhealthy")
                         self._states[key]["crash_count"] = crash_count
@@ -2338,6 +2418,11 @@ class ModelActorSupervisorCore:
                 }
                 results[label] = self._states[key]
             except Exception as e:
+                if not self._actor_generation_matches_current(key, actor):
+                    self._actors.pop(key, None)
+                    self._actor_generations.pop(key, None)
+                    results[label] = self._states.get(key, {})
+                    continue
                 previous = self._states.get(key, {})
                 crash_count = int(previous.get("crash_count", 0)) + 1
                 self._states[key] = {
@@ -2355,6 +2440,7 @@ class ModelActorSupervisorCore:
                     "gpu_count": spec.gpu_count,
                 }
                 self._actors.pop(key, None)
+                self._actor_generations.pop(key, None)
                 try:
                     await self._create_runtime(spec, reason="dead")
                     self._states[key]["crash_count"] = crash_count
@@ -2434,6 +2520,7 @@ class ModelActorSupervisorCore:
                 e,
             )
         self._actors.pop(key, None)
+        self._actor_generations.pop(key, None)
         self._states[key] = {
             **self._states.get(key, {}),
             "domain_key": domain_key,
