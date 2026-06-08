@@ -76,6 +76,43 @@ class FailureClassification:
     detail: str | None = None
 
 
+def classify_preflight_failure(message: str) -> FailureClassification:
+    lowered = str(message or "").lower()
+    if "http error 503" in lowered or "service unavailable" in lowered:
+        return FailureClassification(
+            "server health/control-plane",
+            _compact_error_detail(message) or "HTTP health preflight returned 503 Service Unavailable",
+        )
+    if (
+        "http error 500" in lowered
+        or "http error 502" in lowered
+        or "http error 504" in lowered
+        or "timed out" in lowered
+        or "timeout" in lowered
+        or "connection refused" in lowered
+        or "temporarily unavailable" in lowered
+    ):
+        return FailureClassification(
+            "server exception",
+            _compact_error_detail(message) or "HTTP health preflight failed before model execution",
+        )
+    if (
+        "api key" in lowered
+        or "api_key" in lowered
+        or "unauthorized" in lowered
+        or "forbidden" in lowered
+        or "checkpoint_owner" in lowered
+        or "owner objectid" in lowered
+        or "base url" in lowered
+        or "production url" in lowered
+    ):
+        return FailureClassification("client env/auth", _compact_error_detail(message))
+    return FailureClassification(
+        "client workflow",
+        _compact_error_detail(message) or "preflight failed before model execution",
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run MinT production RL sanity checks with aligned params and artifacts."
@@ -785,6 +822,7 @@ def _failure_surface(result: dict[str, object]) -> str:
 
 
 def preflight_failure_results(models: list[str], message: str) -> list[dict[str, object]]:
+    classification = classify_preflight_failure(message)
     return [
         {
             "model": model,
@@ -797,9 +835,9 @@ def preflight_failure_results(models: list[str], message: str) -> list[dict[str,
             "experiment_dir": None,
             "request_ids": {},
             "session_ids": {},
-            "failure_class": "client env/auth",
+            "failure_class": classification.failure_class,
             "failure_surface": "preflight",
-            "failure_detail": message,
+            "failure_detail": classification.detail or message,
             "timing_summary_json": None,
             "timing_summary_md": None,
             "timing_events_jsonl": None,

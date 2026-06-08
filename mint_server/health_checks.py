@@ -12,6 +12,7 @@ PUBLIC_HEALTHZ_CACHE_TTL_S = 30.0
 PUBLIC_HEALTHZ_REFRESH_TIMEOUT_S = 5.0
 PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S = 2.0
 INTERNAL_HEALTHZ_STALE_AFTER_S = 60.0
+INTERNAL_HEALTHZ_FUTURE_STORE_TIMEOUT_S = 2.0
 
 
 @dataclass
@@ -51,12 +52,14 @@ def public_healthz_cache_age_seconds() -> float | None:
 
 async def _ping_public_dependencies(*, timeout_s: float) -> None:
     from .backend.model_work_scheduler import model_work_scheduler
-    from .backend.task_state_store import task_futures
+    from .backend.task_state_store import task_state_store
 
     scheduler_ping = getattr(model_work_scheduler, "async_ping", None)
     if scheduler_ping is None:
         scheduler_ping = getattr(model_work_scheduler, "ping")
-    task_ping = getattr(task_futures, "async_ping", None)
+    task_ping = getattr(task_state_store, "async_ping", None)
+    if task_ping is None:
+        task_ping = getattr(task_state_store, "ping")
 
     component_timeout_s = min(timeout_s, PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S)
 
@@ -257,6 +260,40 @@ async def _billing_outbox_health_snapshot() -> dict[str, object]:
     }
 
 
+async def _future_state_store_health_snapshot() -> dict[str, object]:
+    timeout_s = _env_float(
+        "MINT_INTERNAL_HEALTHZ_FUTURE_STORE_TIMEOUT_S",
+        INTERNAL_HEALTHZ_FUTURE_STORE_TIMEOUT_S,
+    )
+    started = time.monotonic()
+    try:
+        from .backend.task_state_store import task_futures
+
+        ping = await asyncio.wait_for(
+            task_futures.async_ping(timeout_s=timeout_s),
+            timeout=max(0.001, timeout_s),
+        )
+    except asyncio.TimeoutError:
+        return {
+            "status": "degraded",
+            "reason": "future_state_store_ping_timeout",
+            "timeout_s": timeout_s,
+        }
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "reason": "future_state_store_unavailable",
+            "error": f"{type(e).__name__}: {e}",
+        }
+
+    return {
+        "status": "ready",
+        "latency_s": max(0.0, time.monotonic() - started),
+        "store": ping.get("store") if isinstance(ping, dict) else None,
+        "actor_name": ping.get("actor_name") if isinstance(ping, dict) else None,
+    }
+
+
 async def internal_lightweight_healthz_response() -> dict:
     """Internal operational health from process-local/cached control-plane state."""
     now = time.time()
@@ -289,6 +326,9 @@ async def internal_lightweight_healthz_response() -> dict:
     billing_snapshot = await _billing_outbox_health_snapshot()
     if _cron_degraded_from_snapshot(billing_snapshot) and status == "ready":
         status = "degraded"
+    future_store_snapshot = await _future_state_store_health_snapshot()
+    if _cron_degraded_from_snapshot(future_store_snapshot) and status == "ready":
+        status = "degraded"
 
     observed_at = supervisor_snapshot.get("observed_at")
     topology = supervisor_snapshot.get("topology")
@@ -307,4 +347,5 @@ async def internal_lightweight_healthz_response() -> dict:
         "maintenance_cron_actor": cron_snapshot,
         "startup": startup_snapshot,
         "billing_outbox": billing_snapshot,
+        "future_state_store": future_store_snapshot,
     }

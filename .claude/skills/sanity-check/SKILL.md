@@ -100,6 +100,7 @@ If the wrapper reports any failure:
 2. Classify the failure as one of:
    - `client env/auth`: base URL, API key, auth, or checkpoint owner id.
    - `client workflow`: wrapper/script compatibility problems, SDK URI mismatch, local validation errors, or report-generation bugs.
+   - `server health/control-plane`: HTTP health preflight 503 or a public control-plane dependency reported unhealthy before model execution.
    - `capacity/scheduling`: placement pending, actor not registered, queue not consumed, GPU/PG held by stale actor.
    - `server exception`: traceback, 5xx, explicit request failure, actor crash, `ActorDiedError`, `EngineDeadError`, CUDA OOM.
    - `timing degradation`: no hard failure, but a stage is materially slower than expected.

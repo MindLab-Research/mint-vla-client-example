@@ -58,6 +58,29 @@ def test_sampling_inactivity_is_capacity_scheduling_with_detail():
     assert "inactivity TTL" in classification.detail
 
 
+def test_preflight_http_503_is_control_plane_health():
+    train_check = _load_train_check()
+
+    classification = train_check.classify_preflight_failure(
+        "HTTP preflight failed: HTTP Error 503: Service Unavailable"
+    )
+    results = train_check.preflight_failure_results(["Qwen/Test"], classification.detail or "")
+
+    assert classification.failure_class == "server health/control-plane"
+    assert results[0]["failure_class"] == "server health/control-plane"
+    assert results[0]["failure_surface"] == "preflight"
+
+
+def test_preflight_auth_remains_client_env_auth():
+    train_check = _load_train_check()
+
+    classification = train_check.classify_preflight_failure(
+        "MINT_API_KEY is required for production sanity checks"
+    )
+
+    assert classification.failure_class == "client env/auth"
+
+
 def test_unknown_failure_includes_compact_error_detail():
     train_check = _load_train_check()
     text = """
