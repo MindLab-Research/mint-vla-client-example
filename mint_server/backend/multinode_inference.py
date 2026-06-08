@@ -11,7 +11,6 @@ For K2 (1T params, 384 experts):
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import math
 import os
@@ -52,6 +51,12 @@ from .node_placement import (
     assert_node_ip_capacity,
     ModelGpuPlacement,
     parse_model_gpu_placement,
+)
+from .qwen35_text_vllm_adapter import (
+    QWEN35_VLLM_ARCHITECTURE,
+    infer_hf_torch_dtype_str,
+    install_vllm_qwen35_text_only_adapter_patches,
+    materialize_qwen35_text_vllm_config,
 )
 
 if TYPE_CHECKING:
@@ -990,35 +995,12 @@ def _create_mint_vllm_multinode_actor(
             lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
             lora_dtype_resolved = lora_dtype_env
             if self.enable_lora and lora_dtype_env.lower() == "auto":
-                def _infer_hf_torch_dtype_str(model_path: str) -> str | None:
-                    from transformers import AutoConfig
-                    import torch
-
-                    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-                    torch_dtype = getattr(cfg, "torch_dtype", None)
-                    if torch_dtype is None:
-                        return None
-                    if isinstance(torch_dtype, str):
-                        dtype_str = torch_dtype
-                    elif isinstance(torch_dtype, torch.dtype):
-                        dtype_str = str(torch_dtype)
-                    else:
-                        dtype_str = str(torch_dtype)
-                    dtype_str = dtype_str.replace("torch.", "").strip().lower()
-                    if dtype_str in ("fp16", "float16", "half"):
-                        return "float16"
-                    if dtype_str in ("bf16", "bfloat16"):
-                        return "bfloat16"
-                    if dtype_str in ("fp32", "float32"):
-                        return "float32"
-                    return None
-
                 # vLLM fused MoE LoRA Triton kernels reinterpret LoRA weight pointers as the
                 # output dtype (see vllm/lora/ops/triton_ops/fused_moe_lora_op.py). If LoRA
                 # weights are loaded in fp16 while model output is bf16, the kernel will
                 # read fp16 memory as bf16 and can produce NaNs. Default to bf16 for BF16
                 # model snapshots unless explicitly overridden.
-                inferred = _infer_hf_torch_dtype_str(str(self.model_path))
+                inferred = infer_hf_torch_dtype_str(str(self.model_path))
                 if inferred is not None:
                     lora_dtype_resolved = inferred
                 elif "BF16" in str(self.model_path).upper():
@@ -1033,6 +1015,15 @@ def _create_mint_vllm_multinode_actor(
             logger.info(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
             )
+            qwen35_vllm_config_path = materialize_qwen35_text_vllm_config(str(self.model_path))
+            if qwen35_vllm_config_path is not None:
+                install_vllm_qwen35_text_only_adapter_patches()
+                logger.info(
+                    "Using Qwen3.5 text-only vLLM adapter: model=%r hf_config_path=%r architecture=%s",
+                    self.model_path,
+                    qwen35_vllm_config_path,
+                    QWEN35_VLLM_ARCHITECTURE,
+                )
             enable_return_routed_experts = (server_config.router_replay_mode == "R3")
             if enable_return_routed_experts:
                 import inspect
@@ -1058,6 +1049,7 @@ def _create_mint_vllm_multinode_actor(
             all2all_backend = all2all_backend_env or default_all2all_backend
             engine_args = AsyncEngineArgs(
                 model=self.model_path,
+                hf_config_path=qwen35_vllm_config_path,
                 tensor_parallel_size=self.tensor_parallel_size,
                 pipeline_parallel_size=self.pipeline_parallel_size,
                 data_parallel_size=self.data_parallel_size,

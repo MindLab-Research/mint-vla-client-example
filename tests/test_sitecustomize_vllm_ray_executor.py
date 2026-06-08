@@ -123,3 +123,146 @@ def test_initialize_ray_cluster_prefers_ray_address_env_for_original(monkeypatch
 
     assert out == "ok"
     assert calls["ray_address"] == "192.168.39.87:6379"
+
+
+def test_qwen35_text_only_adapter_patch_runs_from_sitecustomize(monkeypatch):
+    import torch
+
+    class QwenNextMixtureOfExperts:
+        def __init__(self, config=None):
+            self.config = config
+
+        def set_moe_parameters(self):
+            raise RuntimeError("No Qwen3Next layer found in the model.layers.")
+
+    config = types.SimpleNamespace(
+        mint_qwen35_text_only_shim=True,
+        linear_num_key_heads=2,
+        linear_key_head_dim=2,
+        linear_num_value_heads=4,
+        linear_value_head_dim=2,
+    )
+
+    class Qwen3NextForCausalLM:
+        def __init__(self, config=config):
+            self.config = config
+
+        def load_weights(self, weights):
+            return list(weights)
+
+    class Qwen3NextModel:
+        def __init__(self):
+            self.config = config
+
+        def load_weights(self, weights):
+            return list(weights)
+
+    fake_vllm = _fake_package("vllm")
+    fake_executor = _fake_package("vllm.model_executor")
+    fake_models = _fake_package("vllm.model_executor.models")
+    fake_qwen3_next = types.ModuleType("vllm.model_executor.models.qwen3_next")
+    fake_qwen3_next.QwenNextMixtureOfExperts = QwenNextMixtureOfExperts
+    fake_qwen3_next.Qwen3NextForCausalLM = Qwen3NextForCausalLM
+    fake_qwen3_next.Qwen3NextModel = Qwen3NextModel
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor", fake_executor)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models", fake_models)
+    monkeypatch.setitem(sys.modules, "vllm.model_executor.models.qwen3_next", fake_qwen3_next)
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_qwen35_text_only_adapter()
+
+    unmarked_model = QwenNextMixtureOfExperts(types.SimpleNamespace())
+    try:
+        unmarked_model.set_moe_parameters()
+    except RuntimeError as exc:
+        assert "No Qwen3Next layer found" in str(exc)
+    else:
+        raise AssertionError("unmarked Qwen3Next MoE initialization must preserve upstream failure")
+
+    model = QwenNextMixtureOfExperts(config)
+    model.set_moe_parameters()
+
+    assert model.moe_layers == []
+    assert model.num_moe_layers == 0
+    assert model.num_logical_experts == 0
+
+    weights = [
+        ("model.language_model.layers.0.mlp.gate_proj.weight", "text"),
+        ("model.visual.blocks.0.attn.qkv.weight", "vision"),
+        ("model.language_model.norm.weight", "native"),
+    ]
+    outer_expected = [
+        ("model.layers.0.mlp.gate_proj.weight", "text"),
+        ("model.norm.weight", "native"),
+    ]
+    inner_expected = [
+        ("layers.0.mlp.gate_proj.weight", "text"),
+        ("norm.weight", "native"),
+    ]
+
+    assert Qwen3NextForCausalLM().load_weights(weights) == outer_expected
+    assert Qwen3NextModel().load_weights(weights) == inner_expected
+
+    unmarked_weights = Qwen3NextModel()
+    unmarked_weights.config = types.SimpleNamespace()
+    assert unmarked_weights.load_weights(weights) == weights
+
+    qkv = torch.arange(16 * 3, dtype=torch.float32).reshape(16, 3)
+    z = 100 + torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
+    b = 200 + torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    a = 300 + torch.arange(4 * 3, dtype=torch.float32).reshape(4, 3)
+    packed = Qwen3NextModel().load_weights(
+        [
+            ("model.language_model.layers.0.linear_attn.in_proj_qkv.weight", qkv),
+            ("model.language_model.layers.0.linear_attn.in_proj_b.weight", b),
+            ("model.language_model.layers.0.linear_attn.in_proj_z.weight", z),
+            ("model.language_model.layers.0.linear_attn.in_proj_a.weight", a),
+        ]
+    )
+    q, k, v = torch.split(qkv, [4, 4, 8], dim=0)
+    q = q.reshape(2, 2, 3)
+    k = k.reshape(2, 2, 3)
+    v = v.reshape(2, 4, 3)
+    z_grouped = z.reshape(2, 4, 3)
+    expected_qkvz = torch.cat([q, k, v, z_grouped], dim=1).reshape(-1, 3)
+    expected_ba = torch.cat([b.reshape(2, 2, 3), a.reshape(2, 2, 3)], dim=1).reshape(
+        -1, 3
+    )
+
+    assert packed[0][0] == "layers.0.linear_attn.in_proj_qkvz.weight"
+    assert torch.equal(packed[0][1], expected_qkvz)
+    assert packed[1][0] == "layers.0.linear_attn.in_proj_ba.weight"
+    assert torch.equal(packed[1][1], expected_ba)
+
+
+def test_qwen35_linear_attention_packing_fails_fast_on_bad_shapes():
+    import pytest
+    import torch
+
+    from mint_server.backend.qwen35_text_vllm_adapter import (
+        _pack_qwen35_b_a,
+        _pack_qwen35_qkv_z,
+    )
+
+    config = types.SimpleNamespace(
+        linear_num_key_heads=2,
+        linear_key_head_dim=2,
+        linear_num_value_heads=4,
+        linear_value_head_dim=2,
+    )
+
+    with pytest.raises(ValueError, match="in_proj_qkv weight shape"):
+        _pack_qwen35_qkv_z(
+            config,
+            torch.zeros((15, 3)),
+            torch.zeros((8, 3)),
+        )
+
+    with pytest.raises(ValueError, match="in_proj_a weight shape"):
+        _pack_qwen35_b_a(
+            config,
+            torch.zeros((4, 3)),
+            torch.zeros((5, 3)),
+        )

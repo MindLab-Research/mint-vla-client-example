@@ -120,3 +120,18 @@ def test_is_topology_desired_model_accepts_snapshot_entries(monkeypatch, tmp_pat
         ),
     )
     assert mr.is_topology_desired_model("Qwen/Qwen3-0.6B")
+
+
+def test_qwen35_27b_registry_and_path():
+    from mint_server.backend.model_registry import get_model_config
+    from mint_server.backend.multi_lora_engine import _resolve_model_path
+
+    cfg = get_model_config("Qwen/Qwen3.5-27B")
+    assert cfg.num_parameters == 27.0
+    assert cfg.is_moe is False
+    assert cfg.inference_tp == 4
+    assert cfg.max_loras >= 1
+    assert cfg.supported_modalities == ("text",)
+
+    path = _resolve_model_path("Qwen/Qwen3.5-27B")
+    assert "models--Qwen--Qwen3.5-27B" in path

@@ -87,6 +87,7 @@ class ModelConfig:
     # Cross-family dispatch metadata. Defaults preserve current text-model behavior.
     policy_family: Literal["text_lm", "ar_action_tokens", "flow_action"] = "text_lm"
     inference_modality: Literal["tokens", "actions"] = "tokens"
+    supported_modalities: tuple[Literal["text", "image", "video"], ...] = ("text",)
     training_backend: str = "mint_text"
     camera_layout: tuple[str, ...] = ()
     action_dim: int | None = None
@@ -216,6 +217,25 @@ MODEL_CONFIGS = {
         is_moe=False, inference_tp=1, inference_dp=1, train_tp=1, train_ep=1,
         max_model_len=32768,  # 32K context
         gradient_checkpointing=True,
+    ),
+    "Qwen/Qwen3.5-27B": ModelConfig(
+        num_parameters=27.0,
+        is_moe=False,
+        inference_tp=4,
+        inference_dp=1,
+        train_tp=4,
+        train_ep=1,
+        max_model_len=32768,
+        max_num_seqs=128,
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.90,
+        max_loras=4,
+        max_cpu_loras=16,
+        max_lora_rank=64,
+        gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
+        supported_modalities=("text",),
     ),
     # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA

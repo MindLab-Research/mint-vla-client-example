@@ -18,6 +18,21 @@ def _load_repo_sitecustomize() -> None:
     spec.loader.exec_module(module)
 
 
+def _prepare_ray_worker_bootstrap(script_path: str) -> None:
+    norm = script_path.replace("\\", "/")
+    if not norm.endswith("/ray/_private/workers/default_worker.py"):
+        return
+
+    os.environ["RAY_CLIENT_MODE"] = "0"
+    try:
+        import ray._private.client_mode_hook as client_mode_hook
+
+        client_mode_hook._explicitly_disable_client_mode()
+        client_mode_hook._set_client_hook_status(False)
+    except Exception:
+        pass
+
+
 def _run_as_python(argv: list[str]) -> None:
     if not argv:
         raise RuntimeError("vllm worker wrapper requires a target script/module")
@@ -55,6 +70,7 @@ def _run_as_python(argv: list[str]) -> None:
         return
 
     script_path = os.fspath(Path(head).resolve())
+    _prepare_ray_worker_bootstrap(script_path)
     sys.argv = [script_path, *tail]
     runpy.run_path(script_path, run_name="__main__")
 

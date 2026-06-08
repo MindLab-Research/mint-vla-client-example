@@ -1969,6 +1969,17 @@ def _patch_vllm_gpu_worker_kv_debug_info() -> None:
     cls.get_kv_debug_info = get_kv_debug_info  # type: ignore[method-assign]
 
 
+def _patch_vllm_qwen35_text_only_adapter() -> None:
+    try:
+        from mint_server.backend.qwen35_text_vllm_adapter import (
+            install_vllm_qwen35_text_only_adapter_patches,
+        )
+    except Exception:
+        return
+
+    install_vllm_qwen35_text_only_adapter_patches()
+
+
 def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
@@ -1992,6 +2003,7 @@ def _apply_vllm_worker_patches() -> None:
     _patch_vllm_ray_executor_use_explicit_cluster_address()
     _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
     _patch_vllm_gpu_worker_kv_debug_info()
+    _patch_vllm_qwen35_text_only_adapter()
     # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup
     # profiling path. Knob sizing depends on upstream accounting:
     # `weights_memory + peak_activation_memory + non_torch_increase`.
