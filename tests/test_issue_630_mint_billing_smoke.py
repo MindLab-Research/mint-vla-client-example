@@ -17,7 +17,9 @@ class _StubTaskFutureService:
         self.failed: dict[str, str] = {}
         self.billing_observations: dict[str, list[dict]] = {}
 
-    async def async_resolve(self, request_id: str, payload: dict, *, billing_observations=None) -> None:
+    async def async_resolve(
+        self, request_id: str, payload: dict, *, billing_observations=None
+    ) -> None:
         self.resolved[str(request_id)] = dict(payload)
         self.billing_observations[str(request_id)] = list(billing_observations or [])
 
@@ -59,7 +61,9 @@ def _gateway_auth() -> dict:
     }
 
 
-def _commit_success_with_observations(*, request_id: str, observations: list[dict]) -> list[dict]:
+def _commit_success_with_observations(
+    *, request_id: str, observations: list[dict]
+) -> list[dict]:
     store = TaskStateStore.in_memory()
     try:
         store.ensure_task(
@@ -79,7 +83,9 @@ def _commit_success_with_observations(*, request_id: str, observations: list[dic
             billing_observations=observations,
             now=101.0,
         )
-        claimed = store.claim_billing_outbox(claim_id="claim-1", limit=10, lease_ttl_s=30.0, now=102.0)
+        claimed = store.claim_billing_outbox(
+            claim_id="claim-1", limit=10, lease_ttl_s=30.0, now=102.0
+        )
         return [dict(row["event"]) for row in claimed]
     finally:
         store.close()
@@ -96,7 +102,9 @@ def test_issue_630_smoke_sft_vla_success_writes_training_outbox() -> None:
         )
     ]
 
-    events = _commit_success_with_observations(request_id="mint-vla-sft-1", observations=observations)
+    events = _commit_success_with_observations(
+        request_id="mint-vla-sft-1", observations=observations
+    )
 
     assert len(events) == 1
     assert events[0]["charge_item"] == "training"
@@ -107,7 +115,9 @@ def test_issue_630_smoke_sft_vla_success_writes_training_outbox() -> None:
     )
 
 
-def test_issue_630_smoke_rl_rollout_act_and_train_step_are_separate_outbox_events() -> None:
+def test_issue_630_smoke_rl_rollout_act_and_train_step_are_separate_outbox_events() -> (
+    None
+):
     observations = [
         _billing_observation(
             request_id="mint-rl-act-1",
@@ -132,9 +142,15 @@ def test_issue_630_smoke_rl_rollout_act_and_train_step_are_separate_outbox_event
         ),
     ]
 
-    events = _commit_success_with_observations(request_id="mint-rl-rollout-1", observations=observations)
+    events = _commit_success_with_observations(
+        request_id="mint-rl-rollout-1", observations=observations
+    )
 
-    assert [event["charge_item"] for event in events] == ["inference", "inference", "training"]
+    assert [event["charge_item"] for event in events] == [
+        "inference",
+        "inference",
+        "training",
+    ]
     assert [event["request_id"] for event in events] == [
         "mint-rl-act-1",
         "mint-rl-act-2",
@@ -142,7 +158,9 @@ def test_issue_630_smoke_rl_rollout_act_and_train_step_are_separate_outbox_event
     ]
 
 
-def test_issue_630_action_executor_attaches_billing_observation_on_success(monkeypatch) -> None:
+def test_issue_630_action_executor_attaches_billing_observation_on_success(
+    monkeypatch,
+) -> None:
     task_futures = _StubTaskFutureService()
 
     class _ActionSessionManager:
@@ -150,7 +168,9 @@ def test_issue_630_action_executor_attaches_billing_observation_on_success(monke
             return {"actions": [[0.0]], "meta": {"ok": True}}
 
     monkeypatch.setattr(action_sampling, "task_futures", task_futures)
-    monkeypatch.setattr(action_sampling, "action_session_manager", _ActionSessionManager())
+    monkeypatch.setattr(
+        action_sampling, "action_session_manager", _ActionSessionManager()
+    )
 
     billing_input = {
         "charge_item": "inference",
@@ -167,7 +187,14 @@ def test_issue_630_action_executor_attaches_billing_observation_on_success(monke
         extra_inputs={},
     )
 
-    anyio.run(action_sampling._do_act, "act-success-1", request, None, _gateway_auth(), billing_input)
+    anyio.run(
+        action_sampling._do_act,
+        "act-success-1",
+        request,
+        None,
+        _gateway_auth(),
+        billing_input,
+    )
 
     assert task_futures.failed == {}
     assert task_futures.resolved["act-success-1"]["type"] == "act"
@@ -182,8 +209,11 @@ def test_issue_630_action_executor_attaches_billing_observation_on_success(monke
     assert observations[0]["dimension"] == "action"
 
 
-def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeypatch) -> None:
+def test_issue_630_vla_train_step_uses_mint_billing_observation_override(
+    monkeypatch,
+) -> None:
     task_futures = _StubTaskFutureService()
+    inflight_calls: list[tuple[str, int]] = []
 
     class _TrainingManager:
         def __init__(self) -> None:
@@ -206,14 +236,23 @@ def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeyp
             assert request.model_id == "model-rl"
             return {"metrics": {"loss": 1.0}}
 
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
     monkeypatch.setattr(training_routes, "task_futures", task_futures)
     monkeypatch.setattr(training_routes, "training_manager", _TrainingManager())
     monkeypatch.setattr(training_routes, "training_engine", _TrainingEngine())
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+
     async def _materialize(session):
         return session
 
-    monkeypatch.setattr(training_routes, "_materialize_training_session_for_stateful_use", _materialize)
+    monkeypatch.setattr(
+        training_routes, "_materialize_training_session_for_stateful_use", _materialize
+    )
 
     billing_input = {
         "charge_item": "training",
@@ -230,8 +269,16 @@ def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeyp
             "loss_fn": "cross_entropy",
             "data": [
                 {
-                    "model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-                    "loss_fn_inputs": {"target_tokens": {"data": [11, 12], "shape": [2], "dtype": "int64"}},
+                    "model_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                    },
+                    "loss_fn_inputs": {
+                        "target_tokens": {
+                            "data": [11, 12],
+                            "shape": [2],
+                            "dtype": "int64",
+                        }
+                    },
                 }
             ],
         },
@@ -251,6 +298,7 @@ def test_issue_630_vla_train_step_uses_mint_billing_observation_override(monkeyp
     )
 
     assert task_futures.failed == {}
+    assert inflight_calls == [("model-rl", -1)]
     observations = task_futures.billing_observations["mint-rl-train-override"]
     assert len(observations) == 1
     assert observations[0]["account_id"] == "acct-1"

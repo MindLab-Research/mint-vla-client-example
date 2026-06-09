@@ -61,13 +61,17 @@ class _StubTaskFutureService:
     async def async_update_meta(self, _request_id: str, _meta: dict) -> None:
         return None
 
-    async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
+    async def async_mark_queued(
+        self, request_id: str, meta: dict | None = None
+    ) -> None:
         self.queued.append((request_id, meta))
 
     async def async_cleanup(self, request_id: str) -> None:
         self.cleaned.append(request_id)
 
-    async def async_resolve(self, request_id: str, payload: dict, *, billing_observations=None) -> None:
+    async def async_resolve(
+        self, request_id: str, payload: dict, *, billing_observations=None
+    ) -> None:
         self.resolved.append((request_id, payload))
         self.billing_observations[request_id] = list(billing_observations or [])
 
@@ -76,7 +80,9 @@ class _StubTaskFutureService:
 
 
 class _StubModelWorkScheduler:
-    def __init__(self, *, fail: bool = False, task_futures: _StubTaskFutureService | None = None) -> None:
+    def __init__(
+        self, *, fail: bool = False, task_futures: _StubTaskFutureService | None = None
+    ) -> None:
         self.calls: list[dict] = []
         self.cancelled: list[dict] = []
         self.fail = bool(fail)
@@ -167,7 +173,12 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
             }
 
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
-    monkeypatch.setattr(mint_routes, "action_session_manager", _StubActionSessionManager(), raising=False)
+    monkeypatch.setattr(
+        mint_routes,
+        "action_session_manager",
+        _StubActionSessionManager(),
+        raising=False,
+    )
     _install_billing_user(monkeypatch, mint_routes)
 
     import mint_server.backend.model_work_scheduler as mws
@@ -185,7 +196,12 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
                 "state": {"data": [0.0] * 8, "shape": [8], "dtype": "float32"},
                 "model_input": {
                     "chunks": [
-                        {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                        {
+                            "type": "image",
+                            "data": "aW1n",
+                            "format": "png",
+                            "expected_tokens": 256,
+                        },
                         {"type": "encoded_text", "tokens": [1, 2, 3]},
                     ]
                 },
@@ -210,7 +226,9 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
     assert queued["extra"]["gateway_auth"]["apikey_id"] == _APIKEY_ID
 
 
-def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
+def test_mint_create_action_session_maps_capacity_runtime_error_to_503(
+    monkeypatch,
+) -> None:
     from mint_server.routes import mint as mint_routes
     import mint_server.supported_models_gate as supported_models_gate
 
@@ -226,31 +244,46 @@ def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypat
         _ = http_request
         return base_model
 
-    monkeypatch.setattr(mint_routes, 'action_session_manager', _StubActionSessionManager(), raising=False)
-    monkeypatch.setattr(mint_routes, 'can_access_model', lambda base_model, user_data: True)
-    monkeypatch.setattr(mint_routes, '_get_user_data', lambda request: None)
-    monkeypatch.setattr(mint_routes, '_resolve_checkpoint_for_user', lambda path, **_: '/resolved/checkpoint')
-    monkeypatch.setattr(supported_models_gate, 'enforce_base_model_allowed', _allow_model)
+    monkeypatch.setattr(
+        mint_routes,
+        "action_session_manager",
+        _StubActionSessionManager(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mint_routes, "can_access_model", lambda base_model, user_data: True
+    )
+    monkeypatch.setattr(mint_routes, "_get_user_data", lambda request: None)
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, **_: "/resolved/checkpoint",
+    )
+    monkeypatch.setattr(
+        supported_models_gate, "enforce_base_model_allowed", _allow_model
+    )
 
     app = FastAPI()
-    app.include_router(mint_routes.router, prefix='/api/v1/mint')
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
     client = TestClient(app)
 
     resp = client.post(
-        '/api/v1/mint/action_sessions',
+        "/api/v1/mint/action_sessions",
         json={
-            'base_model': 'openpi/pi0-fast-libero-low-mem-finetune',
-            'session_id': 'act-test',
-            'action_session_seq_id': 0,
-            'model_path': 'mint://model/checkpoint',
+            "base_model": "openpi/pi0-fast-libero-low-mem-finetune",
+            "session_id": "act-test",
+            "action_session_seq_id": 0,
+            "model_path": "mint://model/checkpoint",
         },
     )
 
     assert resp.status_code == 503, resp.text
-    assert 'pinned node capacity check failed' in resp.text
+    assert "pinned node capacity check failed" in resp.text
 
 
-def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeypatch) -> None:
+def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(
+    monkeypatch,
+) -> None:
     from mint_server.routes import mint as mint_routes
     import mint_server.supported_models_gate as supported_models_gate
 
@@ -258,68 +291,84 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(monkeyp
 
     class _StubActionSessionManager:
         async def create_session(self, **kwargs):
-            captured['create_session_kwargs'] = kwargs
-            return 'action-session-123'
+            captured["create_session_kwargs"] = kwargs
+            return "action-session-123"
 
     async def _allow_model(*, base_model: str, http_request):
         _ = http_request
         return base_model
 
     def _infer(model_path: str, *, user_id: str | None, is_admin: bool) -> str:
-        captured['infer'] = {
-            'model_path': model_path,
-            'user_id': user_id,
-            'is_admin': is_admin,
+        captured["infer"] = {
+            "model_path": model_path,
+            "user_id": user_id,
+            "is_admin": is_admin,
         }
-        return 'openpi/pi0-fast-libero-low-mem-finetune'
+        return "openpi/pi0-fast-libero-low-mem-finetune"
 
-    def _resolve(path: str, *, user_id: str | None, is_admin: bool, owner_id: str | None = None) -> str:
-        captured['resolve'] = {
-            'path': path,
-            'user_id': user_id,
-            'is_admin': is_admin,
-            'owner_id': owner_id,
+    def _resolve(
+        path: str, *, user_id: str | None, is_admin: bool, owner_id: str | None = None
+    ) -> str:
+        captured["resolve"] = {
+            "path": path,
+            "user_id": user_id,
+            "is_admin": is_admin,
+            "owner_id": owner_id,
         }
-        return '/resolved/user-a/checkpoint'
+        return "/resolved/user-a/checkpoint"
 
-    monkeypatch.setattr(mint_routes, 'action_session_manager', _StubActionSessionManager(), raising=False)
-    monkeypatch.setattr(mint_routes, 'can_access_model', lambda base_model, user_data: True)
-    monkeypatch.setattr(mint_routes, '_get_user_data', lambda request: None)
-    monkeypatch.setattr(mint_routes, '_get_user_id', lambda request: 'user-a')
-    monkeypatch.setattr(mint_routes, 'can_bypass_ownership', lambda request: True)
-    monkeypatch.setattr(mint_routes, '_infer_base_model_from_checkpoint', _infer)
-    monkeypatch.setattr(mint_routes, '_resolve_checkpoint_for_user', _resolve)
-    monkeypatch.setattr(supported_models_gate, 'enforce_base_model_allowed', _allow_model)
+    monkeypatch.setattr(
+        mint_routes,
+        "action_session_manager",
+        _StubActionSessionManager(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        mint_routes, "can_access_model", lambda base_model, user_data: True
+    )
+    monkeypatch.setattr(mint_routes, "_get_user_data", lambda request: None)
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda request: "user-a")
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda request: True)
+    monkeypatch.setattr(mint_routes, "_infer_base_model_from_checkpoint", _infer)
+    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
+    monkeypatch.setattr(
+        supported_models_gate, "enforce_base_model_allowed", _allow_model
+    )
 
     app = FastAPI()
-    app.include_router(mint_routes.router, prefix='/api/v1/mint')
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
     client = TestClient(app)
 
     resp = client.post(
-        '/api/v1/mint/action_sessions',
+        "/api/v1/mint/action_sessions",
         json={
-            'session_id': 'act-test',
-            'action_session_seq_id': 0,
-            'model_path': 'mint://model/checkpoint',
-            'owner_id': 'user-a',
+            "session_id": "act-test",
+            "action_session_seq_id": 0,
+            "model_path": "mint://model/checkpoint",
+            "owner_id": "user-a",
         },
     )
 
     assert resp.status_code == 200, resp.text
-    assert resp.json()['action_session_id'] == 'action-session-123'
-    assert captured['infer'] == {
-        'model_path': 'mint://model/checkpoint',
-        'user_id': 'user-a',
-        'is_admin': True,
+    assert resp.json()["action_session_id"] == "action-session-123"
+    assert captured["infer"] == {
+        "model_path": "mint://model/checkpoint",
+        "user_id": "user-a",
+        "is_admin": True,
     }
-    assert captured['resolve'] == {
-        'path': 'mint://model/checkpoint',
-        'user_id': 'user-a',
-        'is_admin': True,
-        'owner_id': 'user-a',
+    assert captured["resolve"] == {
+        "path": "mint://model/checkpoint",
+        "user_id": "user-a",
+        "is_admin": True,
+        "owner_id": "user-a",
     }
-    assert captured['create_session_kwargs']['model_path'] == '/resolved/user-a/checkpoint'
-    assert captured['create_session_kwargs']['base_model'] == 'openpi/pi0-fast-libero-low-mem-finetune'
+    assert (
+        captured["create_session_kwargs"]["model_path"] == "/resolved/user-a/checkpoint"
+    )
+    assert (
+        captured["create_session_kwargs"]["base_model"]
+        == "openpi/pi0-fast-libero-low-mem-finetune"
+    )
 
 
 def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> None:
@@ -335,14 +384,18 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     )
 
     class _StubTrainingManager:
-        def __init__(self) -> None:
-            self.inflight: list[tuple[str, int]] = []
-
         def get_session(self, model_id: str):
             return session if model_id == "model-123" else None
 
         def mark_inflight(self, model_id: str, delta: int) -> None:
-            self.inflight.append((model_id, delta))
+            raise AssertionError(
+                f"VLA HTTP route must not use local manager inflight: {model_id} {delta}"
+            )
+
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
 
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", object())
@@ -354,6 +407,9 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
     monkeypatch.setattr(
         training_routes,
         "_build_training_scheduler_extra",
@@ -394,7 +450,12 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
                         },
                         "model_input": {
                             "chunks": [
-                                {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                                {
+                                    "type": "image",
+                                    "data": "aW1n",
+                                    "format": "png",
+                                    "expected_tokens": 256,
+                                },
                                 {"type": "encoded_text", "tokens": [1, 2, 3]},
                             ]
                         },
@@ -423,6 +484,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
 
     assert resp.status_code == 200, resp.text
     request_id = resp.json()["request_id"]
+    assert inflight_calls == [("model-123", +1)]
     assert task_futures.created == [request_id]
     assert len(scheduler.calls) == 1
     queued = scheduler.calls[0]
@@ -452,25 +514,120 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     assert request_json["data"][0]["supervision"]["target_tokens"]["shape"] == [2]
 
 
-def test_mint_vla_train_step_background_lowers_observation_and_supervision(monkeypatch) -> None:
+def test_mint_vla_train_step_route_releases_durable_inflight_on_enqueue_failure(
+    monkeypatch,
+) -> None:
+    from mint_server.routes import mint as mint_routes
+
+    task_futures = _StubTaskFutureService()
+    scheduler = _StubModelWorkScheduler(fail=True, task_futures=task_futures)
+    session = SimpleNamespace(
+        model_id="model-123",
+        base_model="openpi/pi0-fast-libero-low-mem-finetune",
+        backend="openpi_fast",
+    )
+
+    class _StubTrainingManager:
+        def get_session(self, model_id: str):
+            return session if model_id == "model-123" else None
+
+        def mark_inflight(self, model_id: str, delta: int) -> None:
+            raise AssertionError(
+                f"VLA HTTP route must not use local manager inflight: {model_id} {delta}"
+            )
+
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    async def _fake_enqueue_training_request_with_trace(**kwargs):
+        await kwargs["enqueue_coro"]
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures)
+    monkeypatch.setattr(mint_routes, "training_engine", object())
+    monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
+    _install_billing_user(monkeypatch, mint_routes)
+
+    import mint_server.backend.model_work_scheduler as mws
+    from mint_server.routes import training as training_routes
+
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_build_training_scheduler_extra",
+        lambda *, session, model_id, training_op, seq_id=None: {
+            "scheduler_domain": f"training:{session.base_model}",
+            "scheduler_session_key": model_id,
+            "training_op": training_op,
+            "seq_id": seq_id,
+            "backend": session.backend,
+        },
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_enqueue_training_request_with_trace",
+        _fake_enqueue_training_request_with_trace,
+    )
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    resp = client.post(
+        "/api/v1/mint/vla/train_step",
+        json={
+            "model_id": "model-123",
+            "loss_fn": "cross_entropy",
+            "data": [
+                {
+                    "observation": {
+                        "state": {
+                            "data": [0.0] * 8,
+                            "shape": [8],
+                            "dtype": "float32",
+                        },
+                        "model_input": {
+                            "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                        },
+                    },
+                    "supervision": {
+                        "target_tokens": {
+                            "data": [11, 12],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
+                    },
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert inflight_calls == [("model-123", +1), ("model-123", -1)]
+
+
+def test_mint_vla_train_step_background_lowers_observation_and_supervision(
+    monkeypatch,
+) -> None:
     from mint_server.models.mint_types import VLATrainStepRequest
     from mint_server.routes import mint as mint_routes
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
-    mark_calls: list[tuple[str, int]] = []
     captured: dict[str, object] = {}
 
-    class _StubTrainingManager:
-        def mark_inflight(self, model_id: str, delta: int) -> None:
-            mark_calls.append((model_id, delta))
-
-    async def _fake_do_train_step(request_id: str, request, user_id: str | None, gateway_auth=None) -> None:
+    async def _fake_do_train_step(
+        request_id: str, request, user_id: str | None, gateway_auth=None
+    ) -> None:
         _ = request_id, user_id, gateway_auth
         captured["request"] = request
 
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
-    monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     monkeypatch.setattr(training_routes, "_do_train_step", _fake_do_train_step)
 
     request = VLATrainStepRequest.model_validate(
@@ -487,15 +644,32 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
                         },
                         "model_input": {
                             "chunks": [
-                                {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                                {
+                                    "type": "image",
+                                    "data": "aW1n",
+                                    "format": "png",
+                                    "expected_tokens": 256,
+                                },
                                 {"type": "encoded_text", "tokens": [1, 2, 3]},
                             ]
                         },
                     },
                     "supervision": {
-                        "target_tokens": {"data": [11, 12], "shape": [2], "dtype": "int64"},
-                        "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
-                        "token_ar_mask": {"data": [1, 1], "shape": [2], "dtype": "int64"},
+                        "target_tokens": {
+                            "data": [11, 12],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
+                        "weights": {
+                            "data": [1.0, 1.0],
+                            "shape": [2],
+                            "dtype": "float32",
+                        },
+                        "token_ar_mask": {
+                            "data": [1, 1],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
                     },
                 }
             ],
@@ -510,7 +684,82 @@ def test_mint_vla_train_step_background_lowers_observation_and_supervision(monke
     assert lowered.loss_fn_inputs["state"].shape == [8]
     assert lowered.loss_fn_inputs["target_tokens"].shape == [2]
     assert lowered.loss_fn_inputs["token_ar_mask"].shape == [2]
-    assert mark_calls == []
+
+
+def test_mint_vla_train_step_background_releases_durable_inflight_on_lowering_failure(
+    monkeypatch,
+) -> None:
+    from mint_server.models.mint_types import VLATrainStepRequest
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
+
+    task_futures = _StubTaskFutureService()
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    async def _unexpected_do_train_step(*_args, **_kwargs) -> None:
+        raise AssertionError("_do_train_step should not run when VLA lowering fails")
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+    monkeypatch.setattr(training_routes, "_do_train_step", _unexpected_do_train_step)
+
+    request = VLATrainStepRequest.model_validate(
+        {
+            "model_id": "model-123",
+            "loss_fn": "cross_entropy",
+            "data": [
+                {
+                    "observation": {
+                        "state": {
+                            "data": [0.0] * 8,
+                            "shape": [8],
+                            "dtype": "float32",
+                        },
+                        "model_input": {
+                            "chunks": [
+                                {
+                                    "type": "encoded_text",
+                                    "tokens": [1, 2, 3],
+                                }
+                            ]
+                        },
+                    },
+                    "supervision": {
+                        "target_tokens": {
+                            "data": [11],
+                            "shape": [1],
+                            "dtype": "int64",
+                        },
+                        "weights": {
+                            "data": [1.0],
+                            "shape": [1],
+                            "dtype": "float32",
+                        },
+                        "token_ar_mask": {
+                            "data": [1, 1],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
+                        "state": {
+                            "data": [0.0],
+                            "shape": [1],
+                            "dtype": "float32",
+                        },
+                    },
+                }
+            ],
+        }
+    )
+
+    asyncio.run(mint_routes._do_vla_train_step("req-lower-fail", request, "user-a"))
+
+    assert task_futures.failed
+    assert inflight_calls == [("model-123", -1)]
 
 
 def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> None:
@@ -531,15 +780,23 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     async def _fake_enqueue_training_request_with_trace(**kwargs):
         await kwargs["enqueue_coro"]
 
+    async def _mark_training_inflight(_model_id: str, _delta: int) -> None:
+        return None
+
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
-    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _fake_route_session_info)
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _fake_route_session_info
+    )
 
     import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
     monkeypatch.setattr(
         training_routes,
         "_build_training_scheduler_extra",
@@ -570,10 +827,16 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
                 {
                     "observation": {
                         "state": {"data": [0.0] * 8, "shape": [8], "dtype": "float32"},
-                        "model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                        "model_input": {
+                            "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                        },
                     },
                     "supervision": {
-                        "target_tokens": {"data": [11, 12], "shape": [2], "dtype": "int64"},
+                        "target_tokens": {
+                            "data": [11, 12],
+                            "shape": [2],
+                            "dtype": "int64",
+                        },
                     },
                 }
             ],
@@ -583,7 +846,10 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
     assert resp.status_code == 200, resp.text
     assert len(scheduler.calls) == 1
     assert scheduler.calls[0]["op"] == "mint.vla.train_step"
-    assert scheduler.calls[0]["domain_key"] == "training:openpi/pi0-fast-libero-low-mem-finetune"
+    assert (
+        scheduler.calls[0]["domain_key"]
+        == "training:openpi/pi0-fast-libero-low-mem-finetune"
+    )
 
 
 def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
@@ -620,11 +886,23 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
                 "data": [
                     {
                         "observation": {
-                            "state": {"data": [0.0] * 8, "shape": [8], "dtype": "float32"},
-                            "model_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                            "state": {
+                                "data": [0.0] * 8,
+                                "shape": [8],
+                                "dtype": "float32",
+                            },
+                            "model_input": {
+                                "chunks": [
+                                    {"type": "encoded_text", "tokens": [1, 2, 3]}
+                                ]
+                            },
                         },
                         "supervision": {
-                            "target_tokens": {"data": [11, 12], "shape": [2], "dtype": "int64"},
+                            "target_tokens": {
+                                "data": [11, 12],
+                                "shape": [2],
+                                "dtype": "int64",
+                            },
                         },
                     }
                 ],
@@ -632,7 +910,11 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
         ).encode("utf-8"),
         user_id="user-a",
         extra={
-            "gateway_auth": {"account_id": "acct", "apikey_id": "key", "request_id": "gw-req"},
+            "gateway_auth": {
+                "account_id": "acct",
+                "apikey_id": "key",
+                "request_id": "gw-req",
+            },
             "billing_observation_input": {"charge_item": "training", "quantity": 5},
         },
     )
@@ -643,7 +925,10 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
     assert captured["user_id"] == "user-a"
     assert captured["request"].model_id == "model-123"
     assert captured["gateway_auth"]["apikey_id"] == "key"
-    assert captured["billing_observation_input"] == {"charge_item": "training", "quantity": 5}
+    assert captured["billing_observation_input"] == {
+        "charge_item": "training",
+        "quantity": 5,
+    }
 
 
 def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> None:
@@ -676,13 +961,19 @@ def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> N
         request_json=json.dumps(
             {
                 "action_session_id": "action-session-1",
-                "observation": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
+                "observation": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
                 "extra_inputs": {},
             }
         ).encode("utf-8"),
         user_id="user-a",
         extra={
-            "gateway_auth": {"account_id": "acct", "apikey_id": "key", "request_id": "gw-act"},
+            "gateway_auth": {
+                "account_id": "acct",
+                "apikey_id": "key",
+                "request_id": "gw-act",
+            },
             "billing_observation_input": {"charge_item": "inference", "quantity": 67},
         },
     )
@@ -693,7 +984,10 @@ def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> N
     assert captured["request"].action_session_id == "action-session-1"
     assert captured["billing_observations"] is None
     assert captured["gateway_auth"]["apikey_id"] == "key"
-    assert captured["billing_observation_input"] == {"charge_item": "inference", "quantity": 67}
+    assert captured["billing_observation_input"] == {
+        "charge_item": "inference",
+        "quantity": 67,
+    }
 
 
 def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
@@ -719,7 +1013,9 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
 
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
-    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
+    monkeypatch.setattr(
+        mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None
+    )
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -774,7 +1070,9 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     assert resolved_flags == [True, True]
 
 
-def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypatch, tmp_path) -> None:
+def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(
+    monkeypatch, tmp_path
+) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
     import mint_server.backend.mintx_ops as mintx_ops
@@ -797,12 +1095,16 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     monkeypatch.setattr(
         mint_routes,
         "build_persistent_cache_dir",
-        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"),
+        lambda **_kwargs: str(
+            tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"
+        ),
     )
     monkeypatch.setattr(
         mint_routes,
         "interpolate_checkpoints_to_dir",
-        lambda **_kwargs: SimpleNamespace(output_checkpoint_type="sampler", has_rank_shards=False),
+        lambda **_kwargs: SimpleNamespace(
+            output_checkpoint_type="sampler", has_rank_shards=False
+        ),
     )
     monkeypatch.setattr(
         mint_routes,
@@ -817,7 +1119,9 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     monkeypatch.setattr(
         mint_routes,
         "begin_async_checkpoint_mirror",
-        lambda *_args, **_kwargs: "/tos-mindverse/mint_checkpoints/owner-a/model-123/ema-0010/sampler",
+        lambda *_args, **_kwargs: (
+            "/tos-mindverse/mint_checkpoints/owner-a/model-123/ema-0010/sampler"
+        ),
     )
     monkeypatch.setattr(
         mint_routes,
@@ -888,7 +1192,9 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
                 "source_paths": ["/resolved/ckpt-a", "/resolved/ckpt-b"],
                 "coefficients": [0.9, 0.1],
                 "has_rank_shards": False,
-                "filesystem_path": str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"),
+                "filesystem_path": str(
+                    tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0010"
+                ),
                 "persistent_filesystem_path": "/tos-mindverse/mint_checkpoints/owner-a/model-123/ema-0010/sampler",
                 "mirror_status": "pending",
                 "type": "mint_interpolate_checkpoints",
@@ -897,7 +1203,9 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(monkeypat
     ]
 
 
-def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path) -> None:
+def test_mint_interpolate_do_path_marks_failed_checkpoint(
+    monkeypatch, tmp_path
+) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
     import mint_server.backend.mintx_ops as mintx_ops
@@ -922,13 +1230,17 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
     monkeypatch.setattr(
         mint_routes,
         "build_persistent_cache_dir",
-        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0011"),
+        lambda **_kwargs: str(
+            tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0011"
+        ),
     )
 
     def _raise_interpolate(**_kwargs):
         raise RuntimeError("interpolate_failed")
 
-    monkeypatch.setattr(mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate)
+    monkeypatch.setattr(
+        mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate
+    )
 
     request = InterpolateCheckpointsRequest(
         source_paths=["/resolved/ckpt-a", "/resolved/ckpt-b"],
@@ -937,14 +1249,18 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(monkeypatch, tmp_path)
         retry=False,
     )
 
-    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err", request, "owner-a"))
+    asyncio.run(
+        mint_routes._do_interpolate_checkpoints("req-interp-err", request, "owner-a")
+    )
 
     assert failed_marks == [("ckpt-rec-failed", "upload_error")]
     assert task_futures.resolved == []
     assert task_futures.failed == [("req-interp-err", "interpolate_failed")]
 
 
-def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(monkeypatch, tmp_path) -> None:
+def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(
+    monkeypatch, tmp_path
+) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
     import mint_server.backend.mintx_ops as mintx_ops
@@ -969,13 +1285,17 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
     monkeypatch.setattr(
         mint_routes,
         "build_persistent_cache_dir",
-        lambda **_kwargs: str(tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0012"),
+        lambda **_kwargs: str(
+            tmp_path / "persistent_cache" / "owner-a" / "model-123" / "ema-0012"
+        ),
     )
 
     def _raise_interpolate(**_kwargs):
         raise RuntimeError("interpolate_failed")
 
-    monkeypatch.setattr(mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate)
+    monkeypatch.setattr(
+        mint_routes, "interpolate_checkpoints_to_dir", _raise_interpolate
+    )
 
     request = InterpolateCheckpointsRequest(
         source_paths=["/resolved/ckpt-a", "/resolved/ckpt-b"],
@@ -984,7 +1304,9 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(m
         retry=False,
     )
 
-    asyncio.run(mint_routes._do_interpolate_checkpoints("req-interp-err-2", request, "owner-a"))
+    asyncio.run(
+        mint_routes._do_interpolate_checkpoints("req-interp-err-2", request, "owner-a")
+    )
 
     assert task_futures.resolved == []
     assert task_futures.failed == [("req-interp-err-2", "interpolate_failed")]
@@ -997,6 +1319,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler(task_futures=task_futures)
+    inflight_calls: list[tuple[str, int]] = []
 
     class _StubSession:
         base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -1043,6 +1366,12 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     async def _noop_protect(_info: dict) -> None:
         return None
 
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    async def _materialize_training_session_for_stateful_use(session):
+        return session
+
     resolved_flags: list[bool] = []
 
     def _resolve(path, **kwargs):
@@ -1055,15 +1384,31 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: True)
     monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", _resolve)
-    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
-    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
-    monkeypatch.setattr(mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False)
+    monkeypatch.setattr(
+        mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None
+    )
+    monkeypatch.setattr(
+        mint_routes, "_protect_training_session_enqueue_window", _noop_protect
+    )
+    monkeypatch.setattr(
+        mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False
+    )
 
     import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
-    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_materialize_training_session_for_stateful_use",
+        _materialize_training_session_for_stateful_use,
+    )
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _get_training_route_session_info
+    )
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -1075,8 +1420,12 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
         "temperature": 1.0,
         "data": [
             {
-                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "student_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
+                "reference_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                },
                 "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
                 "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
             }
@@ -1103,11 +1452,15 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
     assert resolved_flags == [True]
+    assert inflight_calls == [("model-123", +1)]
 
     request = ForwardBackwardReverseKLRequest.model_validate(queued_request_json)
     import asyncio
 
-    asyncio.run(mint_routes._do_forward_backward_reverse_kl(request_id, request, "user-a"))
+    asyncio.run(
+        mint_routes._do_forward_backward_reverse_kl(request_id, request, "user-a")
+    )
+    assert inflight_calls == [("model-123", +1), ("model-123", -1)]
 
     assert task_futures.resolved == [
         (
@@ -1134,12 +1487,15 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
     ]
 
 
-def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime(monkeypatch) -> None:
+def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime(
+    monkeypatch,
+) -> None:
     from mint_server.routes import mint as mint_routes
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler(task_futures=task_futures)
+    inflight_calls: list[tuple[str, int]] = []
 
     async def _get_training_route_session_info(model_id: str):
         if model_id == "model-123":
@@ -1154,20 +1510,36 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     async def _noop_protect(_info: dict) -> None:
         return None
 
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
-    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
-    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
-    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _noop_protect)
-    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, **_: "/resolved/ref-step-0010",
+    )
+    monkeypatch.setattr(
+        mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None
+    )
+    monkeypatch.setattr(
+        mint_routes, "_protect_training_session_enqueue_window", _noop_protect
+    )
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _get_training_route_session_info
+    )
 
     import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -1179,8 +1551,12 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
         "temperature": 1.0,
         "data": [
             {
-                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "student_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
+                "reference_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                },
                 "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
                 "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
             }
@@ -1206,6 +1582,90 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
     assert isinstance(queued_meta["queued_at"], float)
     queued_request_json = json.loads(queued["request_json"].decode("utf-8"))
     assert queued_request_json["reference_model_path"] == "/resolved/ref-step-0010"
+    assert inflight_calls == [("model-123", +1)]
+
+
+def test_mint_reverse_kl_route_releases_durable_inflight_on_enqueue_failure(
+    monkeypatch,
+) -> None:
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
+
+    task_futures = _StubTaskFutureService()
+    scheduler = _StubModelWorkScheduler(fail=True, task_futures=task_futures)
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _get_training_route_session_info(model_id: str):
+        if model_id == "model-123":
+            return {
+                "model_id": model_id,
+                "session_id": "sess-123",
+                "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+                "backend": "megatron",
+            }
+        return None
+
+    async def _noop_protect(_info: dict) -> None:
+        return None
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures)
+    monkeypatch.setattr(mint_routes, "training_engine", None)
+    monkeypatch.setattr(mint_routes, "training_manager", None)
+    monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
+    monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, **_: "/resolved/ref-step-0010",
+    )
+    monkeypatch.setattr(
+        mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None
+    )
+    monkeypatch.setattr(
+        mint_routes, "_protect_training_session_enqueue_window", _noop_protect
+    )
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _get_training_route_session_info
+    )
+
+    import mint_server.backend.model_work_scheduler as mws
+
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    payload = {
+        "model_id": "model-123",
+        "reference_model_path": "mint://teacher/sampler_weights/ref-step-0010",
+        "temperature": 1.0,
+        "data": [
+            {
+                "student_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
+                "reference_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                },
+                "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
+                "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
+            }
+        ],
+    }
+
+    resp = client.post("/api/v1/mint/forward_backward_reverse_kl", json=payload)
+
+    assert resp.status_code == 503, resp.text
+    assert inflight_calls == [("model-123", +1), ("model-123", -1)]
+    assert task_futures.cleaned
 
 
 def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:
@@ -1213,9 +1673,13 @@ def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> Non
     from mint_server.routes import mint as mint_routes
 
     async def _raise_store_error(_model_id: str):
-        raise HTTPException(status_code=503, detail="Training session store unavailable")
+        raise HTTPException(
+            status_code=503, detail="Training session store unavailable"
+        )
 
-    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _raise_store_error)
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _raise_store_error
+    )
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "training_engine", None)
 
@@ -1229,8 +1693,12 @@ def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> Non
         "temperature": 1.0,
         "data": [
             {
-                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "student_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
+                "reference_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                },
                 "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
                 "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
             }
@@ -1241,13 +1709,18 @@ def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> Non
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == "Training session store unavailable"
-def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch) -> None:
+
+
+def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(
+    monkeypatch,
+) -> None:
     from mint_server.routes import mint as mint_routes
     from mint_server.routes import training as training_routes
 
     task_futures = _StubTaskFutureService()
     scheduler = _StubModelWorkScheduler(task_futures=task_futures)
     protected: list[dict] = []
+    inflight_calls: list[tuple[str, int]] = []
 
     async def _get_training_route_session_info(model_id: str):
         if model_id == "model-123":
@@ -1262,20 +1735,38 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
     async def _protect_training_session_enqueue_window(session_info: dict) -> None:
         protected.append(dict(session_info))
 
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
     monkeypatch.setattr(mint_routes, "task_futures", task_futures)
     monkeypatch.setattr(mint_routes, "training_engine", None)
     monkeypatch.setattr(mint_routes, "training_manager", None)
     monkeypatch.setattr(mint_routes, "_get_user_id", lambda _request: "user-a")
     monkeypatch.setattr(mint_routes, "can_bypass_ownership", lambda _request: False)
-    monkeypatch.setattr(mint_routes, "_resolve_checkpoint_for_user", lambda path, **_: "/resolved/ref-step-0010")
-    monkeypatch.setattr(mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None)
-    monkeypatch.setattr(mint_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
-    monkeypatch.setattr(mint_routes, "_get_route_training_store_info", _get_training_route_session_info)
+    monkeypatch.setattr(
+        mint_routes,
+        "_resolve_checkpoint_for_user",
+        lambda path, **_: "/resolved/ref-step-0010",
+    )
+    monkeypatch.setattr(
+        mint_routes, "_require_peft_adapter_checkpoint", lambda _path: None
+    )
+    monkeypatch.setattr(
+        mint_routes,
+        "_protect_training_session_enqueue_window",
+        _protect_training_session_enqueue_window,
+    )
+    monkeypatch.setattr(
+        mint_routes, "_get_route_training_store_info", _get_training_route_session_info
+    )
 
     import mint_server.backend.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
 
     app = FastAPI()
     app.include_router(mint_routes.router, prefix="/api/v1/mint")
@@ -1287,8 +1778,12 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
         "temperature": 1.0,
         "data": [
             {
-                "student_input": {"chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]},
-                "reference_input": {"chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]},
+                "student_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                },
+                "reference_input": {
+                    "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                },
                 "target_tokens": {"data": [7, 8], "shape": [2], "dtype": "int64"},
                 "weights": {"data": [1.0, 1.0], "shape": [2], "dtype": "float32"},
             }
@@ -1299,3 +1794,159 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(monkeypatch
 
     assert resp.status_code == 200, resp.text
     assert [entry["session_id"] for entry in protected] == ["sess-123"]
+    assert inflight_calls == [("model-123", +1)]
+
+
+def test_mint_reverse_kl_background_restores_detached_training_session(
+    monkeypatch,
+) -> None:
+    from mint_server.models.mint_types import ForwardBackwardReverseKLRequest
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
+
+    task_futures = _StubTaskFutureService()
+    inflight_calls: list[tuple[str, int]] = []
+    restored: list[str] = []
+    materialized: list[str] = []
+
+    class _StubSession:
+        base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        model_id = "model-123"
+        backend = "megatron"
+
+    class _StubTrainingManager:
+        def get_session(self, model_id: str):
+            assert model_id == "model-123"
+            return None
+
+    class _StubTrainingEngine:
+        async def forward_backward_reverse_kl(self, session, request):
+            assert session.model_id == "model-123"
+            assert getattr(session, "materialized", False) is True
+            assert request.reference_model_path == "/resolved/ref-step-0010"
+            return {"ok": True, "type": "mint_forward_backward_reverse_kl"}
+
+    async def _restore_training_session(model_id: str):
+        restored.append(model_id)
+        return _StubSession() if model_id == "model-123" else None
+
+    async def _materialize_training_session_for_stateful_use(session):
+        materialized.append(session.model_id)
+        session.materialized = True
+        return session
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures)
+    monkeypatch.setattr(mint_routes, "training_engine", _StubTrainingEngine())
+    monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
+    monkeypatch.setattr(
+        training_routes, "_restore_training_session", _restore_training_session
+    )
+    monkeypatch.setattr(
+        training_routes,
+        "_materialize_training_session_for_stateful_use",
+        _materialize_training_session_for_stateful_use,
+    )
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+    monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
+
+    request = ForwardBackwardReverseKLRequest.model_validate(
+        {
+            "model_id": "model-123",
+            "reference_model_path": "/resolved/ref-step-0010",
+            "temperature": 1.0,
+            "data": [
+                {
+                    "student_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                    },
+                    "reference_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                    },
+                    "target_tokens": {
+                        "data": [7, 8],
+                        "shape": [2],
+                        "dtype": "int64",
+                    },
+                    "weights": {
+                        "data": [1.0, 1.0],
+                        "shape": [2],
+                        "dtype": "float32",
+                    },
+                }
+            ],
+        }
+    )
+
+    asyncio.run(
+        mint_routes._do_forward_backward_reverse_kl("req-restore", request, "user-a")
+    )
+
+    assert restored == ["model-123"]
+    assert materialized == ["model-123"]
+    assert inflight_calls == [("model-123", -1)]
+    assert task_futures.resolved == [
+        ("req-restore", {"ok": True, "type": "mint_forward_backward_reverse_kl"})
+    ]
+
+
+def test_mint_reverse_kl_background_releases_durable_inflight_on_early_failure(
+    monkeypatch,
+) -> None:
+    from mint_server.models.mint_types import ForwardBackwardReverseKLRequest
+    from mint_server.routes import mint as mint_routes
+    from mint_server.routes import training as training_routes
+
+    task_futures = _StubTaskFutureService()
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures)
+    monkeypatch.setattr(mint_routes, "training_engine", None)
+    monkeypatch.setattr(mint_routes, "training_manager", None)
+    monkeypatch.setattr(
+        training_routes, "_mark_training_inflight", _mark_training_inflight
+    )
+
+    request = ForwardBackwardReverseKLRequest.model_validate(
+        {
+            "model_id": "model-123",
+            "reference_model_path": "/resolved/ref-step-0010",
+            "temperature": 1.0,
+            "data": [
+                {
+                    "student_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": [1, 2, 3]}]
+                    },
+                    "reference_input": {
+                        "chunks": [{"type": "encoded_text", "tokens": [4, 5, 6]}]
+                    },
+                    "target_tokens": {
+                        "data": [7, 8],
+                        "shape": [2],
+                        "dtype": "int64",
+                    },
+                    "weights": {
+                        "data": [1.0, 1.0],
+                        "shape": [2],
+                        "dtype": "float32",
+                    },
+                }
+            ],
+        }
+    )
+
+    asyncio.run(
+        mint_routes._do_forward_backward_reverse_kl("req-early-fail", request, "user-a")
+    )
+
+    assert task_futures.failed == [
+        ("req-early-fail", "Training engine not initialized")
+    ]
+    assert inflight_calls == [("model-123", -1)]

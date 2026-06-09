@@ -1,12 +1,12 @@
 """Training session manager for per-model training state.
 
 Each training model gets its own session with LoRA weights and optimizer.
-Sessions are automatically cleaned up after inactivity.
+Detached maintenance owns periodic cleanup; this manager only exposes explicit
+session operations for the runtime that instantiated it.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
@@ -124,14 +124,12 @@ class TrainingSessionManager:
     """Manages multiple training sessions.
 
     Maps model_id → TrainingSession.
-    Includes background cleanup of idle sessions (mirrors SessionManager pattern).
     """
 
     def __init__(self, inactivity_timeout: float = DEFAULT_TRAINING_INACTIVITY_TIMEOUT):
         self._sessions: dict[str, TrainingSession] = {}
         self._inactivity_timeout = inactivity_timeout
-        self._cleanup_task: asyncio.Task | None = None
-        self._engine = None  # Set via start_cleanup_task; used by cleanup loop
+        self._engine = None  # Optional engine hook for explicit detached cleanup helpers.
         self._obs_training_totals: dict[str, int] = {
             "training_sessions_total": 0,
             "training_sessions_active": 0,
@@ -547,35 +545,8 @@ class TrainingSessionManager:
             self._persist_last_activity(model_id, session.last_activity)
             self.refresh_observability_session(model_id, before=before)
 
-    # =========================================================================
-    # Background cleanup of idle training sessions
-    # =========================================================================
-
-    async def start_cleanup_task(self, engine) -> None:
-        """Start the background cleanup task.
-
-        Args:
-            engine: VerlTrainingEngine used to shutdown idle sessions.
-        """
-        self._engine = engine
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            logger.info(
-                f"Started training session cleanup task "
-                f"(timeout={self._inactivity_timeout}s)"
-            )
-
-    async def _cleanup_loop(self) -> None:
-        """Periodically check for and cleanup inactive training sessions."""
-        while True:
-            await asyncio.sleep(60)  # Check every minute
-            try:
-                await self._cleanup_inactive()
-            except Exception as e:
-                logger.error(f"Training session cleanup error: {e}")
-
     async def _cleanup_inactive(self) -> None:
-        """Cleanup training sessions inactive for longer than timeout."""
+        """Cleanup inactive training sessions when invoked by a detached authority."""
         try:
             from .training_session_store import async_list_training_sessions
 
@@ -699,15 +670,6 @@ class TrainingSessionManager:
         Args:
             engine: VerlTrainingEngine to shutdown sessions with.
         """
-        # Stop cleanup task
-        if self._cleanup_task is not None:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            self._cleanup_task = None
-
         session_ids = list(self._sessions.keys())
         for model_id in session_ids:
             session = self._sessions.get(model_id)

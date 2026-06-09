@@ -13,8 +13,20 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global action session manager reference (set by app lifespan).
+# Execution-runtime action session manager reference (left unbound in API workers).
 action_session_manager: object | None = None
+
+
+def _current_action_session_manager() -> object | None:
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.action_manager
+    except Exception:
+        pass
+    return action_session_manager
 
 
 async def _do_act(
@@ -25,10 +37,11 @@ async def _do_act(
     billing_observation_input: dict | None = None,
 ) -> None:
     try:
-        if action_session_manager is None:
+        manager = _current_action_session_manager()
+        if manager is None:
             raise RuntimeError("Action session manager not initialized")
 
-        out = await action_session_manager.act(  # type: ignore[attr-defined]
+        out = await manager.act(  # type: ignore[attr-defined]
             action_session_id=request.action_session_id,
             observation=request.observation,
             extra_inputs=request.extra_inputs,

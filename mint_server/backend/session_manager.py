@@ -1,7 +1,8 @@
 """Session manager for per-session VerlInferenceEngine instances.
 
 Each sampling session gets its own engine with dedicated LoRA weights.
-Sessions are automatically cleaned up after inactivity.
+Detached maintenance owns periodic cleanup; this manager only exposes explicit
+session operations for the runtime that instantiated it.
 
 Supports two modes:
 1. Per-session engine: Traditional mode, spawns new engine per session (slow init)
@@ -68,7 +69,6 @@ class SessionManager:
 
     Each session has its own engine with dedicated LoRA adapter,
     enabling session isolation for different LoRA variants.
-    Sessions are automatically cleaned up after inactivity.
 
     For ephemeral weight syncs during training, uses a shared engine
     with hot LoRA reload for 100x+ faster weight updates.
@@ -90,7 +90,6 @@ class SessionManager:
         self.inactivity_timeout = inactivity_timeout
         self.shared_engine_lora_rank = shared_engine_lora_rank
         self._sessions: dict[str, SessionInfo] = {}
-        self._cleanup_task: asyncio.Task | None = None
         self._shared_engine: VerlInferenceEngine | None = None
         self._shared_engine_lock = asyncio.Lock()
         self._obs_sampling_totals: dict[str, int] = {
@@ -183,22 +182,8 @@ class SessionManager:
         self._apply_sampling_obs_delta(self._sampling_obs_state(before), -1)
         self._apply_sampling_obs_delta(self._sampling_obs_state(after), 1)
 
-    async def start_cleanup_task(self) -> None:
-        """Start the local cleanup loop."""
-        if self._cleanup_task is None:
-            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            logger.info(
-                f"Started session cleanup task (timeout={self.inactivity_timeout}s)"
-            )
-
-    async def _cleanup_loop(self) -> None:
-        """Periodically check for and cleanup inactive sessions."""
-        while True:
-            await asyncio.sleep(60)  # Check every minute
-            await self._cleanup_inactive()
-
     async def _cleanup_inactive(self) -> None:
-        """Cleanup sessions inactive for longer than timeout."""
+        """Cleanup inactive sessions when invoked by a detached authority."""
         now = time.time()
         for sid, info in list(self._sessions.items()):
             if not info.uses_base_model and (not info.is_shared or info.uses_multi_lora):
@@ -591,16 +576,7 @@ class SessionManager:
         return True
 
     async def shutdown_all(self) -> None:
-        """Shutdown all sessions and cleanup task. Called on application exit."""
-        # Stop cleanup task
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-            self._cleanup_task = None
-
+        """Shutdown all sessions. Called on runtime exit."""
         # Shutdown all sessions
         session_ids = list(self._sessions.keys())
         for session_id in session_ids:

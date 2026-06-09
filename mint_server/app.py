@@ -145,10 +145,6 @@ async def _cancel_task(task: asyncio.Task | None) -> None:
 
 
 async def _shutdown_local_inference_runtime(inference_manager: SessionManager) -> None:
-    await _cancel_task(getattr(inference_manager, "_cleanup_task", None))
-    if hasattr(inference_manager, "_cleanup_task"):
-        inference_manager._cleanup_task = None
-
     sessions = dict(getattr(inference_manager, "_sessions", {}))
     getattr(inference_manager, "_sessions", {}).clear()
     for session_id, info in sessions.items():
@@ -172,10 +168,6 @@ async def _shutdown_local_inference_runtime(inference_manager: SessionManager) -
 
 
 async def _shutdown_local_training_runtime(train_manager) -> None:
-    await _cancel_task(getattr(train_manager, "_cleanup_task", None))
-    if hasattr(train_manager, "_cleanup_task"):
-        train_manager._cleanup_task = None
-
     sessions = dict(getattr(train_manager, "_sessions", {}))
     getattr(train_manager, "_sessions", {}).clear()
     for model_id, session in sessions.items():

@@ -23,14 +23,20 @@ from fastapi.responses import JSONResponse
 
 from ..config import config as server_config
 from ..backend.model_work_scheduler import ModelWorkSchedulerConflictError
-from ..backend.queue_stage_timing import attach_queue_stage_timing, build_queue_stage_timing
+from ..backend.queue_stage_timing import (
+    attach_queue_stage_timing,
+    build_queue_stage_timing,
+)
 from ..backend.task_state_store import (
     FutureStatus,
     TaskStateStoreUnavailableError,
     billing_observations_from_auth,
     task_futures,
 )
-from ..backend.model_work_admission import ModelWorkAdmissionRejectedError, enqueue_model_work
+from ..backend.model_work_admission import (
+    ModelWorkAdmissionRejectedError,
+    enqueue_model_work,
+)
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -53,7 +59,10 @@ from ..models.types import (
     SamplingParams,
     UntypedAPIFuture,
 )
-from ..sampling_utils import normalize_prompt_logprobs_for_tinker, sampled_sequence_from_result
+from ..sampling_utils import (
+    normalize_prompt_logprobs_for_tinker,
+    sampled_sequence_from_result,
+)
 
 if TYPE_CHECKING:
     from ..backend.session_manager import SessionManager
@@ -62,12 +71,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global session manager reference (set by app lifespan)
+# Execution-runtime session manager reference (left unbound in API workers).
 session_manager: SessionManager | None = None
 
 _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
 _MAX_INFLIGHT_SAMPLE_TASKS = int(server_config.sampling_max_inflight_sample_tasks)
-_MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(server_config.sampling_max_concurrent_samples_per_request)
+_MAX_CONCURRENT_SAMPLES_PER_REQUEST = int(
+    server_config.sampling_max_concurrent_samples_per_request
+)
 _inflight_sample_tasks = 0
 
 _SAMPLE_COALESCE = bool(server_config.sampling_sample_coalesce)
@@ -88,6 +99,14 @@ _SAMPLE_ONCE_ROUTE = "sample_once"
 
 
 def _active_session_manager() -> SessionManager | None:
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.inference_manager
+    except Exception:
+        pass
     if session_manager is not None:
         return session_manager
     try:
@@ -156,40 +175,46 @@ def build_sample_once_billing_observations(
     sequence,
     http_request: Request,
     request_id: str,
+    model: str | None = None,
 ) -> list[dict]:
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
-    label_model = _resolve_billing_model(session_id)
-    return (
-        billing_observations_from_auth(
-            auth_ctx=billing_auth,
-            request_id=request_id,
-            charge_item="sampling",
-            quantity=len(token_ids),
-            unit="tokens",
-            route="sampling.sample_once",
-            dimension="prefill",
-            model=label_model,
-        )
-        + billing_observations_from_auth(
-            auth_ctx=billing_auth,
-            request_id=request_id,
-            charge_item="sampling",
-            quantity=len(sequence.tokens),
-            unit="tokens",
-            route="sampling.sample_once",
-            dimension="sample",
-            model=label_model,
-        )
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
+    label_model = str(model or "") or _resolve_billing_model(session_id)
+    return billing_observations_from_auth(
+        auth_ctx=billing_auth,
+        request_id=request_id,
+        charge_item="sampling",
+        quantity=len(token_ids),
+        unit="tokens",
+        route="sampling.sample_once",
+        dimension="prefill",
+        model=label_model,
+    ) + billing_observations_from_auth(
+        auth_ctx=billing_auth,
+        request_id=request_id,
+        charge_item="sampling",
+        quantity=len(sequence.tokens),
+        unit="tokens",
+        route="sampling.sample_once",
+        dimension="sample",
+        model=label_model,
     )
 
 
-def _record_vllm_workload_start(*, actor_name: str | None, base_model: str, op: str) -> None:
+def _record_vllm_workload_start(
+    *, actor_name: str | None, base_model: str, op: str
+) -> None:
     from ..backend.runtime_observability import runtime_observability
 
-    runtime_observability.begin_vllm_request(actor_name=actor_name, base_model=base_model, op=op)
+    runtime_observability.begin_vllm_request(
+        actor_name=actor_name, base_model=base_model, op=op
+    )
 
 
-def _vllm_request_observation(results: list[object], generated_tokens: int) -> dict[str, float | None]:
+def _vllm_request_observation(
+    results: list[object], generated_tokens: int
+) -> dict[str, float | None]:
     if not results:
         return {
             "ttft_s": None,
@@ -265,8 +290,16 @@ def _snapshot_from_manager_getters(session_id: str) -> SamplingSessionSnapshot |
     adapter_path = get_adapter_path(session_id) if callable(get_adapter_path) else None
     lora_loaded = bool(get_loaded(session_id)) if callable(get_loaded) else False
     lora_int_id = get_lora_int_id(session_id) if callable(get_lora_int_id) else None
-    uses_base_model = bool(is_base_model_session(session_id)) if callable(is_base_model_session) else False
-    metadata_version = int(get_metadata_version(session_id) or 1) if callable(get_metadata_version) else 1
+    uses_base_model = (
+        bool(is_base_model_session(session_id))
+        if callable(is_base_model_session)
+        else False
+    )
+    metadata_version = (
+        int(get_metadata_version(session_id) or 1)
+        if callable(get_metadata_version)
+        else 1
+    )
 
     return SamplingSessionSnapshot(
         session_id=session_id,
@@ -281,7 +314,9 @@ def _snapshot_from_manager_getters(session_id: str) -> SamplingSessionSnapshot |
     )
 
 
-def _coerce_sampling_snapshot(raw: object, session_id: str) -> SamplingSessionSnapshot | None:
+def _coerce_sampling_snapshot(
+    raw: object, session_id: str
+) -> SamplingSessionSnapshot | None:
     if raw is None:
         return None
     return SamplingSessionSnapshot(
@@ -313,7 +348,9 @@ def _get_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
     return _snapshot_from_manager_getters(session_id)
 
 
-async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
+async def _async_get_detached_sampling_snapshot(
+    session_id: str,
+) -> SamplingSessionSnapshot | None:
     try:
         from ..backend.sampling_session_store import async_get_sampling_session_info
 
@@ -336,7 +373,37 @@ async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSess
         lora_rank=int(info.get("lora_rank") or 0),
         adapter_path=info.get("adapter_path"),
         lora_loaded=bool(info.get("lora_loaded")),
-        lora_int_id=None if info.get("lora_int_id") is None else int(info.get("lora_int_id")),
+        lora_int_id=None
+        if info.get("lora_int_id") is None
+        else int(info.get("lora_int_id")),
+        metadata_version=max(1, int(info.get("metadata_version") or 1)),
+    )
+
+
+async def _async_get_http_sampling_snapshot(
+    session_id: str,
+) -> SamplingSessionSnapshot | None:
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        info = await async_get_sampling_session_info(session_id)
+    except Exception as e:
+        raise HTTPException(
+            status_code=503, detail="Sampling session store unavailable"
+        ) from e
+    if not isinstance(info, dict):
+        return None
+    return SamplingSessionSnapshot(
+        session_id=str(info.get("session_id") or session_id),
+        uses_multi_lora=True,
+        uses_base_model=bool(info.get("uses_base_model")),
+        base_model=info.get("base_model"),
+        lora_rank=int(info.get("lora_rank") or 0),
+        adapter_path=info.get("adapter_path"),
+        lora_loaded=bool(info.get("lora_loaded")),
+        lora_int_id=None
+        if info.get("lora_int_id") is None
+        else int(info.get("lora_int_id")),
         metadata_version=max(1, int(info.get("metadata_version") or 1)),
     )
 
@@ -359,9 +426,14 @@ async def _drop_local_sampling_session(session_id: str) -> None:
         return
     try:
         await end_session(session_id)
-        logger.info("[sampling restore] dropped stale local sampler session_id=%s after TaskStateStore miss", session_id)
+        logger.info(
+            "[sampling restore] dropped stale local sampler session_id=%s after TaskStateStore miss",
+            session_id,
+        )
     except Exception as e:
-        logger.warning("Failed to drop stale local sampler session_id=%s: %s", session_id, e)
+        logger.warning(
+            "Failed to drop stale local sampler session_id=%s: %s", session_id, e
+        )
 
 
 async def _restore_local_sampling_session_if_needed(session_id: str) -> bool:
@@ -383,7 +455,9 @@ async def _restore_local_sampling_session_if_needed(session_id: str) -> bool:
 
         info = await async_get_sampling_session_info(session_id)
     except Exception as e:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+        raise HTTPException(
+            status_code=503, detail="Sampling session store unavailable"
+        ) from e
 
     if not isinstance(info, dict):
         return False
@@ -394,7 +468,10 @@ async def _restore_local_sampling_session_if_needed(session_id: str) -> bool:
         restored = _has_local_sampling_session(session_id)
 
     if restored:
-        logger.info("[sampling restore] restored TaskStateStore-backed sampler session_id=%s", session_id)
+        logger.info(
+            "[sampling restore] restored TaskStateStore-backed sampler session_id=%s",
+            session_id,
+        )
     return restored or _has_local_sampling_session(session_id)
 
 
@@ -410,7 +487,9 @@ async def _refresh_sampling_session_if_stale(
 
         info = await async_get_sampling_session_info(session_id)
     except Exception as e:
-        logger.debug("Sampling session refresh skipped session_id=%s: %s", session_id, e)
+        logger.debug(
+            "Sampling session refresh skipped session_id=%s: %s", session_id, e
+        )
         return snapshot
 
     if not isinstance(info, dict):
@@ -465,8 +544,12 @@ async def _enqueue_sampling_request_with_trace(
         span.add_event(
             "enqueue_done",
             {
-                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
-                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+                "elapsed_ms": round(
+                    (time.perf_counter() - enqueue_start_s) * 1000.0, 3
+                ),
+                "route_elapsed_ms": round(
+                    (time.perf_counter() - route_start_s) * 1000.0, 3
+                ),
             },
         )
         return out
@@ -484,7 +567,9 @@ async def _ensure_session_lora_loaded(
 
     snap = snapshot or _get_sampling_snapshot(session_id)
     if snap is None:
-        raise RuntimeError(f"No sampling session metadata found for session {session_id}")
+        raise RuntimeError(
+            f"No sampling session metadata found for session {session_id}"
+        )
     if int(snap.lora_rank) <= 0:
         return
 
@@ -498,7 +583,9 @@ async def _ensure_session_lora_loaded(
 
     adapter_path = snap.adapter_path
     if not adapter_path:
-        raise RuntimeError(f"Session {session_id} has lora_rank={snap.lora_rank} but no adapter_path")
+        raise RuntimeError(
+            f"Session {session_id} has lora_rank={snap.lora_rank} but no adapter_path"
+        )
 
     lock = await _get_lora_load_lock(session_id)
     with start_as_current_span(
@@ -514,7 +601,11 @@ async def _ensure_session_lora_loaded(
     ):
         async with lock:
             refreshed = _get_sampling_snapshot(session_id)
-            if refreshed is not None and refreshed.lora_loaded and refreshed.lora_int_id is not None:
+            if (
+                refreshed is not None
+                and refreshed.lora_loaded
+                and refreshed.lora_int_id is not None
+            ):
                 return
             if refreshed is not None and refreshed.adapter_path:
                 adapter_path = refreshed.adapter_path
@@ -522,7 +613,9 @@ async def _ensure_session_lora_loaded(
             # Prefer path-based loading to avoid sending large tensors through Ray.
             add_from_path = getattr(engine, "add_lora_for_session_from_path", None)
             if add_from_path is None:
-                raise RuntimeError(f"Engine for session {session_id} does not support add_lora_for_session_from_path()")
+                raise RuntimeError(
+                    f"Engine for session {session_id} does not support add_lora_for_session_from_path()"
+                )
 
             load_snapshot = refreshed or snap
             with start_as_current_span(
@@ -531,23 +624,31 @@ async def _ensure_session_lora_loaded(
                 op="sampling.ensure_session_lora_loaded.add_from_path",
                 attributes={
                     "sampling_session_id": str(session_id),
-                    "base_model": str(load_snapshot.base_model) if load_snapshot.base_model else None,
+                    "base_model": str(load_snapshot.base_model)
+                    if load_snapshot.base_model
+                    else None,
                     "lora_rank": int(load_snapshot.lora_rank),
                     "adapter_path": str(adapter_path),
                     "lora_loaded_before": bool(load_snapshot.lora_loaded),
                 },
             ):
-                lora_int_id = await add_from_path(sampling_session_id=session_id, lora_path=adapter_path)
+                lora_int_id = await add_from_path(
+                    sampling_session_id=session_id, lora_path=adapter_path
+                )
             manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
 
 
-async def _register_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
+async def _register_coalesced_abort_aliases(
+    waiters: list[tuple], engine_request_id: str
+) -> None:
     async with _coalesced_abort_aliases_guard:
         for _fut, _ns, request_id in waiters:
             _coalesced_abort_aliases[request_id] = engine_request_id
 
 
-async def _unregister_coalesced_abort_aliases(waiters: list[tuple], engine_request_id: str) -> None:
+async def _unregister_coalesced_abort_aliases(
+    waiters: list[tuple], engine_request_id: str
+) -> None:
     async with _coalesced_abort_aliases_guard:
         for _fut, _ns, request_id in waiters:
             if _coalesced_abort_aliases.get(request_id) == engine_request_id:
@@ -582,13 +683,17 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
     started = time.monotonic()
     last_log = started
     await_timeout_s = float(os.environ.get("MINT_SAMPLE_AWAIT_TIMEOUT_S", "0"))
-    logger.info(f"[sample await start] request_id={request_id} await_timeout_s={await_timeout_s}")
+    logger.info(
+        f"[sample await start] request_id={request_id} await_timeout_s={await_timeout_s}"
+    )
     try:
         while True:
             done, _ = await asyncio.wait({task}, timeout=0.5)
             if done:
                 elapsed = time.monotonic() - started
-                logger.info(f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}")
+                logger.info(
+                    f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}"
+                )
                 return await task
             try:
                 status = await task_futures.async_get_status(request_id)
@@ -597,7 +702,9 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
             now = time.monotonic()
             elapsed = now - started
             if now - last_log >= 30.0:
-                logger.info(f"[sample await progress] request_id={request_id} elapsed_s={elapsed:.1f} future_status={status.value}")
+                logger.info(
+                    f"[sample await progress] request_id={request_id} elapsed_s={elapsed:.1f} future_status={status.value}"
+                )
                 last_log = now
             if await_timeout_s > 0 and elapsed >= await_timeout_s:
                 await _abort_engine_request(engine, request_id)
@@ -617,7 +724,9 @@ async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable)
                     await task
                 except Exception:
                     pass
-                raise RuntimeError(f"request_id={request_id} canceled due to future_status={status.value}")
+                raise RuntimeError(
+                    f"request_id={request_id} canceled due to future_status={status.value}"
+                )
     except asyncio.CancelledError:
         await _abort_engine_request(engine, request_id)
         task.cancel()
@@ -667,7 +776,9 @@ def _stop_key(stop: object | None) -> object:
         if all(isinstance(x, str) for x in stop):
             return ("ts", tuple(str(x) for x in stop))
         raise ValueError(f"stop must be list[int] or list[str], got mixed: {stop!r}")
-    raise TypeError(f"stop must be None, str, list[str], or list[int]; got {type(stop)}")
+    raise TypeError(
+        f"stop must be None, str, list[str], or list[int]; got {type(stop)}"
+    )
 
 
 async def _coalesced_generate(
@@ -736,7 +847,10 @@ async def _coalesced_generate(
             _sample_coalesce_groups[key] = g
         # If this request would exceed the per-group total sample cap, flush the existing group
         # immediately (without including this request), then start a fresh group.
-        if int(g["total_samples"]) + need > _SAMPLE_COALESCE_MAX_SAMPLES and g["waiters"]:
+        if (
+            int(g["total_samples"]) + need > _SAMPLE_COALESCE_MAX_SAMPLES
+            and g["waiters"]
+        ):
             _sample_coalesce_groups.pop(key, None)
             flush_task = g.get("flush_task")
             if flush_task is not None:
@@ -763,9 +877,13 @@ async def _coalesced_generate(
 
         g["waiters"].append((fut, need, request_id))
         g["total_samples"] = int(g["total_samples"]) + need
-        do_flush_now = (len(g["waiters"]) >= _SAMPLE_COALESCE_MAX_BATCH) or (int(g["total_samples"]) >= _SAMPLE_COALESCE_MAX_SAMPLES)
+        do_flush_now = (len(g["waiters"]) >= _SAMPLE_COALESCE_MAX_BATCH) or (
+            int(g["total_samples"]) >= _SAMPLE_COALESCE_MAX_SAMPLES
+        )
         if g["flush_task"] is None:
-            delay_s = 0.0 if do_flush_now else max(0.0, _SAMPLE_COALESCE_WINDOW_MS / 1000.0)
+            delay_s = (
+                0.0 if do_flush_now else max(0.0, _SAMPLE_COALESCE_WINDOW_MS / 1000.0)
+            )
             g["flush_task"] = asyncio.create_task(_flush_coalesced_group(key, delay_s))
         logger.info(
             f"[coalesce queue] request_id={request_id} sampling_session_id={sampling_session_id} coalesce_identity={coalesce_identity} "
@@ -857,7 +975,9 @@ async def _flush_group(g: dict) -> None:
         finally:
             await _unregister_coalesced_abort_aliases(waiters, vllm_request_id)
         if len(results) != total:
-            raise RuntimeError(f"coalesce: got {len(results)} results for total_samples={total}")
+            raise RuntimeError(
+                f"coalesce: got {len(results)} results for total_samples={total}"
+            )
 
         cur = 0
         for fut, ns, _rid in waiters:
@@ -907,13 +1027,17 @@ def _normalize_topk_prompt_logprobs(
             pairs: list[tuple[int, float]] = []
             for pair in entry:
                 if not isinstance(pair, (list, tuple)) or len(pair) != 2:
-                    raise ValueError(f"topk_prompt_logprobs[{i}] has invalid pair: {pair!r}")
+                    raise ValueError(
+                        f"topk_prompt_logprobs[{i}] has invalid pair: {pair!r}"
+                    )
                 tok, lp = pair
                 pairs.append((int(tok), float(lp)))
             pairs.sort(key=lambda kv: kv[1], reverse=True)
             out.append(pairs[:k])
             continue
-        raise ValueError(f"topk_prompt_logprobs[{i}] has invalid entry type: {type(entry)}")
+        raise ValueError(
+            f"topk_prompt_logprobs[{i}] has invalid entry type: {type(entry)}"
+        )
     return out
 
 
@@ -940,7 +1064,9 @@ def _get_apikey_id(
         return str(billing_auth.apikey_id)
     user_data = getattr(request.state, "user_data", None)
     if isinstance(user_data, dict):
-        apikey_id = str(user_data.get("apikey_id") or user_data.get("key_id") or "").strip()
+        apikey_id = str(
+            user_data.get("apikey_id") or user_data.get("key_id") or ""
+        ).strip()
         if apikey_id:
             return apikey_id
     return None
@@ -960,7 +1086,9 @@ def _get_asample_throttle_identity(
     return "anonymous", None, "anonymous"
 
 
-async def _append_billing_observations(*, observations: list[dict], source: str) -> None:
+async def _append_billing_observations(
+    *, observations: list[dict], source: str
+) -> None:
     if not observations:
         return
     await task_futures.async_append_billing_outbox(observations, source=source)
@@ -970,6 +1098,15 @@ async def _append_billing_observations(*, observations: list[dict], source: str)
 async def asample(
     request: SampleRequest,
     http_request: Request,
+) -> UntypedAPIFuture:
+    return await _asample_impl(request, http_request)
+
+
+async def _asample_impl(
+    request: SampleRequest,
+    http_request: Request,
+    request_id_override: str | None = None,
+    suppress_billing: bool = False,
 ) -> UntypedAPIFuture:
     """Submit an async sampling request.
 
@@ -991,8 +1128,12 @@ async def asample(
 
         selector = request.model_path or request.base_model
         if not isinstance(selector, str) or not selector:
-            raise HTTPException(status_code=422, detail="base_model or model_path is required")
-        session_id, _created_base_model = await ensure_sampling_session(model_path=selector, http_request=http_request)
+            raise HTTPException(
+                status_code=422, detail="base_model or model_path is required"
+            )
+        session_id, _created_base_model = await ensure_sampling_session(
+            model_path=selector, http_request=http_request
+        )
         request = request.model_copy(
             update={
                 "sampling_session_id": session_id,
@@ -1003,14 +1144,17 @@ async def asample(
         )
 
     uses_existing_session_selector = request.has_session_selector()
-    if server_config.sampling_require_seq_id and uses_existing_session_selector and request.seq_id is None:
+    if (
+        server_config.sampling_require_seq_id
+        and uses_existing_session_selector
+        and request.seq_id is None
+    ):
         raise HTTPException(
             status_code=422,
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
     session_id = request.get_session_id()
-    manager = _active_session_manager()
-    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    snapshot = await _async_get_http_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
         try:
@@ -1028,11 +1172,16 @@ async def asample(
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         user_data = getattr(http_request.state, "user_data", None)
         if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+            raise HTTPException(
+                status_code=403, detail=get_access_denied_error(base_model)
+            )
 
         resp = await forward_json(
             upstream=upstream,
@@ -1047,9 +1196,13 @@ async def asample(
         payload = resp.json()
         upstream_request_id = payload.get("request_id")
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream asample returned invalid request_id")
+            raise HTTPException(
+                status_code=502, detail="Upstream asample returned invalid request_id"
+            )
         return UntypedAPIFuture(
-            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+            request_id=encode_request_id(
+                upstream_alias=upstream_alias, upstream_request_id=upstream_request_id
+            )
         )
 
     prompt_token_count: int | None = None
@@ -1060,7 +1213,9 @@ async def asample(
     if snapshot is not None and snapshot.uses_multi_lora:
         base_model = snapshot.base_model
         if not base_model:
-            raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
+            raise HTTPException(
+                status_code=500, detail=f"Session {session_id!r} missing base_model"
+            )
         token_ids = request.prompt.to_token_ids()
         prompt_token_count = len(token_ids)
         from ..backend.model_registry import get_model_config
@@ -1092,15 +1247,21 @@ async def asample(
             decision="rejected",
             reason="server_overloaded",
         )
-        raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
+        raise HTTPException(
+            status_code=429, detail="Sampling backpressure: server overloaded"
+        )
     user_id = _get_user_id(http_request)
     request_json = request.model_dump_json().encode("utf-8")
     payload_hash = _payload_hash(request_json)
-    if request.seq_id is not None:
+    if request_id_override is not None:
+        request_id = str(request_id_override)
+    elif request.seq_id is not None:
         request_id = _deterministic_request_id(session_id, request.seq_id)
     else:
         request_id = uuid.uuid4().hex
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
     throttle_principal, apikey_id, throttle_scope = _get_asample_throttle_identity(
         http_request,
         billing_auth=billing_auth,
@@ -1108,14 +1269,15 @@ async def asample(
     model_work_attempt_id = uuid.uuid4().hex
     base_model = snapshot.base_model if snapshot is not None else None
     if snapshot is None or not base_model:
-        snapshot = _get_sampling_snapshot(session_id)
-        base_model = snapshot.base_model if snapshot is not None else None
-    if snapshot is None or not base_model:
-        raise HTTPException(status_code=404, detail=f"Sampling session {session_id!r} not found")
+        raise HTTPException(
+            status_code=404, detail=f"Sampling session {session_id!r} not found"
+        )
 
     # Set request_id in context for logging
     set_request_id(request_id)
-    logger.info(f"asample request received: session_id={session_id}, seq_id={request.seq_id}")
+    logger.info(
+        f"asample request received: session_id={session_id}, seq_id={request.seq_id}"
+    )
 
     try:
         if prompt_token_count is None:
@@ -1141,7 +1303,9 @@ async def asample(
             "token_cost": token_cost,
         }
         enqueue_extra = merge_queue_priority_extra(
-            {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+            {"gateway_auth": billing_auth.__dict__}
+            if billing_auth is not None
+            else None,
             request=http_request,
         )
         admission = await enqueue_model_work(
@@ -1162,6 +1326,7 @@ async def asample(
                 **enqueue_extra,
                 "model_work_attempt_id": model_work_attempt_id,
                 "sampling_admission_principal": throttle_principal or "anonymous",
+                "suppress_billing": bool(suppress_billing),
             },
             queued_meta=queued_meta,
             create_future=True,
@@ -1188,7 +1353,9 @@ async def asample(
             "error": "sampling_backpressure",
             "reason": reason,
             "domain": str(result.get("domain_key") or domain_key),
-            "principal": str(result.get("principal") or throttle_principal or "anonymous"),
+            "principal": str(
+                result.get("principal") or throttle_principal or "anonymous"
+            ),
             "current": int(result.get("current") or 0),
             "limit": int(result.get("limit") or 0),
             "retry_after_s": int(result.get("retry_after_s") or 5),
@@ -1206,7 +1373,10 @@ async def asample(
                 "ModelWorkSchedulerConflictError",
                 "duplicate request_id",
             )
-            raise HTTPException(status_code=503, detail="Failed to enqueue sampling request: duplicate request_id")
+            raise HTTPException(
+                status_code=503,
+                detail="Failed to enqueue sampling request: duplicate request_id",
+            )
         try:
             meta = await task_futures.async_get_meta(request_id)
             existing_hash = meta.get("payload_hash") if isinstance(meta, dict) else None
@@ -1224,7 +1394,9 @@ async def asample(
         except HTTPException:
             raise
         except TaskStateStoreUnavailableError:
-            raise HTTPException(status_code=503, detail="Ray unavailable: TaskStateStore requires Ray")
+            raise HTTPException(
+                status_code=503, detail="Ray unavailable: TaskStateStore requires Ray"
+            )
         except KeyError:
             logger.exception(
                 "[sampling.asample] duplicate request_id missing from TaskStateStore request_id=%s session_id=%s seq_id=%s",
@@ -1246,14 +1418,20 @@ async def asample(
             type(e).__name__,
             str(e),
         )
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue sampling request: {e}")
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue sampling request: {e}"
+        )
 
     sampling_admission = admission.scheduler_result.get("sampling_inflight_admission")
-    if isinstance(sampling_admission, dict) and bool(sampling_admission.get("would_reject")):
+    if isinstance(sampling_admission, dict) and bool(
+        sampling_admission.get("would_reject")
+    ):
         record_sampling_admission_metric(
             route=_ASAMPLE_ROUTE,
             decision="would_reject",
-            reason=str(sampling_admission.get("reason") or "sampling_inflight_limit_exceeded"),
+            reason=str(
+                sampling_admission.get("reason") or "sampling_inflight_limit_exceeded"
+            ),
             scope=throttle_scope,
             domain_key=domain_key,
         )
@@ -1281,7 +1459,11 @@ async def sample_once(
     bill_usage: bool = True,
 ) -> SampledSequence:
     """Synchronously execute one sampling request using the multi-LoRA path."""
-    from ..gateway import async_remote_sampling_session, forward_json, upstream_for_alias
+    from ..gateway import (
+        async_remote_sampling_session,
+        forward_json,
+        upstream_for_alias,
+    )
 
     if _should_backpressure(http_request):
         record_sampling_admission_metric(
@@ -1289,10 +1471,11 @@ async def sample_once(
             decision="rejected",
             reason="server_overloaded",
         )
-        raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
+        raise HTTPException(
+            status_code=429, detail="Sampling backpressure: server overloaded"
+        )
 
-    manager = _active_session_manager()
-    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    snapshot = await _async_get_http_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
         try:
@@ -1306,17 +1489,24 @@ async def sample_once(
                 remote = remote_sampling_session(session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and manager is None:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
+    if snapshot is None and remote is None:
+        raise HTTPException(
+            status_code=404, detail=f"Sampling session {session_id!r} not found"
+        )
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         user_data = getattr(http_request.state, "user_data", None)
         if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+            raise HTTPException(
+                status_code=403, detail=get_access_denied_error(base_model)
+            )
 
         sample_request = SampleRequest(
             sampling_session_id=session_id,
@@ -1342,9 +1532,13 @@ async def sample_once(
         payload = resp.json()
         upstream_request_id = payload.get("request_id")
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream asample returned invalid request_id")
+            raise HTTPException(
+                status_code=502, detail="Upstream asample returned invalid request_id"
+            )
 
-        poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
+        poll_timeout_s = float(
+            env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800"
+        )
         poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
         deadline = time.time() + poll_timeout_s
         while True:
@@ -1368,7 +1562,9 @@ async def sample_once(
                 await asyncio.sleep(poll_sleep_s)
                 continue
             if poll_resp.status_code >= 400:
-                raise HTTPException(status_code=poll_resp.status_code, detail=poll_resp.text)
+                raise HTTPException(
+                    status_code=poll_resp.status_code, detail=poll_resp.text
+                )
             try:
                 poll_payload = poll_resp.json()
             except Exception as e:
@@ -1395,204 +1591,70 @@ async def sample_once(
                 )
             return sample_response.sequences[0]
 
-    if manager is None:
-        from ..models.types import FutureRetrieveRequest
-        from .futures import retrieve_future
+    from ..models.types import FutureRetrieveRequest
+    from .futures import retrieve_future
 
-        future = await asample(
-            SampleRequest(
-                sampling_session_id=session_id,
-                num_samples=1,
-                prompt=ModelInput.from_ints(token_ids),
-                sampling_params=SamplingParams(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                ),
+    future = await _asample_impl(
+        SampleRequest(
+            sampling_session_id=session_id,
+            num_samples=1,
+            prompt=ModelInput.from_ints(token_ids),
+            sampling_params=SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
             ),
+        ),
+        http_request,
+        request_id_override=request_id,
+        suppress_billing=not bool(bill_usage),
+    )
+    poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
+    poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
+    deadline = time.time() + poll_timeout_s
+    while True:
+        poll_response = Response()
+        payload = await retrieve_future(
+            FutureRetrieveRequest(request_id=future.request_id),
             http_request,
+            poll_response,
         )
-        poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
-        poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
-        deadline = time.time() + poll_timeout_s
-        while True:
-            poll_response = Response()
-            payload = await retrieve_future(
-                FutureRetrieveRequest(request_id=future.request_id),
-                http_request,
-                poll_response,
-            )
-            if poll_response.status_code == 408:
-                if time.time() > deadline:
-                    raise HTTPException(
-                        status_code=504,
-                        detail=(
-                            "Local retrieve_future timed out after "
-                            f"{poll_timeout_s:.1f}s for request_id={future.request_id!r}"
-                        ),
-                    )
-                await asyncio.sleep(poll_sleep_s)
-                continue
-            if poll_response.status_code >= 400:
-                if isinstance(payload, dict) and "detail" in payload:
-                    detail = payload["detail"]
-                else:
-                    detail = payload
-                raise HTTPException(status_code=poll_response.status_code, detail=detail)
-            if isinstance(payload, dict) and "error" in payload:
-                raise HTTPException(status_code=500, detail=payload["error"])
-            try:
-                sample_response = SampleResponse.model_validate(payload)
-            except Exception as e:
+        if poll_response.status_code == 408:
+            if time.time() > deadline:
                 raise HTTPException(
-                    status_code=502,
-                    detail=f"Local retrieve_future returned invalid sample payload: {type(e).__name__}: {e}",
-                ) from e
-            if len(sample_response.sequences) != 1:
-                raise HTTPException(
-                    status_code=502,
+                    status_code=504,
                     detail=(
-                        f"Local retrieve_future returned {len(sample_response.sequences)} sequences "
-                        "for sample_once(num_samples=1)"
+                        "Local retrieve_future timed out after "
+                        f"{poll_timeout_s:.1f}s for request_id={future.request_id!r}"
                     ),
                 )
-            return sample_response.sequences[0]
-
-    engine = None
-    model_actor_supervisor = None
-    model_actor_supervisor_actor_name: str | None = None
-    manager.mark_session_inflight(session_id, +1)
-    try:
-        snapshot = _get_sampling_snapshot(session_id)
-        if snapshot is None:
-            await _restore_local_sampling_session_if_needed(session_id)
-            snapshot = _get_sampling_snapshot(session_id)
-        is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else manager.is_multi_lora_session(session_id)
-        if is_multi_lora:
-            base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
-            if not base_model:
-                raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
-
-            from ..backend.model_registry import get_model_config
-
-            try:
-                max_model_len = int(get_model_config(base_model).max_model_len)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Cannot determine max_model_len for base_model {base_model!r}: "
-                        f"{type(e).__name__}: {e}"
-                    ),
-                ) from e
-
-            total_len = len(token_ids) + int(max_tokens)
-            if total_len > max_model_len:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
-                        f"for model {base_model}"
-                    ),
-                )
-
-            engine = await run_async_with_otel_span(
-                "sampling.get_engine_for_session",
-                lambda: manager.get_engine_for_session(session_id),
-                component="sampling",
-                op="sampling.get_engine_for_session",
-                request_id=request_id,
-                attributes={
-                    "sampling_session_id": session_id,
-                    "base_model": snapshot.base_model if snapshot is not None else None,
-                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                },
-            )
-            if engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
-
-            model_actor_supervisor = get_model_actor_supervisor()
-            model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
-            if not isinstance(model_actor_supervisor_actor_name, str) or not model_actor_supervisor_actor_name:
-                raise RuntimeError(
-                    f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
-                )
-            model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, +1)
-            await run_async_with_otel_span(
-                "sampling.ensure_lora_loaded",
-                lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
-                component="sampling",
-                op="sampling.ensure_lora_loaded",
-                request_id=request_id,
-                attributes={
-                    "sampling_session_id": session_id,
-                    "base_model": snapshot.base_model if snapshot is not None else None,
-                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                    "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
-                },
-            )
-            result = await _await_with_external_fail_abort(
-                engine=engine,
-                request_id=request_id,
-                awaitable=engine.generate(
-                    sampling_session_id=session_id,
-                    prompt_ids=token_ids,
-                    request_id=request_id,
-                    max_tokens=max_tokens,
-                    stop=stop,
-                    temperature=temperature,
-                    top_k=-1,
-                    top_p=top_p,
-                    logprobs=False,
+            await asyncio.sleep(poll_sleep_s)
+            continue
+        if poll_response.status_code >= 400:
+            if isinstance(payload, dict) and "detail" in payload:
+                detail = payload["detail"]
+            else:
+                detail = payload
+            raise HTTPException(status_code=poll_response.status_code, detail=detail)
+        if isinstance(payload, dict) and "error" in payload:
+            raise HTTPException(status_code=500, detail=payload["error"])
+        try:
+            sample_response = SampleResponse.model_validate(payload)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Local retrieve_future returned invalid sample payload: {type(e).__name__}: {e}",
+            ) from e
+        if len(sample_response.sequences) != 1:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Local retrieve_future returned {len(sample_response.sequences)} sequences "
+                    "for sample_once(num_samples=1)"
                 ),
             )
-        else:
-            engine = manager.get_engine(session_id)
-            if engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-            result = await _await_with_external_fail_abort(
-                engine=engine,
-                request_id=request_id,
-                awaitable=engine.generate(
-                    prompt_ids=token_ids,
-                    request_id=request_id,
-                    max_tokens=max_tokens,
-                    stop=stop,
-                    temperature=temperature,
-                    top_k=-1,
-                    top_p=top_p,
-                    logprobs=False,
-                ),
-            )
-
-        sequence = sampled_sequence_from_result(result)
-        if bill_usage:
-            await _append_billing_observations(
-                observations=build_sample_once_billing_observations(
-                    session_id=session_id,
-                    token_ids=token_ids,
-                    sequence=sequence,
-                    http_request=http_request,
-                    request_id=request_id,
-                ),
-                source="sync_http",
-            )
-        return sequence
-    except HTTPException:
-        await _abort_engine_request(engine, request_id)
-        raise
-    except Exception:
-        await _abort_engine_request(engine, request_id)
-        raise
-    finally:
-        if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
-            model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        manager.mark_session_inflight(session_id, -1)
+        return sample_response.sequences[0]
 
 
 async def _do_sample(
@@ -1600,6 +1662,7 @@ async def _do_sample(
     request: SampleRequest,
     user_id: str | None,
     gateway_auth: dict | None = None,
+    suppress_billing: bool = False,
 ) -> None:
     """Background task to perform sampling."""
     # Restore request_id context for logging
@@ -1622,23 +1685,36 @@ async def _do_sample(
     }
     try:
         try:
-            if session_manager is None:
+            manager = _active_session_manager()
+            if manager is None:
                 raise RuntimeError("Session manager not initialized")
 
             token_ids = request.prompt.to_token_ids()
-            session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
+            session_id = (
+                request.get_session_id()
+            )  # Supports both sampling_session_id and model_id
             await _restore_local_sampling_session_if_needed(session_id)
             workload_base_model = _resolve_billing_model(session_id)
-            session_manager.mark_session_inflight(session_id, +1)
+            manager.mark_session_inflight(session_id, +1)
             snapshot = _get_sampling_snapshot(session_id)
 
             # Handle include_prompt_logprobs alias
-            want_prompt_logprobs = request.prompt_logprobs or request.include_prompt_logprobs
+            want_prompt_logprobs = (
+                request.prompt_logprobs or request.include_prompt_logprobs
+            )
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
-            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
+            is_multi_lora = (
+                bool(snapshot.uses_multi_lora)
+                if snapshot is not None
+                else manager.is_multi_lora_session(session_id)
+            )
             if is_multi_lora:
-                base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
+                base_model = (
+                    snapshot.base_model
+                    if snapshot is not None
+                    else manager.get_session_base_model(session_id)
+                )
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
                 from ..backend.model_registry import get_model_config
@@ -1653,7 +1729,9 @@ async def _do_sample(
 
             # Generate for each sample
             if request.num_samples < 1:
-                raise ValueError(f"num_samples must be >= 1 (got {request.num_samples})")
+                raise ValueError(
+                    f"num_samples must be >= 1 (got {request.num_samples})"
+                )
 
             if is_multi_lora:
                 # Multi-LoRA mode: handles both LoRA and base model sessions
@@ -1672,22 +1750,30 @@ async def _do_sample(
                 )
                 engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: session_manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
                     attributes={
                         "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model if snapshot is not None else None,
-                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                        "base_model": snapshot.base_model
+                        if snapshot is not None
+                        else None,
+                        "lora_rank": int(snapshot.lora_rank)
+                        if snapshot is not None
+                        else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded)
+                        if snapshot is not None
+                        else None,
                     },
                 )
                 await _safe_update_sample_meta(
                     request_id,
                     {
                         "stage": "lora_load",
-                        "engine_acquire_s": max(0.0, time.perf_counter() - engine_acquire_t0),
+                        "engine_acquire_s": max(
+                            0.0, time.perf_counter() - engine_acquire_t0
+                        ),
                     },
                 )
                 logger.info(
@@ -1699,11 +1785,16 @@ async def _do_sample(
 
                 model_actor_supervisor = get_model_actor_supervisor()
                 model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
-                if not isinstance(model_actor_supervisor_actor_name, str) or not model_actor_supervisor_actor_name:
+                if (
+                    not isinstance(model_actor_supervisor_actor_name, str)
+                    or not model_actor_supervisor_actor_name
+                ):
                     raise RuntimeError(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
-                model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, +1)
+                model_actor_supervisor.mark_inflight(
+                    model_actor_supervisor_actor_name, +1
+                )
                 _record_vllm_workload_start(
                     actor_name=model_actor_supervisor_actor_name,
                     base_model=workload_base_model,
@@ -1726,16 +1817,26 @@ async def _do_sample(
                 )
                 await run_async_with_otel_span(
                     "sampling.ensure_lora_loaded",
-                    lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
+                    lambda: _ensure_session_lora_loaded(
+                        engine, session_id, snapshot=snapshot
+                    ),
                     component="sampling",
                     op="sampling.ensure_lora_loaded",
                     request_id=request_id,
                     attributes={
                         "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model if snapshot is not None else None,
-                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                        "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                        "base_model": snapshot.base_model
+                        if snapshot is not None
+                        else None,
+                        "lora_rank": int(snapshot.lora_rank)
+                        if snapshot is not None
+                        else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded)
+                        if snapshot is not None
+                        else None,
+                        "has_adapter_path": bool(snapshot.adapter_path)
+                        if snapshot is not None
+                        else None,
                     },
                 )
                 await _safe_update_sample_meta(
@@ -1747,7 +1848,9 @@ async def _do_sample(
                         "max_tokens": int(request.sampling_params.max_tokens),
                     },
                 )
-                logger.info(f"[sample path] session_id={session_id} stage=after_lora_load")
+                logger.info(
+                    f"[sample path] session_id={session_id} stage=after_lora_load"
+                )
 
                 gen_many = getattr(engine, "generate_many", None)
                 can_coalesce = (
@@ -1793,7 +1896,10 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate",
                         request_id=request_id,
-                        attributes={"sampling_session_id": session_id, "num_samples": request.num_samples},
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "num_samples": request.num_samples,
+                        },
                     )
                 elif request.num_samples == 1:
                     logger.info("[sample path] branch=generate_single")
@@ -1818,12 +1924,17 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate",
                         request_id=request_id,
-                        attributes={"sampling_session_id": session_id, "num_samples": 1},
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "num_samples": 1,
+                        },
                     )
                     results = [one_result]
                 else:
                     if gen_many is None:
-                        raise RuntimeError(f"Engine for session {session_id} does not support generate_many()")
+                        raise RuntimeError(
+                            f"Engine for session {session_id} does not support generate_many()"
+                        )
                     logger.info("[sample path] branch=generate_many")
                     generate_t0 = time.perf_counter()
                     results = await run_async_with_otel_span(
@@ -1847,12 +1958,15 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate_many",
                         request_id=request_id,
-                        attributes={"sampling_session_id": session_id, "num_samples": request.num_samples},
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "num_samples": request.num_samples,
+                        },
                     )
                 generate_s = max(0.0, time.perf_counter() - generate_t0)
             else:
                 # Legacy mode: per-session engine
-                engine = session_manager.get_engine(session_id)
+                engine = manager.get_engine(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
                 model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
@@ -1884,7 +1998,9 @@ async def _do_sample(
                     async with sem:
                         return await _generate_one(i)
 
-                results = await asyncio.gather(*(_generate_limited(i) for i in range(request.num_samples)))
+                results = await asyncio.gather(
+                    *(_generate_limited(i) for i in range(request.num_samples))
+                )
 
             sequences = []
             for result in results:
@@ -1919,7 +2035,10 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.compute_prompt_logprobs",
                         request_id=request_id,
-                        attributes={"sampling_session_id": session_id, "prompt_tokens": len(token_ids)},
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "prompt_tokens": len(token_ids),
+                        },
                     )
                 else:
                     computed_logprobs = await engine.compute_logprobs(
@@ -1964,12 +2083,13 @@ async def _do_sample(
                     request.topk_prompt_logprobs,
                 )
 
-            auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
-            prefill_tokens = len(token_ids)
-            sampling_tokens = sum(len(seq.tokens) for seq in sequences)
-            label_model = _resolve_billing_model(session_id)
-            billing_observations = (
-                billing_observations_from_auth(
+            billing_observations = []
+            if not suppress_billing:
+                auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
+                prefill_tokens = len(token_ids)
+                sampling_tokens = sum(len(seq.tokens) for seq in sequences)
+                label_model = _resolve_billing_model(session_id)
+                billing_observations = billing_observations_from_auth(
                     auth_ctx=auth_ctx,
                     request_id=request_id,
                     charge_item="sampling",
@@ -1978,8 +2098,7 @@ async def _do_sample(
                     route="sampling.asample",
                     dimension="prefill",
                     model=label_model,
-                )
-                + billing_observations_from_auth(
+                ) + billing_observations_from_auth(
                     auth_ctx=auth_ctx,
                     request_id=request_id,
                     charge_item="sampling",
@@ -1989,7 +2108,6 @@ async def _do_sample(
                     dimension="sample",
                     model=label_model,
                 )
-            )
             # Compatibility: older tinker clients don't accept a top-level `type` field on SampleResponse.
             response_payload = response.model_dump(exclude={"type"})
             try:
@@ -2046,16 +2164,20 @@ async def _do_sample(
                 base_model=workload_base_model,
                 op="asample",
                 status=workload_status,
-                prompt_tokens=len(token_ids) if 'token_ids' in locals() else 0,
+                prompt_tokens=len(token_ids) if "token_ids" in locals() else 0,
                 generated_tokens=workload_generated_tokens,
                 started_at=workload_started_at,
                 ttft_s=workload_obs["ttft_s"],
                 tpot_s=workload_obs["tpot_s"],
             )
-        if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
+        if (
+            model_actor_supervisor is not None
+            and model_actor_supervisor_actor_name is not None
+        ):
             model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        if session_manager is not None and session_id is not None:
-            session_manager.mark_session_inflight(session_id, -1)
+        manager = _active_session_manager()
+        if manager is not None and session_id is not None:
+            manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1
 
 
@@ -2078,7 +2200,7 @@ async def compute_logprobs(
         upstream_for_alias,
     )
 
-    snapshot = await _async_get_detached_sampling_snapshot(request.sampling_session_id)
+    snapshot = await _async_get_http_sampling_snapshot(request.sampling_session_id)
     remote = None
     if snapshot is None:
         try:
@@ -2092,17 +2214,25 @@ async def compute_logprobs(
                 remote = remote_sampling_session(request.sampling_session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and session_manager is None:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
+    if snapshot is None and remote is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Sampling session {request.sampling_session_id!r} not found",
+        )
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         user_data = getattr(http_request.state, "user_data", None)
         if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+            raise HTTPException(
+                status_code=403, detail=get_access_denied_error(base_model)
+            )
 
         resp = await forward_json(
             upstream=upstream,
@@ -2117,16 +2247,24 @@ async def compute_logprobs(
         payload = resp.json()
         upstream_request_id = payload.get("request_id")
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream compute_logprobs returned invalid request_id")
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream compute_logprobs returned invalid request_id",
+            )
         return UntypedAPIFuture(
-            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+            request_id=encode_request_id(
+                upstream_alias=upstream_alias, upstream_request_id=upstream_request_id
+            )
         )
 
     # Preflight length gate for multi-LoRA sessions to fail fast on registry issues.
     if snapshot is not None and snapshot.uses_multi_lora:
         base_model = snapshot.base_model
         if not base_model:
-            raise HTTPException(status_code=500, detail=f"Session {request.sampling_session_id!r} missing base_model")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Session {request.sampling_session_id!r} missing base_model",
+            )
         token_ids = request.sequence.to_token_ids()
         from ..backend.model_registry import get_model_config
 
@@ -2156,10 +2294,15 @@ async def compute_logprobs(
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
     base_model = snapshot.base_model if snapshot is not None else None
     if not base_model:
-        raise HTTPException(status_code=500, detail=f"Session {request.sampling_session_id!r} missing base_model")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Session {request.sampling_session_id!r} missing base_model",
+        )
     domain_key = _model_work_domain_key(str(base_model))
     affinity_group = (
         _model_work_affinity_group(snapshot)
@@ -2180,7 +2323,9 @@ async def compute_logprobs(
             ordering_key=f"session:{request.sampling_session_id}",
             token_cost=max(1, len(request.sequence.to_token_ids())),
             extra=merge_queue_priority_extra(
-                {"gateway_auth": billing_auth.__dict__} if billing_auth is not None else None,
+                {"gateway_auth": billing_auth.__dict__}
+                if billing_auth is not None
+                else None,
                 request=http_request,
             ),
             queued_meta={
@@ -2203,7 +2348,9 @@ async def compute_logprobs(
             },
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}")
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue compute_logprobs request: {e}"
+        )
 
     record_sampling_admission_metric(
         route=_COMPUTE_LOGPROBS_ROUTE,
@@ -2229,22 +2376,34 @@ async def _do_compute_logprobs(
     workload_status = "error"
     try:
         set_request_id(request_id)
-        if session_manager is None:
+        manager = _active_session_manager()
+        if manager is None:
             raise RuntimeError("Session manager not initialized")
 
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
         await _restore_local_sampling_session_if_needed(session_id)
         workload_base_model = _resolve_billing_model(session_id)
-        session_manager.mark_session_inflight(session_id, +1)
+        manager.mark_session_inflight(session_id, +1)
         snapshot = _get_sampling_snapshot(session_id)
-        base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
+        base_model = (
+            snapshot.base_model
+            if snapshot is not None
+            else manager.get_session_base_model(session_id)
+        )
 
         async def _compute_logprobs_action():
-            nonlocal model_actor_supervisor, model_actor_supervisor_actor_name, workload_started
+            nonlocal \
+                model_actor_supervisor, \
+                model_actor_supervisor_actor_name, \
+                workload_started
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
-            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
+            is_multi_lora = (
+                bool(snapshot.uses_multi_lora)
+                if snapshot is not None
+                else manager.is_multi_lora_session(session_id)
+            )
             if is_multi_lora:
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
@@ -2261,15 +2420,21 @@ async def _do_compute_logprobs(
             if is_multi_lora:
                 multi_lora_engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: session_manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
                     attributes={
                         "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model if snapshot is not None else None,
-                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                        "base_model": snapshot.base_model
+                        if snapshot is not None
+                        else None,
+                        "lora_rank": int(snapshot.lora_rank)
+                        if snapshot is not None
+                        else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded)
+                        if snapshot is not None
+                        else None,
                     },
                 )
                 if multi_lora_engine is None:
@@ -2277,12 +2442,19 @@ async def _do_compute_logprobs(
                 from ..backend.model_actor_supervisor import get_model_actor_supervisor
 
                 model_actor_supervisor = get_model_actor_supervisor()
-                model_actor_supervisor_actor_name = getattr(multi_lora_engine, "actor_name", None)
-                if not isinstance(model_actor_supervisor_actor_name, str) or not model_actor_supervisor_actor_name:
+                model_actor_supervisor_actor_name = getattr(
+                    multi_lora_engine, "actor_name", None
+                )
+                if (
+                    not isinstance(model_actor_supervisor_actor_name, str)
+                    or not model_actor_supervisor_actor_name
+                ):
                     raise RuntimeError(
                         f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
                     )
-                model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, +1)
+                model_actor_supervisor.mark_inflight(
+                    model_actor_supervisor_actor_name, +1
+                )
                 _record_vllm_workload_start(
                     actor_name=model_actor_supervisor_actor_name,
                     base_model=workload_base_model,
@@ -2291,16 +2463,26 @@ async def _do_compute_logprobs(
                 workload_started = True
                 await run_async_with_otel_span(
                     "sampling.ensure_lora_loaded",
-                    lambda: _ensure_session_lora_loaded(multi_lora_engine, session_id, snapshot=snapshot),
+                    lambda: _ensure_session_lora_loaded(
+                        multi_lora_engine, session_id, snapshot=snapshot
+                    ),
                     component="sampling",
                     op="sampling.ensure_lora_loaded",
                     request_id=request_id,
                     attributes={
                         "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model if snapshot is not None else None,
-                        "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                        "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                        "base_model": snapshot.base_model
+                        if snapshot is not None
+                        else None,
+                        "lora_rank": int(snapshot.lora_rank)
+                        if snapshot is not None
+                        else None,
+                        "lora_loaded_before": bool(snapshot.lora_loaded)
+                        if snapshot is not None
+                        else None,
+                        "has_adapter_path": bool(snapshot.adapter_path)
+                        if snapshot is not None
+                        else None,
                     },
                 )
                 return await multi_lora_engine.compute_logprobs(
@@ -2309,7 +2491,7 @@ async def _do_compute_logprobs(
                     request_id=request_id,
                 )
 
-            engine = session_manager.get_engine(session_id)
+            engine = manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
             model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
@@ -2337,7 +2519,9 @@ async def _do_compute_logprobs(
             },
         )
 
-        logprobs = normalize_prompt_logprobs_for_tinker(logprobs, prompt_len=len(token_ids))
+        logprobs = normalize_prompt_logprobs_for_tinker(
+            logprobs, prompt_len=len(token_ids)
+        )
         response = ComputeLogprobsResponse(logprobs=logprobs)
         # Compatibility: older tinker clients don't accept a top-level `type` field on ComputeLogprobsResponse.
         auth_ctx = GatewayAuthContext(**gateway_auth) if gateway_auth else None
@@ -2387,11 +2571,15 @@ async def _do_compute_logprobs(
                 base_model=workload_base_model,
                 op="compute_logprobs",
                 status=workload_status,
-                prompt_tokens=len(token_ids) if 'token_ids' in locals() else 0,
+                prompt_tokens=len(token_ids) if "token_ids" in locals() else 0,
                 generated_tokens=0,
                 started_at=workload_started_at,
             )
-        if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
+        if (
+            model_actor_supervisor is not None
+            and model_actor_supervisor_actor_name is not None
+        ):
             model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        if session_manager is not None and session_id is not None:
-            session_manager.mark_session_inflight(session_id, -1)
+        manager = _active_session_manager()
+        if manager is not None and session_id is not None:
+            manager.mark_session_inflight(session_id, -1)

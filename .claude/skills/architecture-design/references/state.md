@@ -20,7 +20,12 @@ This project has multiple identifiers that look similar but have different owner
 - `sampling_session_id`
   - Created by `POST /api/v1/create_sampling_session`.
   - Used by sampling endpoints to select a base model and optional LoRA adapter.
-  - In multi-LoRA mode, `sampling_session_id` is mapped (in-process) to a `lora_int_id` that vLLM uses to select frozen adapter weights.
+  - HTTP workers persist sampling metadata through `TaskStateStore` sampling-session
+    methods and do not register API-process `SessionManager` state as authority.
+  - In multi-LoRA runtime execution, `sampling_session_id` may be cached in a
+    runtime-local `SessionManager` and mapped to a `lora_int_id` that vLLM uses
+    to select frozen adapter weights. That cache is reconstructable from
+    detached sampling metadata and the vLLM LoRA registry.
   - In gateway mode, upstream routing metadata for remote sampling sessions is persisted through `TaskStateStore` gateway-session methods.
 
 - `request_id`
@@ -35,6 +40,8 @@ State that survives an API restart in detached control-plane actors:
 - `TaskStateStore` entries (`request_id` status/result metadata and terminal payload pointers)
 - session and sampler index metadata
 - training-session recovery metadata
+- training-session `last_activity` and `inflight_ops` metadata used to protect
+  queued HTTP windows from detached idle cleanup
 - gateway routing metadata for remote sampling sessions and training models
 - billing outbox rows awaiting PG flush
 - session heartbeat metadata used by cleanup and REST metadata checks
@@ -60,10 +67,10 @@ depend on SQLite table scans or a process-local dict.
 State that is still in-process and lost on API restart:
 
 - `sessions` dict request metadata
-- `SessionManager` sampling-session bindings
-- `sampling_session_id -> lora_int_id` mappings
-- `TrainingSessionManager` live session objects
-- engine registries and other API-host caches
+- runtime-local `SessionManager` sampling-session bindings and
+  `sampling_session_id -> lora_int_id` mappings
+- runtime-local `TrainingSessionManager` live session objects
+- engine registries and other runtime/API-host caches
 
 Many Ray actors are detached and can survive server restarts. This is useful for reuse, but it also means you must reason about reconciliation between persisted control-plane metadata, in-process registries, and actors still running.
 

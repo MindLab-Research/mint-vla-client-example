@@ -63,6 +63,42 @@ training_engine = None
 action_session_manager = None
 
 
+def _current_training_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_manager
+    except Exception:
+        pass
+    return training_manager
+
+
+def _current_training_engine():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_engine
+    except Exception:
+        pass
+    return training_engine
+
+
+def _current_action_session_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.action_manager
+    except Exception:
+        pass
+    return action_session_manager
+
+
 def _get_user_data(request: Request) -> dict | None:
     return _request_user_data(request)
 
@@ -95,7 +131,8 @@ def _model_input_estimated_tokens(model_input: object) -> int:
 
 
 def _action_session_billing_metadata(action_session_id: str) -> dict[str, object]:
-    getter = getattr(action_session_manager, "get_billing_metadata", None)
+    manager = _current_action_session_manager()
+    getter = getattr(manager, "get_billing_metadata", None)
     if not callable(getter):
         return {}
     try:
@@ -123,7 +160,13 @@ def _action_billing_input(
         "input_tokens": int(input_tokens),
         "action_output_tokens": int(action_output_tokens),
     }
-    for key in ("base_model", "policy_family", "action_dim", "action_horizon", "action_token_budget"):
+    for key in (
+        "base_model",
+        "policy_family",
+        "action_dim",
+        "action_horizon",
+        "action_token_budget",
+    ):
         value = session_metadata.get(key)
         if value not in (None, ""):
             metadata[key] = value
@@ -216,7 +259,10 @@ def _resolve_checkpoint_for_user(
     owner_id: str | None = None,
 ) -> str:
     if is_admin and not str(owner_id or "").strip():
-        raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint references")
+        raise HTTPException(
+            status_code=400,
+            detail="owner_id is required for admin checkpoint references",
+        )
     owner_scope = owner_id if is_admin and owner_id is not None else user_id
     try:
         resolved = resolve_checkpoint_path(path, user_id=owner_scope, is_admin=is_admin)
@@ -235,7 +281,9 @@ def _can_bypass_checkpoint_ownership(request: Request) -> bool:
     return can_bypass_ownership(request)
 
 
-def _resolve_checkpoint_for_request(path: str, request: Request, *, owner_id: str | None = None) -> str:
+def _resolve_checkpoint_for_request(
+    path: str, request: Request, *, owner_id: str | None = None
+) -> str:
     return _resolve_checkpoint_for_user(
         path,
         user_id=_get_user_id(request),
@@ -254,11 +302,18 @@ def _infer_base_model_from_checkpoint_for_request(
     owner_id: str | None = None,
 ) -> str:
     if _can_bypass_checkpoint_ownership(request) and not str(owner_id or "").strip():
-        raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint references")
+        raise HTTPException(
+            status_code=400,
+            detail="owner_id is required for admin checkpoint references",
+        )
     try:
         return _infer_base_model_from_checkpoint(
             model_path,
-            user_id=(owner_id if owner_id is not None and _can_bypass_checkpoint_ownership(request) else _get_user_id(request)),
+            user_id=(
+                owner_id
+                if owner_id is not None and _can_bypass_checkpoint_ownership(request)
+                else _get_user_id(request)
+            ),
             is_admin=_can_bypass_checkpoint_ownership(request),
         )
     except ValueError as e:
@@ -291,11 +346,17 @@ async def _claim_sampler_checkpoint_or_raise(
             checkpoint_created_at=checkpoint_created_at,
             retry=retry,
         )
-    except (CheckpointAlreadyUploadingError, CheckpointAlreadyExistsError, CheckpointAlreadyFailedError) as e:
+    except (
+        CheckpointAlreadyUploadingError,
+        CheckpointAlreadyExistsError,
+        CheckpointAlreadyFailedError,
+    ) as e:
         raise RuntimeError(str(e)) from e
 
 
-async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str) -> None:
+async def _mark_checkpoint_failed_safe(
+    ckpt_id: str | None, *, fail_reason: str
+) -> None:
     try:
         await mark_checkpoint_failed(ckpt_id, fail_reason=fail_reason)
     except Exception:
@@ -334,6 +395,7 @@ def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
         )
     return total_tokens, max_seq_len
 
+
 def _vla_token_stats(data: list[VLADatum]) -> tuple[int, int]:
     total_tokens = 0
     max_seq_len = 0
@@ -346,7 +408,9 @@ def _vla_token_stats(data: list[VLADatum]) -> tuple[int, int]:
         if target_tokens is not None:
             target_shape = list(target_tokens.shape)
             if len(target_shape) != 1:
-                raise ValueError(f"target_tokens must be rank-1, got shape={target_shape}")
+                raise ValueError(
+                    f"target_tokens must be rank-1, got shape={target_shape}"
+                )
             seq_len += int(target_shape[0])
         total_tokens += seq_len
         if seq_len > max_seq_len:
@@ -356,7 +420,9 @@ def _vla_token_stats(data: list[VLADatum]) -> tuple[int, int]:
 
 def _lower_vla_datum(item: VLADatum) -> Datum:
     if "state" in item.supervision:
-        raise ValueError("VLADatum.supervision must not contain 'state'; use observation.state")
+        raise ValueError(
+            "VLADatum.supervision must not contain 'state'; use observation.state"
+        )
     return Datum(
         model_input=item.observation.model_input,
         loss_fn_inputs={
@@ -377,13 +443,17 @@ def _lower_vla_train_step_request(request: VLATrainStepRequest) -> TrainStepRequ
             loss_fn_config=request.loss_fn_config,
         ),
     )
+
+
 @router.post("/action_sessions", response_model=MintCreateActionSessionResponse)
 async def create_action_session(
     request: MintCreateActionSessionRequest,
     http_request: Request,
 ) -> MintCreateActionSessionResponse:
     if action_session_manager is None:
-        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+        raise HTTPException(
+            status_code=503, detail="Action session manager not initialized"
+        )
 
     user_id = _get_user_id(http_request)
     base_model = request.base_model
@@ -398,7 +468,9 @@ async def create_action_session(
 
     from ..supported_models_gate import enforce_base_model_allowed
 
-    base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
+    base_model = await enforce_base_model_allowed(
+        base_model=base_model, http_request=http_request
+    )
 
     user_data = _get_user_data(http_request)
     if not can_access_model(base_model, user_data):
@@ -406,7 +478,9 @@ async def create_action_session(
 
     model_path = request.model_path
     if model_path:
-        model_path = _resolve_checkpoint_for_request(model_path, http_request, owner_id=request.owner_id)
+        model_path = _resolve_checkpoint_for_request(
+            model_path, http_request, owner_id=request.owner_id
+        )
 
     try:
         action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
@@ -418,20 +492,24 @@ async def create_action_session(
         )
     except RuntimeError as exc:
         message = str(exc)
-        if 'pinned node capacity check failed' in message:
+        if "pinned node capacity check failed" in message:
             raise HTTPException(status_code=503, detail=message) from exc
         raise
     return MintCreateActionSessionResponse(action_session_id=str(action_session_id))
 
 
-@router.post("/action_sessions/{action_session_id}/act", response_model=UntypedAPIFuture)
+@router.post(
+    "/action_sessions/{action_session_id}/act", response_model=UntypedAPIFuture
+)
 async def act(
     action_session_id: str,
     request: VLAActRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
     if action_session_manager is None:
-        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+        raise HTTPException(
+            status_code=503, detail="Action session manager not initialized"
+        )
 
     queued_request = ActRequest(
         action_session_id=action_session_id,
@@ -442,7 +520,9 @@ async def act(
     )
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
     billing_input = _action_billing_input(
         action_session_id=action_session_id,
         request=request,
@@ -470,7 +550,9 @@ async def act(
             extra=extra,
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue action act request: {e}")
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue action act request: {e}"
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -491,7 +573,9 @@ async def vla_train_step(
     if session is None:
         session = await _get_route_training_store_info(request.model_id)
     if session is None:
-        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
 
     try:
         _, max_seq_len = _vla_token_stats(request.data)
@@ -513,7 +597,9 @@ async def vla_train_step(
     user_id = _get_user_id(http_request)
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
     billing_input = {
         "charge_item": "training",
         "quantity": _vla_billing_token_count(request.data),
@@ -530,9 +616,8 @@ async def vla_train_step(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, +1)
-            inflight_marked = True
+        await training_routes._mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         scheduler_extra = training_routes._build_training_scheduler_extra(
             session=session,
             model_id=request.model_id,
@@ -541,7 +626,9 @@ async def vla_train_step(
         )
         domain_key = str(scheduler_extra.get("scheduler_domain") or "")
         if not domain_key:
-            from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+            from ..backend.model_actor_supervisor import (
+                domain_key_for_training_base_model,
+            )
 
             domain_key = domain_key_for_training_base_model(base_model)
         if billing_auth is not None:
@@ -572,20 +659,30 @@ async def vla_train_step(
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue VLA train_step request: {e}")
+        if inflight_marked:
+            await training_routes._mark_training_inflight(request.model_id, -1)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue VLA train_step request: {e}"
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
 
-@router.delete("/action_sessions/{action_session_id}", response_model=MintDeleteActionSessionResponse)
-async def delete_action_session(action_session_id: str) -> MintDeleteActionSessionResponse:
+@router.delete(
+    "/action_sessions/{action_session_id}",
+    response_model=MintDeleteActionSessionResponse,
+)
+async def delete_action_session(
+    action_session_id: str,
+) -> MintDeleteActionSessionResponse:
     if action_session_manager is None:
-        raise HTTPException(status_code=503, detail="Action session manager not initialized")
+        raise HTTPException(
+            status_code=503, detail="Action session manager not initialized"
+        )
 
     await action_session_manager.shutdown_session(action_session_id)  # type: ignore[attr-defined]
     return MintDeleteActionSessionResponse(action_session_id=action_session_id)
+
 
 async def _get_route_training_store_info(model_id: str) -> dict | None:
     from ..routes.training import _get_training_route_session_info
@@ -601,12 +698,16 @@ async def _get_route_training_store_info(model_id: str) -> dict | None:
 
         store_info = await async_get_training_session_info(model_id)
     except Exception as e:
-        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
+        raise HTTPException(
+            status_code=503, detail="Training session store unavailable"
+        ) from e
     return store_info if isinstance(store_info, dict) else None
 
 
 async def _protect_training_session_enqueue_window(session_info: dict) -> None:
-    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+    from ..routes.training import (
+        _protect_training_session_enqueue_window as _training_protect,
+    )
 
     await _training_protect(session_info)
 
@@ -656,7 +757,9 @@ async def interpolate_checkpoints(
     request = request.model_copy(update={"source_paths": resolved_sources})
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
-    billing_auth = build_billing_auth_context(http_request, fallback_request_id=request_id)
+    billing_auth = build_billing_auth_context(
+        http_request, fallback_request_id=request_id
+    )
     billing_input = {
         "charge_item": "checkpoint_storage",
         "quantity": max(1, len(request.source_paths)),
@@ -696,7 +799,10 @@ async def interpolate_checkpoints(
             extra=extra,
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue interpolate_checkpoints request: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to enqueue interpolate_checkpoints request: {e}",
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -722,9 +828,19 @@ async def _do_interpolate_checkpoints(
         # validate metadata/model lineage before choosing output location
         from ..backend.mintx_ops import _validate_source_metadata
 
-        model_id, model_name, _backend, _first_meta = _validate_source_metadata(resolved_sources)
-        checkpoint_name = request.output_path.strip() if request.output_path else f"mintx-{uuid.uuid4().hex[:12]}"
-        if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
+        model_id, model_name, _backend, _first_meta = _validate_source_metadata(
+            resolved_sources
+        )
+        checkpoint_name = (
+            request.output_path.strip()
+            if request.output_path
+            else f"mintx-{uuid.uuid4().hex[:12]}"
+        )
+        if (
+            checkpoint_name in (".", "..")
+            or "/" in checkpoint_name
+            or "\\" in checkpoint_name
+        ):
             raise ValueError(f"Invalid output_path: {request.output_path!r}")
 
         created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -794,7 +910,9 @@ async def _do_interpolate_checkpoints(
         )
     except Exception as e:
         if not mirror_started:
-            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+            await _mark_checkpoint_failed_safe(
+                claimed_ckpt_id, fail_reason="upload_error"
+            )
         logger.exception(
             "[mint.interpolate_checkpoints] failed request_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -812,7 +930,9 @@ async def forward_backward_reverse_kl(
 ) -> UntypedAPIFuture:
     info = await _get_route_training_store_info(request.model_id)
     if not isinstance(info, dict):
-        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
 
     await _protect_training_session_enqueue_window(info)
     try:
@@ -840,13 +960,20 @@ async def forward_backward_reverse_kl(
         owner_id=request.owner_id,
     )
     _require_peft_adapter_checkpoint(resolved_reference_path)
-    request = request.model_copy(update={"reference_model_path": resolved_reference_path})
+    request = request.model_copy(
+        update={"reference_model_path": resolved_reference_path}
+    )
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
+    from . import training as training_routes
+
+    inflight_marked = False
     try:
         from ..backend.model_actor_supervisor import domain_key_for_training_base_model
 
+        await training_routes._mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_mint_model_work(
             request_id=request_id,
             op="mint.forward_backward_reverse_kl",
@@ -863,7 +990,12 @@ async def forward_backward_reverse_kl(
             user_id=user_id,
         )
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue forward_backward_reverse_kl request: {e}")
+        if inflight_marked:
+            await training_routes._mark_training_inflight(request.model_id, -1)
+        raise HTTPException(
+            status_code=503,
+            detail=f"Failed to enqueue forward_backward_reverse_kl request: {e}",
+        ) from e
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -875,11 +1007,20 @@ async def _do_forward_backward_reverse_kl(
 ) -> None:
     set_request_id(request_id)
     try:
-        if training_engine is None or training_manager is None:
+        from . import training as training_routes
+
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
+        if session is None:
+            session = await training_routes._restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        session = await training_routes._materialize_training_session_for_stateful_use(
+            session
+        )
 
         token_count, max_seq_len = _reverse_kl_token_stats(request.data)
         from ..routes.training import _get_max_model_len
@@ -900,7 +1041,7 @@ async def _do_forward_backward_reverse_kl(
             max_seq_len,
             request.reference_model_path,
         )
-        result = await training_engine.forward_backward_reverse_kl(session, request)
+        result = await engine.forward_backward_reverse_kl(session, request)
         logger.info(
             "[%s] forward_backward_reverse_kl done: elapsed_s=%.3f",
             session.model_id,
@@ -917,6 +1058,10 @@ async def _do_forward_backward_reverse_kl(
             "check_reference_checkpoint_and_reverse_kl_batch_shape",
         )
         await task_futures.async_fail(request_id, str(e))
+    finally:
+        from . import training as training_routes
+
+        await training_routes._mark_training_inflight(request.model_id, -1)
 
 
 async def _do_vla_train_step(
@@ -940,12 +1085,13 @@ async def _do_vla_train_step(
             "check_vla_observation_and_supervision_shapes",
         )
         await task_futures.async_fail(request_id, str(e))
-        if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        await training_routes._mark_training_inflight(request.model_id, -1)
         return
 
     if billing_observation_input is None:
-        await training_routes._do_train_step(request_id, internal_request, user_id, gateway_auth)
+        await training_routes._do_train_step(
+            request_id, internal_request, user_id, gateway_auth
+        )
     else:
         await training_routes._do_train_step(
             request_id,

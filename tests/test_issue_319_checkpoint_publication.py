@@ -34,20 +34,37 @@ class _StubTaskFutureService:
         self.resolve(request_id, payload)
 
 
+def _stub_training_inflight(monkeypatch, route_module) -> list[tuple[str, int]]:
+    calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        calls.append((model_id, delta))
+
+    monkeypatch.setattr(
+        route_module, "_mark_training_inflight", _mark_training_inflight
+    )
+    return calls
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
 
 
 @pytest.mark.anyio
-async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_name(monkeypatch, tmp_path: Path) -> None:
+async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_name(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.models.types import SaveWeightsForSamplerRequest
     from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
 
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     failed: dict[str, str] = {}
 
@@ -71,12 +88,18 @@ async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_nam
     monkeypatch.setattr(
         tr,
         "training_engine",
-        SimpleNamespace(save_weights_for_sampler=lambda **_kwargs: (_ for _ in ()).throw(AssertionError("should not run"))),
+        SimpleNamespace(
+            save_weights_for_sampler=lambda **_kwargs: (_ for _ in ()).throw(
+                AssertionError("should not run")
+            )
+        ),
     )
     monkeypatch.setattr(
         tr,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
 
     request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="../bad")
@@ -89,17 +112,23 @@ async def test_issue_319_save_weights_for_sampler_rejects_invalid_checkpoint_nam
 
     assert failed["request_id"] == "req-319-sampler-invalid-name"
     assert "Invalid checkpoint name" in failed["error"]
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
-async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypatch, tmp_path: Path) -> None:
+async def test_issue_319_save_weights_for_sampler_fails_before_metadata(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.models.types import SaveWeightsForSamplerRequest
     from mint_server.routes import training as tr
 
     async def _identity_materialize(session):
         return session
 
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_missing_lora"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -137,13 +166,23 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     monkeypatch.setattr(
         tr,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
-    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
-    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
-    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
-    request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-bad")
+    monkeypatch.setattr(
+        tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral")
+    )
+    monkeypatch.setattr(
+        tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent")
+    )
+    request = SaveWeightsForSamplerRequest(
+        model_id="run-319", seq_id=0, path="sampler-bad"
+    )
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler",
         request=request,
@@ -154,6 +193,7 @@ async def test_issue_319_save_weights_for_sampler_fails_before_metadata(monkeypa
     assert failed["request_id"] == "req-319-sampler"
     assert "invalid sampler checkpoint" in failed["error"]
     assert not ckpt_dir.exists()
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
@@ -166,7 +206,10 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
     async def _identity_materialize(session):
         return session
 
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_missing_lora_mark_failed"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -209,11 +252,17 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
     monkeypatch.setattr(
         tr,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
-    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
 
-    request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-mark-failed")
+    request = SaveWeightsForSamplerRequest(
+        model_id="run-319", seq_id=0, path="sampler-mark-failed"
+    )
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler-mark-failed",
         request=request,
@@ -223,6 +272,7 @@ async def test_issue_319_save_weights_for_sampler_mark_failed_error_does_not_mas
 
     assert failed["request_id"] == "req-319-sampler-mark-failed"
     assert "invalid sampler checkpoint" in failed["error"]
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
@@ -235,7 +285,10 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     async def _identity_materialize(session):
         return session
 
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_corrupt_lora"
     _touch(ckpt_dir / "adapter_model.safetensors", b"")
@@ -273,13 +326,23 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     monkeypatch.setattr(
         tr,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
-    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(tr, "get_persistent_cache_dir", lambda: str(tmp_path))
-    monkeypatch.setattr(tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral"))
-    monkeypatch.setattr(tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent"))
-    request = SaveWeightsForSamplerRequest(model_id="run-319", seq_id=0, path="sampler-corrupt")
+    monkeypatch.setattr(
+        tr, "get_ephemeral_checkpoints_dir", lambda: str(tmp_path / "ephemeral")
+    )
+    monkeypatch.setattr(
+        tr, "get_persistent_checkpoints_dir", lambda: str(tmp_path / "persistent")
+    )
+    request = SaveWeightsForSamplerRequest(
+        model_id="run-319", seq_id=0, path="sampler-corrupt"
+    )
     await tr._do_save_weights_for_sampler(
         request_id="req-319-sampler-corrupt",
         request=request,
@@ -290,13 +353,17 @@ async def test_issue_319_save_weights_for_sampler_rejects_corrupt_safetensors(
     assert failed["request_id"] == "req-319-sampler-corrupt"
     assert "Unreadable adapter_model.safetensors" in failed["error"]
     assert not ckpt_dir.exists()
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
-async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path: Path) -> None:
+async def test_issue_319_save_state_fails_before_metadata(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.models.types import SaveStateRequest
     from mint_server.routes import weights as wt
 
+    inflight_calls = _stub_training_inflight(monkeypatch, wt)
     ckpt_dir = tmp_path / "training_missing_lora"
     _touch(ckpt_dir / "optimizer.pt", b"optimizer")
 
@@ -324,13 +391,19 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
             )
         ),
     )
-    monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
+    monkeypatch.setattr(
+        wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights)
+    )
     monkeypatch.setattr(
         wt,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
-    monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     request = SaveStateRequest(model_id="run-319", path="training-bad")
     await wt._do_save_state(
         request_id="req-319-training",
@@ -343,6 +416,7 @@ async def test_issue_319_save_state_fails_before_metadata(monkeypatch, tmp_path:
     assert failed["request_id"] == "req-319-training"
     assert "invalid training checkpoint" in failed["error"]
     assert not (ckpt_dir / "metadata.json").exists()
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
@@ -352,6 +426,7 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
     from mint_server.models.types import SaveStateRequest
     from mint_server.routes import weights as wt
 
+    inflight_calls = _stub_training_inflight(monkeypatch, wt)
     ckpt_dir = tmp_path / "training_missing_lora_mark_failed"
     _touch(ckpt_dir / "optimizer.pt", b"optimizer")
 
@@ -383,14 +458,20 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
             )
         ),
     )
-    monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
+    monkeypatch.setattr(
+        wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights)
+    )
     monkeypatch.setattr(wt, "mark_checkpoint_failed", _mark_failed)
     monkeypatch.setattr(
         wt,
         "task_futures",
-        _StubTaskFutureService(resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail),
+        _StubTaskFutureService(
+            resolve=lambda *_args, **_kwargs: None, async_fail=_async_fail
+        ),
     )
-    monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
 
     request = SaveStateRequest(model_id="run-319", path="training-mark-failed")
     await wt._do_save_state(
@@ -403,6 +484,7 @@ async def test_issue_319_save_state_mark_failed_error_does_not_mask_root_failure
 
     assert failed["request_id"] == "req-319-training-mark-failed"
     assert "invalid training checkpoint" in failed["error"]
+    assert inflight_calls == [("run-319", -1)]
 
 
 @pytest.mark.anyio
@@ -412,9 +494,17 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
     from mint_server.models.types import SaveStateRequest
     from mint_server.routes import weights as wt
 
+    inflight_calls = _stub_training_inflight(monkeypatch, wt)
     ckpt_dir = tmp_path / "training_openpi"
     _touch(ckpt_dir / "1" / "params" / "_METADATA")
-    _touch(ckpt_dir / "1" / "assets" / "physical-intelligence" / "libero" / "norm_stats.json")
+    _touch(
+        ckpt_dir
+        / "1"
+        / "assets"
+        / "physical-intelligence"
+        / "libero"
+        / "norm_stats.json"
+    )
     _touch(ckpt_dir / "1" / "train_state" / "_METADATA")
 
     resolved: dict[str, object] = {}
@@ -441,14 +531,20 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
             )
         ),
     )
-    monkeypatch.setattr(wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights))
+    monkeypatch.setattr(
+        wt, "training_engine", SimpleNamespace(save_weights=_fake_save_weights)
+    )
     monkeypatch.setattr(
         wt,
         "task_futures",
         _StubTaskFutureService(resolve=_resolve, async_fail=_async_fail),
     )
-    monkeypatch.setattr(wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir))
-    monkeypatch.setattr(wt, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        wt, "build_persistent_cache_dir", lambda **_kwargs: str(ckpt_dir)
+    )
+    monkeypatch.setattr(
+        wt, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None
+    )
     request = SaveStateRequest(model_id="run-319-openpi", path="training-openpi")
     await wt._do_save_state(
         request_id="req-319-training-openpi",
@@ -461,9 +557,12 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
     assert resolved["request_id"] == "req-319-training-openpi"
     metadata_path = ckpt_dir / "metadata.json"
     assert metadata_path.exists()
+    assert inflight_calls == [("run-319-openpi", -1)]
 
 
-def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
+def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
@@ -511,7 +610,9 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
     async def _no_remote(**_kwargs):
         return None
 
-    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+    async def _list_catalog_checkpoints_for_model(
+        *, model_id: str, owner_id: str | None, is_admin: bool
+    ):
         assert model_id == "run-319"
         assert owner_id is None
         assert is_admin is False
@@ -537,9 +638,13 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
         ]
 
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
-    monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(
+        wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)]
+    )
     monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
-    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
+    monkeypatch.setattr(
+        wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model
+    )
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -555,7 +660,9 @@ def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(monkeypatch, tmp_
     assert "sampler_weights/sampler-bad" not in checkpoint_ids
 
 
-def test_issue_641_publish_checkpoint_catalog_recovers_valid_failed_staging(monkeypatch) -> None:
+def test_issue_641_publish_checkpoint_catalog_recovers_valid_failed_staging(
+    monkeypatch,
+) -> None:
     from mint_server import checkpoint_index
 
     ckpt_id = "64100000-0000-0000-0000-000000000001"
@@ -658,7 +765,10 @@ def test_issue_641_publish_checkpoint_catalog_recovers_valid_failed_staging(monk
     assert row["checkpoint_type"] == "training"
     assert row["size_bytes"] == 235
     assert ckpt_id not in state["staging"]
-    assert state["catalog"][ckpt_id]["storage_root"] == "/vePFS-Mindverse/share/mint/prod/checkpoints"
+    assert (
+        state["catalog"][ckpt_id]["storage_root"]
+        == "/vePFS-Mindverse/share/mint/prod/checkpoints"
+    )
     assert state["closed"] is True
 
 
@@ -718,7 +828,10 @@ def test_issue_641_claim_checkpoint_reuses_failed_staging_row(monkeypatch) -> No
             text = sql.strip()
             if text.startswith("SELECT pg_advisory_xact_lock"):
                 return "SELECT"
-            if text.startswith("UPDATE checkpoint_staging") and "SET status = 'uploading'" in text:
+            if (
+                text.startswith("UPDATE checkpoint_staging")
+                and "SET status = 'uploading'" in text
+            ):
                 row = state["staging"][0]
                 assert args[0] == ckpt_id
                 row["status"] = "uploading"
@@ -757,11 +870,16 @@ def test_issue_641_claim_checkpoint_reuses_failed_staging_row(monkeypatch) -> No
     assert claimed == ckpt_id
     assert state["staging"][0]["status"] == "uploading"
     assert state["staging"][0]["fail_reason"] is None
-    assert state["staging"][0]["storage_root"] == "/vePFS-Mindverse/share/mint/prod/runtime/persistent_cache"
+    assert (
+        state["staging"][0]["storage_root"]
+        == "/vePFS-Mindverse/share/mint/prod/runtime/persistent_cache"
+    )
     assert state["closed"] is True
 
 
-def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
+def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
@@ -790,7 +908,9 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
     async def _no_remote(**_kwargs):
         return None
 
-    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+    async def _list_catalog_checkpoints_for_model(
+        *, model_id: str, owner_id: str | None, is_admin: bool
+    ):
         assert model_id == "run-319-mismatch"
         assert owner_id is None
         assert is_admin is False
@@ -807,9 +927,13 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
         ]
 
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
-    monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(
+        wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)]
+    )
     monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
-    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
+    monkeypatch.setattr(
+        wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model
+    )
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()
@@ -821,7 +945,9 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(monkeypatch, t
     assert resp.json() == {"detail": f"No checkpoints found for model '{model_id}'"}
 
 
-def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_path: Path) -> None:
+def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(
+    monkeypatch, tmp_path: Path
+) -> None:
     from mint_server.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
@@ -850,7 +976,9 @@ def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_
     async def _no_remote(**_kwargs):
         return None
 
-    async def _list_catalog_checkpoints_for_model(*, model_id: str, owner_id: str | None, is_admin: bool):
+    async def _list_catalog_checkpoints_for_model(
+        *, model_id: str, owner_id: str | None, is_admin: bool
+    ):
         assert model_id == "run-319-corrupt"
         assert owner_id is None
         assert is_admin is False
@@ -867,9 +995,13 @@ def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(monkeypatch, tmp_
         ]
 
     monkeypatch.setattr(wt, "CHECKPOINTS_DIR", str(root))
-    monkeypatch.setattr(wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)])
+    monkeypatch.setattr(
+        wt, "get_persistent_search_roots", lambda primary_root=None: [str(root)]
+    )
     monkeypatch.setattr(wt, "checkpoint_index_enabled", lambda: True)
-    monkeypatch.setattr(wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model)
+    monkeypatch.setattr(
+        wt, "list_catalog_checkpoints_for_model", _list_catalog_checkpoints_for_model
+    )
     monkeypatch.setattr(wt, "_forward_remote_checkpoint_route", _no_remote)
 
     app = FastAPI()

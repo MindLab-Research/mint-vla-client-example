@@ -68,12 +68,18 @@ from ..models.types import (
     CheckpointUploadResponse,
     CheckpointsListResponse,
     LoadStateRequest,
+    LoRAConfig,
     SaveStateRequest,
     UntypedAPIFuture,
     WeightsInfoRequest,
     WeightsInfoResponse,
 )
-from ..logging_context import classify_failure_reason, get_otel_tracer, run_async_with_otel_span, set_request_id
+from ..logging_context import (
+    classify_failure_reason,
+    get_otel_tracer,
+    run_async_with_otel_span,
+    set_request_id,
+)
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..queue_priority import merge_queue_priority_extra
 from ..webhook import EventType, send_task_event
@@ -86,10 +92,46 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Global references (set by app lifespan)
+# Execution-runtime references (left unbound in API workers).
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
+
+
+def _current_training_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_manager
+    except Exception:
+        pass
+    return training_manager
+
+
+def _current_training_engine():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_engine
+    except Exception:
+        pass
+    return training_engine
+
+
+def _current_inference_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.inference_manager
+    except Exception:
+        pass
+    return inference_manager
 
 
 def _wait_for_checkpoint_artifacts(
@@ -109,7 +151,9 @@ def _wait_for_checkpoint_artifacts(
             if checkpoint_type == "sampler":
                 validate_sampler_checkpoint_for_sampling(path)
             else:
-                validate_checkpoint_dir(path, checkpoint_type=cast(Any, checkpoint_type))
+                validate_checkpoint_dir(
+                    path, checkpoint_type=cast(Any, checkpoint_type)
+                )
             return
         except Exception as e:
             last_error = e
@@ -127,8 +171,12 @@ def _loaded_training_session_lora_payload(lora_config: Any) -> dict[str, Any] | 
     model_dump = getattr(lora_config, "model_dump", None)
     if callable(model_dump):
         payload = model_dump()
-        if not isinstance(payload, dict) or not all(isinstance(key, str) for key in payload):
-            raise TypeError(f"Unsupported lora_config payload type: {type(payload).__name__}")
+        if not isinstance(payload, dict) or not all(
+            isinstance(key, str) for key in payload
+        ):
+            raise TypeError(
+                f"Unsupported lora_config payload type: {type(payload).__name__}"
+            )
         return dict(cast(dict[str, Any], payload))
     if isinstance(lora_config, dict):
         return dict(lora_config)
@@ -149,7 +197,9 @@ def _next_loaded_training_session_metadata_version(session: Any) -> int:
     return next_version
 
 
-async def _persist_loaded_training_session(session: Any, *, request_user_id: str | None) -> None:
+async def _persist_loaded_training_session(
+    session: Any, *, request_user_id: str | None
+) -> None:
     from ..backend.training_session_manager import MATERIALIZATION_STATE_READY
     from ..backend.training_session_store import async_upsert_training_session
     from ..config import RAY_NAMESPACE
@@ -158,11 +208,16 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
     session_id = str(getattr(session, "session_id", "") or "")
     base_model = str(getattr(session, "base_model", "") or "")
     if not model_id or not session_id or not base_model:
-        raise RuntimeError("Cannot persist loaded training session without model_id, session_id, and base_model")
+        raise RuntimeError(
+            "Cannot persist loaded training session without model_id, session_id, and base_model"
+        )
 
     actor_name = None
-    if training_engine is not None:
-        actor_name = getattr(training_engine, "_model_actor_supervisor_actor_names", {}).get(model_id)
+    engine = _current_training_engine()
+    if engine is not None:
+        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(
+            model_id
+        )
     if actor_name is not None:
         session.actor_name = str(actor_name or "") or None
     if not getattr(session, "namespace", None):
@@ -170,7 +225,8 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
 
     metadata_version = _next_loaded_training_session_metadata_version(session)
     materialization_state = str(
-        getattr(session, "materialization_state", MATERIALIZATION_STATE_READY) or MATERIALIZATION_STATE_READY
+        getattr(session, "materialization_state", MATERIALIZATION_STATE_READY)
+        or MATERIALIZATION_STATE_READY
     )
     await async_upsert_training_session(
         {
@@ -178,14 +234,20 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
             "session_id": session_id,
             "model_seq_id": int(getattr(session, "model_seq_id")),
             "base_model": base_model,
-            "lora_config": _loaded_training_session_lora_payload(getattr(session, "lora_config", None)),
-            "rollout_correction_config": getattr(session, "rollout_correction_config", None),
+            "lora_config": _loaded_training_session_lora_payload(
+                getattr(session, "lora_config", None)
+            ),
+            "rollout_correction_config": getattr(
+                session, "rollout_correction_config", None
+            ),
             "user_metadata": dict(getattr(session, "user_metadata", {}) or {}),
             "learning_rate": float(getattr(session, "learning_rate")),
             "current_step": int(getattr(session, "current_step")),
             "backend": str(getattr(session, "backend")),
             "actor_name": getattr(session, "actor_name", None),
-            "namespace": str(getattr(session, "namespace", RAY_NAMESPACE) or RAY_NAMESPACE),
+            "namespace": str(
+                getattr(session, "namespace", RAY_NAMESPACE) or RAY_NAMESPACE
+            ),
             "user_id": getattr(session, "user_id", None) or request_user_id,
             "created_at": getattr(session, "created_at", None),
             "last_activity": float(getattr(session, "last_activity")),
@@ -196,8 +258,9 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
             "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
         }
     )
-    if training_manager is not None:
-        mark_persisted = getattr(training_manager, "mark_persisted", None)
+    manager = _current_training_manager()
+    if manager is not None:
+        mark_persisted = getattr(manager, "mark_persisted", None)
         if callable(mark_persisted):
             mark_persisted(model_id)
 
@@ -223,11 +286,17 @@ async def _claim_checkpoint_or_raise(
             checkpoint_created_at=checkpoint_created_at,
             retry=retry,
         )
-    except (CheckpointAlreadyUploadingError, CheckpointAlreadyExistsError, CheckpointAlreadyFailedError) as e:
+    except (
+        CheckpointAlreadyUploadingError,
+        CheckpointAlreadyExistsError,
+        CheckpointAlreadyFailedError,
+    ) as e:
         raise RuntimeError(str(e)) from e
 
 
-async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str) -> None:
+async def _mark_checkpoint_failed_safe(
+    ckpt_id: str | None, *, fail_reason: str
+) -> None:
     try:
         await mark_checkpoint_failed(ckpt_id, fail_reason=fail_reason)
     except Exception:
@@ -243,12 +312,82 @@ def _require_write_access(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Write access required")
 
 
-def _mark_training_inflight(model_id: str, delta: int) -> None:
-    if training_manager is None:
-        return
-    mark = getattr(training_manager, "mark_inflight", None)
-    if callable(mark):
-        mark(model_id, delta)
+async def _mark_training_inflight(model_id: str, delta: int) -> None:
+    from ..backend.training_session_store import async_mark_training_session_inflight
+
+    await async_mark_training_session_inflight(model_id, delta)
+
+
+async def _get_or_restore_training_session_for_weights(model_id: str):
+    manager = _current_training_manager()
+    engine = _current_training_engine()
+    if engine is None or manager is None:
+        raise RuntimeError("Training engine not initialized")
+
+    get_local_session = getattr(manager, "get_local_session", None)
+    session = (
+        get_local_session(model_id)
+        if callable(get_local_session)
+        else manager.get_session(model_id)
+    )
+    if session is not None:
+        return session
+
+    from ..backend.async_ray_control import async_lookup_actor_handle
+    from ..backend.training_session_store import async_get_training_session_info
+    from ..config import RAY_NAMESPACE
+
+    info = await async_get_training_session_info(model_id)
+    if not isinstance(info, dict):
+        return None
+
+    restore = getattr(manager, "restore_training_session_info", None)
+    if callable(restore):
+        session = restore(info)
+    else:
+        lora_cfg = None
+        if info.get("lora_config"):
+            lora_cfg = LoRAConfig(**info["lora_config"])
+        session = manager.create_session(
+            model_id=model_id,
+            session_id=str(info.get("session_id", "")),
+            model_seq_id=int(info.get("model_seq_id", 0)),
+            base_model=str(info.get("base_model", "")),
+            lora_config=lora_cfg,
+            rollout_correction_config=info.get("rollout_correction_config"),
+            user_metadata=info.get("user_metadata") or {},
+            user_id=info.get("user_id"),
+            learning_rate=float(info.get("learning_rate", 1e-4)),
+            metadata_version=max(1, int(info.get("metadata_version") or 1)),
+            materialization_state=info.get("materialization_state"),
+            tokenizer_info=info.get("tokenizer_info")
+            if isinstance(info.get("tokenizer_info"), dict)
+            else None,
+            tokenizer_identity=info.get("tokenizer_identity"),
+            tokenizer_source_path=info.get("tokenizer_source_path"),
+            actor_name=info.get("actor_name"),
+            namespace=info.get("namespace"),
+        )
+
+    if session is None:
+        return None
+
+    actor_name = str(info.get("actor_name") or "") or None
+    if actor_name:
+        namespace = str(info.get("namespace") or RAY_NAMESPACE)
+        try:
+            worker = await async_lookup_actor_handle(actor_name, namespace)
+        except Exception:
+            worker = None
+        if worker is not None:
+            getattr(engine, "_workers", {})[model_id] = worker
+            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = (
+                actor_name
+            )
+            session.actor_name = actor_name
+            session.namespace = namespace
+
+    return session
 
 
 async def _fail_future(request_id: str, error: str) -> None:
@@ -279,6 +418,7 @@ def _get_webhook_url(request: Request) -> str | None:
     if user_data:
         return user_data.get("webhook_url")
     return None
+
 
 def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -> dict:
     payload = {} if extra is None else dict(extra)
@@ -348,20 +488,13 @@ async def _get_route_training_store_info(model_id: str) -> dict | None:
     info = await _get_training_route_session_info(model_id)
     if isinstance(info, dict):
         return info
-    if training_manager is not None:
-        return None
-
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        store_info = await async_get_training_session_info(model_id)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
-    return store_info if isinstance(store_info, dict) else None
+    return None
 
 
 async def _protect_training_session_enqueue_window(session_info: dict) -> None:
-    from ..routes.training import _protect_training_session_enqueue_window as _training_protect
+    from ..routes.training import (
+        _protect_training_session_enqueue_window as _training_protect,
+    )
 
     await _training_protect(session_info)
 
@@ -398,8 +531,12 @@ async def _enqueue_weights_request_with_trace(
         span.add_event(
             "enqueue_done",
             {
-                "elapsed_ms": round((time.perf_counter() - enqueue_start_s) * 1000.0, 3),
-                "route_elapsed_ms": round((time.perf_counter() - route_start_s) * 1000.0, 3),
+                "elapsed_ms": round(
+                    (time.perf_counter() - enqueue_start_s) * 1000.0, 3
+                ),
+                "route_elapsed_ms": round(
+                    (time.perf_counter() - route_start_s) * 1000.0, 3
+                ),
             },
         )
 
@@ -421,7 +558,9 @@ def _resolve_mint_path(
     """Convert path identifier to filesystem path without checkpoint-root scans."""
     owner_scope = owner_id if is_admin else user_id
     try:
-        resolved = resolve_checkpoint_path(mint_uri, user_id=owner_scope, is_admin=is_admin)
+        resolved = resolve_checkpoint_path(
+            mint_uri, user_id=owner_scope, is_admin=is_admin
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if mint_uri.startswith("ckpt_") and resolved == mint_uri:
@@ -438,9 +577,15 @@ def _to_mint_path(model_id: str, checkpoint_name: str) -> str:
     return f"mint://{model_id}/{checkpoint_name}"
 
 
-def _infer_train_flags_from_target_modules(target_modules: object) -> tuple[bool, bool, bool]:
-    if not isinstance(target_modules, list) or not all(isinstance(name, str) for name in target_modules):
-        raise ValueError("Checkpoint adapter_config.json target_modules must be a list of strings")
+def _infer_train_flags_from_target_modules(
+    target_modules: object,
+) -> tuple[bool, bool, bool]:
+    if not isinstance(target_modules, list) or not all(
+        isinstance(name, str) for name in target_modules
+    ):
+        raise ValueError(
+            "Checkpoint adapter_config.json target_modules must be a list of strings"
+        )
     names = set(target_modules)
     attn_names = {
         "linear_qkv",
@@ -460,9 +605,20 @@ def _infer_train_flags_from_target_modules(target_modules: object) -> tuple[bool
         "wk",
         "weights_proj",
     }
-    mlp_names = {"linear_fc1", "linear_fc2", "gate_proj", "up_proj", "down_proj", "gate"}
+    mlp_names = {
+        "linear_fc1",
+        "linear_fc2",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "gate",
+    }
     unembed_names = {"lm_head", "output_layer", "unembed"}
-    return bool(names & attn_names), bool(names & mlp_names), bool(names & unembed_names)
+    return (
+        bool(names & attn_names),
+        bool(names & mlp_names),
+        bool(names & unembed_names),
+    )
 
 
 def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
@@ -470,25 +626,34 @@ def _read_checkpoint_json_object(path: str, *, label: str) -> dict[str, object]:
         with open(path, encoding="utf-8") as f:
             payload = json.load(f)
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Malformed {label}: {e.msg}") from e
+        raise HTTPException(
+            status_code=400, detail=f"Malformed {label}: {e.msg}"
+        ) from e
     except OSError as e:
-        raise HTTPException(status_code=400, detail=f"Unable to read {label}: {e}") from e
+        raise HTTPException(
+            status_code=400, detail=f"Unable to read {label}: {e}"
+        ) from e
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail=f"Invalid {label}: expected JSON object")
+        raise HTTPException(
+            status_code=400, detail=f"Invalid {label}: expected JSON object"
+        )
     return payload
 
 
 def _checkpoint_has_megatron_adapter_shards(path: str) -> bool:
     try:
-        return any(name.startswith("mp_rank_") and name.endswith("_adapter.pt") for name in os.listdir(path))
+        return any(
+            name.startswith("mp_rank_") and name.endswith("_adapter.pt")
+            for name in os.listdir(path)
+        )
     except OSError:
         return False
 
 
 def _checkpoint_has_peft_adapter(path: str) -> bool:
-    return os.path.isfile(os.path.join(path, "adapter_model.safetensors")) and os.path.isfile(
-        os.path.join(path, "adapter_config.json")
-    )
+    return os.path.isfile(
+        os.path.join(path, "adapter_model.safetensors")
+    ) and os.path.isfile(os.path.join(path, "adapter_config.json"))
 
 
 def _checkpoint_declared_backend(path: str, metadata: dict[str, object]) -> str | None:
@@ -524,7 +689,9 @@ def _checkpoint_can_recreate_training_client(
     if backend == "bumblebee":
         if checkpoint_backend == "megatron":
             return declared_type == "training" and _checkpoint_has_peft_adapter(path)
-        return checkpoint_backend == "bumblebee" and checkpoint_has_optimizer_state(path)
+        return checkpoint_backend == "bumblebee" and checkpoint_has_optimizer_state(
+            path
+        )
     if backend != "peft":
         return False
     try:
@@ -532,7 +699,9 @@ def _checkpoint_can_recreate_training_client(
     except OSError:
         return False
     has_adapter_model = "adapter_model.safetensors" in names
-    return has_adapter_model and (declared_type == "training" or checkpoint_has_optimizer_state(path))
+    return has_adapter_model and (
+        declared_type == "training" or checkpoint_has_optimizer_state(path)
+    )
 
 
 @router.post("/weights_info", response_model=WeightsInfoResponse)
@@ -567,17 +736,24 @@ async def weights_info(
 
     declared_type = metadata.get("checkpoint_type", metadata.get("type"))
     if declared_type == "sampler" or "/sampler_weights/" in request.tinker_path:
-        raise HTTPException(status_code=400, detail="Sampler checkpoint cannot recreate a training client")
+        raise HTTPException(
+            status_code=400,
+            detail="Sampler checkpoint cannot recreate a training client",
+        )
 
     adapter_cfg: dict[str, object] = {}
     if os.path.exists(adapter_cfg_path):
-        adapter_cfg = _read_checkpoint_json_object(adapter_cfg_path, label="adapter_config.json")
+        adapter_cfg = _read_checkpoint_json_object(
+            adapter_cfg_path, label="adapter_config.json"
+        )
 
     base_model = metadata.get("model_name")
     if not isinstance(base_model, str) or not base_model:
         base_model = adapter_cfg.get("base_model_name_or_path")
     if not isinstance(base_model, str) or not base_model:
-        raise HTTPException(status_code=400, detail="Checkpoint metadata missing base model")
+        raise HTTPException(
+            status_code=400, detail="Checkpoint metadata missing base model"
+        )
     from ..routes.training import _infer_training_backend_for_base_model
 
     try:
@@ -604,14 +780,19 @@ async def weights_info(
     lora_rank = adapter_cfg.get("r")
     if not isinstance(lora_rank, int) or isinstance(lora_rank, bool) or lora_rank <= 0:
         if is_lora:
-            raise HTTPException(status_code=400, detail="Invalid or missing LoRA rank in adapter_config.json")
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or missing LoRA rank in adapter_config.json",
+            )
         lora_rank = None
 
     train_attn = train_mlp = train_unembed = None
     if is_lora:
         try:
-            train_attn, train_mlp, train_unembed = _infer_train_flags_from_target_modules(
-                adapter_cfg.get("target_modules")
+            train_attn, train_mlp, train_unembed = (
+                _infer_train_flags_from_target_modules(
+                    adapter_cfg.get("target_modules")
+                )
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -633,7 +814,9 @@ def _checkpoint_rank(storage_tier: str | None) -> int:
     return 0
 
 
-def _require_checkpoint_owner(*, request_user_id: str | None, owner_id: str | None, is_admin: bool = False) -> None:
+def _require_checkpoint_owner(
+    *, request_user_id: str | None, owner_id: str | None, is_admin: bool = False
+) -> None:
     if is_admin:
         return
     if request_user_id is None:
@@ -666,7 +849,10 @@ def _checkpoint_owner_scope(
     if is_admin:
         owner_id = str(requested_owner_id or "").strip()
         if not owner_id:
-            raise HTTPException(status_code=400, detail="owner_id is required for admin checkpoint access")
+            raise HTTPException(
+                status_code=400,
+                detail="owner_id is required for admin checkpoint access",
+            )
         if not _is_valid_checkpoint_segment(owner_id):
             raise HTTPException(status_code=400, detail="Invalid owner_id")
         return owner_id
@@ -739,7 +925,9 @@ def _catalog_checkpoint_path(row: dict[str, Any]) -> str | None:
         return selected
     candidate = os.path.join(base, checkpoint_type)
     candidate_real = os.path.realpath(candidate)
-    if not (candidate_real == root_real or candidate_real.startswith(root_real + os.sep)):
+    if not (
+        candidate_real == root_real or candidate_real.startswith(root_real + os.sep)
+    ):
         return None
     return candidate
 
@@ -822,15 +1010,32 @@ def _build_catalog_checkpoint_info(
             step = None
 
     return CheckpointInfo(
-        checkpoint_id=(f"weights/{raw_checkpoint_id}" if checkpoint_type == "training" else f"sampler_weights/{raw_checkpoint_id}"),
+        checkpoint_id=(
+            f"weights/{raw_checkpoint_id}"
+            if checkpoint_type == "training"
+            else f"sampler_weights/{raw_checkpoint_id}"
+        ),
         checkpoint_type=checkpoint_type,
         time=_parse_checkpoint_time(created_at, fallback_path=ckpt_path),
         owner_id=_catalog_row_text(row, "owner_id"),
-        tinker_path=checkpoint_uri(model_id, raw_checkpoint_id, prefer_tinker=True, checkpoint_type=checkpoint_type),
-        path=checkpoint_uri(model_id, raw_checkpoint_id, prefer_tinker=prefer_tinker, checkpoint_type=checkpoint_type),
+        tinker_path=checkpoint_uri(
+            model_id,
+            raw_checkpoint_id,
+            prefer_tinker=True,
+            checkpoint_type=checkpoint_type,
+        ),
+        path=checkpoint_uri(
+            model_id,
+            raw_checkpoint_id,
+            prefer_tinker=prefer_tinker,
+            checkpoint_type=checkpoint_type,
+        ),
         step=int(step) if isinstance(step, int) else None,
         created_at=created_at,
-        storage_tier=str(metadata.get("storage_tier") or _storage_tier_from_catalog_row(row) or "") or None,
+        storage_tier=str(
+            metadata.get("storage_tier") or _storage_tier_from_catalog_row(row) or ""
+        )
+        or None,
         mirror_status=str(metadata.get("mirror_status") or "") or None,
         mirror_error=str(metadata.get("mirror_error") or "") or None,
     )
@@ -869,7 +1074,9 @@ def _build_sdk_archive_redirect_response(
         for key, value in request.query_params.multi_items()
         if key not in {"direct", "download_token"}
     }
-    direct_url_obj = base.replace(path=request.url.path).include_query_params(**passthrough_params, direct="1")
+    direct_url_obj = base.replace(path=request.url.path).include_query_params(
+        **passthrough_params, direct="1"
+    )
     effective_user_id = passthrough_params.get("owner_id") or user_id
     if secret:
         token, exp = make_archive_download_token(
@@ -899,7 +1106,11 @@ async def _close_upstream_response(response, client) -> None:
 
 
 async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
-    from ..gateway import async_remote_training_model_info, forward_json, upstream_for_alias
+    from ..gateway import (
+        async_remote_training_model_info,
+        forward_json,
+        upstream_for_alias,
+    )
 
     remote = await async_remote_training_model_info(model_id)
     if remote is None:
@@ -910,7 +1121,10 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
     owner_id = remote.get("owner_id")
     upstream = upstream_for_alias(upstream_alias)
     if upstream is None:
-        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+        )
 
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
@@ -932,7 +1146,10 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
         )
     except Exception:
         logger.exception("Upstream checkpoint list failed: %s", upstream_alias)
-        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint list failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Upstream {upstream_alias!r} checkpoint list failed",
+        )
 
     if resp.status_code >= 400:
         try:
@@ -940,13 +1157,21 @@ async def _forward_remote_checkpoint_route(*, model_id: str, request: Request):
         except Exception:
             detail = resp.text
         else:
-            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+            detail = (
+                payload.get("detail", payload) if isinstance(payload, dict) else payload
+            )
         raise HTTPException(status_code=resp.status_code, detail=detail)
     return CheckpointsListResponse.model_validate(resp.json())
 
 
-async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: str, request: Request, direct: bool):
-    from ..gateway import async_remote_training_model_info, forward_request, upstream_for_alias
+async def _forward_remote_checkpoint_archive(
+    *, model_id: str, checkpoint_id: str, request: Request, direct: bool
+):
+    from ..gateway import (
+        async_remote_training_model_info,
+        forward_request,
+        upstream_for_alias,
+    )
 
     remote = await async_remote_training_model_info(model_id)
     if remote is None:
@@ -957,7 +1182,10 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
     owner_id = remote.get("owner_id")
     upstream = upstream_for_alias(upstream_alias)
     if upstream is None:
-        raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+        )
 
     user_data = _get_user_data(request)
     if not can_access_model(base_model, user_data):
@@ -984,7 +1212,10 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
         )
     except Exception:
         logger.exception("Upstream checkpoint archive failed: %s", upstream_alias)
-        raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} checkpoint archive failed")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Upstream {upstream_alias!r} checkpoint archive failed",
+        )
 
     if resp.status_code >= 400:
         text = await resp.aread()
@@ -995,7 +1226,9 @@ async def _forward_remote_checkpoint_archive(*, model_id: str, checkpoint_id: st
         except Exception:
             detail = decoded
         else:
-            detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+            detail = (
+                payload.get("detail", payload) if isinstance(payload, dict) else payload
+            )
         raise HTTPException(status_code=resp.status_code, detail=detail)
 
     if resp.status_code in (301, 302, 303, 307, 308):
@@ -1039,10 +1272,11 @@ async def save_weights(
     request: SaveStateRequest,
     http_request: Request,
 ) -> UntypedAPIFuture:
-    """Save training checkpoint (Tinker TrainingClient.save_state).
+    """Save sampler weights for inference.
 
-    Tinker SDK calls POST /api/v1/save_weights for TrainingClient.save_state(...).
-    This must produce a training checkpoint (weights + optimizer state).
+    Tinker SDK calls POST /api/v1/save_weights when it needs model weights
+    that can be loaded by a sampler. Training checkpoints with optimizer state
+    are handled by POST /api/v1/save_state.
     """
     _require_write_access(http_request)
     route_start_s = time.perf_counter()
@@ -1061,12 +1295,15 @@ async def save_weights(
             upstream = upstream_for_alias(upstream_alias)
             if upstream is None:
                 raise HTTPException(
-                    status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}"
+                    status_code=500,
+                    detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
                 )
 
             user_data = _get_user_data(http_request)
             if not can_access_model(base_model, user_data):
-                raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+                raise HTTPException(
+                    status_code=403, detail=get_access_denied_error(base_model)
+                )
 
             try:
                 resp = await forward_json(
@@ -1079,20 +1316,31 @@ async def save_weights(
                 )
             except Exception:
                 logger.exception("Upstream save_weights failed: %s", upstream_alias)
-                raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_weights failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Upstream {upstream_alias!r} save_weights failed",
+                )
 
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             payload = resp.json()
             upstream_request_id = payload.get("request_id")
             if not isinstance(upstream_request_id, str) or not upstream_request_id:
-                raise HTTPException(status_code=502, detail="Upstream save_weights returned invalid request_id")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Upstream save_weights returned invalid request_id",
+                )
             return UntypedAPIFuture(
-                request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+                request_id=encode_request_id(
+                    upstream_alias=upstream_alias,
+                    upstream_request_id=upstream_request_id,
+                )
             )
 
     if not isinstance(store_info, dict):
-        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
 
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
@@ -1106,9 +1354,8 @@ async def save_weights(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1117,16 +1364,20 @@ async def save_weights(
             user_id=user_id,
             webhook_url=webhook_url,
             model_id=request.model_id,
-            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            domain_key=_training_domain_key_from_store_info(
+                store_info, model_id=request.model_id
+            ),
             extra=merge_queue_priority_extra(
                 {"prefer_tinker": bool(prefer_tinker)},
                 request=http_request,
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue save_weights request: {e}"
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -1162,12 +1413,15 @@ async def save_state(
             upstream = upstream_for_alias(upstream_alias)
             if upstream is None:
                 raise HTTPException(
-                    status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}"
+                    status_code=500,
+                    detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
                 )
 
             user_data = _get_user_data(http_request)
             if not can_access_model(base_model, user_data):
-                raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+                raise HTTPException(
+                    status_code=403, detail=get_access_denied_error(base_model)
+                )
 
             try:
                 resp = await forward_json(
@@ -1180,20 +1434,31 @@ async def save_state(
                 )
             except Exception:
                 logger.exception("Upstream save_state failed: %s", upstream_alias)
-                raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} save_state failed")
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Upstream {upstream_alias!r} save_state failed",
+                )
 
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             payload = resp.json()
             upstream_request_id = payload.get("request_id")
             if not isinstance(upstream_request_id, str) or not upstream_request_id:
-                raise HTTPException(status_code=502, detail="Upstream save_state returned invalid request_id")
+                raise HTTPException(
+                    status_code=502,
+                    detail="Upstream save_state returned invalid request_id",
+                )
             return UntypedAPIFuture(
-                request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+                request_id=encode_request_id(
+                    upstream_alias=upstream_alias,
+                    upstream_request_id=upstream_request_id,
+                )
             )
 
     if not isinstance(store_info, dict):
-        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
 
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
@@ -1207,9 +1472,8 @@ async def save_state(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1218,16 +1482,20 @@ async def save_state(
             user_id=user_id,
             webhook_url=webhook_url,
             model_id=request.model_id,
-            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            domain_key=_training_domain_key_from_store_info(
+                store_info, model_id=request.model_id
+            ),
             extra=merge_queue_priority_extra(
                 {"prefer_tinker": bool(prefer_tinker)},
                 request=http_request,
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue save_state request: {e}"
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -1245,22 +1513,24 @@ async def _do_save_state(
     Also registers the model for sampling via multi-LoRA engine.
     """
     session = None
-    inflight_marked = False
     claimed_ckpt_id: str | None = None
     mirror_started = False
 
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
-            raise RuntimeError("Training engine not initialized")
-        inflight_marked = True
-
-        session = training_manager.get_session(request.model_id)
+        session = await _get_or_restore_training_session_for_weights(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        engine = _current_training_engine()
+        if engine is None:
+            raise RuntimeError("Training engine not initialized")
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
-            if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\" in checkpoint_name:
+            if (
+                checkpoint_name in (".", "..")
+                or "/" in checkpoint_name
+                or "\\" in checkpoint_name
+            ):
                 raise ValueError(f"Invalid checkpoint name: {request.path!r}")
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
@@ -1297,7 +1567,7 @@ async def _do_save_state(
             checkpoint_export_t0 = time.perf_counter()
             await run_async_with_otel_span(
                 "weights.save_state.execute",
-                lambda: training_engine.save_weights(session, save_path),
+                lambda: engine.save_weights(session, save_path),
                 component="routes.weights",
                 op="weights.save_state",
                 request_id=str(request_id),
@@ -1313,7 +1583,9 @@ async def _do_save_state(
                 request_id,
                 {
                     "stage": "validate_checkpoint",
-                    "checkpoint_export_s": max(0.0, time.perf_counter() - checkpoint_export_t0),
+                    "checkpoint_export_s": max(
+                        0.0, time.perf_counter() - checkpoint_export_t0
+                    ),
                 },
             )
 
@@ -1333,7 +1605,7 @@ async def _do_save_state(
                 request.model_id,
                 save_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _save_state_once()
 
         # Save ownership metadata (for user-scoped checkpoint API)
@@ -1357,7 +1629,9 @@ async def _do_save_state(
             request_id,
             {
                 "stage": "write_checkpoint_metadata",
-                "validate_checkpoint_s": max(0.0, time.perf_counter() - validate_checkpoint_t0),
+                "validate_checkpoint_s": max(
+                    0.0, time.perf_counter() - validate_checkpoint_t0
+                ),
             },
         )
 
@@ -1382,7 +1656,9 @@ async def _do_save_state(
             request_id,
             {
                 "stage": "begin_async_checkpoint_mirror",
-                "write_checkpoint_metadata_s": max(0.0, time.perf_counter() - write_metadata_t0),
+                "write_checkpoint_metadata_s": max(
+                    0.0, time.perf_counter() - write_metadata_t0
+                ),
             },
         )
 
@@ -1399,7 +1675,9 @@ async def _do_save_state(
             request_id,
             {
                 "stage": "ready",
-                "begin_async_checkpoint_mirror_s": max(0.0, time.perf_counter() - mirror_t0),
+                "begin_async_checkpoint_mirror_s": max(
+                    0.0, time.perf_counter() - mirror_t0
+                ),
             },
         )
 
@@ -1423,21 +1701,24 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        await task_futures.async_resolve(request_id, {
-            "checkpoint_id": checkpoint_name,
-            "checkpoint_record_id": claimed_ckpt_id,
-            "path": selected_path,
-            "mint_path": mint_path,
-            "tinker_path": tinker_path,
-            "filesystem_path": save_path,
-            "persistent_filesystem_path": persistent_path,
-            "mirror_status": MIRROR_STATUS_PENDING,
-            "storage_tier": "persistent_cache",
-            "mirror_error": None,
-            "type": "save_weights",
-            "sampling_registered": sampling_registered,
-            "checkpoint_type": "training",
-        })
+        await task_futures.async_resolve(
+            request_id,
+            {
+                "checkpoint_id": checkpoint_name,
+                "checkpoint_record_id": claimed_ckpt_id,
+                "path": selected_path,
+                "mint_path": mint_path,
+                "tinker_path": tinker_path,
+                "filesystem_path": save_path,
+                "persistent_filesystem_path": persistent_path,
+                "mirror_status": MIRROR_STATUS_PENDING,
+                "storage_tier": "persistent_cache",
+                "mirror_error": None,
+                "type": "save_weights",
+                "sampling_registered": sampling_registered,
+                "checkpoint_type": "training",
+            },
+        )
 
         # 发送 completed 状态 - 训练完成（权重已保存）
         if webhook_url and user_id:
@@ -1454,7 +1735,9 @@ async def _do_save_state(
 
     except Exception as e:
         if not mirror_started:
-            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+            await _mark_checkpoint_failed_safe(
+                claimed_ckpt_id, fail_reason="upload_error"
+            )
         logger.exception(
             "[weights.save_state] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -1467,7 +1750,9 @@ async def _do_save_state(
 
         # 发送 failed 状态
         if webhook_url and user_id:
-            failed_session_id = session.model_id if session is not None else request.model_id
+            failed_session_id = (
+                session.model_id if session is not None else request.model_id
+            )
             failed_model_name = session.base_model if session is not None else None
             send_task_event(
                 webhook_url=webhook_url,
@@ -1480,8 +1765,7 @@ async def _do_save_state(
                 error=str(e),
             )
     finally:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        await _mark_training_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -1497,21 +1781,23 @@ async def _do_save_weights(
     Also registers the model for sampling via multi-LoRA engine.
     """
     session = None
-    inflight_marked = False
     claimed_ckpt_id: str | None = None
     mirror_started = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
-            raise RuntimeError("Training engine not initialized")
-        inflight_marked = True
-
-        session = training_manager.get_session(request.model_id)
+        session = await _get_or_restore_training_session_for_weights(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        engine = _current_training_engine()
+        if engine is None:
+            raise RuntimeError("Training engine not initialized")
         checkpoint_name = request.path.strip() if request.path is not None else ""
         if checkpoint_name:
-            if checkpoint_name in (".", "..") or "/" in checkpoint_name or "\\\\" in checkpoint_name:
+            if (
+                checkpoint_name in (".", "..")
+                or "/" in checkpoint_name
+                or "\\\\" in checkpoint_name
+            ):
                 raise ValueError(f"Invalid checkpoint name: {request.path!r}")
         else:
             checkpoint_name = f"ckpt_{uuid.uuid4().hex[:12]}"
@@ -1539,10 +1825,12 @@ async def _do_save_weights(
         async def _save_weights_once() -> None:
             await run_async_with_otel_span(
                 "weights.save_weights.execute",
-                lambda: training_engine.save_weights_for_sampler(
+                lambda: engine.save_weights_for_sampler(
                     session=session,
                     checkpoint_name=checkpoint_name,
-                    checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
+                    checkpoint_base_dir=os.path.dirname(
+                        os.path.dirname(os.path.dirname(save_path))
+                    ),
                     checkpoint_type="sampler",
                 ),
                 component="routes.weights",
@@ -1573,7 +1861,7 @@ async def _do_save_weights(
                 request.model_id,
                 save_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _save_weights_once()
 
         os.makedirs(save_path, exist_ok=True)
@@ -1663,7 +1951,9 @@ async def _do_save_weights(
 
     except Exception as e:
         if not mirror_started:
-            await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
+            await _mark_checkpoint_failed_safe(
+                claimed_ckpt_id, fail_reason="upload_error"
+            )
         logger.exception(
             "[weights.save_weights] failed request_id=%s model_id=%s failure_reason=%s error_type=%s next_action=%s",
             str(request_id),
@@ -1675,7 +1965,9 @@ async def _do_save_weights(
         await _fail_future(request_id, str(e))
 
         if webhook_url and user_id:
-            failed_session_id = session.model_id if session is not None else request.model_id
+            failed_session_id = (
+                session.model_id if session is not None else request.model_id
+            )
             send_task_event(
                 webhook_url=webhook_url,
                 event_type=EventType.TASK_FAILED,
@@ -1687,8 +1979,7 @@ async def _do_save_weights(
                 error=str(e),
             )
     finally:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        await _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1714,16 +2005,25 @@ async def load_state(
     )
 
     store_info = await _get_route_training_store_info(request.model_id)
-    remote = None if isinstance(store_info, dict) else await async_remote_training_model(request.model_id)
+    remote = (
+        None
+        if isinstance(store_info, dict)
+        else await async_remote_training_model(request.model_id)
+    )
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
         if upstream is None:
-            raise HTTPException(status_code=500, detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Gateway misconfig: unknown upstream alias {upstream_alias!r}",
+            )
 
         user_data = _get_user_data(http_request)
         if not can_access_model(base_model, user_data):
-            raise HTTPException(status_code=403, detail=get_access_denied_error(base_model))
+            raise HTTPException(
+                status_code=403, detail=get_access_denied_error(base_model)
+            )
 
         user_id = _get_user_id(http_request)
         incoming_headers = dict(http_request.headers)
@@ -1732,19 +2032,27 @@ async def load_state(
         if request.path.startswith(("mint://", "ckpt_")):
             owner_scope = request.owner_id if can_system else user_id
             try:
-                local_path = resolve_checkpoint_path(request.path, user_id=owner_scope, is_admin=can_system)
+                local_path = resolve_checkpoint_path(
+                    request.path, user_id=owner_scope, is_admin=can_system
+                )
                 if request.path.startswith("ckpt_") and local_path == request.path:
                     raise HTTPException(status_code=404, detail="Checkpoint not found")
-                ensure_checkpoint_path_allowed(local_path, user_id=owner_scope, is_admin=can_system)
+                ensure_checkpoint_path_allowed(
+                    local_path, user_id=owner_scope, is_admin=can_system
+                )
             except ValueError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
             except PermissionError as e:
                 raise HTTPException(status_code=403, detail=str(e)) from e
             if os.path.isdir(local_path):
-                proxy_timeout_s = float(os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600"))
+                proxy_timeout_s = float(
+                    os.environ.get("MINT_GATEWAY_CHECKPOINT_PROXY_TIMEOUT_S", "600")
+                )
                 tmp_archive = build_gateway_proxy_archive_path()
                 try:
-                    await async_create_checkpoint_archive(local_path, tmp_archive, timeout_s=proxy_timeout_s)
+                    await async_create_checkpoint_archive(
+                        local_path, tmp_archive, timeout_s=proxy_timeout_s
+                    )
                     upload_resp = await forward_file(
                         upstream=upstream,
                         path="/api/v1/checkpoints/upload",
@@ -1758,7 +2066,9 @@ async def load_state(
                     except OSError:
                         pass
                 if upload_resp.status_code >= 400:
-                    raise HTTPException(status_code=upload_resp.status_code, detail=upload_resp.text)
+                    raise HTTPException(
+                        status_code=upload_resp.status_code, detail=upload_resp.text
+                    )
                 payload = upload_resp.json()
                 ckpt_id = payload.get("checkpoint_id")
                 if not isinstance(ckpt_id, str) or not ckpt_id:
@@ -1780,20 +2090,29 @@ async def load_state(
             )
         except Exception:
             logger.exception("Upstream load_state failed: %s", upstream_alias)
-            raise HTTPException(status_code=503, detail=f"Upstream {upstream_alias!r} load_state failed")
+            raise HTTPException(
+                status_code=503, detail=f"Upstream {upstream_alias!r} load_state failed"
+            )
 
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         payload = resp.json()
         upstream_request_id = payload.get("request_id")
         if not isinstance(upstream_request_id, str) or not upstream_request_id:
-            raise HTTPException(status_code=502, detail="Upstream load_state returned invalid request_id")
+            raise HTTPException(
+                status_code=502,
+                detail="Upstream load_state returned invalid request_id",
+            )
         return UntypedAPIFuture(
-            request_id=encode_request_id(upstream_alias=upstream_alias, upstream_request_id=upstream_request_id)
+            request_id=encode_request_id(
+                upstream_alias=upstream_alias, upstream_request_id=upstream_request_id
+            )
         )
 
     if not isinstance(store_info, dict):
-        raise HTTPException(status_code=404, detail=f"Model '{request.model_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Model '{request.model_id}' not found"
+        )
 
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
@@ -1824,9 +2143,8 @@ async def load_state(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1835,16 +2153,20 @@ async def load_state(
             user_id=user_id,
             webhook_url=None,
             model_id=request.model_id,
-            domain_key=_training_domain_key_from_store_info(store_info, model_id=request.model_id),
+            domain_key=_training_domain_key_from_store_info(
+                store_info, model_id=request.model_id
+            ),
             extra=merge_queue_priority_extra(
                 {},
                 request=http_request,
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
-        raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
+        raise HTTPException(
+            status_code=503, detail=f"Failed to enqueue load_state request: {e}"
+        )
 
     return UntypedAPIFuture(request_id=request_id)
 
@@ -1853,16 +2175,14 @@ async def _do_load_state(
     request_id: str, request: LoadStateRequest, user_id: str | None
 ) -> None:
     """Background task to load state."""
-    inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
-            raise RuntimeError("Training engine not initialized")
-        inflight_marked = True
-
-        session = training_manager.get_session(request.model_id)
+        session = await _get_or_restore_training_session_for_weights(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
+        engine = _current_training_engine()
+        if engine is None:
+            raise RuntimeError("Training engine not initialized")
         load_path = request.path
 
         logger.info(f"[{session.model_id}] Loading state from: {load_path}")
@@ -1876,7 +2196,9 @@ async def _do_load_state(
         async def _load_state_once() -> None:
             await run_async_with_otel_span(
                 "weights.load_state.execute",
-                lambda: training_engine.load_weights(session, load_path, load_optimizer=request.optimizer),
+                lambda: engine.load_weights(
+                    session, load_path, load_optimizer=request.optimizer
+                ),
                 component="routes.weights",
                 op="weights.load_state",
                 request_id=str(request_id),
@@ -1904,7 +2226,7 @@ async def _do_load_state(
                 request.model_id,
                 load_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _load_state_once()
 
         metadata_persisted = True
@@ -1941,8 +2263,7 @@ async def _do_load_state(
         )
         await _fail_future(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        await _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1968,7 +2289,9 @@ async def upload_checkpoint_archive(
     owner_dir = user_id or "anonymous"
 
     checkpoint_id = f"ckpt_{uuid.uuid4().hex[:12]}"
-    parent_dir = os.path.join(get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)[0], owner_dir)
+    parent_dir = os.path.join(
+        get_persistent_search_roots(primary_root=CHECKPOINTS_DIR)[0], owner_dir
+    )
     final_dir = os.path.join(parent_dir, checkpoint_id)
     tmp_dir = final_dir + ".tmp"
     tmp_archive: str | None = None
@@ -2003,7 +2326,9 @@ async def upload_checkpoint_archive(
         # - Otherwise, infer from presence of optimizer artifacts.
         from ..checkpoints import checkpoint_has_optimizer_state
 
-        inferred_type = "training" if checkpoint_has_optimizer_state(tmp_dir) else "sampler"
+        inferred_type = (
+            "training" if checkpoint_has_optimizer_state(tmp_dir) else "sampler"
+        )
 
         existing_meta: dict | None = None
         existing_meta_path = os.path.join(tmp_dir, "metadata.json")
@@ -2016,9 +2341,14 @@ async def upload_checkpoint_archive(
 
         declared_type = None
         if isinstance(existing_meta, dict):
-            declared_type = existing_meta.get("checkpoint_type") or existing_meta.get("type")
+            declared_type = existing_meta.get("checkpoint_type") or existing_meta.get(
+                "type"
+            )
         if declared_type is not None and declared_type not in ("training", "sampler"):
-            raise HTTPException(status_code=400, detail=f"Invalid checkpoint_type in metadata.json: {declared_type!r}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid checkpoint_type in metadata.json: {declared_type!r}",
+            )
 
         checkpoint_type = declared_type or inferred_type
         if declared_type is not None and declared_type != inferred_type:
@@ -2049,7 +2379,11 @@ async def upload_checkpoint_archive(
             if os.path.exists(adapter_cfg_path):
                 with open(adapter_cfg_path) as f:
                     cfg = json.load(f)
-                model_name = cfg.get("base_model_name_or_path") or cfg.get("base_model") or model_name
+                model_name = (
+                    cfg.get("base_model_name_or_path")
+                    or cfg.get("base_model")
+                    or model_name
+                )
         except Exception:
             pass
         if isinstance(existing_meta, dict):
@@ -2093,10 +2427,14 @@ async def upload_checkpoint_archive(
 # =============================================================================
 
 
-@router.get("/training_runs/{model_id}/checkpoints", response_model=CheckpointsListResponse)
+@router.get(
+    "/training_runs/{model_id}/checkpoints", response_model=CheckpointsListResponse
+)
 async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListResponse:
     """List catalog-backed checkpoints for a model without scanning filesystem roots."""
-    remote_response = await _forward_remote_checkpoint_route(model_id=model_id, request=request)
+    remote_response = await _forward_remote_checkpoint_route(
+        model_id=model_id, request=request
+    )
     if remote_response is not None:
         return remote_response
 
@@ -2128,7 +2466,9 @@ async def list_checkpoints(model_id: str, request: Request) -> CheckpointsListRe
             checkpoints.append(info)
 
     if not checkpoints:
-        raise HTTPException(status_code=404, detail=f"No checkpoints found for model '{model_id}'")
+        raise HTTPException(
+            status_code=404, detail=f"No checkpoints found for model '{model_id}'"
+        )
 
     checkpoints.sort(key=lambda item: (item.step or 0, item.time), reverse=True)
     return CheckpointsListResponse(model_id=model_id, checkpoints=checkpoints)
@@ -2164,7 +2504,9 @@ def _select_exact_checkpoint_from_candidates(
     for p in existing:
         selected = _existing_checkpoint_view(
             p,
-            checkpoint_type=(expected_type if expected_type in ("training", "sampler") else None),
+            checkpoint_type=(
+                expected_type if expected_type in ("training", "sampler") else None
+            ),
         )
         if selected is None:
             training_view = _existing_checkpoint_view(p, checkpoint_type="training")
@@ -2198,9 +2540,14 @@ def _select_exact_checkpoint_from_candidates(
             continue
         if metadata.get("model_id") != model_id:
             continue
-        if expected_type is not None and metadata.get("checkpoint_type") != expected_type:
+        if (
+            expected_type is not None
+            and metadata.get("checkpoint_type") != expected_type
+        ):
             continue
-        actual_owner = str(metadata.get("owner_id") or "anonymous").strip() or "anonymous"
+        actual_owner = (
+            str(metadata.get("owner_id") or "anonymous").strip() or "anonymous"
+        )
         expected_owner = str(required_owner_id or "anonymous").strip() or "anonymous"
         if actual_owner != expected_owner:
             saw_unowned = True
@@ -2259,10 +2606,20 @@ async def _resolve_weight_checkpoint(
                         metadata = loaded
                 except Exception:
                     metadata = {}
-            actual_owner = str(metadata.get("owner_id") or scoped_owner_id or "anonymous").strip() or "anonymous"
-            actual_model_id = str(metadata.get("model_id") or model_id).strip() or model_id
-            actual_type = str(metadata.get("checkpoint_type") or expected_type or "").strip() or expected_type
-            if actual_owner == str(scoped_owner_id or "anonymous").strip() and actual_model_id == str(model_id):
+            actual_owner = (
+                str(metadata.get("owner_id") or scoped_owner_id or "anonymous").strip()
+                or "anonymous"
+            )
+            actual_model_id = (
+                str(metadata.get("model_id") or model_id).strip() or model_id
+            )
+            actual_type = (
+                str(metadata.get("checkpoint_type") or expected_type or "").strip()
+                or expected_type
+            )
+            if actual_owner == str(
+                scoped_owner_id or "anonymous"
+            ).strip() and actual_model_id == str(model_id):
                 if expected_type is None or actual_type == expected_type:
                     metadata.setdefault("owner_id", scoped_owner_id)
                     metadata.setdefault("model_id", model_id)
@@ -2281,7 +2638,9 @@ async def _resolve_weight_checkpoint(
         expected_type=expected_type,
     )
     if resolved is None:
-        raise HTTPException(status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found")
+        raise HTTPException(
+            status_code=404, detail=f"Checkpoint '{checkpoint_id}' not found"
+        )
     ckpt_path, metadata = resolved
     return ckpt_path, metadata, catalog_row
 
@@ -2311,7 +2670,9 @@ async def delete_checkpoint(
         ckpt_id = _catalog_row_text(catalog_row, "ckpt_id")
         if ckpt_id:
             try:
-                await mark_catalog_checkpoint_deleted(ckpt_id, owner_id=user_id, is_admin=is_admin)
+                await mark_catalog_checkpoint_deleted(
+                    ckpt_id, owner_id=user_id, is_admin=is_admin
+                )
             except Exception:
                 logger.exception(
                     "[weights.delete_checkpoint] catalog tombstone failed model_id=%s checkpoint_id=%s ckpt_id=%s",
@@ -2416,5 +2777,5 @@ async def download_checkpoint_archive(
     return StreamingResponse(
         stream_tar_gz(),
         media_type="application/gzip",
-        headers={"Content-Disposition": f"attachment; filename=\"{filename}\""},
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )

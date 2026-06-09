@@ -51,8 +51,12 @@ class _SessionCacheEntry:
     last_used: float
 
 
-_MAX_SESSION_CACHE_SIZE = int(env_get(os.environ, "MINT_OAI_SESSION_CACHE_MAX_SIZE", "1024") or 1024)
-_SESSION_CACHE_TTL_S = int(env_get(os.environ, "MINT_OAI_SESSION_CACHE_TTL_S", "3600") or 3600)
+_MAX_SESSION_CACHE_SIZE = int(
+    env_get(os.environ, "MINT_OAI_SESSION_CACHE_MAX_SIZE", "1024") or 1024
+)
+_SESSION_CACHE_TTL_S = int(
+    env_get(os.environ, "MINT_OAI_SESSION_CACHE_TTL_S", "3600") or 3600
+)
 _session_cache: OrderedDict[tuple[str | None, str], _SessionCacheEntry] = OrderedDict()
 _session_lock = asyncio.Lock()
 _tokenizer_cache: dict[str, Any] = {}
@@ -62,6 +66,8 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 # Secondary: ```json {...} ``` / ```json [...] ``` code blocks for tool payloads.
 # Handles models whose native chat templates emit JSON code blocks instead of <tool_call> XML.
 _CODE_BLOCK_TOOL_RE = re.compile(r"```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```", re.DOTALL)
+
+
 def _get_user_id(request: Request) -> str | None:
     user_data = getattr(request.state, "user_data", None)
     if user_data:
@@ -69,7 +75,13 @@ def _get_user_id(request: Request) -> str | None:
     return None
 
 
-def _error_response(*, message: str, status_code: int, error_type: str = "invalid_request_error", code: str | None = None):
+def _error_response(
+    *,
+    message: str,
+    status_code: int,
+    error_type: str = "invalid_request_error",
+    code: str | None = None,
+):
     return JSONResponse(
         status_code=status_code,
         content={
@@ -188,7 +200,11 @@ def _prune_session_cache(now: float) -> None:
     if not _session_cache:
         return
     if _SESSION_CACHE_TTL_S > 0:
-        expired = [key for key, entry in _session_cache.items() if _is_session_cache_expired(entry, now)]
+        expired = [
+            key
+            for key, entry in _session_cache.items()
+            if _is_session_cache_expired(entry, now)
+        ]
         for key in expired:
             _session_cache.pop(key, None)
     if _MAX_SESSION_CACHE_SIZE > 0:
@@ -196,7 +212,9 @@ def _prune_session_cache(now: float) -> None:
             _session_cache.popitem(last=False)
 
 
-async def _get_or_create_cached_session(*, model_path: str, http_request: Request) -> tuple[str, str]:
+async def _get_or_create_cached_session(
+    *, model_path: str, http_request: Request
+) -> tuple[str, str]:
     user_id = _get_user_id(http_request)
     cache_key = (user_id, model_path)
     now = time.time()
@@ -220,7 +238,9 @@ async def _get_or_create_cached_session(*, model_path: str, http_request: Reques
                 cached.last_used = now
                 _session_cache.move_to_end(cache_key)
                 return cached.session_id, cached.base_model
-        session_id, base_model = await ensure_sampling_session(model_path=model_path, http_request=http_request)
+        session_id, base_model = await ensure_sampling_session(
+            model_path=model_path, http_request=http_request
+        )
         _session_cache[cache_key] = _SessionCacheEntry(
             session_id=session_id,
             base_model=base_model,
@@ -235,6 +255,23 @@ async def _get_or_create_cached_session(*, model_path: str, http_request: Reques
 
 def _invalidate_cached_session(*, user_id: str | None, model_path: str) -> None:
     _session_cache.pop((user_id, model_path), None)
+
+
+async def _is_remote_sampling_session(session_id: str) -> bool:
+    try:
+        from ..gateway import async_remote_sampling_session
+
+        remote = await async_remote_sampling_session(session_id)
+    except Exception:
+        remote = None
+    if remote is not None:
+        return True
+    try:
+        from ..gateway import remote_sampling_session
+
+        return remote_sampling_session(session_id) is not None
+    except Exception:
+        return False
 
 
 def _should_retry_with_fresh_session(exc: Exception) -> bool:
@@ -312,7 +349,9 @@ def _tool_prompt_text(request: OAIChatCompletionRequest) -> str:
     if mode == "required":
         lines.append("You must call at least one tool before giving a final answer.")
     elif mode == "function" and function_name is not None:
-        lines.append(f"You must call the function `{function_name}` before giving a final answer.")
+        lines.append(
+            f"You must call the function `{function_name}` before giving a final answer."
+        )
     return "\n".join(lines)
 
 
@@ -331,14 +370,19 @@ def _message_to_fallback_dict(message) -> dict[str, Any]:
             except (json.JSONDecodeError, ValueError):
                 args = tc.function.arguments
             payload = {"name": tc.function.name, "arguments": args}
-            tc_parts.append(f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>")
+            tc_parts.append(
+                f"<tool_call>{json.dumps(payload, ensure_ascii=False)}</tool_call>"
+            )
         tc_text = "\n".join(tc_parts)
         prefix = message.content or ""
         combined = (prefix + "\n" + tc_text).strip() if prefix else tc_text
         return {"role": "assistant", "content": combined}
 
     if message.role == "tool":
-        return {"role": "user", "content": f"<tool_result>{message.content}</tool_result>"}
+        return {
+            "role": "user",
+            "content": f"<tool_result>{message.content}</tool_result>",
+        }
 
     item: dict[str, Any] = {"role": message.role}
     if message.content is not None:
@@ -416,7 +460,11 @@ def _parse_tool_call_payload(payload: str) -> OAIToolCall | None:
         logger.warning("Skipping tool_call with missing/invalid name: %r", parsed)
         return None
 
-    arguments_json = arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False)
+    arguments_json = (
+        arguments
+        if isinstance(arguments, str)
+        else json.dumps(arguments, ensure_ascii=False)
+    )
     return OAIToolCall(
         id=f"call_{uuid.uuid4().hex}",
         function=OAIFunctionCall(name=name, arguments=arguments_json),
@@ -428,7 +476,9 @@ def _coerce_tool_calls(items: list[dict[str, Any]]) -> list[OAIToolCall]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        function = item.get("function") if isinstance(item.get("function"), dict) else None
+        function = (
+            item.get("function") if isinstance(item.get("function"), dict) else None
+        )
         name = None
         arguments = None
         if function is not None:
@@ -480,7 +530,11 @@ def _extract_tool_calls(text: str) -> tuple[str | None, list[OAIToolCall]]:
     # Primary: <tool_call>...</tool_call> XML (Qwen3, DeepSeek, and our fallback prompt path).
     matches = list(_TOOL_CALL_RE.finditer(text))
     if matches:
-        tool_calls = [tc for m in matches if (tc := _parse_tool_call_payload(m.group(1).strip())) is not None]
+        tool_calls = [
+            tc
+            for m in matches
+            if (tc := _parse_tool_call_payload(m.group(1).strip())) is not None
+        ]
         if not tool_calls:
             # All blocks were malformed – treat entire output as plain text.
             return text.strip() or None, []
@@ -512,7 +566,13 @@ def _invalid_tool_call_names(
     tool_calls: list[OAIToolCall],
 ) -> list[str]:
     allowed_names = {tool.function.name for tool in request.tools or []}
-    return sorted({tool_call.function.name for tool_call in tool_calls if tool_call.function.name not in allowed_names})
+    return sorted(
+        {
+            tool_call.function.name
+            for tool_call in tool_calls
+            if tool_call.function.name not in allowed_names
+        }
+    )
 
 
 def _validate_tool_calls(
@@ -539,7 +599,9 @@ def _validate_tool_calls(
         )
 
     if mode == "required" and not tool_calls:
-        raise HTTPException(status_code=400, detail="Model did not return a required tool call")
+        raise HTTPException(
+            status_code=400, detail="Model did not return a required tool call"
+        )
 
     if mode == "function" and function_name is not None:
         if not tool_calls:
@@ -547,7 +609,13 @@ def _validate_tool_calls(
                 status_code=400,
                 detail=f"Model did not return the required tool call {function_name!r}",
             )
-        wrong_tool_names = sorted({tool_call.function.name for tool_call in tool_calls if tool_call.function.name != function_name})
+        wrong_tool_names = sorted(
+            {
+                tool_call.function.name
+                for tool_call in tool_calls
+                if tool_call.function.name != function_name
+            }
+        )
         if wrong_tool_names:
             raise HTTPException(
                 status_code=400,
@@ -575,7 +643,9 @@ def _render_chat_prompt_token_ids(
     force_tool_prompt: bool = False,
 ) -> list[int]:
     if force_tool_prompt and request.tools:
-        fallback_messages = _build_chat_template_messages(request, include_tool_prompt=True)
+        fallback_messages = _build_chat_template_messages(
+            request, include_tool_prompt=True
+        )
         return tokenizer.apply_chat_template(
             fallback_messages,
             tokenize=True,
@@ -606,7 +676,9 @@ def _render_chat_prompt_token_ids(
             exc,
         )
         try:
-            fallback_messages = _build_chat_template_messages(request, include_tool_prompt=True)
+            fallback_messages = _build_chat_template_messages(
+                request, include_tool_prompt=True
+            )
             return tokenizer.apply_chat_template(
                 fallback_messages,
                 tokenize=True,
@@ -672,7 +744,9 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                 http_request=http_request,
             )
             tokenizer = await _get_tokenizer(base_model)
-            prompt_token_ids = tokenizer.encode(request.prompt, add_special_tokens=False)
+            prompt_token_ids = tokenizer.encode(
+                request.prompt, add_special_tokens=False
+            )
             try:
                 sampling_request_id = f"oai_cmpl_{uuid.uuid4().hex}"
                 sequence = await sample_once(
@@ -695,15 +769,17 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                 if attempt == 1:
                     raise
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
-        billing_observations = build_sample_once_billing_observations(
-            session_id=sampling_session_id,
-            token_ids=prompt_token_ids,
-            sequence=sequence,
-            http_request=http_request,
-            request_id=sampling_request_id,
-        )
-        if billing_observations:
-            await _append_billing_observations(billing_observations)
+        if not await _is_remote_sampling_session(sampling_session_id):
+            billing_observations = build_sample_once_billing_observations(
+                session_id=sampling_session_id,
+                token_ids=prompt_token_ids,
+                sequence=sequence,
+                http_request=http_request,
+                request_id=sampling_request_id,
+                model=base_model,
+            )
+            if billing_observations:
+                await _append_billing_observations(billing_observations)
         return OAICompletionResponse(
             id=f"cmpl-{uuid.uuid4().hex}",
             created=int(time.time()),
@@ -749,7 +825,9 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                     base_model=base_model,
                     force_tool_prompt=force_tool_prompt,
                 )
-                if not isinstance(prompt_token_ids, list) or (prompt_token_ids and not isinstance(prompt_token_ids[0], int)):
+                if not isinstance(prompt_token_ids, list) or (
+                    prompt_token_ids and not isinstance(prompt_token_ids[0], int)
+                ):
                     raise HTTPException(
                         status_code=500,
                         detail=f"Tokenizer.apply_chat_template returned unexpected type {type(prompt_token_ids).__name__}; expected list[int]",
@@ -772,7 +850,9 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                 except Exception as exc:
                     if not _should_retry_with_fresh_session(exc):
                         raise
-                    _invalidate_cached_session(user_id=user_id, model_path=request.model)
+                    _invalidate_cached_session(
+                        user_id=user_id, model_path=request.model
+                    )
                     if attempt == 1:
                         raise
 
@@ -787,7 +867,9 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                         "Native template path yielded no tool_calls for %s "
                         "(tool_choice=%r). Model may use an unrecognised output format. "
                         "Output[:300]: %r",
-                        request.model, request.tool_choice, text[:300],
+                        request.model,
+                        request.tool_choice,
+                        text[:300],
                     )
             else:
                 content, tool_calls = text, []
@@ -807,7 +889,11 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                 and (
                     bool(invalid_names)
                     or (mode == "required" and not tool_calls)
-                    or (mode == "function" and function_name is not None and not tool_calls)
+                    or (
+                        mode == "function"
+                        and function_name is not None
+                        and not tool_calls
+                    )
                     or wrong_function
                 )
             )
@@ -815,21 +901,29 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                 logger.warning(
                     "Tool constraint not satisfied for model %s (mode=%s, invalid_names=%s, "
                     "tool_calls=%d, wrong_function=%s); retrying with explicit tool prompt",
-                    request.model, mode, invalid_names, len(tool_calls), wrong_function,
+                    request.model,
+                    mode,
+                    invalid_names,
+                    len(tool_calls),
+                    wrong_function,
                 )
                 continue
 
             _validate_tool_calls(request, tool_calls=tool_calls)
-            finish_reason = "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
-            billing_observations = build_sample_once_billing_observations(
-                session_id=sampling_session_id,
-                token_ids=prompt_token_ids,
-                sequence=sequence,
-                http_request=http_request,
-                request_id=sampling_request_id,
+            finish_reason = (
+                "tool_calls" if tool_calls else _finish_reason(sequence.stop_reason)
             )
-            if billing_observations:
-                await _append_billing_observations(billing_observations)
+            if not await _is_remote_sampling_session(sampling_session_id):
+                billing_observations = build_sample_once_billing_observations(
+                    session_id=sampling_session_id,
+                    token_ids=prompt_token_ids,
+                    sequence=sequence,
+                    http_request=http_request,
+                    request_id=sampling_request_id,
+                    model=base_model,
+                )
+                if billing_observations:
+                    await _append_billing_observations(billing_observations)
             return OAIChatCompletionResponse(
                 id=f"chatcmpl-{uuid.uuid4().hex}",
                 created=int(time.time()),
@@ -837,7 +931,9 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                 choices=[
                     OAIChatCompletionChoice(
                         index=0,
-                        message=OAIChatMessageResponse(content=content, tool_calls=tool_calls or None),
+                        message=OAIChatMessageResponse(
+                            content=content, tool_calls=tool_calls or None
+                        ),
                         finish_reason=finish_reason,
                     )
                 ],
