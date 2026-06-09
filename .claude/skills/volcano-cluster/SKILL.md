@@ -226,6 +226,7 @@ cat /vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml
 | Task stuck in Queue | Check Volcano console capacity. If capacity is sufficient but the job remains queued, split desired nodes into one-job-per-node aliases. |
 | Worker fails to join Ray | Confirm head IP file, port reachability, image/runtime path, and PFS mounts. |
 | Stale actors block placement | Kill via Mint API or supervisor-owned actor cleanup before canceling provider jobs. |
+| Ray reports temp/spill filesystem over 95% full | Treat this as a scratch hygiene warning, not proof that spilling is disabled. First inspect the `mint ray path check` startup lines and confirm `object_spilling_directory` resolves under `/mnt/tmp` with the expected Vepfs mount. If the backing mount is correct, clean or rotate stale vePFS scratch in a separate owner/age-scoped procedure; do not add startup fail-fast behavior by default. |
 
 ## Config Files
 
@@ -242,7 +243,10 @@ The dev/prod templates depend on shared runtime assets under
 `/vePFS-Mindverse/share/mint/runtime`:
 
 - `supervisor/current/bin/mint-ray-node`: starts Ray through Python internals
-  with `/mnt/tmp` for Ray temp/spill/cache paths.
+  with `/mnt/tmp` for Ray temp/spill/cache paths. On startup it emits
+  warning-only `mint ray path check` diagnostics for the configured path,
+  resolved path, writability, free/total bytes, and backing mount. Low free
+  space is logged as a warning; it is not a startup failure.
 - `services/{dev,prod}-{head,worker}`: runit service directories for Ray and
   sshd.
 - `ssh/sshd_config`: shared sshd config using
