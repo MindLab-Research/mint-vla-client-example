@@ -27,6 +27,7 @@ from mint_server.backend.model_actor_supervisor import (
     domain_key_for_vllm_base_model,
     queue_id_for_replica,
 )
+from mint_server.backend import model_actor_placement as placement_module
 from mint_server.backend.model_actor_placement import ModelActorPlacementReconciler
 from mint_server.backend.supervisor_state_store import (
     SupervisorMemoryStateStore,
@@ -792,7 +793,8 @@ async def test_issue_593_supervisor_client_forwards_sync_and_async_methods(
     assert ("mark_ready", ("actor-a",), {}) in actor.calls
 
 
-def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
+def test_issue_593_supervisor_exposes_explicit_inventory_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mint_server.backend.model_actor_inventory.ray.is_initialized", lambda: False)
     supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
 
     entry = supervisor.register(
@@ -819,7 +821,8 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract() -> None:
     assert supervisor.unregister("vllm-contract-actor") is True
 
 
-def test_bumblebee_actor_inventory_reports_bumblebee_backend() -> None:
+def test_bumblebee_actor_inventory_reports_bumblebee_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("mint_server.backend.model_actor_inventory.ray.is_initialized", lambda: False)
     supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
     actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
 
@@ -1946,6 +1949,47 @@ def test_issue_593_topology_specs_inherit_runtime_placement(
     ]
 
 
+def test_issue_593_topology_specs_accept_bumblebee_training_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                base_model: {
+                    "bumblebee": {
+                        "placement": [
+                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4},
+                            {"replica": 0, "worker_alias": "mint-worker-1", "gpu_count": 4},
+                        ]
+                    }
+                }
+            },
+        ),
+    )
+
+    specs = desired_specs_from_env()
+    training_specs = [spec for spec in specs if spec.base_model == base_model and spec.launcher_key == "training"]
+
+    assert training_specs == [
+        ModelActorSpec(
+            domain_key="bumblebee:mint_megatron_qwen3_30b_a3b_instruct_2507",
+            base_model=base_model,
+            launcher_key="training",
+            worker_aliases=("mint-worker-0", "mint-worker-1"),
+            placement_alias_slices=(
+                ("replica-0", "mint-worker-0", 4),
+                ("replica-0", "mint-worker-1", 4),
+            ),
+            gpu_count=4,
+        )
+    ]
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+
+
 def test_topology_legacy_megatron_launcher_follows_selected_moe_backend(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -2405,6 +2449,87 @@ def test_issue_593_placement_reconciler_evicts_foreign_blockers_when_target_abse
     assert out["evicted_actor_names"] == ["foreign_gpu_actor"]
     assert out["evicted_placement_group_names"] == ["foreign_vllm_pg"]
     assert out["reclaimed_total"] >= 2
+
+
+def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_prefix(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class _Row:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self._payload = payload
+
+        def asdict(self) -> dict[str, object]:
+            return dict(self._payload)
+
+    class _RayState:
+        @staticmethod
+        def list_actors(**kwargs):
+            calls.append(dict(kwargs))
+            return [
+                _Row(
+                    {
+                        "state": "ALIVE",
+                        "name": "mint_model_runtime_vllm-Qwen-Test_replica-1",
+                        "ray_namespace": "mint-ns",
+                        "required_resources": {"GPU": 4},
+                        "node_id": "node-1",
+                    }
+                ),
+                _Row(
+                    {
+                        "state": "ALIVE",
+                        "name": "not_mint_runtime",
+                        "ray_namespace": "mint-ns",
+                        "required_resources": {"GPU": 8},
+                        "node_id": "node-1",
+                    }
+                ),
+            ]
+
+    class _RayUtil:
+        state = _RayState()
+
+    class _Ray:
+        util = _RayUtil()
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def nodes() -> list[dict[str, str]]:
+            return [{"NodeID": "node-1", "NodeManagerAddress": "10.0.0.17"}]
+
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "mint-ns")
+    monkeypatch.setitem(sys.modules, "ray", _Ray)
+    monkeypatch.setitem(sys.modules, "ray.util", _RayUtil())
+    monkeypatch.setitem(sys.modules, "ray.util.state", _RayState())
+
+    out = list(placement_module._default_gpu_actor_lister())
+
+    assert calls == [
+        {
+            "detail": True,
+            "limit": 10000,
+            "filters": [("ray_namespace", "=", "mint-ns")],
+        }
+    ]
+    assert out == [
+        {
+            "name": "mint_model_runtime_vllm-Qwen-Test_replica-1",
+            "namespace": "mint-ns",
+            "node_ip": "10.0.0.17",
+            "gpu": 4.0,
+            "node_id": "node-1",
+        },
+        {
+            "name": "not_mint_runtime",
+            "namespace": "mint-ns",
+            "node_ip": "10.0.0.17",
+            "gpu": 8.0,
+            "node_id": "node-1",
+        },
+    ]
 
 
 def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure() -> None:

@@ -8211,6 +8211,48 @@ class MegatronWorkerGroup:
             )
         return effective_session_id
 
+    def _assert_session_active_for_sampler_export(
+        self,
+        session_id: str,
+        *,
+        actual_rank: int | None = None,
+    ) -> None:
+        """Validate sampler export without performing a training-state session switch."""
+        current_session = getattr(self, "_current_session", None)
+        if current_session != session_id:
+            raise RuntimeError(
+                f"sampler LoRA export requires the requested session to already be active: "
+                f"requested={session_id!r}, current={current_session!r}. "
+                "Refusing to switch sessions during sampler export."
+            )
+        if actual_rank is not None and int(actual_rank) != int(self._actual_rank):
+            raise RuntimeError(
+                f"Session {session_id} requested actual_rank={actual_rank}, "
+                f"but loaded rank is {self._actual_rank}"
+            )
+        session_manager = getattr(self, "_session_manager", None)
+        if session_manager is None:
+            return
+        session_exists = session_manager.session_exists(session_id)
+        if not session_exists:
+            return
+        has_actor_only_state = getattr(
+            session_manager,
+            "has_actor_only_state",
+            lambda _session_id: False,
+        )(session_id)
+        if has_actor_only_state and not self._session_state_cached_on_workers(session_id):
+            raise RuntimeError(
+                f"Session cache for {session_id} still has actor-only training state; "
+                "reload it from an explicit checkpoint before exporting sampler weights."
+            )
+        meta = getattr(session_manager, "get_metadata", lambda _session_id: None)(session_id)
+        if not isinstance(meta, dict):
+            raise RuntimeError(
+                f"Session cache for {session_id} is missing session_metadata.json; "
+                "reload from an explicit checkpoint before exporting sampler weights."
+            )
+
     def _contaminated_map(self) -> dict[str, str]:
         mapping = getattr(self, "_contaminated_sessions", None)
         if not isinstance(mapping, dict):
@@ -9827,21 +9869,10 @@ class MegatronWorkerGroup:
         )
         self._assert_session_request_allowed(effective_session_id, op="save_lora_weights")
         self._validate_trusted_pair_for_request(effective_session_id, op="save_lora_weights")
-        try:
-            self._ensure_session_loaded(
-                effective_session_id,
-                traceparent=traceparent,
-                actual_rank=actual_rank,
-                train_attn=train_attn,
-                train_mlp=train_mlp,
-                train_unembed=train_unembed,
-            )
-        except Exception as e:
-            self._mark_session_contaminated(
-                effective_session_id,
-                reason=f"save_lora_weights:ensure_session_loaded:{type(e).__name__}",
-            )
-            raise
+        self._assert_session_active_for_sampler_export(
+            effective_session_id,
+            actual_rank=actual_rank,
+        )
 
         logger.info(
             f"[MegatronWorkerGroup] save_lora_weights: {save_path} "

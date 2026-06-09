@@ -274,6 +274,7 @@ def _prepare_worker_for_forward_backward(worker, monkeypatch):
         max_model_len = 2048
 
     fake_training = types.ModuleType("mint_server.backend.megatron_training")
+    fake_training.benchmark_debug_input_entries = lambda *a, **kw: []  # type: ignore
     fake_training.create_sft_loss_fn = lambda **kw: (lambda *a, **k: None)  # type: ignore
     fake_training.create_ppo_loss_fn = lambda *a, **kw: (lambda *a2, **k2: None)  # type: ignore
     fake_training.mint_datum_to_tensordict = lambda *a, **kw: "fake_tensordict"  # type: ignore
@@ -2780,12 +2781,10 @@ def test_issue_193_partial_swap_explicit_session_recovers_optim_step(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# Test 33: partial swap can recover with explicit session for save_lora_weights
+# Test 33: sampler export refuses implicit session recovery
 # ---------------------------------------------------------------------------
 
-def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monkeypatch):
-    import ray as ray_module
-
+def test_issue_193_partial_swap_explicit_session_rejects_save_lora_weights(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
     group._current_session = None
@@ -2796,9 +2795,49 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
 
     def fake_ensure_session_loaded(session_id, **kwargs):
         ensure_calls.append((session_id, kwargs))
-        return {"switched": False}
+        raise AssertionError("sampler export must not switch sessions")
 
     group._ensure_session_loaded = fake_ensure_session_loaded
+
+    with pytest.raises(RuntimeError, match="already be active"):
+        group.save_lora_weights(
+            "/tmp/recovery_lora",
+            session_id="recovered_session",
+            train_attn=False,
+            train_mlp=True,
+            train_unembed=False,
+        )
+
+    assert ensure_calls == []
+
+
+def test_issue_17_save_lora_weights_active_session_skips_ensure_session_loaded(monkeypatch):
+    import ray as ray_module
+
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "active_session"
+    group._step_count = 9
+    group._actual_rank = 8
+    group._session_unknown_due_to_partial_swap = False
+    group._contaminated_sessions = {}
+    group._blocked_sessions = {}
+
+    group._bind_traceparent = lambda traceparent: None
+    group._validate_trusted_pair_for_request = lambda session_id, op: None
+    group._session_state_cached_on_workers = lambda session_id: True
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {
+            "session_exists": staticmethod(lambda session_id: True),
+            "has_actor_only_state": staticmethod(lambda session_id: False),
+            "get_metadata": staticmethod(lambda session_id: {"step": 9}),
+        },
+    )()
+    group._ensure_session_loaded = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("sampler export must not switch sessions")
+    )
 
     class _FakeSaveLoraRemoteMethod:
         def __init__(self):
@@ -2823,29 +2862,18 @@ def test_issue_193_partial_swap_explicit_session_recovers_save_lora_weights(monk
     monkeypatch.setattr(ray_module, "get", mock_ray_get)
 
     result = group.save_lora_weights(
-        "/tmp/recovery_lora",
-        session_id="recovered_session",
+        "/tmp/active_lora",
+        session_id="active_session",
+        actual_rank=8,
         train_attn=False,
         train_mlp=True,
         train_unembed=False,
     )
 
     assert result["current_step"] == 9
-    assert ensure_calls == [
-        (
-            "recovered_session",
-            {
-                "traceparent": None,
-                "actual_rank": None,
-                "train_attn": False,
-                "train_mlp": True,
-                "train_unembed": False,
-            },
-        )
-    ]
     assert worker.save_lora_weights.calls == [
         (
-            "/tmp/recovery_lora",
+            "/tmp/active_lora",
             9,
             8,
             {

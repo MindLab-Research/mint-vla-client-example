@@ -216,11 +216,15 @@ def build_persistent_cache_dir(
 def checkpoint_has_lora_weights(path: str) -> bool:
     return os.path.exists(os.path.join(path, "adapter_model.safetensors")) or bool(
         glob.glob(os.path.join(path, "mp_rank_*_adapter.pt"))
+    ) or os.path.exists(
+        os.path.join(path, "bumblebee_rank_sharded_adapter.json")
     )
 
 
 def checkpoint_has_sampling_adapter_weights(path: str) -> bool:
-    return os.path.exists(os.path.join(path, "adapter_model.safetensors"))
+    return os.path.exists(os.path.join(path, "adapter_model.safetensors")) or os.path.exists(
+        os.path.join(path, "bumblebee_rank_sharded_adapter.json")
+    )
 
 
 def _checkpoint_has_openpi_norm_stats(root: Path) -> bool:
@@ -517,12 +521,21 @@ def validate_checkpoint_dir(path: str, *, checkpoint_type: CheckpointType | None
 def validate_sampler_checkpoint_for_sampling(path: str) -> None:
     if not checkpoint_has_sampling_adapter_weights(path) and not checkpoint_has_openpi_policy_weights(path):
         raise ValueError(
-            "Missing sampling weights: expected adapter_model.safetensors or OpenPI params/_METADATA with assets/**/norm_stats.json"
+            "Missing sampling weights: expected adapter_model.safetensors, "
+            "bumblebee_rank_sharded_adapter.json, or OpenPI params/_METADATA with assets/**/norm_stats.json"
         )
     if checkpoint_has_optimizer_state(path):
         raise ValueError("Sampler checkpoint must not include optimizer state")
     if checkpoint_has_openpi_policy_weights(path):
         return
+    if os.path.exists(os.path.join(path, "bumblebee_rank_sharded_adapter.json")):
+        try:
+            from .backend.bumblebee_lora import prepare_lora_adapter_for_vllm
+
+            prepare_lora_adapter_for_vllm(path)
+            return
+        except Exception as e:
+            raise ValueError(f"Unreadable Bumblebee rank-sharded adapter for sampling: {e}") from e
     try:
         from safetensors import safe_open
 
@@ -1183,7 +1196,7 @@ def _iter_runtime_checkpoint_dirs(root: str) -> list[str]:
     seen: set[str] = set()
     for current_root, dirnames, filenames in os.walk(root):
         has_metadata = "metadata.json" in filenames
-        has_lora = "adapter_model.safetensors" in filenames or bool(
+        has_lora = "adapter_model.safetensors" in filenames or "bumblebee_rank_sharded_adapter.json" in filenames or bool(
             glob.glob(os.path.join(current_root, "mp_rank_*_adapter.pt"))
         )
         has_optimizer = "optimizer.pt" in filenames or bool(

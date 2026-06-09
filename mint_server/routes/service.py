@@ -364,6 +364,18 @@ async def _create_sampling_session_impl(
                 http_request=http_request,
             )
 
+        from ..backend.bumblebee_lora import prepare_lora_adapter_for_vllm
+
+        try:
+            adapter_path = prepare_lora_adapter_for_vllm(adapter_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to prepare LoRA adapter for sampling: {exc}",
+            ) from exc
+
         # Fast validation: ensure weights exist; loading happens on first /asample.
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")
         if not os.path.exists(weights_path):

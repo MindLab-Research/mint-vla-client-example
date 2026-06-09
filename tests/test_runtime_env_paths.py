@@ -60,10 +60,10 @@ def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, 
             "-c",
             (
                 "import json, os; "
-                "from mint_server.config import actor_runtime_env_vars; "
+                "from mint_server.config import PFS_PYTHONPATH, actor_runtime_env_vars; "
                 "from mint_server.runtime_config import actor_env_from_environ; "
                 "print(json.dumps({"
-                "'runtime_env': actor_runtime_env_vars(pythonpath='X'), "
+                "'runtime_env': actor_runtime_env_vars(pythonpath=PFS_PYTHONPATH), "
                 "'actor_env': actor_env_from_environ(os.environ)"
                 "}))"
             ),
@@ -96,6 +96,29 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     assert str(env_root / "src" / "Megatron-LM") in parts
     assert parts[-2] == "/vePFS/code/yiwen/mint-server"
     assert parts[-1] == "/vePFS/hf/modules"
+
+
+def test_config_prepends_actor_extra_pythonpath(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    extra = tmp_path / "vendor" / "flash-attn-current"
+    extra.mkdir(parents=True)
+    env = {
+        **os.environ,
+        "PFS_RUNTIME_ENV_ROOT": str(env_root),
+        "MINT_CODE_ROOT": "/repo",
+        "PFS_HF_MODULES_PATH": "/hf",
+        "RAY_ADDRESS": "local",
+        "MINT_ACTOR_EXTRA_PYTHONPATH": str(extra),
+    }
+
+    payload = _load_actor_runtime_env_payload(env)
+
+    actor_env = payload["runtime_env"]
+    parts = actor_env["PYTHONPATH"].split(":")
+    assert parts[0] == str(extra)
+    assert str(env_root / "site-packages") in parts
+    assert actor_env["MINT_ACTOR_EXTRA_PYTHONPATH"] == str(extra)
 
 
 def test_build_runtime_pythonpath_fails_on_incomplete_root(tmp_path):
@@ -1241,6 +1264,24 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
     assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
     assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
     assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
+
+
+def test_actor_runtime_env_vars_forwards_state_store_paths(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    payload = _load_actor_runtime_env_payload(
+        {
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_TASK_STATE_STORE_DB_PATH": ":memory:",
+            "MINT_FUTURE_STATE_STORE_DB_PATH": str(tmp_path / "future.rocksdb"),
+        },
+    )
+    data = payload["runtime_env"]
+    assert data["MINT_TASK_STATE_STORE_DB_PATH"] == ":memory:"
+    assert data["MINT_FUTURE_STATE_STORE_DB_PATH"] == str(tmp_path / "future.rocksdb")
 
 
 def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):

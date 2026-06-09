@@ -1320,6 +1320,7 @@ def _create_extended_server_class(
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
             from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
+            from .bumblebee_lora import prepare_lora_adapter_for_vllm
 
             debug = os.environ.get("MINT_VLLM_LORA_DEBUG", "0").strip() in {"1", "true", "yes"}
             if debug:
@@ -1327,6 +1328,7 @@ def _create_extended_server_class(
                     f"[DEBUG add_lora_from_path] lora_int_id={lora_int_id}, lora_path={lora_path}",
                     flush=True,
                 )
+            lora_path = prepare_lora_adapter_for_vllm(lora_path)
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,
@@ -3043,9 +3045,12 @@ class VerlInferenceEngine:
         import os
 
         from safetensors.torch import load_file
+        from .bumblebee_lora import prepare_lora_adapter_for_vllm
 
         if not self._initialized:
             await self.initialize()
+
+        adapter_path = prepare_lora_adapter_for_vllm(adapter_path)
 
         # Load tensors and config from local files (on API server)
         weights_path = os.path.join(adapter_path, "adapter_model.safetensors")

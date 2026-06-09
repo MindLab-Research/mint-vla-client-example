@@ -247,6 +247,18 @@ def validate_peft_adapter_checkpoint_shapes(
 
     weights_path = os.path.join(adapter_dir, "adapter_model.safetensors")
     if not os.path.isfile(weights_path):
+        rank_manifest = os.path.join(adapter_dir, "bumblebee_rank_sharded_adapter.json")
+        streamed_index = os.path.join(adapter_dir, "adapter_model.safetensors.index.json")
+        if os.path.isfile(rank_manifest):
+            raise ValueError(
+                "Bumblebee rank-sharded adapter must be converted with "
+                "prepare_lora_adapter_for_vllm() before PEFT shape validation"
+            )
+        if os.path.isfile(streamed_index):
+            raise ValueError(
+                "Bumblebee streamed_sharded adapter is an intermediate size-sharded artifact "
+                "and is not directly loadable by vLLM"
+            )
         raise ValueError(f"Adapter weights not found: {weights_path!r}")
 
     tp_size = max(1, int(tensor_parallel_size or 1))

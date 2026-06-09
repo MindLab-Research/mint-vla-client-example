@@ -1180,8 +1180,10 @@ def _create_mint_vllm_multinode_actor(
             """
             self._bind_traceparent(traceparent)
             from vllm.lora.request import LoRARequest
+            from .bumblebee_lora import prepare_lora_adapter_for_vllm
             from .lora_utils import maybe_validate_peft_adapter_checkpoint_shapes
 
+            lora_path = prepare_lora_adapter_for_vllm(lora_path)
             lora_request = LoRARequest(
                 lora_name=lora_name,
                 lora_int_id=lora_int_id,

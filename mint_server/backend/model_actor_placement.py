@@ -264,13 +264,18 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
             return []
         from ray.util import state as ray_state
 
+        namespace = _ray_namespace()
         node_id_to_ip = {
             str(node.get("NodeID") or ""): str(node.get("NodeManagerAddress") or "")
             for node in ray.nodes()
             if node.get("NodeID") and node.get("NodeManagerAddress")
         }
         try:
-            rows = ray_state.list_actors(detail=True, limit=10000)
+            rows = ray_state.list_actors(
+                detail=True,
+                limit=10000,
+                filters=[("ray_namespace", "=", namespace)],
+            )
             return _gpu_actor_records_from_rows(rows, node_id_to_ip=node_id_to_ip)
         except Exception:
             from ray._private import state as private_state
@@ -284,7 +289,6 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
             )
     except Exception:
         return []
-
 
 def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]]:
     if isinstance(bundles, dict):

@@ -15,6 +15,7 @@ from .runtime_env import (
     build_runtime_pythonpath,
     env_get as _runtime_env_get,
     env_nonempty as _runtime_env_nonempty,
+    join_pythonpath,
 )
 from .checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from .config_hydration import hydrate_from_config_actor
@@ -134,6 +135,8 @@ PFS_HF_MODULES_PATH = _resolve_env_or_config(
     _file_pfs_hf_modules_path,
 )
 
+MINT_ACTOR_EXTRA_PYTHONPATH = _env_nonempty(os.environ, "MINT_ACTOR_EXTRA_PYTHONPATH") or ""
+
 def ensure_runtime_env_configured() -> str:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT must be set")
@@ -145,10 +148,13 @@ def ensure_runtime_env_configured() -> str:
 
 
 PFS_PYTHONPATH = (
-    build_runtime_pythonpath(
-        env_root=PFS_RUNTIME_ENV_ROOT,
-        mint_code_root=MINT_CODE_ROOT,
-        pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+    join_pythonpath(
+        MINT_ACTOR_EXTRA_PYTHONPATH,
+        build_runtime_pythonpath(
+            env_root=PFS_RUNTIME_ENV_ROOT,
+            mint_code_root=MINT_CODE_ROOT,
+            pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+        ),
     )
     if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
     else ""
@@ -257,6 +263,9 @@ def actor_runtime_env_vars(
         "MINT_RAY_JOB_WORKING_DIR",
         "MINT_RAY_WORKING_DIR",
         "MINT_RAY_PY_MODULES_CSV",
+        "MINT_ACTOR_EXTRA_PYTHONPATH",
+        "MINT_TASK_STATE_STORE_DB_PATH",
+        "MINT_FUTURE_STATE_STORE_DB_PATH",
     ):
         value = _env_nonempty(os.environ, key)
         if value is not None:
