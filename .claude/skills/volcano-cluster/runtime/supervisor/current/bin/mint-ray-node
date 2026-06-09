@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import socket
 import sys
@@ -11,6 +12,18 @@ from ray._private.parameter import RayParams
 
 
 CHECK_INTERVAL_S = 10
+DEFAULT_MIN_TMP_FREE_BYTES = 50 * 1024 * 1024 * 1024
+
+
+def _int_env(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        print(f"mint ray ignoring invalid integer env {name}={value!r}; using default={default}", flush=True)
+        return default
 
 
 def _port_open(address: str) -> bool:
@@ -51,6 +64,137 @@ def _read_head(head_ip_path: str) -> str:
         time.sleep(5)
 
 
+def _mountinfo_unescape(value: str) -> str:
+    out = value
+    for escaped, char in (("\\040", " "), ("\\011", "\t"), ("\\012", "\n"), ("\\134", "\\")):
+        out = out.replace(escaped, char)
+    return out
+
+
+def _read_mountinfo(path: str = "/proc/self/mountinfo") -> list[dict[str, str]]:
+    entries: list[dict[str, str]] = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        if " - " not in line:
+            continue
+        before, after = line.split(" - ", 1)
+        before_parts = before.split()
+        after_parts = after.split()
+        if len(before_parts) < 5 or len(after_parts) < 2:
+            continue
+        entries.append(
+            {
+                "mount_point": _mountinfo_unescape(before_parts[4]),
+                "fs_type": _mountinfo_unescape(after_parts[0]),
+                "mount_source": _mountinfo_unescape(after_parts[1]),
+            }
+        )
+    return entries
+
+
+def _mount_for_path(path: Path, entries: list[dict[str, str]]) -> dict[str, str] | None:
+    path_text = str(path)
+    best: dict[str, str] | None = None
+    best_len = -1
+    for entry in entries:
+        mount_point = entry.get("mount_point") or ""
+        if not mount_point:
+            continue
+        if path_text == mount_point or path_text.startswith(mount_point.rstrip("/") + "/"):
+            if len(mount_point) > best_len:
+                best = entry
+                best_len = len(mount_point)
+    return best
+
+
+def _path_is_writable(path: Path) -> bool:
+    probe = path / f".mint-ray-node-write-check-{os.getpid()}"
+    try:
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        try:
+            probe.unlink()
+        except OSError:
+            pass
+        return False
+
+
+def _path_diagnostic(
+    *,
+    role: str,
+    node_id: str,
+    kind: str,
+    path: str,
+    min_free_bytes: int,
+    mountinfo: list[dict[str, str]] | None = None,
+) -> dict[str, object]:
+    configured = Path(path)
+    resolved = configured.resolve(strict=False)
+    exists = configured.exists()
+    writable = _path_is_writable(configured) if exists and configured.is_dir() else False
+    stat_path = configured if exists else configured.parent
+    free_bytes = None
+    total_bytes = None
+    try:
+        stats = os.statvfs(stat_path)
+        free_bytes = int(stats.f_bavail * stats.f_frsize)
+        total_bytes = int(stats.f_blocks * stats.f_frsize)
+    except OSError:
+        pass
+
+    mount = _mount_for_path(resolved, mountinfo if mountinfo is not None else _read_mountinfo())
+    warnings: list[str] = []
+    if free_bytes is not None and free_bytes < min_free_bytes:
+        warnings.append("low_free_space")
+    if not exists:
+        warnings.append("missing_path")
+    elif not writable:
+        warnings.append("not_writable")
+
+    record: dict[str, object] = {
+        "role": role,
+        "node_id": node_id,
+        "kind": kind,
+        "configured": str(configured),
+        "resolved": str(resolved),
+        "exists": exists,
+        "writable": writable,
+        "free_bytes": free_bytes,
+        "total_bytes": total_bytes,
+        "min_free_bytes": min_free_bytes,
+        "warnings": warnings,
+    }
+    if mount is not None:
+        record.update(
+            {
+                "mount_point": mount.get("mount_point", ""),
+                "fs_type": mount.get("fs_type", ""),
+                "mount_source": mount.get("mount_source", ""),
+            }
+        )
+    return record
+
+
+def _log_path_diagnostics(role: str, node_id: str, paths: dict[str, str]) -> None:
+    min_free_bytes = _int_env("MINT_RAY_WARN_TMP_FREE_BYTES", DEFAULT_MIN_TMP_FREE_BYTES)
+    mountinfo = _read_mountinfo()
+    for kind, path in paths.items():
+        record = _path_diagnostic(
+            role=role,
+            node_id=node_id,
+            kind=kind,
+            path=path,
+            min_free_bytes=min_free_bytes,
+            mountinfo=mountinfo,
+        )
+        print(f"mint ray path check {json.dumps(record, sort_keys=True)}", flush=True)
+
+
 def _prepare_tmp(role: str, node_id: str) -> tuple[str, str, str, str]:
     tmp_root = os.environ.get("MINT_TMP_ROOT", "/mnt/tmp")
     if role == "head":
@@ -72,6 +216,17 @@ def _prepare_tmp(role: str, node_id: str) -> tuple[str, str, str, str]:
         f"role={role} temp_dir={temp_dir} object_spilling_directory={object_spilling_dir} "
         f"tmpdir={os_tmpdir} xdg_cache_home={xdg_cache_home}",
         flush=True,
+    )
+    _log_path_diagnostics(
+        role,
+        node_id,
+        {
+            "MINT_TMP_ROOT": str(tmp_root),
+            "temp_dir": str(temp_dir),
+            "object_spilling_directory": str(object_spilling_dir),
+            "TMPDIR": str(os_tmpdir),
+            "XDG_CACHE_HOME": str(xdg_cache_home),
+        },
     )
     return str(temp_dir), str(object_spilling_dir), str(os_tmpdir), str(xdg_cache_home)
 
