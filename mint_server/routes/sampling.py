@@ -1039,7 +1039,7 @@ async def asample(
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
     session_id = request.get_session_id()
-    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    snapshot = await _async_get_http_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
         try:
@@ -1136,9 +1136,6 @@ async def asample(
     )
     model_work_attempt_id = uuid.uuid4().hex
     base_model = snapshot.base_model if snapshot is not None else None
-    if snapshot is None or not base_model:
-        snapshot = _get_sampling_snapshot(session_id)
-        base_model = snapshot.base_model if snapshot is not None else None
     if snapshot is None or not base_model:
         raise HTTPException(status_code=404, detail=f"Sampling session {session_id!r} not found")
 
@@ -1320,8 +1317,7 @@ async def sample_once(
         )
         raise HTTPException(status_code=429, detail="Sampling backpressure: server overloaded")
 
-    manager = _active_session_manager()
-    snapshot = await _async_get_detached_sampling_snapshot(session_id)
+    snapshot = await _async_get_http_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:
         try:
@@ -1335,8 +1331,8 @@ async def sample_once(
                 remote = remote_sampling_session(session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and manager is None:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
+    if snapshot is None and remote is None:
+        raise HTTPException(status_code=404, detail=f"Sampling session {session_id!r} not found")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)
@@ -1424,182 +1420,68 @@ async def sample_once(
                 )
             return sample_response.sequences[0]
 
-    if manager is None:
-        from ..models.types import FutureRetrieveRequest
-        from .futures import retrieve_future
+    from ..models.types import FutureRetrieveRequest
+    from .futures import retrieve_future
 
-        future = await asample(
-            SampleRequest(
-                sampling_session_id=session_id,
-                num_samples=1,
-                prompt=ModelInput.from_ints(token_ids),
-                sampling_params=SamplingParams(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=stop,
-                ),
+    future = await asample(
+        SampleRequest(
+            sampling_session_id=session_id,
+            num_samples=1,
+            prompt=ModelInput.from_ints(token_ids),
+            sampling_params=SamplingParams(
+                max_tokens=max_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stop=stop,
             ),
+        ),
+        http_request,
+    )
+    poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
+    poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
+    deadline = time.time() + poll_timeout_s
+    while True:
+        poll_response = Response()
+        payload = await retrieve_future(
+            FutureRetrieveRequest(request_id=future.request_id),
             http_request,
+            poll_response,
         )
-        poll_timeout_s = float(env_get(os.environ, "MINT_POLL_TIMEOUT_S", "1800") or "1800")
-        poll_sleep_s = float(env_get(os.environ, "MINT_POLL_SLEEP_S", "0.2") or "0.2")
-        deadline = time.time() + poll_timeout_s
-        while True:
-            poll_response = Response()
-            payload = await retrieve_future(
-                FutureRetrieveRequest(request_id=future.request_id),
-                http_request,
-                poll_response,
-            )
-            if poll_response.status_code == 408:
-                if time.time() > deadline:
-                    raise HTTPException(
-                        status_code=504,
-                        detail=(
-                            "Local retrieve_future timed out after "
-                            f"{poll_timeout_s:.1f}s for request_id={future.request_id!r}"
-                        ),
-                    )
-                await asyncio.sleep(poll_sleep_s)
-                continue
-            if poll_response.status_code >= 400:
-                if isinstance(payload, dict) and "detail" in payload:
-                    detail = payload["detail"]
-                else:
-                    detail = payload
-                raise HTTPException(status_code=poll_response.status_code, detail=detail)
-            if isinstance(payload, dict) and "error" in payload:
-                raise HTTPException(status_code=500, detail=payload["error"])
-            try:
-                sample_response = SampleResponse.model_validate(payload)
-            except Exception as e:
+        if poll_response.status_code == 408:
+            if time.time() > deadline:
                 raise HTTPException(
-                    status_code=502,
-                    detail=f"Local retrieve_future returned invalid sample payload: {type(e).__name__}: {e}",
-                ) from e
-            if len(sample_response.sequences) != 1:
-                raise HTTPException(
-                    status_code=502,
+                    status_code=504,
                     detail=(
-                        f"Local retrieve_future returned {len(sample_response.sequences)} sequences "
-                        "for sample_once(num_samples=1)"
+                        "Local retrieve_future timed out after "
+                        f"{poll_timeout_s:.1f}s for request_id={future.request_id!r}"
                     ),
                 )
-            return sample_response.sequences[0]
-
-    engine = None
-    model_actor_supervisor = None
-    model_actor_supervisor_actor_name: str | None = None
-    manager.mark_session_inflight(session_id, +1)
-    try:
-        snapshot = _get_sampling_snapshot(session_id)
-        if snapshot is None:
-            await _restore_local_sampling_session_if_needed(session_id)
-            snapshot = _get_sampling_snapshot(session_id)
-        is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else manager.is_multi_lora_session(session_id)
-        if is_multi_lora:
-            base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
-            if not base_model:
-                raise HTTPException(status_code=500, detail=f"Session {session_id!r} missing base_model")
-
-            from ..backend.model_registry import get_model_config
-
-            try:
-                max_model_len = int(get_model_config(base_model).max_model_len)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        f"Cannot determine max_model_len for base_model {base_model!r}: "
-                        f"{type(e).__name__}: {e}"
-                    ),
-                ) from e
-
-            total_len = len(token_ids) + int(max_tokens)
-            if total_len > max_model_len:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Prompt+max_tokens length {total_len} exceeds max_model_len {max_model_len} "
-                        f"for model {base_model}"
-                    ),
-                )
-
-            engine = await run_async_with_otel_span(
-                "sampling.get_engine_for_session",
-                lambda: manager.get_engine_for_session(session_id),
-                component="sampling",
-                op="sampling.get_engine_for_session",
-                request_id=request_id,
-                attributes={
-                    "sampling_session_id": session_id,
-                    "base_model": snapshot.base_model if snapshot is not None else None,
-                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                },
-            )
-            if engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
-
-            model_actor_supervisor = get_model_actor_supervisor()
-            model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
-            if not isinstance(model_actor_supervisor_actor_name, str) or not model_actor_supervisor_actor_name:
-                raise RuntimeError(
-                    f"Engine for session {session_id} missing actor_name; cannot protect from eviction"
-                )
-            model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, +1)
-            await run_async_with_otel_span(
-                "sampling.ensure_lora_loaded",
-                lambda: _ensure_session_lora_loaded(engine, session_id, snapshot=snapshot),
-                component="sampling",
-                op="sampling.ensure_lora_loaded",
-                request_id=request_id,
-                attributes={
-                    "sampling_session_id": session_id,
-                    "base_model": snapshot.base_model if snapshot is not None else None,
-                    "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
-                    "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
-                    "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
-                },
-            )
-            result = await _await_with_external_fail_abort(
-                engine=engine,
-                request_id=request_id,
-                awaitable=engine.generate(
-                    sampling_session_id=session_id,
-                    prompt_ids=token_ids,
-                    request_id=request_id,
-                    max_tokens=max_tokens,
-                    stop=stop,
-                    temperature=temperature,
-                    top_k=-1,
-                    top_p=top_p,
-                    logprobs=False,
+            await asyncio.sleep(poll_sleep_s)
+            continue
+        if poll_response.status_code >= 400:
+            if isinstance(payload, dict) and "detail" in payload:
+                detail = payload["detail"]
+            else:
+                detail = payload
+            raise HTTPException(status_code=poll_response.status_code, detail=detail)
+        if isinstance(payload, dict) and "error" in payload:
+            raise HTTPException(status_code=500, detail=payload["error"])
+        try:
+            sample_response = SampleResponse.model_validate(payload)
+        except Exception as e:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Local retrieve_future returned invalid sample payload: {type(e).__name__}: {e}",
+            ) from e
+        if len(sample_response.sequences) != 1:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Local retrieve_future returned {len(sample_response.sequences)} sequences "
+                    "for sample_once(num_samples=1)"
                 ),
             )
-        else:
-            engine = manager.get_engine(session_id)
-            if engine is None:
-                raise RuntimeError(f"No engine found for session {session_id}")
-            result = await _await_with_external_fail_abort(
-                engine=engine,
-                request_id=request_id,
-                awaitable=engine.generate(
-                    prompt_ids=token_ids,
-                    request_id=request_id,
-                    max_tokens=max_tokens,
-                    stop=stop,
-                    temperature=temperature,
-                    top_k=-1,
-                    top_p=top_p,
-                    logprobs=False,
-                ),
-            )
-
-        sequence = sampled_sequence_from_result(result)
+        sequence = sample_response.sequences[0]
         if bill_usage:
             await _append_billing_observations(
                 observations=build_sample_once_billing_observations(
@@ -1612,16 +1494,6 @@ async def sample_once(
                 source="sync_http",
             )
         return sequence
-    except HTTPException:
-        await _abort_engine_request(engine, request_id)
-        raise
-    except Exception:
-        await _abort_engine_request(engine, request_id)
-        raise
-    finally:
-        if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
-            model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        manager.mark_session_inflight(session_id, -1)
 
 
 async def _do_sample(

@@ -65,6 +65,20 @@ class _AsyncTaskFutureService:
         return "pending"
 
 
+def _sampling_snapshot(sr, *, session_id: str, base_model: str, lora_int_id: int | None = 1):
+    return sr.SamplingSessionSnapshot(
+        session_id=session_id,
+        uses_multi_lora=True,
+        uses_base_model=False,
+        base_model=base_model,
+        lora_rank=0,
+        adapter_path=None,
+        lora_loaded=False,
+        lora_int_id=lora_int_id,
+        metadata_version=1,
+    )
+
+
 class _AsyncModelWorkScheduler:
     def __init__(self, captured: dict) -> None:
         self._captured = captured
@@ -294,16 +308,11 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
 
     captured: dict = {}
 
-    monkeypatch.setattr(
-        sr,
-        "session_manager",
-        SimpleNamespace(
-            is_multi_lora_session=lambda _session_id: True,
-            get_engine=lambda _session_id: None,
-            get_session_base_model=lambda _session_id: "Qwen/Qwen3-0.6B",
-            get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
-        ),
-    )
+    async def _async_get_http_sampling_snapshot(session_id: str):
+        assert session_id == "sess-281"
+        return _sampling_snapshot(sr, session_id=session_id, base_model="Qwen/Qwen3-0.6B", lora_int_id=1)
+
+    monkeypatch.setattr(sr, "_async_get_http_sampling_snapshot", _async_get_http_sampling_snapshot)
     monkeypatch.setattr(sr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
@@ -602,16 +611,11 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(monke
 
     captured: dict = {}
 
-    monkeypatch.setattr(
-        sr,
-        "session_manager",
-        SimpleNamespace(
-            is_multi_lora_session=lambda _session_id: True,
-            get_engine=lambda _session_id: None,
-            get_session_base_model=lambda _session_id: "Qwen/Qwen3-0.6B",
-            get_session_replica_key=lambda _session_id: None,
-        ),
-    )
+    async def _async_get_http_sampling_snapshot(session_id: str):
+        assert session_id == "sess-281"
+        return _sampling_snapshot(sr, session_id=session_id, base_model="Qwen/Qwen3-0.6B", lora_int_id=None)
+
+    monkeypatch.setattr(sr, "_async_get_http_sampling_snapshot", _async_get_http_sampling_snapshot)
     monkeypatch.setattr(sr, "task_futures", _AsyncTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))

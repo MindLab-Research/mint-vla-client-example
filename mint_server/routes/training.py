@@ -207,12 +207,6 @@ async def _mark_training_inflight(model_id: str, delta: int) -> None:
     from ..backend.training_session_store import async_mark_training_session_inflight
 
     await async_mark_training_session_inflight(model_id, delta)
-    manager = _current_training_manager()
-    if manager is None:
-        return
-    mark = getattr(manager, "mark_inflight", None)
-    if callable(mark):
-        mark(model_id, delta)
 
 
 async def _fail_future(request_id: str, error: str) -> None:
@@ -4394,27 +4388,11 @@ async def _get_control_plane_tokenizer_info(model_id: str, info: dict[str, Any])
     if isinstance(tokenizer_info, dict):
         return dict(tokenizer_info)
 
-    tokenizer_metadata = None
-    if training_manager is not None and training_engine is not None:
-        session = training_manager.get_session(model_id)
-        if session is None:
-            session = await _restore_training_session(model_id)
-        if session is not None and _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
-            try:
-                tokenizer_metadata = await _collect_control_plane_tokenizer_metadata(session)
-            except Exception as e:
-                logger.warning(
-                    "[get_tokenizer] worker tokenizer fetch failed model_id=%s error_type=%s error=%s; falling back to local metadata",
-                    str(model_id),
-                    type(e).__name__,
-                    e,
-                )
-    if tokenizer_metadata is None:
-        tokenizer_metadata = await asyncio.to_thread(
-            _build_local_tokenizer_metadata,
-            str(info.get("base_model") or ""),
-            backend,
-        )
+    tokenizer_metadata = await asyncio.to_thread(
+        _build_local_tokenizer_metadata,
+        str(info.get("base_model") or ""),
+        backend,
+    )
 
     backfill_payload = {
         "model_id": str(model_id),

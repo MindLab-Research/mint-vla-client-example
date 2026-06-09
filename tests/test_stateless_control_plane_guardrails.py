@@ -74,9 +74,51 @@ def _function_source(path: Path, function_name: str) -> str:
     raise AssertionError(f"function {function_name!r} not found in {path}")
 
 
+def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    return {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _called_local_functions(node: ast.AST, functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]) -> set[str]:
+    called: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in functions:
+            called.add(child.func.id)
+    return called
+
+
+def _reachable_local_function_names(
+    path: Path,
+    roots: list[str],
+    *,
+    ignore: set[str] | None = None,
+) -> set[str]:
+    functions = _module_functions(path)
+    ignored = ignore or set()
+    seen: set[str] = set()
+    stack = list(roots)
+    while stack:
+        name = stack.pop()
+        if name in seen or name in ignored:
+            continue
+        if name not in functions:
+            continue
+        seen.add(name)
+        stack.extend(_called_local_functions(functions[name], functions) - seen - ignored)
+    return seen
+
+
+def _function_sources(path: Path, function_names: set[str]) -> str:
+    return "\n\n".join(_function_source(path, name) for name in sorted(function_names))
+
+
 def test_mainline_http_routes_do_not_use_training_route_globals_as_authority() -> None:
     training_path = REPO_ROOT / "mint_server" / "routes" / "training.py"
-    for function_name in [
+    roots = [
         "forward_backward",
         "train_step",
         "forward",
@@ -86,11 +128,62 @@ def test_mainline_http_routes_do_not_use_training_route_globals_as_authority() -
         "delete_model",
         "get_session_guard_state",
         "get_tokenizer",
-    ]:
-        source = _function_source(training_path, function_name)
-        assert "training_manager" not in source
-        assert "training_engine" not in source
-        assert "_restore_training_session(" not in source
+        "_get_control_plane_tokenizer_info",
+    ]
+    source = _function_sources(training_path, set(roots))
+    assert "training_manager" not in source
+    assert "training_engine" not in source
+    assert "_restore_training_session(" not in source
+
+    reachable = _reachable_local_function_names(
+        training_path,
+        roots,
+        ignore={
+            # Shared request/metadata helpers are allowed to inspect detached state.
+            "_build_training_scheduler_extra",
+            "_enqueue_internal_serialized_model_op",
+            "_infer_training_backend_for_base_model",
+            "_refresh_training_session_from_info_if_needed",
+            "_resolve_training_route_session",
+            "_session_info_from_live",
+            "_wait_internal_future_result",
+        },
+    )
+    reachable_source = _function_sources(training_path, reachable)
+    assert "training_manager" not in reachable_source
+    assert "training_engine" not in reachable_source
+    assert "_restore_training_session(" not in reachable_source
+    assert "_mark_training_inflight" in reachable
+
+
+def test_mainline_weights_http_routes_do_not_use_training_route_globals_as_authority() -> None:
+    weights_path = REPO_ROOT / "mint_server" / "routes" / "weights.py"
+    roots = ["save_weights", "save_state", "load_state"]
+    source = _function_sources(weights_path, set(roots))
+    assert "training_manager" not in source
+    assert "training_engine" not in source
+    assert "_restore_training_session(" not in source
+
+    reachable = _reachable_local_function_names(
+        weights_path,
+        roots,
+        ignore={
+            # Queue execution helpers are runtime-actor-local and allowed to use ExecutionContext/local managers.
+            "_do_load_state",
+            "_do_save_state",
+            "_do_save_weights",
+            # Detached metadata helpers may drop stale runtime-local cache but are not HTTP authority.
+            "_drop_local_training_session",
+            "_refresh_training_session_from_info_if_needed",
+            "_resolve_training_route_session",
+            "_wait_internal_future_result",
+        },
+    )
+    reachable_source = _function_sources(weights_path, reachable)
+    assert "training_manager" not in reachable_source
+    assert "training_engine" not in reachable_source
+    assert "_restore_training_session(" not in reachable_source
+    assert "_mark_training_inflight" in reachable
 
 
 def test_sampling_http_routes_do_not_use_session_manager_as_authority() -> None:
@@ -101,9 +194,37 @@ def test_sampling_http_routes_do_not_use_session_manager_as_authority() -> None:
         (service_path, "ensure_sampling_session"),
         (service_path, "get_sampler"),
         (service_path, "session_heartbeat"),
+        (sampling_path, "asample"),
+        (sampling_path, "sample_once"),
         (sampling_path, "compute_logprobs"),
+        (sampling_path, "_async_get_http_sampling_snapshot"),
     ]:
         source = _function_source(path, function_name)
         assert "session_manager" not in source
         assert "_local_sampling_config(" not in source
         assert "_active_session_manager(" not in source
+        assert "_async_get_detached_sampling_snapshot(" not in source
+
+    reachable = _reachable_local_function_names(
+        sampling_path,
+        ["asample", "sample_once", "compute_logprobs"],
+        ignore={
+            # Queue execution helpers are runtime-actor-local and allowed to use ExecutionContext/local managers.
+            "_do_sample",
+            "_do_compute_logprobs",
+            # Billing/admission helpers are not sampling-session authority.
+            "_append_billing_observations",
+            "_build_sampling_queue_resource_extra",
+            "_get_asample_throttle_identity",
+            "_get_user_id",
+            "_record_route_latency",
+            "_resolve_billing_model",
+            "_safe_update_sample_meta",
+            "_should_backpressure",
+        },
+    )
+    reachable_source = _function_sources(sampling_path, reachable)
+    assert "_get_sampling_snapshot(" not in reachable_source
+    assert "_async_get_detached_sampling_snapshot(" not in reachable_source
+    assert "_restore_local_sampling_session_if_needed(" not in reachable_source
+    assert "_active_session_manager(" not in reachable_source

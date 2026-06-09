@@ -285,12 +285,6 @@ async def _mark_training_inflight(model_id: str, delta: int) -> None:
     from ..backend.training_session_store import async_mark_training_session_inflight
 
     await async_mark_training_session_inflight(model_id, delta)
-    manager = _current_training_manager()
-    if manager is None:
-        return
-    mark = getattr(manager, "mark_inflight", None)
-    if callable(mark):
-        mark(model_id, delta)
 
 
 async def _fail_future(request_id: str, error: str) -> None:

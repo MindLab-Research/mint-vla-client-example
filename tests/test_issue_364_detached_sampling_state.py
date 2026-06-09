@@ -11,7 +11,9 @@ import pytest
 from fastapi import HTTPException
 
 from mint_server import app as app_module
+from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.session_manager import SessionManager
+from mint_server.models.types import SampleResponse, SampledSequence
 from mint_server.routes import sampling as sampling_route
 from mint_server.routes import service as service_route
 
@@ -322,19 +324,16 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
 
 
 @pytest.mark.anyio
-async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
+async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager = SessionManager()
-    engine = _FakeEngine()
-    manager.set_multi_model_manager(_FakeMultiModelManager(engine))
-    model_actor_inventory = _FakeModelActorInventory()
+    import mint_server.backend.model_work_scheduler as mws
 
     async def _async_get_sampling_session_info(session_id: str):
         assert session_id == "sess-364-live"
         return {
             "session_id": session_id,
-            "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "base_model": "Qwen/Qwen3-0.6B",
             "metadata_version": 3,
             "uses_base_model": True,
             "last_activity": 1.0,
@@ -343,7 +342,38 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
     async def _async_remote_sampling_session(_session_id: str):
         raise AssertionError("local detached sampler should not be routed as remote")
 
-    monkeypatch.setattr(sampling_route, "session_manager", manager)
+    from mint_server.routes import futures as futures_route
+
+    captured: dict = {}
+    futures: dict[str, SampleResponse] = {}
+
+    class _FakeScheduler:
+        async def append(self, **kwargs):
+            captured.update(kwargs)
+            request_id = str(kwargs["request_id"])
+            futures[request_id] = SampleResponse(
+                sequences=[SampledSequence(tokens=[101, 102], logprobs=None, stop_reason="length")]
+            )
+            return {"ok": True, "scheduler_instance_id": "scheduler-364"}
+
+    class _FakeTaskFutures:
+        async def async_ensure_pending(self, request_id: str, meta=None) -> dict:
+            return {"created": True, "meta": dict(meta or {}), "request_id": request_id}
+
+        async def async_update_meta(self, _request_id: str, meta=None) -> None:
+            return None
+
+        async def async_get_status(self, request_id: str) -> FutureStatus:
+            assert request_id in futures
+            return FutureStatus.DONE
+
+        async def async_get_result(self, request_id: str):
+            return futures[request_id].model_dump()
+
+    fake_task_futures = _FakeTaskFutures()
+    monkeypatch.setattr(sampling_route, "task_futures", fake_task_futures)
+    monkeypatch.setattr(futures_route, "task_futures", fake_task_futures)
+    monkeypatch.setattr(mws, "model_work_scheduler", _FakeScheduler())
     monkeypatch.setattr(
         "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
@@ -356,7 +386,6 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
         "mint_server.backend.model_registry.get_model_config",
         lambda _model_name: SimpleNamespace(max_model_len=8192),
     )
-    _install_fake_model_actor_inventory(monkeypatch, model_actor_inventory)
 
     sequence = await sampling_route.sample_once(
         session_id="sess-364-live",
@@ -370,13 +399,11 @@ async def test_issue_364_sample_once_restores_local_sampler_from_detached_store(
         user_id=None,
     )
 
-    assert manager.is_base_model_session("sess-364-live") is True
-    assert engine.generate_calls[0]["sampling_session_id"] == "sess-364-live"
-    assert model_actor_inventory.calls == [("actor-364", 1), ("actor-364", -1)]
+    assert captured["op"] == "sampling.asample"
+    assert captured["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
+    assert captured["affinity_group"] == "base:Qwen/Qwen3-0.6B"
+    assert captured["ordering_key"] == "session:sess-364-live"
     assert sequence.tokens == [101, 102]
-    snapshot = manager.get_sampling_session_snapshot("sess-364-live")
-    assert snapshot is not None
-    assert snapshot.metadata_version == 3
 
 
 @pytest.mark.anyio
