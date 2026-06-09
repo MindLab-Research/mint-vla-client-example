@@ -8238,10 +8238,11 @@ class MegatronWorkerGroup:
                     f"requested={session_id!r}, current={current_session!r}. "
                     "Refusing to switch sessions during sampler export."
                 )
-        if actual_rank is not None and int(actual_rank) != int(self._actual_rank):
+        loaded_rank = getattr(self, "_actual_rank", None)
+        if actual_rank is not None and loaded_rank is not None and int(actual_rank) != int(loaded_rank):
             raise RuntimeError(
                 f"Session {session_id} requested actual_rank={actual_rank}, "
-                f"but loaded rank is {self._actual_rank}"
+                f"but loaded rank is {loaded_rank}"
             )
         session_manager = getattr(self, "_session_manager", None)
         if session_manager is None:

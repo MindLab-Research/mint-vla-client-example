@@ -2830,6 +2830,24 @@ def test_issue_193_sampler_export_allows_initial_no_active_session():
     group._assert_session_active_for_sampler_export("initial_session", actual_rank=8)
 
 
+def test_issue_193_sampler_export_allows_initial_no_active_session_before_rank_materialized():
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._actual_rank = None
+    group._session_unknown_due_to_partial_swap = False
+    group._session_state_cached_on_workers = lambda session_id: True
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {
+            "session_exists": staticmethod(lambda session_id: False),
+        },
+    )()
+
+    group._assert_session_active_for_sampler_export("initial_session", actual_rank=8)
+
+
 def test_issue_193_sampler_export_still_rejects_session_switch():
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
