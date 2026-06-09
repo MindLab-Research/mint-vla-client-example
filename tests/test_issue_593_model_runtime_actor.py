@@ -1385,14 +1385,26 @@ def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
 async def test_issue_593_default_executor_initializes_execution_bindings(monkeypatch) -> None:
     import mint_server.backend.model_runtime_actor as runtime_module
     import mint_server.backend.model_work_dispatch as dispatch_module
+    from mint_server.backend.execution_context import current_execution_context
+    from mint_server.routes import sampling
 
     calls: list[str] = []
+    inference_manager = object()
+    original_sampling_manager = sampling.session_manager
 
     async def _initialize_execution_bindings():
         calls.append("init")
-        return {"inference_manager": object()}
+        return {
+            "inference_manager": inference_manager,
+            "train_manager": object(),
+            "train_engine": object(),
+            "action_manager": object(),
+        }
 
     async def _execute_work_item(item, **_kwargs):
+        assert current_execution_context() is not None
+        assert current_execution_context().inference_manager is inference_manager
+        assert sampling.session_manager is original_sampling_manager
         calls.append(f"execute:{item.op}")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
@@ -1406,22 +1418,35 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
     await _default_executor(_lease("runtime-req-2"))
 
     assert calls == ["init", "execute:sampling.asample", "execute:sampling.asample"]
+    assert sampling.session_manager is original_sampling_manager
 
 
 @pytest.mark.anyio
 async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) -> None:
     import mint_server.backend.model_runtime_actor as runtime_module
     import mint_server.backend.model_work_dispatch as dispatch_module
+    from mint_server.backend.execution_context import current_execution_context
+    from mint_server.routes import training
 
     calls: list[str] = []
     lease = _lease("runtime-training-req")
     lease["item"]["op"] = "training.forward_backward"
+    train_manager = object()
+    original_training_manager = training.training_manager
 
     async def _initialize_execution_bindings():
         calls.append("init")
-        return {"train_manager": object()}
+        return {
+            "inference_manager": object(),
+            "train_manager": train_manager,
+            "train_engine": object(),
+            "action_manager": object(),
+        }
 
     async def _execute_work_item(item, **_kwargs):
+        assert current_execution_context() is not None
+        assert current_execution_context().train_manager is train_manager
+        assert training.training_manager is original_training_manager
         calls.append(f"execute:{item.op}")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
@@ -1434,6 +1459,7 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
     await _default_executor(lease)
 
     assert calls == ["init", "execute:training.forward_backward"]
+    assert training.training_manager is original_training_manager
 
 
 def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None:

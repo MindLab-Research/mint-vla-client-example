@@ -52,6 +52,12 @@ Implications:
   - `weights.py`: save/load weights and checkpoints; bridges training to inference.
   - `futures.py`: `request_id` polling.
 
+- `mint_server/backend/execution_context.py`
+  - Runtime-actor-local execution context for queued model work. `ModelRuntimeActor`
+    binds manager/engine handles with a contextvar while executing dispatcher
+    work items. API workers must leave route module execution globals unbound;
+    runtime dispatch must not temporarily write route globals.
+
 - `mint_server/backend/async_ray_control.py`
   - Async wrappers for Ray control-plane operations that would otherwise block the FastAPI event loop.
   - Used for actor lookup/kill and placement-group inspection on request paths.

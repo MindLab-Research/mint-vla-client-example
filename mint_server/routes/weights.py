@@ -92,6 +92,42 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For multi-LoRA sampling registration
 
 
+def _current_training_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_manager
+    except Exception:
+        pass
+    return training_manager
+
+
+def _current_training_engine():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_engine
+    except Exception:
+        pass
+    return training_engine
+
+
+def _current_inference_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.inference_manager
+    except Exception:
+        pass
+    return inference_manager
+
+
 def _wait_for_checkpoint_artifacts(
     path: str,
     *,
@@ -161,8 +197,9 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
         raise RuntimeError("Cannot persist loaded training session without model_id, session_id, and base_model")
 
     actor_name = None
-    if training_engine is not None:
-        actor_name = getattr(training_engine, "_model_actor_supervisor_actor_names", {}).get(model_id)
+    engine = _current_training_engine()
+    if engine is not None:
+        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(model_id)
     if actor_name is not None:
         session.actor_name = str(actor_name or "") or None
     if not getattr(session, "namespace", None):
@@ -196,8 +233,9 @@ async def _persist_loaded_training_session(session: Any, *, request_user_id: str
             "tokenizer_source_path": getattr(session, "tokenizer_source_path", None),
         }
     )
-    if training_manager is not None:
-        mark_persisted = getattr(training_manager, "mark_persisted", None)
+    manager = _current_training_manager()
+    if manager is not None:
+        mark_persisted = getattr(manager, "mark_persisted", None)
         if callable(mark_persisted):
             mark_persisted(model_id)
 
@@ -244,9 +282,10 @@ def _require_write_access(request: Request) -> None:
 
 
 def _mark_training_inflight(model_id: str, delta: int) -> None:
-    if training_manager is None:
+    manager = _current_training_manager()
+    if manager is None:
         return
-    mark = getattr(training_manager, "mark_inflight", None)
+    mark = getattr(manager, "mark_inflight", None)
     if callable(mark):
         mark(model_id, delta)
 
@@ -1251,11 +1290,13 @@ async def _do_save_state(
 
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
         checkpoint_name = request.path.strip() if request.path is not None else ""
@@ -1297,7 +1338,7 @@ async def _do_save_state(
             checkpoint_export_t0 = time.perf_counter()
             await run_async_with_otel_span(
                 "weights.save_state.execute",
-                lambda: training_engine.save_weights(session, save_path),
+                lambda: engine.save_weights(session, save_path),
                 component="routes.weights",
                 op="weights.save_state",
                 request_id=str(request_id),
@@ -1333,7 +1374,7 @@ async def _do_save_state(
                 request.model_id,
                 save_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _save_state_once()
 
         # Save ownership metadata (for user-scoped checkpoint API)
@@ -1480,7 +1521,7 @@ async def _do_save_state(
                 error=str(e),
             )
     finally:
-        if inflight_marked and training_manager is not None:
+        if inflight_marked:
             _mark_training_inflight(request.model_id, -1)
 
 
@@ -1502,11 +1543,13 @@ async def _do_save_weights(
     mirror_started = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
         checkpoint_name = request.path.strip() if request.path is not None else ""
@@ -1539,7 +1582,7 @@ async def _do_save_weights(
         async def _save_weights_once() -> None:
             await run_async_with_otel_span(
                 "weights.save_weights.execute",
-                lambda: training_engine.save_weights_for_sampler(
+                lambda: engine.save_weights_for_sampler(
                     session=session,
                     checkpoint_name=checkpoint_name,
                     checkpoint_base_dir=os.path.dirname(os.path.dirname(os.path.dirname(save_path))),
@@ -1573,7 +1616,7 @@ async def _do_save_weights(
                 request.model_id,
                 save_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _save_weights_once()
 
         os.makedirs(save_path, exist_ok=True)
@@ -1687,7 +1730,7 @@ async def _do_save_weights(
                 error=str(e),
             )
     finally:
-        if inflight_marked and training_manager is not None:
+        if inflight_marked:
             _mark_training_inflight(request.model_id, -1)
 
 
@@ -1856,11 +1899,13 @@ async def _do_load_state(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
         load_path = request.path
@@ -1876,7 +1921,7 @@ async def _do_load_state(
         async def _load_state_once() -> None:
             await run_async_with_otel_span(
                 "weights.load_state.execute",
-                lambda: training_engine.load_weights(session, load_path, load_optimizer=request.optimizer),
+                lambda: engine.load_weights(session, load_path, load_optimizer=request.optimizer),
                 component="routes.weights",
                 op="weights.load_state",
                 request_id=str(request_id),
@@ -1904,7 +1949,7 @@ async def _do_load_state(
                 request.model_id,
                 load_exc,
             )
-            await training_engine.create_training_session(session)
+            await engine.create_training_session(session)
             await _load_state_once()
 
         metadata_persisted = True
@@ -1941,7 +1986,7 @@ async def _do_load_state(
         )
         await _fail_future(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
+        if inflight_marked:
             _mark_training_inflight(request.model_id, -1)
 
 

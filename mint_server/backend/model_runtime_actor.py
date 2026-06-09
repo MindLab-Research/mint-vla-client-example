@@ -23,6 +23,7 @@ from ..logging_context import (
     set_trace_id,
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .execution_context import ExecutionContext, bind_execution_context
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
@@ -33,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[None]]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
-_EXECUTION_BINDINGS: dict[str, Any] | None = None
+_EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
 VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
@@ -186,40 +187,41 @@ def get_or_create_model_runtime_actor(
 
 
 async def _default_executor(lease: dict[str, Any]) -> None:
-    await _ensure_execution_bindings()
+    context = await _ensure_execution_bindings()
     item = lease.get("item")
     if not isinstance(item, dict):
         raise RuntimeError(f"model work lease missing item: {lease!r}")
     op = str(item.get("op") or "")
     from .model_work_dispatch import execute_model_work_item
 
-    await execute_model_work_item(
-        SimpleNamespace(
-            request_id=str(item["request_id"]),
-            op=op,
-            request_json=bytes(item.get("request_json") or b""),
-            user_id=None if item.get("user_id") is None else str(item.get("user_id")),
-            apikey_id=None if item.get("apikey_id") is None else str(item.get("apikey_id")),
-            throttle_principal=(
-                None
-                if item.get("throttle_principal") is None
-                else str(item.get("throttle_principal"))
+    with bind_execution_context(context):
+        await execute_model_work_item(
+            SimpleNamespace(
+                request_id=str(item["request_id"]),
+                op=op,
+                request_json=bytes(item.get("request_json") or b""),
+                user_id=None if item.get("user_id") is None else str(item.get("user_id")),
+                apikey_id=None if item.get("apikey_id") is None else str(item.get("apikey_id")),
+                throttle_principal=(
+                    None
+                    if item.get("throttle_principal") is None
+                    else str(item.get("throttle_principal"))
+                ),
+                webhook_url=None if item.get("webhook_url") is None else str(item.get("webhook_url")),
+                extra=dict(item.get("extra") or {}),
+                created_at=float(item.get("created_at") or time.time()),
             ),
-            webhook_url=None if item.get("webhook_url") is None else str(item.get("webhook_url")),
-            extra=dict(item.get("extra") or {}),
-            created_at=float(item.get("created_at") or time.time()),
-        ),
-        component="model_runtime_actor",
-    )
+            component="model_runtime_actor",
+        )
 
 
-async def _ensure_execution_bindings() -> dict[str, Any]:
+async def _ensure_execution_bindings() -> ExecutionContext:
     global _EXECUTION_BINDINGS
     if _EXECUTION_BINDINGS is not None:
         return _EXECUTION_BINDINGS
     from .execution_bindings import initialize_execution_bindings
 
-    _EXECUTION_BINDINGS = await initialize_execution_bindings()
+    _EXECUTION_BINDINGS = ExecutionContext(**await initialize_execution_bindings())
     return _EXECUTION_BINDINGS
 
 

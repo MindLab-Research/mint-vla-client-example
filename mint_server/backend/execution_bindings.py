@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -28,22 +26,11 @@ async def _restore_sampling_sessions_for_worker(inference_manager: Any) -> int:
 
 async def initialize_execution_bindings() -> dict[str, Any]:
     from ..config import config
-    from ..routes import action_sampling, sampling, service, training, weights
     from .action_session_manager import ActionSessionRouter
+    from .execution_context import ExecutionContext
     from .session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
-    from .task_state_store import task_state_store
     from .training_engine_router import TrainingEngineRouter
     from .training_session_manager import TrainingSessionManager
-
-    disable_mint_route = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    mint = None
-    if not disable_mint_route:
-        from ..routes import mint
 
     inference_manager = SessionManager(
         tensor_parallel_size=config.tensor_parallel_size,
@@ -54,8 +41,6 @@ async def initialize_execution_bindings() -> dict[str, Any]:
         if config.session_inactivity_timeout_s is not None
         else DEFAULT_INACTIVITY_TIMEOUT,
     )
-    service.session_manager = inference_manager
-    sampling.session_manager = inference_manager
 
     restored_sampling_sessions = 0
     try:
@@ -87,23 +72,12 @@ async def initialize_execution_bindings() -> dict[str, Any]:
     action_manager = ActionSessionRouter()
     await train_engine.initialize()
 
-    action_sampling.action_session_manager = action_manager
-    training.training_manager = train_manager
-    training.training_engine = train_engine
-    training.inference_manager = inference_manager
-    if mint is not None:
-        mint.training_manager = train_manager
-        mint.training_engine = train_engine
-        mint.action_session_manager = action_manager
-    weights.training_manager = train_manager
-    weights.training_engine = train_engine
-    weights.inference_manager = inference_manager
-
-    return {
-        "inference_manager": inference_manager,
-        "train_manager": train_manager,
-        "train_engine": train_engine,
-        "multi_model_manager": multi_model_manager,
-        "restored_sampling_sessions": int(restored_sampling_sessions),
-        "multi_model_enabled": bool(config.enable_multi_lora),
-    }
+    return ExecutionContext(
+        inference_manager=inference_manager,
+        train_manager=train_manager,
+        train_engine=train_engine,
+        action_manager=action_manager,
+        multi_model_manager=multi_model_manager,
+        restored_sampling_sessions=int(restored_sampling_sessions),
+        multi_model_enabled=bool(config.enable_multi_lora),
+    ).as_dict()

@@ -39,3 +39,26 @@ def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
         source = path.read_text()
         assert "def start_cleanup_task" not in source
         assert "asyncio.create_task(self._cleanup_loop())" not in source
+
+
+def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
+    source = (REPO_ROOT / "mint_server" / "backend" / "execution_bindings.py").read_text()
+    assert "from ..routes" not in source
+    forbidden_assignments = [
+        ".session_manager =",
+        ".training_manager =",
+        ".training_engine =",
+        ".inference_manager =",
+        ".action_session_manager =",
+    ]
+    for assignment in forbidden_assignments:
+        assert assignment not in source
+
+
+def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
+    runtime_source = (REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py").read_text()
+    context_source = (REPO_ROOT / "mint_server" / "backend" / "execution_context.py").read_text()
+
+    assert "bind_legacy_route_globals" not in runtime_source
+    assert "bind_legacy_route_globals" not in context_source
+    assert "from ..routes" not in context_source

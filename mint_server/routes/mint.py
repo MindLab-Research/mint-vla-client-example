@@ -63,6 +63,42 @@ training_engine = None
 action_session_manager = None
 
 
+def _current_training_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_manager
+    except Exception:
+        pass
+    return training_manager
+
+
+def _current_training_engine():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_engine
+    except Exception:
+        pass
+    return training_engine
+
+
+def _current_action_session_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.action_manager
+    except Exception:
+        pass
+    return action_session_manager
+
+
 def _get_user_data(request: Request) -> dict | None:
     return _request_user_data(request)
 
@@ -95,7 +131,8 @@ def _model_input_estimated_tokens(model_input: object) -> int:
 
 
 def _action_session_billing_metadata(action_session_id: str) -> dict[str, object]:
-    getter = getattr(action_session_manager, "get_billing_metadata", None)
+    manager = _current_action_session_manager()
+    getter = getattr(manager, "get_billing_metadata", None)
     if not callable(getter):
         return {}
     try:
@@ -875,9 +912,11 @@ async def _do_forward_backward_reverse_kl(
 ) -> None:
     set_request_id(request_id)
     try:
-        if training_engine is None or training_manager is None:
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
@@ -900,7 +939,7 @@ async def _do_forward_backward_reverse_kl(
             max_seq_len,
             request.reference_model_path,
         )
-        result = await training_engine.forward_backward_reverse_kl(session, request)
+        result = await engine.forward_backward_reverse_kl(session, request)
         logger.info(
             "[%s] forward_backward_reverse_kl done: elapsed_s=%.3f",
             session.model_id,
@@ -940,8 +979,9 @@ async def _do_vla_train_step(
             "check_vla_observation_and_supervision_shapes",
         )
         await task_futures.async_fail(request_id, str(e))
-        if training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        manager = _current_training_manager()
+        if manager is not None:
+            manager.mark_inflight(request.model_id, -1)
         return
 
     if billing_observation_input is None:

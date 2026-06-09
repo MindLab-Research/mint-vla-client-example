@@ -88,6 +88,14 @@ _SAMPLE_ONCE_ROUTE = "sample_once"
 
 
 def _active_session_manager() -> SessionManager | None:
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.inference_manager
+    except Exception:
+        pass
     if session_manager is not None:
         return session_manager
     try:
@@ -1621,23 +1629,24 @@ async def _do_sample(
     }
     try:
         try:
-            if session_manager is None:
+            manager = _active_session_manager()
+            if manager is None:
                 raise RuntimeError("Session manager not initialized")
 
             token_ids = request.prompt.to_token_ids()
             session_id = request.get_session_id()  # Supports both sampling_session_id and model_id
             await _restore_local_sampling_session_if_needed(session_id)
             workload_base_model = _resolve_billing_model(session_id)
-            session_manager.mark_session_inflight(session_id, +1)
+            manager.mark_session_inflight(session_id, +1)
             snapshot = _get_sampling_snapshot(session_id)
 
             # Handle include_prompt_logprobs alias
             want_prompt_logprobs = request.prompt_logprobs or request.include_prompt_logprobs
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
-            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
+            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else manager.is_multi_lora_session(session_id)
             if is_multi_lora:
-                base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
+                base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
                 from ..backend.model_registry import get_model_config
@@ -1671,7 +1680,7 @@ async def _do_sample(
                 )
                 engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: session_manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -1851,7 +1860,7 @@ async def _do_sample(
                 generate_s = max(0.0, time.perf_counter() - generate_t0)
             else:
                 # Legacy mode: per-session engine
-                engine = session_manager.get_engine(session_id)
+                engine = manager.get_engine(session_id)
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
                 model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
@@ -2053,8 +2062,9 @@ async def _do_sample(
             )
         if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
             model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        if session_manager is not None and session_id is not None:
-            session_manager.mark_session_inflight(session_id, -1)
+        manager = _active_session_manager()
+        if manager is not None and session_id is not None:
+            manager.mark_session_inflight(session_id, -1)
         _inflight_sample_tasks -= 1
 
 
@@ -2228,22 +2238,23 @@ async def _do_compute_logprobs(
     workload_status = "error"
     try:
         set_request_id(request_id)
-        if session_manager is None:
+        manager = _active_session_manager()
+        if manager is None:
             raise RuntimeError("Session manager not initialized")
 
         token_ids = request.sequence.to_token_ids()
         session_id = request.sampling_session_id
         await _restore_local_sampling_session_if_needed(session_id)
         workload_base_model = _resolve_billing_model(session_id)
-        session_manager.mark_session_inflight(session_id, +1)
+        manager.mark_session_inflight(session_id, +1)
         snapshot = _get_sampling_snapshot(session_id)
-        base_model = snapshot.base_model if snapshot is not None else session_manager.get_session_base_model(session_id)
+        base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
 
         async def _compute_logprobs_action():
             nonlocal model_actor_supervisor, model_actor_supervisor_actor_name, workload_started
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
-            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else session_manager.is_multi_lora_session(session_id)
+            is_multi_lora = bool(snapshot.uses_multi_lora) if snapshot is not None else manager.is_multi_lora_session(session_id)
             if is_multi_lora:
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
@@ -2260,7 +2271,7 @@ async def _do_compute_logprobs(
             if is_multi_lora:
                 multi_lora_engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: session_manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -2308,7 +2319,7 @@ async def _do_compute_logprobs(
                     request_id=request_id,
                 )
 
-            engine = session_manager.get_engine(session_id)
+            engine = manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")
             model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
@@ -2392,5 +2403,6 @@ async def _do_compute_logprobs(
             )
         if model_actor_supervisor is not None and model_actor_supervisor_actor_name is not None:
             model_actor_supervisor.mark_inflight(model_actor_supervisor_actor_name, -1)
-        if session_manager is not None and session_id is not None:
-            session_manager.mark_session_inflight(session_id, -1)
+        manager = _active_session_manager()
+        if manager is not None and session_id is not None:
+            manager.mark_session_inflight(session_id, -1)

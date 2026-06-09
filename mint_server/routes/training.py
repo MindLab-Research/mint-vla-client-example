@@ -162,15 +162,52 @@ training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For ephemeral flow
 
 
+def _current_training_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_manager
+    except Exception:
+        pass
+    return training_manager
+
+
+def _current_training_engine():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.train_engine
+    except Exception:
+        pass
+    return training_engine
+
+
+def _current_inference_manager():
+    try:
+        from ..backend.execution_context import current_execution_context
+
+        context = current_execution_context()
+        if context is not None:
+            return context.inference_manager
+    except Exception:
+        pass
+    return inference_manager
+
+
 def _require_write_access(request: Request) -> None:
     if not can_write(request):
         raise HTTPException(status_code=403, detail="Write access required")
 
 
 def _mark_training_inflight(model_id: str, delta: int) -> None:
-    if training_manager is None:
+    manager = _current_training_manager()
+    if manager is None:
         return
-    mark = getattr(training_manager, "mark_inflight", None)
+    mark = getattr(manager, "mark_inflight", None)
     if callable(mark):
         mark(model_id, delta)
 
@@ -400,9 +437,10 @@ def _find_actor_handle(actor_name: str, namespace: str):
 
 
 def _snapshot_from_training_session(model_id: str):
-    if training_manager is None:
+    manager = _current_training_manager()
+    if manager is None:
         return None
-    get_session = getattr(training_manager, "get_session", None)
+    get_session = getattr(manager, "get_session", None)
     if not callable(get_session):
         return None
     session = get_session(model_id)
@@ -432,9 +470,10 @@ def _snapshot_from_training_session(model_id: str):
 
 
 def _get_training_snapshot(model_id: str):
-    if training_manager is None:
+    manager = _current_training_manager()
+    if manager is None:
         return None
-    get_snapshot = getattr(training_manager, "get_training_session_snapshot", None)
+    get_snapshot = getattr(manager, "get_training_session_snapshot", None)
     if callable(get_snapshot):
         snapshot = get_snapshot(model_id)
         if snapshot is not None:
@@ -443,20 +482,24 @@ def _get_training_snapshot(model_id: str):
 
 
 def _drop_local_training_session(model_id: str) -> None:
-    if training_manager is not None:
-        delete_session = getattr(training_manager, "delete_session", None)
+    manager = _current_training_manager()
+    engine = _current_training_engine()
+    if manager is not None:
+        delete_session = getattr(manager, "delete_session", None)
         if callable(delete_session):
             try:
                 delete_session(model_id)
             except Exception as e:
                 logger.warning("Failed to delete stale local training session %s: %s", model_id, e)
-    if training_engine is not None:
-        getattr(training_engine, "_workers", {}).pop(model_id, None)
-        getattr(training_engine, "_model_actor_supervisor_actor_names", {}).pop(model_id, None)
+    if engine is not None:
+        getattr(engine, "_workers", {}).pop(model_id, None)
+        getattr(engine, "_model_actor_supervisor_actor_names", {}).pop(model_id, None)
 
 
 def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, snapshot=None):
-    if training_manager is None or not isinstance(info, dict):
+    manager = _current_training_manager()
+    engine = _current_training_engine()
+    if manager is None or not isinstance(info, dict):
         return snapshot
     snap = snapshot or _get_training_snapshot(model_id)
     if snap is None:
@@ -470,8 +513,8 @@ def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, sna
     current_version = max(1, int(getattr(snap, "metadata_version", 1) or 1))
     current_step = max(0, int(getattr(snap, "current_step", 0) or 0))
     current_session = None
-    if training_manager is not None:
-        get_local_session = getattr(training_manager, "get_local_session", None)
+    if manager is not None:
+        get_local_session = getattr(manager, "get_local_session", None)
         current_session = get_local_session(model_id) if callable(get_local_session) else None
     current_actor_name = str(getattr(current_session, "actor_name", "") or "") or None
     current_namespace = str(getattr(current_session, "namespace", "") or "") or None
@@ -480,12 +523,12 @@ def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, sna
     ) or (
         incoming_namespace is not None and incoming_namespace != current_namespace
     )
-    if actor_binding_changed and training_engine is not None:
-        getattr(training_engine, "_workers", {}).pop(model_id, None)
+    if actor_binding_changed and engine is not None:
+        getattr(engine, "_workers", {}).pop(model_id, None)
         if incoming_actor_name is not None:
-            getattr(training_engine, "_model_actor_supervisor_actor_names", {})[model_id] = incoming_actor_name
+            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = incoming_actor_name
         else:
-            getattr(training_engine, "_model_actor_supervisor_actor_names", {}).pop(model_id, None)
+            getattr(engine, "_model_actor_supervisor_actor_names", {}).pop(model_id, None)
     if incoming_version <= current_version and incoming_step <= current_step and not actor_binding_changed:
         return snap
     _restore_training_session_info_compat(info)
@@ -493,14 +536,15 @@ def _refresh_training_session_from_info_if_needed(model_id: str, info: dict, sna
 
 
 def _restore_training_session_info_compat(info: dict):
-    if training_manager is None:
+    manager = _current_training_manager()
+    if manager is None:
         return None
-    restore = getattr(training_manager, "restore_training_session_info", None)
+    restore = getattr(manager, "restore_training_session_info", None)
     if callable(restore):
         return restore(info)
 
-    get_session = getattr(training_manager, "get_session", None)
-    create_session = getattr(training_manager, "create_session", None)
+    get_session = getattr(manager, "get_session", None)
+    create_session = getattr(manager, "create_session", None)
     if not callable(get_session) or not callable(create_session):
         return None
 
@@ -561,7 +605,9 @@ def _restore_training_session_info_compat(info: dict):
 
 async def _restore_training_session(model_id: str):
     """Best-effort restore of a training session after API process restart."""
-    if training_engine is None or training_manager is None:
+    engine = _current_training_engine()
+    manager = _current_training_manager()
+    if engine is None or manager is None:
         return None
     try:
         from ..backend.training_session_store import async_get_training_session_info
@@ -574,12 +620,12 @@ async def _restore_training_session(model_id: str):
         if info.get("lora_config"):
             lora_cfg = LoRAConfig(**info["lora_config"])
 
-        get_local_session = getattr(training_manager, "get_local_session", None)
-        session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+        get_local_session = getattr(manager, "get_local_session", None)
+        session = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
         created_session = False
         original_session_state = None
         if session is None:
-            session = training_manager.create_session(
+            session = manager.create_session(
                 model_id=model_id,
                 session_id=str(info.get("session_id", "")),
                 model_seq_id=int(info.get("model_seq_id", 0)),
@@ -665,7 +711,7 @@ async def _restore_training_session(model_id: str):
                     worker = None
             if worker is None:
                 if created_session:
-                    training_manager.delete_session(model_id)
+                    manager.delete_session(model_id)
                 elif original_session_state is not None:
                     session.backend = original_session_state["backend"]
                     session.created_at = original_session_state["created_at"]
@@ -680,8 +726,8 @@ async def _restore_training_session(model_id: str):
                         session.actor_name = original_session_state["actor_name"]
                         session.namespace = original_session_state["namespace"]
                 return None
-            getattr(training_engine, "_workers", {})[model_id] = worker
-            getattr(training_engine, "_model_actor_supervisor_actor_names", {})[model_id] = actor_name
+            getattr(engine, "_workers", {})[model_id] = worker
+            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = actor_name
 
         return session
     except Exception as e:
@@ -689,10 +735,12 @@ async def _restore_training_session(model_id: str):
 
 
 async def _raise_if_local_model_id_exists(model_id: str) -> None:
-    if training_engine is None or training_manager is None:
+    engine = _current_training_engine()
+    manager = _current_training_manager()
+    if engine is None or manager is None:
         return
-    get_local_session = getattr(training_manager, "get_local_session", None)
-    local_session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+    get_local_session = getattr(manager, "get_local_session", None)
+    local_session = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
     if local_session is not None:
         raise HTTPException(status_code=409, detail=f"Model_id conflict: local model already exists: {model_id!r}")
     try:
@@ -1258,10 +1306,11 @@ def _build_local_tokenizer_metadata(base_model: str, backend: str) -> dict[str, 
 
 
 async def _collect_control_plane_tokenizer_metadata(session: Any) -> dict[str, Any]:
-    if training_engine is None:
+    engine = _current_training_engine()
+    if engine is None:
         raise RuntimeError("Training engine not initialized")
     tokenizer_metadata: dict[str, Any] = {
-        "tokenizer_info": dict(await training_engine.get_tokenizer_info(session))
+        "tokenizer_info": dict(await engine.get_tokenizer_info(session))
     }
     try:
         local_metadata = await asyncio.to_thread(
@@ -1375,7 +1424,8 @@ async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
     )
     from ..backend.training_session_store import async_upsert_training_session
 
-    if training_engine is None:
+    engine = _current_training_engine()
+    if engine is None:
         raise RuntimeError("Training engine not initialized")
 
     state = str(getattr(session, "materialization_state", MATERIALIZATION_STATE_READY) or MATERIALIZATION_STATE_READY)
@@ -1403,14 +1453,14 @@ async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
     )
 
     try:
-        await training_engine.create_training_session(session)
+        await engine.create_training_session(session)
         tokenizer_metadata = None
         if _supports_control_plane_tokenizer_metadata(str(getattr(session, "backend", "") or "")):
             tokenizer_metadata = await _collect_control_plane_tokenizer_metadata(session)
             session.tokenizer_info = dict(tokenizer_metadata.get("tokenizer_info") or {})
             session.tokenizer_identity = str(tokenizer_metadata.get("tokenizer_identity") or "") or None
             session.tokenizer_source_path = str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
-        actor_name = getattr(training_engine, "_model_actor_supervisor_actor_names", {}).get(session.model_id)
+        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(session.model_id)
         session.actor_name = str(actor_name or "") or None
         session.namespace = RAY_NAMESPACE
         session.materialization_state = MATERIALIZATION_STATE_READY
@@ -1428,8 +1478,9 @@ async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
                 metadata_version=ready_version,
             )
         )
-        if training_manager is not None:
-            training_manager.mark_persisted(session.model_id)
+        manager = _current_training_manager()
+        if manager is not None:
+            manager.mark_persisted(session.model_id)
         return session
     except Exception as e:
         session.materialization_state = MATERIALIZATION_STATE_FAILED
@@ -1904,24 +1955,26 @@ async def _do_create_model(
     planned_backend = _infer_training_backend_for_base_model(request.base_model)
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = _current_training_engine()
+        manager = _current_training_manager()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
 
-        get_local_session = getattr(training_manager, "get_local_session", None)
-        existing = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+        get_local_session = getattr(manager, "get_local_session", None)
+        existing = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
         if existing is not None:
             if bool(getattr(existing, "is_active", False)):
                 raise RuntimeError(f"Model '{model_id}' already exists")
             logger.warning(f"[{model_id}] Cleaning up stale inactive session from previous attempt")
-            await training_engine.shutdown_session(existing)
-            training_manager.delete_session(model_id)
+            await engine.shutdown_session(existing)
+            manager.delete_session(model_id)
 
         rollout_correction_config = (
             request.rollout_correction_config.model_dump(exclude_none=True)
             if request.rollout_correction_config
             else None
         )
-        session = training_manager.create_session(
+        session = manager.create_session(
             model_id=model_id,
             session_id=request.session_id,
             model_seq_id=request.model_seq_id,
@@ -1936,7 +1989,7 @@ async def _do_create_model(
         )
         session_created = True
 
-        training_manager.mark_inflight(model_id, +1)
+        manager.mark_inflight(model_id, +1)
         inflight_marked = True
 
         tokenizer_metadata = await _best_effort_local_tokenizer_metadata_for_session(session)
@@ -1960,7 +2013,7 @@ async def _do_create_model(
                 tokenizer_metadata=tokenizer_metadata,
             )
         )
-        training_manager.mark_persisted(model_id)
+        manager.mark_persisted(model_id)
 
         try:
             from ..backend.session_index_store import add_training_run_to_session
@@ -2003,11 +2056,12 @@ async def _do_create_model(
             type(e).__name__,
             "check_training_session_and_actor",
         )
-        if session_created and training_manager is not None:
-            get_local_session = getattr(training_manager, "get_local_session", None)
-            session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
+        manager = _current_training_manager()
+        if session_created and manager is not None:
+            get_local_session = getattr(manager, "get_local_session", None)
+            session = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
             if session is not None:
-                training_manager.delete_session(model_id)
+                manager.delete_session(model_id)
         if session_created:
             try:
                 from ..backend.training_session_store import delete_training_session
@@ -2035,8 +2089,10 @@ async def _do_create_model(
                 error=str(e),
             )
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(model_id, -1)
 
 
 # =============================================================================
@@ -2278,8 +2334,8 @@ async def _do_create_model_from_state(
     session_materialized = False
     try:
         set_request_id(request_id)
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
 
@@ -2404,12 +2460,14 @@ async def _do_create_model_from_state(
             type(e).__name__,
             "check_checkpoint_path_and_training_actor",
         )
-        if session_created and training_manager is not None:
-            get_local_session = getattr(training_manager, "get_local_session", None)
-            session = get_local_session(model_id) if callable(get_local_session) else training_manager.get_session(model_id)
-            if session is not None and session_materialized and training_engine is not None:
+        manager = _current_training_manager()
+        engine = _current_training_engine()
+        if session_created and manager is not None:
+            get_local_session = getattr(manager, "get_local_session", None)
+            session = get_local_session(model_id) if callable(get_local_session) else manager.get_session(model_id)
+            if session is not None and session_materialized and engine is not None:
                 try:
-                    await training_engine.shutdown_session(session)
+                    await engine.shutdown_session(session)
                 except Exception as shutdown_error:
                     logger.warning(
                         "[create_model_from_state] cleanup shutdown failed model_id=%s error_type=%s error=%s",
@@ -2418,7 +2476,7 @@ async def _do_create_model_from_state(
                         shutdown_error,
                     )
             if session is not None:
-                training_manager.delete_session(model_id)
+                manager.delete_session(model_id)
         if session_created:
             try:
                 from ..backend.training_session_store import delete_training_session
@@ -2428,8 +2486,10 @@ async def _do_create_model_from_state(
                 pass
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(model_id, -1)
 
 
 # =============================================================================
@@ -2578,8 +2638,8 @@ async def _do_forward_backward(
     inflight_marked = False
 
     try:
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
@@ -2651,8 +2711,10 @@ async def _do_forward_backward(
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -2800,8 +2862,8 @@ async def _do_train_step(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
@@ -2875,8 +2937,10 @@ async def _do_train_step(
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -3024,8 +3088,8 @@ async def _do_forward(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
@@ -3086,8 +3150,10 @@ async def _do_forward(
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -3221,8 +3287,8 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
     inflight_marked = False
     try:
         set_request_id(request_id)
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
@@ -3267,8 +3333,10 @@ async def _do_optim_step(request_id: str, request: OptimStepRequest, user_id: st
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -3365,17 +3433,19 @@ async def _do_reset_expert_bias(
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = _current_training_engine()
+        manager = _current_training_manager()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(request.model_id)
+        session = manager.get_session(request.model_id)
         if session is None:
             session = await _restore_training_session(request.model_id)
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
 
-        result = await training_engine.reset_expert_bias(session)
+        result = await engine.reset_expert_bias(session)
         modules_reset = int(result.get("modules_reset", 0) or 0)
         await task_futures.async_resolve(
             request_id,
@@ -3395,8 +3465,10 @@ async def _do_reset_expert_bias(
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -3552,8 +3624,8 @@ async def _do_save_weights_for_sampler(
     sampling_session_id: str | None = None
     try:
         set_request_id(request_id)
-        engine = training_engine
-        manager = training_manager
+        engine = _current_training_engine()
+        manager = _current_training_manager()
         if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
@@ -3777,7 +3849,7 @@ async def _do_save_weights_for_sampler(
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
             # Each sampling session gets unique lora_int_id with frozen weights.
             # Matches Tinker SDK semantics where each save creates isolated snapshot.
-            inf_mgr = inference_manager
+            inf_mgr = _current_inference_manager()
             if inf_mgr is None:
                 raise RuntimeError("Inference manager not initialized")
 
@@ -3966,9 +4038,10 @@ async def _do_save_weights_for_sampler(
     except Exception as e:
         if not mirror_started:
             await _mark_checkpoint_failed_safe(claimed_ckpt_id, fail_reason="upload_error")
-        if sampling_session_id is not None and inference_manager is not None:
+        inf_mgr = _current_inference_manager()
+        if sampling_session_id is not None and inf_mgr is not None:
             try:
-                await inference_manager.end_session(sampling_session_id)
+                await inf_mgr.end_session(sampling_session_id)
             except Exception as cleanup_error:
                 logger.warning(
                     "[save_weights_for_sampler] failed to cleanup sampling session %s: %s: %s",
@@ -3997,8 +4070,10 @@ async def _do_save_weights_for_sampler(
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(request.model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -4293,14 +4368,16 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
     inflight_marked = False
     try:
         set_request_id(request_id)
-        if training_engine is None or training_manager is None:
+        engine = _current_training_engine()
+        manager = _current_training_manager()
+        if engine is None or manager is None:
             raise RuntimeError("Training engine not initialized")
         inflight_marked = True
 
-        session = training_manager.get_session(model_id)
+        session = manager.get_session(model_id)
         if session is not None:
-            await training_engine.shutdown_session(session)
-            training_manager.delete_session(model_id)
+            await engine.shutdown_session(session)
+            manager.delete_session(model_id)
 
         try:
             from ..backend.training_session_store import delete_training_session
@@ -4326,8 +4403,10 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
         )
         await task_futures.async_fail(request_id, str(e))
     finally:
-        if inflight_marked and training_manager is not None:
-            training_manager.mark_inflight(model_id, -1)
+        if inflight_marked:
+            manager = _current_training_manager()
+            if manager is not None:
+                manager.mark_inflight(model_id, -1)
 
 
 async def _get_control_plane_tokenizer_info(model_id: str, info: dict[str, Any]) -> dict[str, Any]:
