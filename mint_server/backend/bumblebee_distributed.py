@@ -7,6 +7,7 @@ through Ray calls, and each rank owns a Bumblebee runtime handle.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -135,6 +136,25 @@ def _normalize_bumblebee_peft_adapter_config(adapter_dir: str | Path) -> dict[st
     if changed:
         config_path.write_text(json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return loaded
+
+
+def _infer_bumblebee_reference_actual_rank(checkpoint_path: str | Path) -> int | None:
+    root = Path(checkpoint_path)
+    for relative in (BUMBLEBEE_TRAIN_STATE_META_FILE, "adapter_config.json"):
+        path = root / relative
+        if not path.is_file():
+            continue
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("Failed to read Bumblebee reference rank metadata from %s", path, exc_info=True)
+            continue
+        if not isinstance(loaded, dict):
+            continue
+        raw_rank = loaded.get("actual_rank") if relative == BUMBLEBEE_TRAIN_STATE_META_FILE else loaded.get("r")
+        if isinstance(raw_rank, int) and not isinstance(raw_rank, bool) and raw_rank > 0:
+            return int(raw_rank)
+    return None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -655,6 +675,171 @@ class BumblebeeRankWorker:
             if callable(zero_grad_buffer):
                 zero_grad_buffer()
 
+    def _iter_optimizer_buckets(self) -> list[Any]:
+        _, handle = self._require_runtime()
+        optimizer = getattr(handle, "_optimizer", None)
+        buckets: list[Any] = []
+        seen: set[int] = set()
+
+        def visit(opt: Any) -> None:
+            if opt is None or id(opt) in seen:
+                return
+            seen.add(id(opt))
+            for bucket in getattr(opt, "_all_buckets", ()) or ():
+                buckets.append(bucket)
+            for child in getattr(opt, "chained_optimizers", ()) or ():
+                visit(child)
+            try:
+                inner = getattr(opt, "optimizer", None)
+            except AssertionError:
+                inner = None
+            visit(inner)
+
+        visit(optimizer)
+        return buckets
+
+    def _capture_gradients(self) -> dict[str, Any]:
+        import torch
+
+        _, handle = self._require_runtime()
+        optimizer = getattr(handle, "_optimizer", None)
+        finish_grad_sync = getattr(optimizer, "finish_grad_sync", None)
+        if callable(finish_grad_sync):
+            finish_grad_sync()
+
+        extras = getattr(handle, "_extras", {}) or {}
+        model = getattr(handle, "_model", None)
+        chunks = extras.get("model_chunks", [model] if model is not None else [])
+        params: dict[str, dict[str, torch.Tensor]] = {}
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk is None:
+                continue
+            prefix = "" if len(chunks) == 1 else f"chunk{chunk_idx}."
+            for name, param in chunk.named_parameters():
+                entry: dict[str, torch.Tensor] = {}
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is not None:
+                    entry["main_grad"] = main_grad.detach().cpu().clone()
+                if param.grad is not None:
+                    entry["grad"] = param.grad.detach().cpu().clone()
+                if entry:
+                    params[prefix + name] = entry
+
+        buckets = []
+        for bucket in self._iter_optimizer_buckets():
+            item: dict[str, Any] = {
+                "grad_ready_count": int(getattr(bucket, "grad_ready_count", 0) or 0),
+            }
+            grad_buffer = getattr(bucket, "grad_buffer", None)
+            if isinstance(grad_buffer, torch.Tensor):
+                item["grad_buffer"] = grad_buffer.detach().cpu().clone()
+            grad_shard = getattr(bucket, "grad_shard", None)
+            if isinstance(grad_shard, torch.Tensor):
+                item["grad_shard"] = grad_shard.detach().cpu().clone()
+            buckets.append(item)
+
+        return {"params": params, "buckets": buckets}
+
+    def _restore_gradients(self, state: dict[str, Any]) -> None:
+        import torch
+
+        _, handle = self._require_runtime()
+        extras = getattr(handle, "_extras", {}) or {}
+        model = getattr(handle, "_model", None)
+        chunks = extras.get("model_chunks", [model] if model is not None else [])
+        params = state.get("params") if isinstance(state, dict) else {}
+        if not isinstance(params, dict):
+            raise RuntimeError("Invalid Bumblebee gradient snapshot: params must be a dict")
+
+        model_params: dict[str, Any] = {}
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk is None:
+                continue
+            prefix = "" if len(chunks) == 1 else f"chunk{chunk_idx}."
+            for name, param in chunk.named_parameters():
+                model_params[prefix + name] = param
+
+        missing = sorted(set(params) - set(model_params))
+        if missing:
+            raise RuntimeError(f"Bumblebee gradient snapshot has missing params: {missing[:5]}")
+        for name, entry in params.items():
+            if not isinstance(entry, dict):
+                raise RuntimeError(f"Invalid Bumblebee gradient snapshot for {name}: expected dict")
+            param = model_params[name]
+            saved_main = entry.get("main_grad")
+            if isinstance(saved_main, torch.Tensor):
+                main_grad = getattr(param, "main_grad", None)
+                if main_grad is None:
+                    raise RuntimeError(f"Cannot restore main_grad for {name}: parameter has no main_grad")
+                main_grad.copy_(saved_main.to(device=main_grad.device, dtype=main_grad.dtype))
+            saved_grad = entry.get("grad")
+            if isinstance(saved_grad, torch.Tensor):
+                if param.grad is None:
+                    param.grad = torch.empty_like(param)
+                param.grad.copy_(saved_grad.to(device=param.grad.device, dtype=param.grad.dtype))
+
+        bucket_states = state.get("buckets") if isinstance(state, dict) else []
+        if not isinstance(bucket_states, list):
+            raise RuntimeError("Invalid Bumblebee gradient snapshot: buckets must be a list")
+        buckets = self._iter_optimizer_buckets()
+        if len(bucket_states) != len(buckets):
+            raise RuntimeError(
+                f"Bumblebee gradient snapshot bucket count mismatch: {len(bucket_states)} != {len(buckets)}"
+            )
+        for bucket, saved in zip(buckets, bucket_states, strict=True):
+            if not isinstance(saved, dict):
+                raise RuntimeError("Invalid Bumblebee gradient snapshot bucket entry")
+            grad_buffer = getattr(bucket, "grad_buffer", None)
+            saved_buffer = saved.get("grad_buffer")
+            if isinstance(grad_buffer, torch.Tensor) and isinstance(saved_buffer, torch.Tensor):
+                grad_buffer.copy_(saved_buffer.to(device=grad_buffer.device, dtype=grad_buffer.dtype))
+            grad_shard = getattr(bucket, "grad_shard", None)
+            saved_shard = saved.get("grad_shard")
+            if isinstance(grad_shard, torch.Tensor) and isinstance(saved_shard, torch.Tensor):
+                grad_shard.copy_(saved_shard.to(device=grad_shard.device, dtype=grad_shard.dtype))
+            bucket.grad_ready_count = int(saved.get("grad_ready_count", 0) or 0)
+            if hasattr(bucket, "handle"):
+                bucket.handle = None
+
+    def preserve_current_gradients(self, session_id: str, *, traceparent: str | None = None) -> dict[str, Any]:
+        del traceparent
+        if self._current_session != session_id:
+            raise RuntimeError(
+                f"Cannot preserve gradients for session {session_id!r}: active session is {self._current_session!r}"
+            )
+        _, handle = self._require_runtime()
+        store = handle._extras.setdefault("preserved_gradients", {})
+        snapshot = self._capture_gradients()
+        store[session_id] = snapshot
+        return {
+            "status": "ok",
+            "backend": "bumblebee",
+            "rank": self.rank,
+            "param_grad_count": len(snapshot.get("params", {})),
+            "bucket_count": len(snapshot.get("buckets", [])),
+        }
+
+    def restore_preserved_gradients(
+        self,
+        session_id: str,
+        actual_rank: int | None = None,
+        *,
+        traceparent: str | None = None,
+    ) -> dict[str, Any]:
+        del traceparent
+        self._ensure_session_loaded(session_id, actual_rank)
+        self._restore_preserved_gradients(session_id)
+        return {"status": "ok", "backend": "bumblebee", "rank": self.rank}
+
+    def _restore_preserved_gradients(self, session_id: str) -> None:
+        _, handle = self._require_runtime()
+        store = handle._extras.setdefault("preserved_gradients", {})
+        try:
+            snapshot = store.pop(session_id)
+        except KeyError as exc:
+            raise RuntimeError(f"No preserved Bumblebee gradients for session {session_id!r}") from exc
+        self._restore_gradients(snapshot)
+
     def _benchmark_model_state_debug(self) -> dict[str, Any]:
         _, handle = self._require_runtime()
         extras = getattr(handle, "_extras", {}) or {}
@@ -1093,6 +1278,113 @@ class BumblebeeRankWorker:
             "loss_fn_outputs": [],
             "metrics": metrics,
         }
+        return payload
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict[str, Any]],
+        temperature: float,
+        session_id: str,
+        actual_rank: int | None,
+        *,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+    ) -> dict[str, Any]:
+        del train_attn, train_mlp, train_unembed
+        rt, handle = self._require_runtime()
+        self._ensure_session_loaded(session_id, actual_rank)
+        ps = handle._parallel_state
+        if int(getattr(ps, "cp_size", 1)) != 1:
+            raise NotImplementedError("Bumblebee MinT reverse-KL reference forward is not wired for CP>1 yet")
+
+        from bumblebee.runtime.adapters.mint import mint_reverse_kl_payload_to_reference_batch
+        from bumblebee.runtime.adapters.rl import reference_log_probs_from_forward_result
+
+        batch = mint_reverse_kl_payload_to_reference_batch(
+            data_items,
+            temperature=float(temperature),
+            device="cuda",
+        )
+        runtime_batch = self._mint_batch_to_runtime_dict(batch)
+        runtime_batch["return_vocab_parallel_logits"] = True
+        runtime_batch["return_log_probs"] = False
+        runtime_batch["temperature"] = float(temperature)
+        result = rt.forward_backward(
+            handle,
+            [runtime_batch],
+            None,
+            num_microbatches=1,
+            forward_only=True,
+        )
+        thd_batch = SimpleNamespace(
+            loss_mask=runtime_batch["loss_mask"],
+            completion_lengths=batch.completion_lengths,
+        )
+        result = reference_log_probs_from_forward_result(thd_batch, result)
+        return {"reference_local_log_probs": result, "backend": "bumblebee", "rank": self.rank}
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict[str, Any]],
+        reference_full_log_prob_chunks: list,
+        temperature: float,
+        session_id: str,
+        actual_rank: int | None,
+        *,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+        preserved_gradients: bool = False,
+        zero_gradients: bool = True,
+    ) -> dict[str, Any]:
+        del train_attn, train_mlp, train_unembed
+        rt, handle = self._require_runtime()
+        switch = self._ensure_session_loaded(session_id, actual_rank)
+        ps = handle._parallel_state
+        if int(getattr(ps, "cp_size", 1)) != 1:
+            raise NotImplementedError("Bumblebee MinT reverse-KL backward is not wired for CP>1 yet")
+
+        from bumblebee.runtime.adapters.mint import (
+            mint_reverse_kl_output_to_forward_backward,
+            mint_reverse_kl_payload_to_request,
+        )
+        from bumblebee.runtime.adapters.rl import (
+            reverse_kl_output_from_forward_result,
+            reverse_kl_request_to_forward_backward,
+        )
+
+        if preserved_gradients:
+            self._restore_preserved_gradients(session_id)
+        elif zero_gradients:
+            self._zero_gradients()
+        request = mint_reverse_kl_payload_to_request(
+            data_items,
+            reference_log_probs=reference_full_log_prob_chunks,
+            temperature=float(temperature),
+            device="cuda",
+        )
+        batch, loss_fn = reverse_kl_request_to_forward_backward(request)
+        runtime_batch = self._mint_batch_to_runtime_dict(batch)
+        runtime_batch["return_vocab_parallel_logits"] = True
+        runtime_batch["return_log_probs"] = False
+        runtime_batch["temperature"] = float(temperature)
+        batch.loss_mask = runtime_batch["loss_mask"]
+        result = rt.forward_backward(
+            handle,
+            [runtime_batch],
+            lambda model_output, _runtime_batch: loss_fn(model_output, batch),
+            num_microbatches=1,
+        )
+        output = reverse_kl_output_from_forward_result(request, result)
+        payload = mint_reverse_kl_output_to_forward_backward(output)
+        payload.setdefault("metrics", {}).update(
+            {
+                "backend": "bumblebee",
+                "rank": self.rank,
+                "session_state": switch["session_state"],
+            }
+        )
         return payload
 
     def optimizer_step(
@@ -1800,6 +2092,150 @@ class BumblebeeWorkerGroup:
         ]
         results = self._ray_get_group_results(refs, op="forward")
         self._current_session = session_id
+        return self._merge_rank_payloads(results)
+
+    def forward_reference_full_log_probs(
+        self,
+        data_items: list[dict[str, Any]],
+        temperature: float,
+        session_id: str | None = None,
+        actual_rank: int | None = None,
+        *,
+        traceparent: str | None = None,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+    ) -> list:
+        del traceparent
+        self._ensure_initialized()
+        sid = session_id or self._current_session
+        if not sid:
+            raise RuntimeError("forward_reference_full_log_probs requires session_id")
+        refs = [
+            worker.forward_reference_full_log_probs.remote(
+                data_items,
+                float(temperature),
+                sid,
+                actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
+            for worker in self.workers
+        ]
+        results = self._ray_get_group_results(refs, op="forward_reference_full_log_probs")
+        chunks_by_rank = []
+        for idx, result in enumerate(results):
+            chunks = result.get("reference_local_log_probs") if isinstance(result, dict) else None
+            if not isinstance(chunks, list):
+                raise ValueError(f"reference_local_log_probs missing from Bumblebee worker index {idx}")
+            chunks_by_rank.append(chunks)
+        self._current_session = sid
+        return chunks_by_rank
+
+    def forward_backward_reverse_kl(
+        self,
+        data_items: list[dict[str, Any]],
+        reference_checkpoint_path: str | None,
+        temperature: float,
+        session_id: str | None = None,
+        actual_rank: int | None = None,
+        traceparent: str | None = None,
+        *,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
+        reference_full_log_prob_chunks: list | None = None,
+        preserve_current_gradients: bool = False,
+    ) -> dict[str, Any]:
+        self._ensure_initialized()
+        sid = session_id or self._current_session
+        if not sid:
+            raise RuntimeError("forward_backward_reverse_kl requires session_id")
+
+        reference_chunks = reference_full_log_prob_chunks
+        preserved_gradients = False
+        ref_session_id: str | None = None
+        if reference_chunks is None:
+            if not reference_checkpoint_path:
+                raise RuntimeError("forward_backward_reverse_kl requires reference_checkpoint_path or reference log-probs")
+            ref_session_id = (
+                "mintx_ref_"
+                + hashlib.md5(str(reference_checkpoint_path).encode("utf-8")).hexdigest()[:16]
+            )
+            reference_actual_rank = _infer_bumblebee_reference_actual_rank(reference_checkpoint_path)
+            if preserve_current_gradients:
+                refs = [
+                    worker.preserve_current_gradients.remote(sid, traceparent=traceparent)
+                    for worker in self.workers
+                ]
+                self._ray_get_group_results(refs, op="preserve_current_gradients")
+                preserved_gradients = True
+            try:
+                self.load_training_state(
+                    reference_checkpoint_path,
+                    load_optimizer=False,
+                    session_id=ref_session_id,
+                    actual_rank=reference_actual_rank,
+                )
+                reference_chunks = self.forward_reference_full_log_probs(
+                    data_items,
+                    float(temperature),
+                    session_id=ref_session_id,
+                    actual_rank=reference_actual_rank,
+                    traceparent=traceparent,
+                    train_attn=train_attn,
+                    train_mlp=train_mlp,
+                    train_unembed=train_unembed,
+                )
+            except Exception:
+                if preserved_gradients:
+                    try:
+                        refs = [
+                            worker.restore_preserved_gradients.remote(sid, actual_rank, traceparent=traceparent)
+                            for worker in self.workers
+                        ]
+                        self._ray_get_group_results(refs, op="restore_preserved_gradients")
+                    except Exception:
+                        logger.warning(
+                            "[BumblebeeWorkerGroup] reverse-KL student gradient restore failed after "
+                            "reference prep error: session_id=%s",
+                            sid,
+                            exc_info=True,
+                        )
+                raise
+            finally:
+                try:
+                    self.delete_session(ref_session_id, traceparent=traceparent)
+                except Exception:
+                    logger.warning(
+                        "[BumblebeeWorkerGroup] reverse-KL reference session cleanup failed: session_id=%s",
+                        ref_session_id,
+                        exc_info=True,
+                    )
+
+        refs = [
+            worker.forward_backward_reverse_kl.remote(
+                data_items,
+                (
+                    reference_chunks[idx]
+                    if isinstance(reference_chunks, list)
+                    and len(reference_chunks) == len(self.workers)
+                    else reference_chunks
+                ),
+                float(temperature),
+                sid,
+                actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+                preserved_gradients=preserved_gradients,
+                zero_gradients=not bool(preserve_current_gradients),
+            )
+            for idx, worker in enumerate(self.workers)
+        ]
+        results = self._ray_get_group_results(refs, op="forward_backward_reverse_kl")
+        self._current_session = sid
         return self._merge_rank_payloads(results)
 
     def optim_step(

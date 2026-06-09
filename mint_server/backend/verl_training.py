@@ -4407,6 +4407,26 @@ class VerlTrainingEngine:
                         ref_session_id,
                         exc_info=True,
                     )
+        elif session.backend == "bumblebee":
+            pending = worker.forward_backward_reverse_kl.remote(
+                data_items,
+                request.reference_model_path,
+                float(request.temperature),
+                session.model_id,
+                session.lora_config.rank if session.lora_config else None,
+                traceparent=traceparent,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+                preserve_current_gradients=bool(session.accumulated_gradients > 0),
+            )
+            result = await self._await_worker_call(
+                pending,
+                session,
+                op="forward_backward_reverse_kl",
+                worker=worker,
+                interval_s=30.0,
+            )
         else:
             pending = worker.forward_backward_reverse_kl.remote(
                 data_items,

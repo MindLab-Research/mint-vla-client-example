@@ -378,6 +378,177 @@ def test_bumblebee_worker_group_merges_only_numeric_tinker_metrics():
     assert payload["metrics"] == {"loss:mean": 1.25, "num_tokens:sum": 8}
 
 
+def test_bumblebee_worker_group_exposes_reverse_kl_rank_fanout():
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._ensure_initialized = MethodType(lambda self: None, group)
+    calls: list[tuple[Any, ...]] = []
+
+    class _RemoteMethod:
+        def remote(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return f"ref-{len(calls)}"
+
+    group.workers = [
+        SimpleNamespace(forward_backward_reverse_kl=_RemoteMethod()),
+        SimpleNamespace(forward_backward_reverse_kl=_RemoteMethod()),
+    ]
+
+    def fake_get(self, refs, *, op):
+        assert refs == ["ref-1", "ref-2"]
+        assert op == "forward_backward_reverse_kl"
+        return [
+            {
+                "type": "mint_forward_backward_reverse_kl",
+                "outputs": [],
+                "metrics": {
+                    "loss:mean": 0.25,
+                    "reverse_kl:mean": 0.25,
+                    "num_tokens:sum": 2,
+                    "backend": "bumblebee",
+                    "rank": 0,
+                },
+            }
+        ]
+
+    group._ray_get_group_results = MethodType(fake_get, group)
+
+    payload = group.forward_backward_reverse_kl(
+        [{"student_input": {}, "reference_input": {}}],
+        None,
+        1.0,
+        session_id="session-a",
+        actual_rank=16,
+        reference_full_log_prob_chunks=[["rank0"], ["rank1"]],
+    )
+
+    assert group._current_session == "session-a"
+    assert payload["type"] == "mint_forward_backward_reverse_kl"
+    assert payload["metrics"] == {
+        "loss:mean": 0.25,
+        "reverse_kl:mean": 0.25,
+        "num_tokens:sum": 2,
+    }
+    assert calls[0][0] == (
+        [{"student_input": {}, "reference_input": {}}],
+        ["rank0"],
+        1.0,
+        "session-a",
+        16,
+    )
+    assert calls[1][0] == (
+        [{"student_input": {}, "reference_input": {}}],
+        ["rank1"],
+        1.0,
+        "session-a",
+        16,
+    )
+    assert calls[0][1]["preserved_gradients"] is False
+    assert calls[0][1]["zero_gradients"] is True
+    assert calls[1][1]["preserved_gradients"] is False
+    assert calls[1][1]["zero_gradients"] is True
+
+
+def test_bumblebee_reverse_kl_precomputed_reference_chunks_preserve_accumulated_gradients():
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    group._current_session = "session-a"
+    group._ensure_initialized = MethodType(lambda self: None, group)
+    calls: list[tuple[Any, ...]] = []
+
+    class _RemoteMethod:
+        def remote(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return f"ref-{len(calls)}"
+
+    group.workers = [
+        SimpleNamespace(forward_backward_reverse_kl=_RemoteMethod()),
+        SimpleNamespace(forward_backward_reverse_kl=_RemoteMethod()),
+    ]
+
+    def fake_get(self, refs, *, op):
+        assert refs == ["ref-1", "ref-2"]
+        assert op == "forward_backward_reverse_kl"
+        return [
+            {
+                "type": "mint_forward_backward_reverse_kl",
+                "outputs": [],
+                "metrics": {"loss:mean": 0.25, "num_tokens:sum": 2},
+            }
+        ]
+
+    group._ray_get_group_results = MethodType(fake_get, group)
+
+    group.forward_backward_reverse_kl(
+        [{"student_input": {}, "reference_input": {}}],
+        None,
+        1.0,
+        session_id="session-a",
+        actual_rank=16,
+        reference_full_log_prob_chunks=[["rank0"], ["rank1"]],
+        preserve_current_gradients=True,
+    )
+
+    assert calls[0][1]["preserved_gradients"] is False
+    assert calls[0][1]["zero_gradients"] is False
+    assert calls[1][1]["preserved_gradients"] is False
+    assert calls[1][1]["zero_gradients"] is False
+
+
+def test_bumblebee_reverse_kl_restores_preserved_gradients_after_reference_prep_error():
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    group._current_session = "session-a"
+    group._ensure_initialized = MethodType(lambda self: None, group)
+    ops: list[tuple[str, list[str]]] = []
+
+    class _RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        def remote(self, *args, **kwargs):
+            del args, kwargs
+            return f"{self.name}-ref"
+
+    group.workers = [
+        SimpleNamespace(
+            preserve_current_gradients=_RemoteMethod("preserve-0"),
+            restore_preserved_gradients=_RemoteMethod("restore-0"),
+        ),
+        SimpleNamespace(
+            preserve_current_gradients=_RemoteMethod("preserve-1"),
+            restore_preserved_gradients=_RemoteMethod("restore-1"),
+        ),
+    ]
+    group.load_training_state = MethodType(
+        lambda self, *args, **kwargs: (_ for _ in ()).throw(RuntimeError("reference load failed")),
+        group,
+    )
+    group.delete_session = MethodType(lambda self, *args, **kwargs: {"status": "ok"}, group)
+
+    def fake_get(self, refs, *, op):
+        ops.append((op, list(refs)))
+        return [{"status": "ok"} for _ in refs]
+
+    group._ray_get_group_results = MethodType(fake_get, group)
+
+    with pytest.raises(RuntimeError, match="reference load failed"):
+        group.forward_backward_reverse_kl(
+            [{"student_input": {}, "reference_input": {}}],
+            "/tmp/reference",
+            1.0,
+            session_id="session-a",
+            actual_rank=16,
+            preserve_current_gradients=True,
+        )
+
+    assert ops == [
+        ("preserve_current_gradients", ["preserve-0-ref", "preserve-1-ref"]),
+        ("restore_preserved_gradients", ["restore-0-ref", "restore-1-ref"]),
+    ]
+
+
 def test_issue_670_bumblebee_group_ready_checks_rank_workers():
     group_cls = BumblebeeWorkerGroup.__ray_actor_class__
     group = object.__new__(group_cls)

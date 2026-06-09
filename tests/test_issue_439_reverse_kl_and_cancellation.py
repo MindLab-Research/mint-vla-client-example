@@ -8,6 +8,7 @@ from mint_server.backend.megatron_distributed import (
     MegatronSessionStateManager,
     MegatronWorkerGroup,
 )
+from mint_server.backend.bumblebee_distributed import BumblebeeRankWorker, BumblebeeWorkerGroup
 from mint_server.backend.runtime_observability import RuntimeObservability
 from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
@@ -66,6 +67,11 @@ def test_issue_439_reverse_kl_entrypoints_exist() -> None:
     assert callable(getattr(MegatronWorkerGroup, "forward_reference_full_log_probs", None))
     assert callable(getattr(MegatronWorkerGroup, "prime_session_checkpoint", None))
     assert callable(getattr(MegatronWorkerGroup, "delete_session", None))
+    assert callable(getattr(BumblebeeRankWorker, "forward_backward_reverse_kl", None))
+    assert callable(getattr(BumblebeeRankWorker, "forward_reference_full_log_probs", None))
+    assert callable(getattr(BumblebeeWorkerGroup, "forward_backward_reverse_kl", None))
+    assert callable(getattr(BumblebeeWorkerGroup, "forward_reference_full_log_probs", None))
+    assert callable(getattr(BumblebeeWorkerGroup, "delete_session", None))
 
 
 def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: pytest.MonkeyPatch) -> None:
