@@ -67,6 +67,35 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
+def test_training_session_inflight_is_durable_metadata(tmp_path: Path) -> None:
+    store = TaskStateStore(str(tmp_path / "task-state-training-inflight.sqlite3"))
+    try:
+        store.upsert_training_session(
+            model_id="model-inflight",
+            info={
+                "model_id": "model-inflight",
+                "session_id": "session-inflight",
+                "base_model": "Qwen/Qwen3-0.6B",
+                "metadata_version": 1,
+                "last_activity": 10.0,
+            },
+        )
+
+        assert store.mark_training_session_inflight(model_id="model-inflight", delta=1) == 1
+        info = store.get_training_session(model_id="model-inflight")
+        assert info is not None
+        assert info["inflight_ops"] == 1
+        assert info["last_activity"] >= 10.0
+
+        assert store.mark_training_session_inflight(model_id="model-inflight", delta=-3) == 0
+        info = store.get_training_session(model_id="model-inflight")
+        assert info is not None
+        assert info["inflight_ops"] == 0
+        assert store.mark_training_session_inflight(model_id="missing", delta=1) is None
+    finally:
+        store.close()
+
+
 def test_task_state_store_client_async_cached_actor_survives_concurrent_reset(monkeypatch) -> None:
     import mint_server.backend.task_state_store as module
     import ray
@@ -96,7 +125,6 @@ def test_task_state_store_client_async_cached_actor_survives_concurrent_reset(mo
 
 
 def test_task_state_store_client_sync_cached_actor_survives_reset(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as module
     import ray
 
     class _Actor:

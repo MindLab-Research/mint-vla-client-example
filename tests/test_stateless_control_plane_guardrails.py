@@ -62,3 +62,48 @@ def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
     assert "bind_legacy_route_globals" not in runtime_source
     assert "bind_legacy_route_globals" not in context_source
     assert "from ..routes" not in context_source
+
+
+def _function_source(path: Path, function_name: str) -> str:
+    source = path.read_text()
+    tree = ast.parse(source, filename=str(path))
+    lines = source.splitlines()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+            return "\n".join(lines[node.lineno - 1 : node.end_lineno])
+    raise AssertionError(f"function {function_name!r} not found in {path}")
+
+
+def test_mainline_http_routes_do_not_use_training_route_globals_as_authority() -> None:
+    training_path = REPO_ROOT / "mint_server" / "routes" / "training.py"
+    for function_name in [
+        "forward_backward",
+        "train_step",
+        "forward",
+        "optim_step",
+        "reset_expert_bias",
+        "save_weights_for_sampler",
+        "delete_model",
+        "get_session_guard_state",
+        "get_tokenizer",
+    ]:
+        source = _function_source(training_path, function_name)
+        assert "training_manager" not in source
+        assert "training_engine" not in source
+        assert "_restore_training_session(" not in source
+
+
+def test_sampling_http_routes_do_not_use_session_manager_as_authority() -> None:
+    service_path = REPO_ROOT / "mint_server" / "routes" / "service.py"
+    sampling_path = REPO_ROOT / "mint_server" / "routes" / "sampling.py"
+    for path, function_name in [
+        (service_path, "_create_sampling_session_impl"),
+        (service_path, "ensure_sampling_session"),
+        (service_path, "get_sampler"),
+        (service_path, "session_heartbeat"),
+        (sampling_path, "compute_logprobs"),
+    ]:
+        source = _function_source(path, function_name)
+        assert "session_manager" not in source
+        assert "_local_sampling_config(" not in source
+        assert "_active_session_manager(" not in source

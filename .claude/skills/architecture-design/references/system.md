@@ -47,9 +47,15 @@ Implications:
 
 - `mint_server/routes/*`
   - HTTP endpoints. Most heavy work is delegated to backend modules.
-  - `sampling.py`: async sampling + backpressure; uses `SessionManager`.
-  - `training.py`: training control plane; uses `TrainingSessionManager` + training engine.
-  - `weights.py`: save/load weights and checkpoints; bridges training to inference.
+  - `sampling.py`: async sampling + backpressure; HTTP paths read detached
+    sampling metadata and enqueue through `ModelWorkScheduler`; runtime
+    execution may use actor-local `SessionManager` caches.
+  - `training.py`: training control plane; HTTP paths read detached
+    training metadata and enqueue through `ModelWorkScheduler`; runtime
+    execution may use actor-local `TrainingSessionManager` + training engine.
+  - `weights.py`: save/load weights and checkpoints; HTTP paths read detached
+    training metadata before enqueue and bridge training to inference through
+    runtime actor execution.
   - `futures.py`: `request_id` polling.
 
 - `mint_server/backend/execution_context.py`

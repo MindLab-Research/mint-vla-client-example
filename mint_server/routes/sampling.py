@@ -349,6 +349,28 @@ async def _async_get_detached_sampling_snapshot(session_id: str) -> SamplingSess
     )
 
 
+async def _async_get_http_sampling_snapshot(session_id: str) -> SamplingSessionSnapshot | None:
+    try:
+        from ..backend.sampling_session_store import async_get_sampling_session_info
+
+        info = await async_get_sampling_session_info(session_id)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail="Sampling session store unavailable") from e
+    if not isinstance(info, dict):
+        return None
+    return SamplingSessionSnapshot(
+        session_id=str(info.get("session_id") or session_id),
+        uses_multi_lora=True,
+        uses_base_model=bool(info.get("uses_base_model")),
+        base_model=info.get("base_model"),
+        lora_rank=int(info.get("lora_rank") or 0),
+        adapter_path=info.get("adapter_path"),
+        lora_loaded=bool(info.get("lora_loaded")),
+        lora_int_id=None if info.get("lora_int_id") is None else int(info.get("lora_int_id")),
+        metadata_version=max(1, int(info.get("metadata_version") or 1)),
+    )
+
+
 def _has_local_sampling_session(session_id: str) -> bool:
     manager = _active_session_manager()
     if manager is None:
@@ -2087,7 +2109,7 @@ async def compute_logprobs(
         upstream_for_alias,
     )
 
-    snapshot = await _async_get_detached_sampling_snapshot(request.sampling_session_id)
+    snapshot = await _async_get_http_sampling_snapshot(request.sampling_session_id)
     remote = None
     if snapshot is None:
         try:
@@ -2101,8 +2123,8 @@ async def compute_logprobs(
                 remote = remote_sampling_session(request.sampling_session_id)
             except Exception:
                 remote = None
-    if snapshot is None and remote is None and session_manager is None:
-        raise HTTPException(status_code=503, detail="Sampling session store unavailable")
+    if snapshot is None and remote is None:
+        raise HTTPException(status_code=404, detail=f"Sampling session {request.sampling_session_id!r} not found")
     if remote is not None:
         upstream_alias, base_model = remote
         upstream = upstream_for_alias(upstream_alias)

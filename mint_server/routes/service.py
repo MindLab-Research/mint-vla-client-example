@@ -74,6 +74,7 @@ def _user_visible(request_user_data: dict | None, owner: str | None) -> bool:
 
 
 def _local_sampling_config(session_id: str) -> tuple[str | None, str | None, int | None]:
+    """Runtime/test helper; HTTP routes must prefer detached sampling metadata."""
     if session_manager is None:
         return None, None, None
     get_base_model = getattr(session_manager, "get_session_base_model", None)
@@ -462,9 +463,7 @@ async def _create_sampling_session_impl(
             existing_base = str(existing_info.get("base_model") or "")
             existing_adapter = existing_info.get("adapter_path")
             existing_rank = int(existing_info.get("lora_rank") or 0)
-        else:
-            existing_base, existing_adapter, existing_rank = _local_sampling_config(sampling_session_id)
-        if existing_base is not None:
+        if isinstance(existing_info, dict):
             expected_adapter = adapter_path if request.model_path else None
             expected_rank = int(lora_rank)
             if existing_base != base_model or existing_adapter != expected_adapter or int(existing_rank or 0) != expected_rank:
@@ -514,18 +513,6 @@ async def _create_sampling_session_impl(
             )
         raise HTTPException(status_code=503, detail="Session index store unavailable") from e
 
-    if session_manager is not None:
-        if request.model_path:
-            session_manager.register_multi_lora_session(
-                session_id=sampling_session_id,
-                base_model=base_model,
-                lora_rank=lora_rank,
-                adapter_path=adapter_path,
-                lora_loaded=False,
-            )
-        else:
-            session_manager.register_base_model_session(sampling_session_id, base_model=base_model)
-
     return CreateSamplingSessionResponse(sampling_session_id=sampling_session_id)
 
 
@@ -566,8 +553,6 @@ async def ensure_sampling_session(
             base_model = info.get("base_model")
     except Exception:
         base_model = None
-    if base_model is None and session_manager is not None:
-        base_model, _adapter_path, _rank = _local_sampling_config(sampling_session_id)
     if base_model is None:
         remote = await async_remote_sampling_session(sampling_session_id)
         if remote is not None:
@@ -660,8 +645,6 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
                 persisted = None
             if isinstance(persisted, dict):
                 base_model = persisted.get("base_model")
-            elif session_manager is not None:
-                base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
 
         from ..client_compat import checkpoint_uri, prefer_tinker_uri
 
@@ -709,15 +692,6 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
                 base_model=str(base_model),
                 model_path=None,
             )
-    if session_manager is not None:
-        base_model, _adapter_path, _rank = _local_sampling_config(sampler_id)
-        if base_model:
-            return GetSamplerResponse(
-                sampler_id=sampler_id,
-                base_model=str(base_model),
-                model_path=None,
-            )
-
     raise HTTPException(status_code=404, detail=f"Sampler '{sampler_id}' not found")
 
 
@@ -907,10 +881,13 @@ async def _child_sampler_ids_for_heartbeat(
 
 
 async def _touch_child_sampler_sessions(root_session_id: str, request_user_data: dict | None) -> None:
-    if session_manager is None:
-        return
+    from ..backend.sampling_session_store import async_set_sampling_session_last_activity
+
     for sampler_id in await _child_sampler_ids_for_heartbeat(root_session_id, request_user_data):
-        session_manager.mark_session_inflight(sampler_id, 0)
+        try:
+            await async_set_sampling_session_last_activity(sampler_id, time.time())
+        except Exception as e:
+            logger.warning("[session_heartbeat] child sampler activity update failed for %s: %s", sampler_id, e)
 
 
 async def _update_session_heartbeat_store(session_id: str) -> None:
@@ -941,10 +918,7 @@ async def session_heartbeat(
         await async_set_sampling_session_last_activity(request.session_id, time.time())
     except Exception as e:
         logger.warning("[session_heartbeat] sampling session activity update failed for %s: %s", request.session_id, e)
-    if session_manager is not None:
-        # Keep the root session alive and refresh heartbeat-eligible child sampler sessions.
-        session_manager.mark_session_inflight(request.session_id, 0)
-        await _touch_child_sampler_sessions(request.session_id, _get_user_data(http_request))
+    await _touch_child_sampler_sessions(request.session_id, _get_user_data(http_request))
     return SessionHeartbeatResponse()
 
 

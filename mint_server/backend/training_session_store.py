@@ -52,6 +52,20 @@ def set_training_session_last_activity(model_id: str, last_activity: float) -> N
         logger.debug("Training session store write failed: last_activity: %s", e)
 
 
+async def async_set_training_session_last_activity(model_id: str, last_activity: float) -> float | None:
+    return await task_state_store.async_set_training_session_last_activity(
+        model_id=str(model_id),
+        last_activity=float(last_activity),
+    )
+
+
+async def async_mark_training_session_inflight(model_id: str, delta: int) -> int | None:
+    return await task_state_store.async_mark_training_session_inflight(
+        model_id=str(model_id),
+        delta=int(delta),
+    )
+
+
 def get_training_session_info(model_id: str) -> dict[str, Any] | None:
     return task_state_store.get_training_session(model_id=str(model_id))
 

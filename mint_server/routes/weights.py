@@ -281,7 +281,10 @@ def _require_write_access(request: Request) -> None:
         raise HTTPException(status_code=403, detail="Write access required")
 
 
-def _mark_training_inflight(model_id: str, delta: int) -> None:
+async def _mark_training_inflight(model_id: str, delta: int) -> None:
+    from ..backend.training_session_store import async_mark_training_session_inflight
+
+    await async_mark_training_session_inflight(model_id, delta)
     manager = _current_training_manager()
     if manager is None:
         return
@@ -387,16 +390,7 @@ async def _get_route_training_store_info(model_id: str) -> dict | None:
     info = await _get_training_route_session_info(model_id)
     if isinstance(info, dict):
         return info
-    if training_manager is not None:
-        return None
-
-    try:
-        from ..backend.training_session_store import async_get_training_session_info
-
-        store_info = await async_get_training_session_info(model_id)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail="Training session store unavailable") from e
-    return store_info if isinstance(store_info, dict) else None
+    return None
 
 
 async def _protect_training_session_enqueue_window(session_info: dict) -> None:
@@ -1145,9 +1139,8 @@ async def save_weights(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1163,8 +1156,8 @@ async def save_weights(
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_weights request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1246,9 +1239,8 @@ async def save_state(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1264,8 +1256,8 @@ async def save_state(
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue save_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1522,7 +1514,7 @@ async def _do_save_state(
             )
     finally:
         if inflight_marked:
-            _mark_training_inflight(request.model_id, -1)
+            await _mark_training_inflight(request.model_id, -1)
 
 
 async def _do_save_weights(
@@ -1731,7 +1723,7 @@ async def _do_save_weights(
             )
     finally:
         if inflight_marked:
-            _mark_training_inflight(request.model_id, -1)
+            await _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================
@@ -1867,9 +1859,8 @@ async def load_state(
 
     inflight_marked = False
     try:
-        if training_manager is not None:
-            _mark_training_inflight(request.model_id, +1)
-            inflight_marked = True
+        await _mark_training_inflight(request.model_id, +1)
+        inflight_marked = True
         await _enqueue_weights_model_work(
             route_start_s=route_start_s,
             request_id=request_id,
@@ -1885,8 +1876,8 @@ async def load_state(
             ),
         )
     except Exception as e:
-        if inflight_marked and training_manager is not None:
-            _mark_training_inflight(request.model_id, -1)
+        if inflight_marked:
+            await _mark_training_inflight(request.model_id, -1)
         raise HTTPException(status_code=503, detail=f"Failed to enqueue load_state request: {e}")
 
     return UntypedAPIFuture(request_id=request_id)
@@ -1987,7 +1978,7 @@ async def _do_load_state(
         await _fail_future(request_id, str(e))
     finally:
         if inflight_marked:
-            _mark_training_inflight(request.model_id, -1)
+            await _mark_training_inflight(request.model_id, -1)
 
 
 # =============================================================================

@@ -21,6 +21,8 @@ KNOWN_MODEL_WORK_OPS = (
     "training.optim_step",
     "training.reset_expert_bias",
     "training.delete_model",
+    "training.get_session_guard_state",
+    "training.get_tokenizer_info",
     "weights.save_weights",
     "weights.save_state",
     "weights.load_state",
@@ -264,6 +266,40 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
             op=op,
             request_id=str(item.request_id),
             attributes={"queue.stage": "queue.stage.training.delete_model"},
+        )
+
+    if op == "training.get_session_guard_state":
+        async def _run():
+            payload = json.loads(item.request_json.decode("utf-8"))
+            model_id = payload.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                raise ValueError("training.get_session_guard_state missing model_id")
+            await training._do_get_session_guard_state(item.request_id, model_id)
+
+        return await run_async_with_otel_span(
+            "queue.stage.training.get_session_guard_state",
+            _run,
+            component=component,
+            op=op,
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.get_session_guard_state"},
+        )
+
+    if op == "training.get_tokenizer_info":
+        async def _run():
+            payload = json.loads(item.request_json.decode("utf-8"))
+            model_id = payload.get("model_id")
+            if not isinstance(model_id, str) or not model_id:
+                raise ValueError("training.get_tokenizer_info missing model_id")
+            await training._do_get_tokenizer_info(item.request_id, model_id)
+
+        return await run_async_with_otel_span(
+            "queue.stage.training.get_tokenizer_info",
+            _run,
+            component=component,
+            op=op,
+            request_id=str(item.request_id),
+            attributes={"queue.stage": "queue.stage.training.get_tokenizer_info"},
         )
 
     if op == "weights.save_weights":

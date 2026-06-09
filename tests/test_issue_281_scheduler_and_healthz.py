@@ -88,6 +88,14 @@ async def _noop_async(*_args, **_kwargs) -> None:
     return None
 
 
+def _stub_training_inflight(monkeypatch, route_module, calls: list[tuple[str, int]] | None = None) -> None:
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        if calls is not None:
+            calls.append((model_id, delta))
+
+    monkeypatch.setattr(route_module, "_mark_training_inflight", _mark_training_inflight)
+
+
 @pytest.mark.anyio
 async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> None:
     import mint_server.backend.model_work_scheduler as mws
@@ -102,6 +110,7 @@ async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> Non
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    _stub_training_inflight(monkeypatch, tr)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
@@ -186,6 +195,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    _stub_training_inflight(monkeypatch, tr)
     monkeypatch.setattr(tr, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(
         tr,
@@ -240,6 +250,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(mo
     monkeypatch.setattr(tr, "training_manager", SimpleNamespace(get_session=lambda _model_id: session))
     monkeypatch.setattr(tr, "training_engine", object())
     monkeypatch.setattr(tr, "_restore_training_session", lambda _model_id: None)
+    _stub_training_inflight(monkeypatch, tr)
     monkeypatch.setattr(
         tr,
         "_get_training_route_session_info",
@@ -330,16 +341,21 @@ async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(monkeypatc
         async def async_mark_queued(self, _request_id: str, meta=None) -> None:
             queued_meta.update(meta or {})
 
-    monkeypatch.setattr(
-        sr,
-        "session_manager",
-        SimpleNamespace(
-            is_multi_lora_session=lambda _session_id: True,
-            get_engine=lambda _session_id: None,
-            get_session_base_model=lambda _session_id: "Qwen/Qwen3-0.6B",
-            get_session_replica_key=lambda _session_id: "Qwen/Qwen3-0.6B::replica::1",
-        ),
-    )
+    async def _async_get_http_sampling_snapshot(session_id: str):
+        assert session_id == "sess-281"
+        return sr.SamplingSessionSnapshot(
+            session_id=session_id,
+            uses_multi_lora=True,
+            uses_base_model=False,
+            base_model="Qwen/Qwen3-0.6B",
+            lora_rank=0,
+            adapter_path=None,
+            lora_loaded=False,
+            lora_int_id=None,
+            metadata_version=1,
+        )
+
+    monkeypatch.setattr(sr, "_async_get_http_sampling_snapshot", _async_get_http_sampling_snapshot)
     monkeypatch.setattr(sr, "task_futures", _QueuedTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", _AsyncModelWorkScheduler(captured))
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
@@ -642,6 +658,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
     monkeypatch.setattr(tr, "training_manager", manager)
     monkeypatch.setattr(tr, "training_engine", SimpleNamespace(reset_expert_bias=_fake_reset))
     monkeypatch.setattr(tr, "_restore_training_session", _restore_training_session)
+    inflight_calls: list[tuple[str, int]] = []
+    _stub_training_inflight(monkeypatch, tr, inflight_calls)
     monkeypatch.setattr(
         tr,
         "task_futures",
@@ -660,7 +678,7 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         request_json=b"{}",
         extra={},
     )
-    assert manager.get_local_session("run-281").inflight_ops == 1
+    assert inflight_calls == [("run-281", 1)]
     assert captured["op"] == "training.reset_expert_bias"
     assert captured["affinity_group"] == "training_session:run-281"
     assert captured["ordering_key"] == "training_session:run-281"

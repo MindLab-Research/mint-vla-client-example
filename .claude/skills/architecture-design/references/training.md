@@ -15,6 +15,14 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
 - API workers do not bind local training managers or engines into route module
   globals. HTTP routes validate requests, read durable metadata, and enqueue
   work through detached scheduling paths.
+- Existing-session HTTP routes do not use process-local `TrainingSessionManager`
+  sessions as fallback authority. They resolve `model_id` from
+  `TaskStateStore`-backed training metadata, mark durable `inflight_ops` before
+  enqueue, and release that durable claim if enqueue fails.
+- Synchronous-looking control-plane routes that require runtime state, such as
+  expert-bias reset, session guard state, and runtime tokenizer fetch, enqueue
+  internal serialized model work and wait on `TaskStateStore` futures instead
+  of calling local engine handles from the API worker.
 - `TrainingSessionManager` keeps runtime-actor-local working objects for active
   `model_id`s, inflight counters, and create-time scratch state after
   `ModelRuntimeActor` initializes execution bindings. It is not the durable
@@ -52,8 +60,13 @@ Training sessions (`model_id`) have a bounded lifecycle:
 
 Idle cleanup uses `inflight_ops` protection (analogous to `SessionInfo.inflight_requests`):
 
-- **Queued HTTP handlers** call `mark_inflight(+1)` before enqueue so queue delay cannot race idle cleanup.
-- **Background workers** for queued existing-session operations release that claim with `mark_inflight(-1)` in `finally`, which also refreshes `last_activity` on completion.
+- **Queued HTTP handlers** update `TaskStateStore` training-session
+  `inflight_ops` before enqueue so queue delay cannot race detached idle
+  cleanup. They decrement the durable claim if enqueue fails.
+- **Background workers** for queued existing-session operations release their
+  runtime-local manager claim with `mark_inflight(-1)` in `finally`, which also
+  refreshes `last_activity` on completion. Runtime helpers also update durable
+  metadata where route-level helpers are used.
 - **`_do_create_model`** / **`_do_create_model_from_state`** call `mark_inflight(+1)` right after `create_session()` to protect during slow actor creation.
 - **Session activity persistence**: `touch_session()` / `mark_inflight()` write `last_activity` through `TaskStateStore` training-session methods so API restarts restore the real idle deadline instead of falling back to `created_at`.
 - **Read-only lookups** (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline.

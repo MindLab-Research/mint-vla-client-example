@@ -631,6 +631,23 @@ class TaskStateStore:
             return None
         return float(updated["last_activity"])
 
+    def mark_training_session_inflight(self, *, model_id: str, delta: int) -> int | None:
+        now = time.time()
+        updated = self._hot_kv.mutate_record(
+            "training_session",
+            str(model_id),
+            lambda info: None
+            if info is None
+            else {
+                **info,
+                "last_activity": now,
+                "inflight_ops": max(0, int(info.get("inflight_ops") or 0) + int(delta)),
+            },
+        )
+        if updated is None:
+            return None
+        return int(updated.get("inflight_ops") or 0)
+
     def get_training_session(self, *, model_id: str) -> dict[str, Any] | None:
         return self._hot_kv.get_record("training_session", str(model_id))
 
@@ -1381,7 +1398,6 @@ class TaskStateStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = _now(now)
-        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -3502,6 +3518,9 @@ class _TaskStateStoreActor:
     def set_training_session_last_activity(self, **kwargs: Any) -> float | None:
         return self._store.set_training_session_last_activity(**kwargs)
 
+    def mark_training_session_inflight(self, **kwargs: Any) -> int | None:
+        return self._store.mark_training_session_inflight(**kwargs)
+
     def get_training_session(self, **kwargs: Any) -> dict[str, Any] | None:
         return self._store.get_training_session(**kwargs)
 
@@ -4124,6 +4143,18 @@ class TaskStateStoreClient:
     def set_training_session_last_activity(self, *, model_id: str, last_activity: float) -> float | None:
         out = self._call_sync("set_training_session_last_activity", model_id=str(model_id), last_activity=float(last_activity))
         return None if out is None else float(out)
+
+    async def async_set_training_session_last_activity(self, *, model_id: str, last_activity: float) -> float | None:
+        out = await self._call("set_training_session_last_activity", model_id=str(model_id), last_activity=float(last_activity))
+        return None if out is None else float(out)
+
+    def mark_training_session_inflight(self, *, model_id: str, delta: int) -> int | None:
+        out = self._call_sync("mark_training_session_inflight", model_id=str(model_id), delta=int(delta))
+        return None if out is None else int(out)
+
+    async def async_mark_training_session_inflight(self, *, model_id: str, delta: int) -> int | None:
+        out = await self._call("mark_training_session_inflight", model_id=str(model_id), delta=int(delta))
+        return None if out is None else int(out)
 
     def get_training_session(self, *, model_id: str) -> dict[str, Any] | None:
         out = self._call_sync("get_training_session", model_id=str(model_id))
