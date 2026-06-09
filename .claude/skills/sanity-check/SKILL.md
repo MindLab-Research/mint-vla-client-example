@@ -52,6 +52,10 @@ Wrapper contract:
 - Recursively discovers nested `timing_events.jsonl`, `timing_summary.json`, and `timing_summary.md`.
 - Writes `summary.json`, `summary.md`, and `final_feishu_report.md`.
 - Sends exactly one final Feishu report for `--all-models`, including preflight failures.
+- After `--all-models` completes with all 5 models passed, deletes checkpoints
+  created by that wrapper run for `MINT_TEST_CHECKPOINT_OWNER_ID` and records
+  cleanup counts in the summary/report. Failed or partial runs preserve
+  checkpoints for debugging.
 
 ## Model Matrix
 

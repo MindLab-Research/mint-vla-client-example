@@ -11,6 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO
 from urllib.error import HTTPError, URLError
@@ -19,6 +20,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://mint.macaron.xin"
 DEFAULT_RESULTS_ROOT = "/root/run_results/mint"
+PROD_CONFIG_DIR = Path("/vePFS-Mindverse/share/mint/prod/config")
 FEISHU_TITLE = "MinT sanity-check report"
 DEFAULT_MODELS = {
     "0.6b": "Qwen/Qwen3-0.6B",
@@ -113,6 +115,17 @@ def classify_preflight_failure(message: str) -> FailureClassification:
     )
 
 
+@dataclass
+class CheckpointCleanupResult:
+    attempted: bool = False
+    reason: str | None = None
+    listed: int = 0
+    selected: int = 0
+    deleted: int = 0
+    failed: int = 0
+    errors: list[str] | None = None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run MinT production RL sanity checks with aligned params and artifacts."
@@ -191,6 +204,18 @@ def parse_args() -> argparse.Namespace:
         dest="feishu",
         action="store_false",
         help="Do not send the final Feishu report.",
+    )
+    parser.add_argument(
+        "--cleanup-pass-checkpoints",
+        action="store_true",
+        default=True,
+        help="Delete checkpoints created by a full 5-model sanity run after all models pass.",
+    )
+    parser.add_argument(
+        "--no-cleanup-pass-checkpoints",
+        dest="cleanup_pass_checkpoints",
+        action="store_false",
+        help="Keep checkpoints even when the full sanity matrix passes.",
     )
     return parser.parse_args()
 
@@ -280,6 +305,142 @@ def preflight(base_url: str, api_key: str | None) -> None:
                 print(f"[preflight] /internal/actors -> {resp.status}")
         except (HTTPError, URLError, TimeoutError) as exc:
             print(f"[preflight] /internal/actors probe skipped: {exc}", file=sys.stderr)
+
+
+def _checkpoint_pg_dsn() -> str:
+    return (
+        os.environ.get("MINT_CHECKPOINT_INDEX_PG_DSN")
+        or os.environ.get("TINKER_USAGE_PG_DSN")
+        or os.environ.get("MINT_USAGE_PG_DSN")
+        or ""
+    ).strip()
+
+
+def _valid_checkpoint_segment(value: str) -> bool:
+    return bool(value) and value not in {".", ".."} and "/" not in value and "\\" not in value
+
+
+def _catalog_checkpoint_path(row: dict[str, object]) -> str:
+    storage_root = str(row.get("storage_root") or "")
+    owner_id = str(row.get("owner_id") or "anonymous").strip() or "anonymous"
+    model_id = str(row.get("model_id") or "")
+    raw_checkpoint_id = str(row.get("raw_checkpoint_id") or "")
+    checkpoint_type = str(row.get("checkpoint_type") or "")
+    if checkpoint_type not in {"training", "sampler"}:
+        raise ValueError(f"invalid checkpoint_type={checkpoint_type!r}")
+    for segment in (owner_id, model_id, raw_checkpoint_id):
+        if not _valid_checkpoint_segment(segment):
+            raise ValueError(f"invalid checkpoint path segment={segment!r}")
+    root_real = os.path.realpath(storage_root)
+    if not root_real or root_real == os.path.sep:
+        raise ValueError(f"invalid storage_root={storage_root!r}")
+    candidate = os.path.realpath(
+        os.path.join(storage_root, owner_id, model_id, raw_checkpoint_id, checkpoint_type)
+    )
+    if not candidate.startswith(root_real + os.sep):
+        raise ValueError("checkpoint path escaped storage_root")
+    return candidate
+
+
+def cleanup_pass_checkpoints(
+    *,
+    owner_id: str,
+    models: list[str],
+    started_at_epoch_s: float,
+) -> CheckpointCleanupResult:
+    import asyncio
+
+    return asyncio.run(
+        _async_cleanup_pass_checkpoints(
+            owner_id=owner_id,
+            models=models,
+            started_at_epoch_s=started_at_epoch_s,
+        )
+    )
+
+
+async def _async_cleanup_pass_checkpoints(
+    *,
+    owner_id: str,
+    models: list[str],
+    started_at_epoch_s: float,
+) -> CheckpointCleanupResult:
+    dsn = _checkpoint_pg_dsn()
+    if not dsn:
+        return CheckpointCleanupResult(
+            attempted=True,
+            failed=1,
+            errors=["checkpoint cleanup DSN is not configured"],
+        )
+
+    errors: list[str] = []
+    deleted = 0
+    started_at = datetime.fromtimestamp(started_at_epoch_s, tz=timezone.utc)
+    finished_at = datetime.now(timezone.utc)
+    model_set = set(models)
+
+    import asyncpg
+
+    conn = await asyncpg.connect(
+        dsn=dsn,
+        command_timeout=60,
+        statement_cache_size=0,
+        server_settings={"application_name": "mint_sanity_checkpoint_cleanup"},
+    )
+    try:
+        rows = await conn.fetch(
+            """
+            SELECT ckpt_id::text AS ckpt_id, owner_id, model_id, raw_checkpoint_id,
+                   checkpoint_type, storage_root, size_bytes, model_name, published_at
+            FROM checkpoint_catalog
+            WHERE deleted_at IS NULL
+              AND owner_id = $1
+              AND model_name = ANY($2::text[])
+              AND published_at >= $3
+              AND published_at <= $4
+            ORDER BY published_at ASC
+            """,
+            owner_id,
+            list(model_set),
+            started_at,
+            finished_at,
+        )
+
+        for row in rows:
+            row_dict = dict(row)
+            ckpt_id = str(row_dict["ckpt_id"])
+            try:
+                path = _catalog_checkpoint_path(row_dict)
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                status = await conn.execute(
+                    """
+                    UPDATE checkpoint_catalog
+                    SET deleted_at = now(), updated_at = now()
+                    WHERE ckpt_id = $1::uuid
+                      AND owner_id = $2
+                      AND deleted_at IS NULL
+                    """,
+                    ckpt_id,
+                    owner_id,
+                )
+                if status.endswith(" 1"):
+                    deleted += 1
+                else:
+                    errors.append(f"tombstone skipped ckpt_id={ckpt_id}")
+            except Exception as exc:
+                errors.append(f"delete ckpt_id={ckpt_id}: {type(exc).__name__}: {exc}")
+    finally:
+        await conn.close()
+
+    return CheckpointCleanupResult(
+        attempted=True,
+        listed=len(rows),
+        selected=len(rows),
+        deleted=deleted,
+        failed=len(errors),
+        errors=errors[:20],
+    )
 
 
 def ensure_runner_exists() -> None:
@@ -855,7 +1016,10 @@ def preflight_failure_results(models: list[str], message: str) -> list[dict[str,
     ]
 
 
-def build_feishu_report(results: list[dict[str, object]]) -> str:
+def build_feishu_report(
+    results: list[dict[str, object]],
+    cleanup_result: CheckpointCleanupResult | None = None,
+) -> str:
     lines: list[str] = []
     any_failed = False
     ok_count = sum(1 for result in results if result.get("status") == "ok")
@@ -895,6 +1059,12 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
     lines.append("")
     lines.append("**Ops:** none attempted by wrapper.")
     lines.append("**Issue:** not filed by wrapper.")
+    if cleanup_result is not None and cleanup_result.attempted:
+        lines.append(
+            "**Checkpoint cleanup:** "
+            f"selected={cleanup_result.selected}, deleted={cleanup_result.deleted}, "
+            f"failed={cleanup_result.failed}."
+        )
     if any_failed:
         details = [
             str(result.get("failure_detail"))
@@ -906,7 +1076,10 @@ def build_feishu_report(results: list[dict[str, object]]) -> str:
         else:
             lines.append("**Next:** preserve artifacts, classify with logs/telemetry, remediate minimally, then rerun the full matrix.")
     else:
-        lines.append("**Next:** no action required.")
+        if cleanup_result is not None and cleanup_result.failed:
+            lines.append("**Next:** inspect checkpoint cleanup errors in summary.json.")
+        else:
+            lines.append("**Next:** no action required.")
     return "\n".join(lines)
 
 
@@ -926,7 +1099,12 @@ def send_feishu_report(markdown: str) -> None:
     )
 
 
-def write_summary(results: list[dict[str, object]], run_root: Path, args: argparse.Namespace) -> tuple[Path, Path]:
+def write_summary(
+    results: list[dict[str, object]],
+    run_root: Path,
+    args: argparse.Namespace,
+    cleanup_result: CheckpointCleanupResult | None = None,
+) -> tuple[Path, Path]:
     json_path = Path(args.summary_json) if args.summary_json else run_root / "summary.json"
     md_path = Path(args.summary_md) if args.summary_md else run_root / "summary.md"
 
@@ -934,6 +1112,7 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
         "base_url": args.base_url,
         "num_models": len(results),
         "results": results,
+        "checkpoint_cleanup": cleanup_result.__dict__ if cleanup_result is not None else None,
     }
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
@@ -969,6 +1148,18 @@ def write_summary(results: list[dict[str, object]], run_root: Path, args: argpar
         if result.get("failure_detail"):
             lines.append(f"- failure_detail: `{result['failure_detail']}`")
         lines.append("")
+    if cleanup_result is not None:
+        lines.append("## Checkpoint Cleanup")
+        lines.append(f"- attempted: `{cleanup_result.attempted}`")
+        if cleanup_result.reason:
+            lines.append(f"- reason: `{cleanup_result.reason}`")
+        lines.append(f"- listed: `{cleanup_result.listed}`")
+        lines.append(f"- selected: `{cleanup_result.selected}`")
+        lines.append(f"- deleted: `{cleanup_result.deleted}`")
+        lines.append(f"- failed: `{cleanup_result.failed}`")
+        if cleanup_result.errors:
+            lines.append(f"- errors: `{json.dumps(cleanup_result.errors, sort_keys=True)}`")
+        lines.append("")
     md_path.write_text("\n".join(lines))
     return json_path, md_path
 
@@ -979,9 +1170,10 @@ def write_outputs_and_maybe_notify(
     args: argparse.Namespace,
     *,
     default_send_feishu: bool,
+    cleanup_result: CheckpointCleanupResult | None = None,
 ) -> bool:
-    json_path, md_path = write_summary(results, run_root, args)
-    feishu_report = build_feishu_report(results)
+    json_path, md_path = write_summary(results, run_root, args, cleanup_result)
+    feishu_report = build_feishu_report(results, cleanup_result)
     feishu_report_path = run_root / "final_feishu_report.md"
     feishu_report_path.write_text(feishu_report + "\n")
     print(f"[summary] json={json_path}")
@@ -1013,9 +1205,13 @@ def main() -> int:
     args = parse_args()
     ensure_runner_exists()
     load_env_file(Path(".secrets.env"))
+    if args.base_url == DEFAULT_BASE_URL:
+        load_env_file(PROD_CONFIG_DIR / "prod.env")
+        load_env_file(PROD_CONFIG_DIR / "secrets.env")
     if args.all_models and args.parallel:
         raise SystemExit("--all-models must run sequentially for production sanity-check")
 
+    wrapper_started_at = time.time()
     run_root = make_run_root(Path(args.results_root), args.run_name, create=not args.dry_run)
     models = selected_models(args)
     sequential = bool(args.sequential or args.all_models or not args.parallel)
@@ -1055,15 +1251,51 @@ def main() -> int:
             return 2
 
     results = run_parallel(runs, sequential)
+    failed = [result for result in results if result["exit_code"] != 0]
+    cleanup_result: CheckpointCleanupResult | None = None
+    should_cleanup = (
+        bool(args.cleanup_pass_checkpoints)
+        and bool(args.all_models)
+        and models == ALL_MODELS
+        and not failed
+    )
+    if should_cleanup:
+        owner_id = os.environ["MINT_TEST_CHECKPOINT_OWNER_ID"]
+        print("[cleanup] all models passed; deleting checkpoints created by this run")
+        cleanup_result = cleanup_pass_checkpoints(
+            owner_id=owner_id,
+            models=models,
+            started_at_epoch_s=wrapper_started_at,
+        )
+        print(
+            "[cleanup] "
+            f"listed={cleanup_result.listed} selected={cleanup_result.selected} "
+            f"deleted={cleanup_result.deleted} failed={cleanup_result.failed}"
+        )
+    elif args.all_models:
+        cleanup_result = CheckpointCleanupResult(
+            attempted=False,
+            reason=(
+                "not all models passed"
+                if failed
+                else "cleanup disabled or model matrix did not match ALL_MODELS"
+            ),
+        )
     if not write_outputs_and_maybe_notify(
-        results, run_root, args, default_send_feishu=bool(args.all_models)
+        results,
+        run_root,
+        args,
+        default_send_feishu=bool(args.all_models),
+        cleanup_result=cleanup_result,
     ):
         return 3
 
-    failed = [result for result in results if result["exit_code"] != 0]
     if failed:
         print(f"[summary] failed_models={len(failed)}", file=sys.stderr)
         return 1
+    if cleanup_result is not None and cleanup_result.failed:
+        print(f"[summary] checkpoint_cleanup_failed={cleanup_result.failed}", file=sys.stderr)
+        return 4
     print("[summary] all models passed")
     return 0
 

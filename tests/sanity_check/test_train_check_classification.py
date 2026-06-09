@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def _load_train_check():
@@ -163,6 +164,36 @@ def test_feishu_report_splits_sample_and_eval_throughput():
     assert "gen_tok_s" not in report
 
 
+def test_feishu_report_includes_checkpoint_cleanup_counts():
+    train_check = _load_train_check()
+    report = train_check.build_feishu_report(
+        [
+            {
+                "model": "Qwen/Test",
+                "status": "ok",
+                "slowest_stage": "rl_step_total",
+                "slowest_max_s": 10.0,
+                "wall_clock_s": 20.0,
+                "timing_degraded": False,
+                "generation_summary": None,
+                "queue_stage_attribution": None,
+                "degradation_reason": None,
+            }
+        ],
+        train_check.CheckpointCleanupResult(
+            attempted=True,
+            listed=7,
+            selected=3,
+            deleted=3,
+            failed=0,
+            errors=[],
+        ),
+    )
+
+    assert "Checkpoint cleanup" in report
+    assert "selected=3, deleted=3, failed=0" in report
+
+
 def test_queue_stage_attribution_aggregates_stable_buckets():
     train_check = _load_train_check()
     timing = {
@@ -249,3 +280,145 @@ def test_timing_degradation_is_thresholded_for_success_only():
         wall_clock_s=258.8,
         slowest_max_s=97.1,
     ) is None
+
+
+def test_main_cleans_up_after_full_matrix_pass(monkeypatch, tmp_path):
+    train_check = _load_train_check()
+    monkeypatch.chdir(Path(__file__).resolve().parents[2])
+    monkeypatch.setenv("MINT_API_KEY", "redacted")
+    monkeypatch.setenv("MINT_TEST_CHECKPOINT_OWNER_ID", "0123456789abcdef01234567")
+    monkeypatch.setattr(
+        train_check,
+        "parse_args",
+        lambda: SimpleNamespace(
+            models=[],
+            models_flag=[],
+            all_models=True,
+            num_rl_steps=1,
+            batch_size=2,
+            group_size=4,
+            max_tokens=128,
+            timeout_s=7200.0,
+            base_url=train_check.DEFAULT_BASE_URL,
+            results_root=str(tmp_path),
+            run_name="run",
+            sequential=False,
+            parallel=False,
+            skip_preflight=True,
+            dry_run=False,
+            summary_json=None,
+            summary_md=None,
+            feishu=False,
+            cleanup_pass_checkpoints=True,
+        ),
+    )
+    monkeypatch.setattr(train_check, "ensure_runner_exists", lambda: None)
+    monkeypatch.setattr(train_check, "load_env_file", lambda path: None)
+    monkeypatch.setattr(train_check, "build_runs", lambda args, run_root, create_dirs=True: [])
+
+    def ok_result(model):
+        return {
+            "model": model,
+            "status": "ok",
+            "exit_code": 0,
+            "stdout_log": None,
+            "stderr_log": None,
+            "request_ids": {},
+            "session_ids": {},
+            "timing_degraded": False,
+            "generation_summary": None,
+            "queue_stage_attribution": None,
+        }
+
+    monkeypatch.setattr(
+        train_check,
+        "run_parallel",
+        lambda runs, sequential: [ok_result(model) for model in train_check.ALL_MODELS],
+    )
+    calls = []
+
+    def fake_cleanup(**kwargs):
+        calls.append(kwargs)
+        return train_check.CheckpointCleanupResult(
+            attempted=True,
+            listed=5,
+            selected=5,
+            deleted=5,
+            failed=0,
+            errors=[],
+        )
+
+    monkeypatch.setattr(train_check, "cleanup_pass_checkpoints", fake_cleanup)
+
+    assert train_check.main() == 0
+    assert len(calls) == 1
+    assert calls[0]["models"] == train_check.ALL_MODELS
+
+
+def test_main_returns_failure_when_checkpoint_cleanup_fails(monkeypatch, tmp_path):
+    train_check = _load_train_check()
+    monkeypatch.chdir(Path(__file__).resolve().parents[2])
+    monkeypatch.setenv("MINT_API_KEY", "redacted")
+    monkeypatch.setenv("MINT_TEST_CHECKPOINT_OWNER_ID", "0123456789abcdef01234567")
+    monkeypatch.setattr(
+        train_check,
+        "parse_args",
+        lambda: SimpleNamespace(
+            models=[],
+            models_flag=[],
+            all_models=True,
+            num_rl_steps=1,
+            batch_size=2,
+            group_size=4,
+            max_tokens=128,
+            timeout_s=7200.0,
+            base_url=train_check.DEFAULT_BASE_URL,
+            results_root=str(tmp_path),
+            run_name="run",
+            sequential=False,
+            parallel=False,
+            skip_preflight=True,
+            dry_run=False,
+            summary_json=None,
+            summary_md=None,
+            feishu=False,
+            cleanup_pass_checkpoints=True,
+        ),
+    )
+    monkeypatch.setattr(train_check, "ensure_runner_exists", lambda: None)
+    monkeypatch.setattr(train_check, "load_env_file", lambda path: None)
+    monkeypatch.setattr(train_check, "build_runs", lambda args, run_root, create_dirs=True: [])
+
+    def ok_result(model):
+        return {
+            "model": model,
+            "status": "ok",
+            "exit_code": 0,
+            "stdout_log": None,
+            "stderr_log": None,
+            "request_ids": {},
+            "session_ids": {},
+            "timing_degraded": False,
+            "generation_summary": None,
+            "queue_stage_attribution": None,
+        }
+
+    monkeypatch.setattr(
+        train_check,
+        "run_parallel",
+        lambda runs, sequential: [ok_result(model) for model in train_check.ALL_MODELS],
+    )
+    monkeypatch.setattr(
+        train_check,
+        "cleanup_pass_checkpoints",
+        lambda **kwargs: train_check.CheckpointCleanupResult(
+            attempted=True,
+            listed=5,
+            selected=5,
+            deleted=4,
+            failed=1,
+            errors=["delete failed"],
+        ),
+    )
+
+    assert train_check.main() == 4
