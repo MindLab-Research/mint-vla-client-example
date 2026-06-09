@@ -43,7 +43,9 @@ def _ensure_ray_context_for_dispatch() -> None:
     raise RuntimeError("Ray is not initialized")
 
 
-async def execute_model_work_item(item: Any, *, component: str = "model_work_dispatch") -> None:
+async def execute_model_work_item(
+    item: Any, *, component: str = "model_work_dispatch"
+) -> None:
     _ensure_ray_context_for_dispatch()
     from ..models.mint_types import (
         ForwardBackwardReverseKLRequest,
@@ -70,6 +72,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
     op = str(item.op)
 
     if op == "sampling.asample":
+
         async def _run():
             logger.info(
                 "[%s] sampling.asample request_id=%s stage=before_model_validate",
@@ -87,6 +90,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
                 req,
                 item.user_id,
                 (item.extra or {}).get("gateway_auth"),
+                bool((item.extra or {}).get("suppress_billing")),
             )
 
         return await run_async_with_otel_span(
@@ -99,6 +103,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "sampling.compute_logprobs":
+
         async def _run():
             req = ComputeLogprobsRequest.model_validate_json(item.request_json)
             await sampling._do_compute_logprobs(
@@ -118,9 +123,12 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.create_model":
+
         async def _run():
             req = CreateModelRequest.model_validate_json(item.request_json)
-            await training._do_create_model(item.request_id, req, item.user_id, item.webhook_url)
+            await training._do_create_model(
+                item.request_id, req, item.user_id, item.webhook_url
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.training.create_model",
@@ -132,9 +140,12 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.create_model_from_state":
+
         async def _run():
             req = CreateModelFromStateRequest.model_validate_json(item.request_json)
-            await training._do_create_model_from_state(item.request_id, req, item.user_id)
+            await training._do_create_model_from_state(
+                item.request_id, req, item.user_id
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.training.create_model_from_state",
@@ -146,6 +157,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.train_step":
+
         async def _run():
             req = TrainStepRequest.model_validate_json(item.request_json)
             await training._do_train_step(
@@ -165,6 +177,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.forward":
+
         async def _run():
             req = ForwardRequest.model_validate_json(item.request_json)
             await training._do_forward(
@@ -183,6 +196,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.forward_backward":
+
         async def _run():
             req = ForwardBackwardRequest.model_validate_json(item.request_json)
             await training._do_forward_backward(
@@ -202,6 +216,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.save_weights_for_sampler":
+
         async def _run():
             req = SaveWeightsForSamplerRequest.model_validate_json(item.request_json)
             prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
@@ -224,6 +239,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.optim_step":
+
         async def _run():
             req = OptimStepRequest.model_validate_json(item.request_json)
             await training._do_optim_step(item.request_id, req, item.user_id)
@@ -238,6 +254,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.reset_expert_bias":
+
         async def _run():
             req = ResetExpertBiasRequest.model_validate_json(item.request_json)
             await training._do_reset_expert_bias(item.request_id, req)
@@ -252,6 +269,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.delete_model":
+
         async def _run():
             payload = json.loads(item.request_json.decode("utf-8"))
             model_id = payload.get("model_id")
@@ -269,6 +287,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.get_session_guard_state":
+
         async def _run():
             payload = json.loads(item.request_json.decode("utf-8"))
             model_id = payload.get("model_id")
@@ -286,6 +305,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "training.get_tokenizer_info":
+
         async def _run():
             payload = json.loads(item.request_json.decode("utf-8"))
             model_id = payload.get("model_id")
@@ -303,10 +323,11 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "weights.save_weights":
+
         async def _run():
             req = SaveStateRequest.model_validate_json(item.request_json)
             prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
-            await weights._do_save_state(
+            await weights._do_save_weights(
                 item.request_id,
                 req,
                 user_id=item.user_id,
@@ -324,6 +345,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "weights.save_state":
+
         async def _run():
             req = SaveStateRequest.model_validate_json(item.request_json)
             prefer_tinker = bool((item.extra or {}).get("prefer_tinker"))
@@ -345,6 +367,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "weights.load_state":
+
         async def _run():
             req = LoadStateRequest.model_validate_json(item.request_json)
             await weights._do_load_state(item.request_id, req, item.user_id)
@@ -359,6 +382,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "internal.noop":
+
         async def _run():
             from .task_state_store import task_futures
 
@@ -377,6 +401,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "mint.interpolate_checkpoints":
+
         async def _run():
             req = InterpolateCheckpointsRequest.model_validate_json(item.request_json)
             await mint._do_interpolate_checkpoints(
@@ -397,9 +422,12 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "mint.forward_backward_reverse_kl":
+
         async def _run():
             req = ForwardBackwardReverseKLRequest.model_validate_json(item.request_json)
-            await mint._do_forward_backward_reverse_kl(item.request_id, req, item.user_id)
+            await mint._do_forward_backward_reverse_kl(
+                item.request_id, req, item.user_id
+            )
 
         return await run_async_with_otel_span(
             "queue.stage.mint.forward_backward_reverse_kl",
@@ -411,6 +439,7 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "mint.vla.train_step":
+
         async def _run():
             req = VLATrainStepRequest.model_validate_json(item.request_json)
             await mint._do_vla_train_step(
@@ -431,13 +460,16 @@ async def execute_model_work_item(item: Any, *, component: str = "model_work_dis
         )
 
     if op == "mint.action.act":
+
         async def _run():
             req = ActRequest.model_validate_json(item.request_json)
             await action_sampling._do_act(
                 item.request_id,
                 req,
                 gateway_auth=(item.extra or {}).get("gateway_auth"),
-                billing_observation_input=(item.extra or {}).get("billing_observation_input"),
+                billing_observation_input=(item.extra or {}).get(
+                    "billing_observation_input"
+                ),
             )
 
         return await run_async_with_otel_span(

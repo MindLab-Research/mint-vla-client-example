@@ -11,12 +11,24 @@ import pytest
 
 
 def _import_training_route():
-    sys.modules.setdefault("mint_server.routes.service", types.ModuleType("mint_server.routes.service"))
+    sys.modules.setdefault(
+        "mint_server.routes.service", types.ModuleType("mint_server.routes.service")
+    )
     return importlib.import_module("mint_server.routes.training")
 
 
 async def _identity_materialize(session):
     return session
+
+
+def _stub_training_inflight(monkeypatch, tr) -> list[tuple[str, int]]:
+    calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        calls.append((model_id, delta))
+
+    monkeypatch.setattr(tr, "_mark_training_inflight", _mark_training_inflight)
+    return calls
 
 
 @pytest.fixture
@@ -32,7 +44,10 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -99,9 +114,13 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
+    monkeypatch.setattr(
+        tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
@@ -118,10 +137,10 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     request = SaveWeightsForSamplerRequest(model_id="run-408", seq_id=0)
     await asyncio.wait_for(
         tr._do_save_weights_for_sampler(
-        request_id="req-408-save",
-        request=request,
-        user_id="owner-408",
-        prefer_tinker=True,
+            request_id="req-408-save",
+            request=request,
+            user_id="owner-408",
+            prefer_tinker=True,
         ),
         timeout=0.1,
     )
@@ -136,6 +155,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     sampling_session_id = response["sampling_session_id"]
     assert isinstance(sampling_session_id, str) and sampling_session_id
     assert response["path"] is None
+    assert inflight_calls == [("run-408", -1)]
     assert registration == {
         "session_id": sampling_session_id,
         "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -157,7 +177,10 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -217,12 +240,18 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     monkeypatch.setattr(
         tr,
         "task_futures",
-        SimpleNamespace(async_resolve=_async_resolve, async_fail=lambda *_args, **_kwargs: None),
+        SimpleNamespace(
+            async_resolve=_async_resolve, async_fail=lambda *_args, **_kwargs: None
+        ),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
+    monkeypatch.setattr(
+        tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
@@ -253,6 +282,7 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     assert warm_calls == ["Qwen/Qwen3-30B-A3B-Instruct-2507"]
     assert len(scheduled_tasks) == 1
     assert len(resolved) == 2
+    assert inflight_calls == [("run-408", -1), ("run-408", -1)]
     assert len(registration_calls) == 2
     assert all(call[1]["path"] is None for call in resolved)
 
@@ -269,7 +299,10 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -332,9 +365,13 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
         ),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
+    monkeypatch.setattr(
+        tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
@@ -351,6 +388,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     assert failures == [("req-408-save", "ray not connected")]
     assert resolved == {}
     assert registration == {}
+    assert inflight_calls == [("run-408", -1)]
 
 
 @pytest.mark.anyio
@@ -361,7 +399,10 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -425,9 +466,13 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
         ),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
+    monkeypatch.setattr(
+        tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
@@ -444,3 +489,4 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     assert failures == [("req-408-save", "async warm failed")]
     assert resolved == {}
     assert registration == {}
+    assert inflight_calls == [("run-408", -1)]

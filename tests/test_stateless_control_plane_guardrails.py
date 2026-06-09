@@ -19,9 +19,15 @@ def test_initialize_execution_bindings_is_runtime_actor_only() -> None:
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 func = node.func
-                if isinstance(func, ast.Name) and func.id == "initialize_execution_bindings":
+                if (
+                    isinstance(func, ast.Name)
+                    and func.id == "initialize_execution_bindings"
+                ):
                     callers.append(str(path.relative_to(REPO_ROOT)))
-                elif isinstance(func, ast.Attribute) and func.attr == "initialize_execution_bindings":
+                elif (
+                    isinstance(func, ast.Attribute)
+                    and func.attr == "initialize_execution_bindings"
+                ):
                     callers.append(str(path.relative_to(REPO_ROOT)))
 
     assert callers == ["mint_server/backend/model_runtime_actor.py"]
@@ -42,7 +48,9 @@ def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
 
 
 def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
-    source = (REPO_ROOT / "mint_server" / "backend" / "execution_bindings.py").read_text()
+    source = (
+        REPO_ROOT / "mint_server" / "backend" / "execution_bindings.py"
+    ).read_text()
     assert "from ..routes" not in source
     forbidden_assignments = [
         ".session_manager =",
@@ -56,8 +64,12 @@ def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
 
 
 def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
-    runtime_source = (REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py").read_text()
-    context_source = (REPO_ROOT / "mint_server" / "backend" / "execution_context.py").read_text()
+    runtime_source = (
+        REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+    ).read_text()
+    context_source = (
+        REPO_ROOT / "mint_server" / "backend" / "execution_context.py"
+    ).read_text()
 
     assert "bind_legacy_route_globals" not in runtime_source
     assert "bind_legacy_route_globals" not in context_source
@@ -69,7 +81,10 @@ def _function_source(path: Path, function_name: str) -> str:
     tree = ast.parse(source, filename=str(path))
     lines = source.splitlines()
     for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function_name:
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == function_name
+        ):
             return "\n".join(lines[node.lineno - 1 : node.end_lineno])
     raise AssertionError(f"function {function_name!r} not found in {path}")
 
@@ -83,10 +98,16 @@ def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFuncti
     }
 
 
-def _called_local_functions(node: ast.AST, functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]) -> set[str]:
+def _called_local_functions(
+    node: ast.AST, functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef]
+) -> set[str]:
     called: set[str] = set()
     for child in ast.walk(node):
-        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id in functions:
+        if (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Name)
+            and child.func.id in functions
+        ):
             called.add(child.func.id)
     return called
 
@@ -108,7 +129,9 @@ def _reachable_local_function_names(
         if name not in functions:
             continue
         seen.add(name)
-        stack.extend(_called_local_functions(functions[name], functions) - seen - ignored)
+        stack.extend(
+            _called_local_functions(functions[name], functions) - seen - ignored
+        )
     return seen
 
 
@@ -156,7 +179,9 @@ def test_mainline_http_routes_do_not_use_training_route_globals_as_authority() -
     assert "_mark_training_inflight" in reachable
 
 
-def test_mainline_weights_http_routes_do_not_use_training_route_globals_as_authority() -> None:
+def test_mainline_weights_http_routes_do_not_use_training_route_globals_as_authority() -> (
+    None
+):
     weights_path = REPO_ROOT / "mint_server" / "routes" / "weights.py"
     roots = ["save_weights", "save_state", "load_state"]
     source = _function_sources(weights_path, set(roots))

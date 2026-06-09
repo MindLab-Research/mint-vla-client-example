@@ -13,8 +13,20 @@ import pytest
 
 
 def _import_training_route():
-    sys.modules.setdefault("mint_server.routes.service", types.ModuleType("mint_server.routes.service"))
+    sys.modules.setdefault(
+        "mint_server.routes.service", types.ModuleType("mint_server.routes.service")
+    )
     return importlib.import_module("mint_server.routes.training")
+
+
+def _stub_training_inflight(monkeypatch, tr) -> list[tuple[str, int]]:
+    calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        calls.append((model_id, delta))
+
+    monkeypatch.setattr(tr, "_mark_training_inflight", _mark_training_inflight)
+    return calls
 
 
 @pytest.fixture
@@ -45,11 +57,14 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    inflight_calls = _stub_training_inflight(monkeypatch, tr)
 
     async def _identity_materialize(session):
         return session
 
-    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        tr, "_materialize_training_session_for_stateful_use", _identity_materialize
+    )
 
     ckpt_dir = tmp_path / "sampler_ephemeral"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -110,9 +125,13 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
         SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
     )
     monkeypatch.setattr(tr, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
+    monkeypatch.setattr(
+        tr, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
     monkeypatch.setattr(tr, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
+    monkeypatch.setattr(
+        tr, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir)
+    )
     monkeypatch.setattr(sis, "add_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "add_heartbeat_sampler_to_session", lambda **_kwargs: None)
     monkeypatch.setattr(sis, "upsert_sampler_index", lambda _payload: None)
@@ -142,22 +161,41 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     await asyncio.sleep(0)
 
     assert resolved["request_id"] == "req-408-save"
+    assert inflight_calls == [("run-408", -1)]
     span_by_name = {name: kwargs for name, kwargs in span_calls}
     assert "training.save_weights_for_sampler.validate_checkpoint" in span_by_name
     assert "training.save_weights_for_sampler.write_checkpoint_metadata" in span_by_name
-    assert "training.save_weights_for_sampler.schedule_background_engine_warm" in span_by_name
+    assert (
+        "training.save_weights_for_sampler.schedule_background_engine_warm"
+        in span_by_name
+    )
     assert "training.save_weights_for_sampler.background_engine_warm" in span_by_name
     assert "training.save_weights_for_sampler.register_sampling_session" in span_by_name
     assert "training.save_weights_for_sampler.session_index_write" in span_by_name
-    assert span_by_name["training.save_weights_for_sampler.validate_checkpoint"]["request_id"] == "req-408-save"
-    assert span_by_name["training.save_weights_for_sampler.validate_checkpoint"]["attributes"]["model_id"] == "run-408"
-    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["traceparent"] == (
-        "00-" + ("a" * 32) + "-" + ("1" * 16) + "-01"
+    assert (
+        span_by_name["training.save_weights_for_sampler.validate_checkpoint"][
+            "request_id"
+        ]
+        == "req-408-save"
     )
-    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["request_id"] == "req-408-save"
-    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"]["attributes"]["base_model"] == (
-        "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert (
+        span_by_name["training.save_weights_for_sampler.validate_checkpoint"][
+            "attributes"
+        ]["model_id"]
+        == "run-408"
     )
+    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"][
+        "traceparent"
+    ] == ("00-" + ("a" * 32) + "-" + ("1" * 16) + "-01")
+    assert (
+        span_by_name["training.save_weights_for_sampler.background_engine_warm"][
+            "request_id"
+        ]
+        == "req-408-save"
+    )
+    assert span_by_name["training.save_weights_for_sampler.background_engine_warm"][
+        "attributes"
+    ]["base_model"] == ("Qwen/Qwen3-30B-A3B-Instruct-2507")
 
 
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
@@ -194,16 +232,33 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
             created.append({"options": dict(kwargs)})
             return _Options(kwargs)
 
-    monkeypatch.setattr(model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool())
+    monkeypatch.setattr(
+        model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool()
+    )
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {})
-    monkeypatch.setattr(model_registry, "is_topology_desired_model", lambda _base_model: False)
+    monkeypatch.setattr(
+        model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {}
+    )
+    monkeypatch.setattr(
+        model_registry, "is_topology_desired_model", lambda _base_model: False
+    )
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
-    monkeypatch.setattr(md.ray, "get_actor", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("missing")))
-    monkeypatch.setattr(md.ray.util, "get_placement_group", lambda _name: fake_pg, raising=False)
-    monkeypatch.setattr(md.ray.util, "remove_placement_group", lambda pg: removed.append(pg), raising=False)
+    monkeypatch.setattr(
+        md.ray,
+        "get_actor",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("missing")),
+    )
+    monkeypatch.setattr(
+        md.ray.util, "get_placement_group", lambda _name: fake_pg, raising=False
+    )
+    monkeypatch.setattr(
+        md.ray.util,
+        "remove_placement_group",
+        lambda pg: removed.append(pg),
+        raising=False,
+    )
     monkeypatch.setattr(time, "sleep", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         md,
@@ -227,15 +282,17 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
 
     assert actor is fake_actor
     assert removed == [fake_pg]
-    assert actor_ctor_calls == [{
-        "base_model": "/tmp/qwen",
-        "lora_rank": 8,
-        "learning_rate": 1e-4,
-        "distributed_config": md.DistributedConfig(),
-        "observability_base_model": "/tmp/qwen",
-        "traceparent": "00-" + ("b" * 32) + "-" + ("2" * 16) + "-01",
-        "request_id": "req-408-create",
-    }]
+    assert actor_ctor_calls == [
+        {
+            "base_model": "/tmp/qwen",
+            "lora_rank": 8,
+            "learning_rate": 1e-4,
+            "distributed_config": md.DistributedConfig(),
+            "observability_base_model": "/tmp/qwen",
+            "traceparent": "00-" + ("b" * 32) + "-" + ("2" * 16) + "-01",
+            "request_id": "req-408-create",
+        }
+    ]
     span_by_name = {name: kwargs for name, kwargs in span_calls}
     assert "training.create_model.megatron.actor_lookup" in span_by_name
     assert "training.create_model.megatron.orphan_pg_probe" in span_by_name
@@ -243,11 +300,19 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
     assert "training.create_model.megatron.orphan_pg_remove" in span_by_name
     assert "training.create_model.megatron.actor_create" in span_by_name
     assert "training.create_model.megatron.register_new_actor" in span_by_name
-    assert span_by_name["training.create_model.megatron.actor_lookup"]["traceparent"] == (
-        "00-" + ("b" * 32) + "-" + ("2" * 16) + "-01"
+    assert span_by_name["training.create_model.megatron.actor_lookup"][
+        "traceparent"
+    ] == ("00-" + ("b" * 32) + "-" + ("2" * 16) + "-01")
+    assert (
+        span_by_name["training.create_model.megatron.actor_lookup"]["request_id"]
+        == "req-408-create"
     )
-    assert span_by_name["training.create_model.megatron.actor_lookup"]["request_id"] == "req-408-create"
-    assert span_by_name["training.create_model.megatron.actor_create"]["attributes"]["base_model"] == "/tmp/qwen"
+    assert (
+        span_by_name["training.create_model.megatron.actor_create"]["attributes"][
+            "base_model"
+        ]
+        == "/tmp/qwen"
+    )
 
 
 def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
@@ -302,11 +367,17 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
         assert actor is existing_actor
         killed.append(dict(kwargs))
 
-    monkeypatch.setattr(model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool())
+    monkeypatch.setattr(
+        model_actor_supervisor_mod, "get_model_actor_supervisor", lambda: _FakePool()
+    )
     monkeypatch.setattr(config_mod, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(config_mod, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {})
-    monkeypatch.setattr(model_registry, "is_topology_desired_model", lambda _base_model: False)
+    monkeypatch.setattr(
+        model_actor_supervisor_mod, "actor_observability_metadata", lambda _actor: {}
+    )
+    monkeypatch.setattr(
+        model_registry, "is_topology_desired_model", lambda _base_model: False
+    )
     monkeypatch.setattr(md, "MegatronWorkerGroup", _FakeMegatronWorkerGroup)
     monkeypatch.setattr(md.ray, "is_initialized", lambda: True)
     monkeypatch.setattr(md.ray, "get_actor", _fake_get_actor)
@@ -339,7 +410,9 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
 
 
 @pytest.mark.anyio
-async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(monkeypatch) -> None:
+async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(
+    monkeypatch,
+) -> None:
     from mint_server.backend import megatron_distributed as md
 
     captured: dict[str, object] = {}
@@ -354,7 +427,11 @@ async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_co
 
     monkeypatch.setattr(md, "get_or_create_megatron_worker_group", _fake_get_or_create)
     monkeypatch.setattr(asyncio, "to_thread", _fake_to_thread)
-    monkeypatch.setattr(md, "get_current_traceparent", lambda: "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01")
+    monkeypatch.setattr(
+        md,
+        "get_current_traceparent",
+        lambda: "00-" + ("c" * 32) + "-" + ("3" * 16) + "-01",
+    )
     monkeypatch.setattr(md, "get_request_id", lambda: "req-408-async")
 
     out = await md.async_get_or_create_megatron_worker_group(

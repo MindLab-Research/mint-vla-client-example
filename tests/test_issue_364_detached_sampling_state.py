@@ -87,13 +87,19 @@ class _FakeModelActorInventory:
         self.calls.append((actor_name, int(delta)))
 
 
-def _install_fake_model_actor_inventory(monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorInventory) -> None:
+def _install_fake_model_actor_inventory(
+    monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorInventory
+) -> None:
     module = types.ModuleType("mint_server.backend.model_actor_supervisor")
     module.get_model_actor_supervisor = lambda: pool
-    monkeypatch.setitem(sys.modules, "mint_server.backend.model_actor_supervisor", module)
+    monkeypatch.setitem(
+        sys.modules, "mint_server.backend.model_actor_supervisor", module
+    )
 
 
-def test_issue_364_register_multi_lora_session_persists_detached_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_364_register_multi_lora_session_persists_detached_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     persisted: list[dict] = []
 
     monkeypatch.setattr(
@@ -215,7 +221,10 @@ async def test_issue_364_app_restore_sampling_sessions_reads_detached_store(
 
     assert restored == 2
     assert manager.is_base_model_session("sess-364-base") is True
-    assert manager.get_session_base_model("sess-364-lora") == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert (
+        manager.get_session_base_model("sess-364-lora")
+        == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    )
     assert manager.get_session_lora_int_id("sess-364-lora") == 4
     snapshot = manager.get_sampling_session_snapshot("sess-364-lora")
     assert snapshot is not None
@@ -300,7 +309,11 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
     )
     monkeypatch.setattr(
         "mint_server.backend.sampling_session_store.get_sampling_session_info",
-        lambda session_id: dict(detached_info) if session_id == detached_info.get("session_id") else None,
+        lambda session_id: (
+            dict(detached_info)
+            if session_id == detached_info.get("session_id")
+            else None
+        ),
     )
 
     def _delete_sampling_session(session_id: str) -> None:
@@ -352,7 +365,11 @@ async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
             captured.update(kwargs)
             request_id = str(kwargs["request_id"])
             futures[request_id] = SampleResponse(
-                sequences=[SampledSequence(tokens=[101, 102], logprobs=None, stop_reason="length")]
+                sequences=[
+                    SampledSequence(
+                        tokens=[101, 102], logprobs=None, stop_reason="length"
+                    )
+                ]
             )
             return {"ok": True, "scheduler_instance_id": "scheduler-364"}
 
@@ -403,6 +420,7 @@ async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
     assert captured["domain_key"] == "vllm:Qwen/Qwen3-0.6B"
     assert captured["affinity_group"] == "base:Qwen/Qwen3-0.6B"
     assert captured["ordering_key"] == "session:sess-364-live"
+    assert captured["extra"]["suppress_billing"] is False
     assert sequence.tokens == [101, 102]
 
 
@@ -441,7 +459,9 @@ async def test_issue_364_refreshes_local_sampler_on_version_mismatch(
     assert snapshot.base_model == "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
-def test_issue_364_restore_sampling_session_merges_last_activity_without_version_bump() -> None:
+def test_issue_364_restore_sampling_session_merges_last_activity_without_version_bump() -> (
+    None
+):
     manager = SessionManager()
     manager.register_multi_lora_session(
         session_id="sess-364-activity",
@@ -476,10 +496,18 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
     assert snapshot.metadata_version == 3
 
 
-def test_issue_364_model_actor_inventory_wrapper_preserves_metadata_without_ray(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_issue_364_model_actor_inventory_wrapper_preserves_metadata_without_ray(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-    from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
-    monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
+    from mint_server.backend.model_actor_supervisor import (
+        ActorType,
+        ModelActorSupervisor,
+    )
+
+    monkeypatch.setattr(
+        model_actor_inventory_module.ray, "is_initialized", lambda: False
+    )
     pool = ModelActorSupervisor()
     pool.clear(kill_actors=False)
     actor_name = "actor-364-wrapper-local"
@@ -495,7 +523,9 @@ def test_issue_364_model_actor_inventory_wrapper_preserves_metadata_without_ray(
     )
     pool.mark_ready(actor_name)
 
-    listed = [entry for entry in pool.list_actors() if entry["actor_name"] == actor_name]
+    listed = [
+        entry for entry in pool.list_actors() if entry["actor_name"] == actor_name
+    ]
     assert len(listed) == 1
     assert listed[0]["metadata"]["max_lora_rank"] == 64
     assert listed[0]["backend"] == "peft"
@@ -522,7 +552,9 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
     resolved: dict = {}
 
     class _FakeInferenceEngine:
-        async def add_lora_for_session_from_path(self, *, sampling_session_id: str, lora_path: str) -> int:
+        async def add_lora_for_session_from_path(
+            self, *, sampling_session_id: str, lora_path: str
+        ) -> int:
             assert sampling_session_id
             assert lora_path == str(ckpt_dir)
             return 41
@@ -557,7 +589,19 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
     async def _identity_materialize(session_arg):
         return session_arg
 
-    monkeypatch.setattr(training_route, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setattr(
+        training_route,
+        "_materialize_training_session_for_stateful_use",
+        _identity_materialize,
+    )
+    inflight_calls: list[tuple[str, int]] = []
+
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        inflight_calls.append((model_id, delta))
+
+    monkeypatch.setattr(
+        training_route, "_mark_training_inflight", _mark_training_inflight
+    )
     monkeypatch.setattr(
         training_route,
         "training_manager",
@@ -572,6 +616,7 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
     )
     monkeypatch.setattr(training_route, "inference_manager", _FakeInferenceManager())
+
     async def _async_resolve(request_id: str, response, **_kwargs):
         resolved.update({"request_id": request_id, "response": response})
 
@@ -586,11 +631,23 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
             async_fail=_async_fail,
         ),
     )
-    monkeypatch.setattr(training_route, "checkpoint_has_optimizer_state", lambda _path: False)
-    monkeypatch.setattr(training_route, "validate_sampler_checkpoint_for_sampling", lambda _path: None)
-    monkeypatch.setattr(training_route, "write_checkpoint_metadata", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(training_route, "build_ephemeral_checkpoint_dir", lambda **_kwargs: str(ckpt_dir))
-    monkeypatch.setattr(training_route, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        training_route, "checkpoint_has_optimizer_state", lambda _path: False
+    )
+    monkeypatch.setattr(
+        training_route, "validate_sampler_checkpoint_for_sampling", lambda _path: None
+    )
+    monkeypatch.setattr(
+        training_route, "write_checkpoint_metadata", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        training_route,
+        "build_ephemeral_checkpoint_dir",
+        lambda **_kwargs: str(ckpt_dir),
+    )
+    monkeypatch.setattr(
+        training_route, "begin_async_checkpoint_mirror", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(
         "mint_server.client_compat.checkpoint_uri",
         lambda *_args, **_kwargs: "mint://ckpt/run-364/_ephemeral_364",
@@ -621,6 +678,7 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
     assert registered["adapter_path"] == str(ckpt_dir)
     assert resolved["request_id"] == "req-364-save-sampler"
     assert resolved["response"]["sampling_session_id"] is not None
+    assert inflight_calls == [("run-364", -1)]
 
 
 @pytest.mark.anyio
@@ -682,6 +740,7 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
     )
 
     monkeypatch.setattr(sampling_route, "session_manager", manager)
+
     async def _async_get_sampling_session_info(_session_id: str):
         return None
 
@@ -698,7 +757,9 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
         lambda _session_id: None,
     )
 
-    restored = await sampling_route._restore_local_sampling_session_if_needed("sess-364-gone")
+    restored = await sampling_route._restore_local_sampling_session_if_needed(
+        "sess-364-gone"
+    )
 
     assert restored is False
     assert manager.get_sampling_session_snapshot("sess-364-gone") is None
@@ -739,7 +800,9 @@ async def test_issue_364_asample_missing_detached_sampler_is_404(
     )
 
     with pytest.raises(HTTPException) as exc_info:
-        await sampling_route.asample(req, SimpleNamespace(state=SimpleNamespace(user_data=None), headers={}))
+        await sampling_route.asample(
+            req, SimpleNamespace(state=SimpleNamespace(user_data=None), headers={})
+        )
 
     assert exc_info.value.status_code == 404
     assert "sess-364-missing" in str(exc_info.value.detail)
@@ -764,6 +827,7 @@ async def test_issue_364_compute_logprobs_marks_model_actor_inventory_inflight(
     failed: list[str] = []
 
     monkeypatch.setattr(sampling_route, "session_manager", manager)
+
     async def _async_resolve(request_id: str, response, **_kwargs):
         resolved.update({"request_id": request_id, "response": response})
 

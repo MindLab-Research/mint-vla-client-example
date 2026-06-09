@@ -1,7 +1,12 @@
 import anyio
 from types import SimpleNamespace
 
-from mint_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
+from mint_server.models.types import (
+    ComputeLogprobsRequest,
+    ModelInput,
+    SampleRequest,
+    SamplingParams,
+)
 from mint_server.routes import sampling as sampling_route
 
 
@@ -17,11 +22,15 @@ class _StubTaskFutureService:
         self.order.append("resolve")
         self.resolved[request_id] = dict(payload)
 
-    async def async_resolve(self, request_id: str, payload: dict, *, billing_observations=None) -> None:
+    async def async_resolve(
+        self, request_id: str, payload: dict, *, billing_observations=None
+    ) -> None:
         self.resolve(request_id, payload)
         self.billing_observations[request_id] = list(billing_observations or [])
 
-    async def async_append_billing_outbox(self, observations, *, source: str = "unknown") -> dict:
+    async def async_append_billing_outbox(
+        self, observations, *, source: str = "unknown"
+    ) -> dict:
         self.order.append(f"append:{source}")
         self.outbox_observations.extend(list(observations or []))
         return {"ok": True, "inserted": len(list(observations or []))}
@@ -96,7 +105,10 @@ def test_asample_logs_prefill_and_sample_dimensions(monkeypatch):
     observations = task_futures.billing_observations["req-sample"]
     assert [event["charge_item"] for event in observations] == ["sampling", "sampling"]
     assert [event["quantity"] for event in observations] == [3, 2]
-    assert [event["route"] for event in observations] == ["sampling.asample", "sampling.asample"]
+    assert [event["route"] for event in observations] == [
+        "sampling.asample",
+        "sampling.asample",
+    ]
     assert [event["dimension"] for event in observations] == [
         "prefill",
         "sample",
@@ -124,6 +136,33 @@ def test_asample_attaches_billing_to_future_resolve(monkeypatch):
     assert len(task_futures.billing_observations["req-order"]) == 2
 
 
+def test_asample_suppresses_billing_when_requested(monkeypatch):
+    task_futures = _StubTaskFutureService()
+
+    monkeypatch.setattr(sampling_route, "session_manager", _StubSessionManager())
+    monkeypatch.setattr(sampling_route, "task_futures", task_futures)
+
+    request = SampleRequest(
+        sampling_session_id="sess-1",
+        num_samples=1,
+        prompt=ModelInput.from_ints([1, 2, 3]),
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+
+    anyio.run(
+        sampling_route._do_sample,
+        "req-suppressed",
+        request,
+        None,
+        _gateway_auth(),
+        True,
+    )
+
+    assert "req-suppressed" in task_futures.resolved
+    assert task_futures.failed == {}
+    assert task_futures.billing_observations["req-suppressed"] == []
+
+
 def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
     task_futures = _StubTaskFutureService()
 
@@ -136,7 +175,13 @@ def test_compute_logprobs_logs_prefill_dimension(monkeypatch):
         sequence=ModelInput.from_ints([11, 12, 13, 14]),
     )
 
-    anyio.run(sampling_route._do_compute_logprobs, "req-logprobs", request, None, _gateway_auth())
+    anyio.run(
+        sampling_route._do_compute_logprobs,
+        "req-logprobs",
+        request,
+        None,
+        _gateway_auth(),
+    )
 
     assert "req-logprobs" in task_futures.resolved
     assert task_futures.failed == {}

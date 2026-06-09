@@ -32,7 +32,13 @@ class _DummyTokenizer:
             return self.decode_text
         return "|".join(str(token) for token in tokens)
 
-    def apply_chat_template(self, messages, tools=None, tokenize: bool = True, add_generation_prompt: bool = True):
+    def apply_chat_template(
+        self,
+        messages,
+        tools=None,
+        tokenize: bool = True,
+        add_generation_prompt: bool = True,
+    ):
         assert tokenize is True
         assert add_generation_prompt is True
         self.chat_calls.append(list(messages))
@@ -55,6 +61,7 @@ def _build_app() -> FastAPI:
 
 def _reset_openai_compat_state(monkeypatch):
     from collections import OrderedDict
+
     monkeypatch.setattr(openai_compat, "_session_cache", OrderedDict())
     monkeypatch.setattr(openai_compat, "_tokenizer_cache", {})
 
@@ -64,7 +71,9 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-1", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -76,18 +85,26 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
         return SampledSequence(tokens=[11, 12], logprobs=None, stop_reason="eos")
 
     async def _unexpected_billing_outbox_append(_events):
-        raise AssertionError("empty billing observations should not schedule outbox append")
+        raise AssertionError(
+            "empty billing observations should not schedule outbox append"
+        )
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
-    monkeypatch.setattr(openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append)
+    monkeypatch.setattr(
+        openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append
+    )
 
     app = _build_app()
 
     async def _run():
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http_client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http_client:
             client = AsyncOpenAI(
                 base_url="http://testserver/oai/api/v1",
                 api_key="dummy",
@@ -120,7 +137,9 @@ def test_openai_completions_appends_billing_outbox_before_response(monkeypatch):
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-bill", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -136,15 +155,31 @@ def test_openai_completions_appends_billing_outbox_before_response(monkeypatch):
 
     def _build_billing_observations(**_kwargs):
         return [
-            {"route": "sampling.sample_once", "dimension": "prefill", "request_id": "req-oai-billing"},
-            {"route": "sampling.sample_once", "dimension": "sample", "request_id": "req-oai-billing"},
+            {
+                "route": "sampling.sample_once",
+                "dimension": "prefill",
+                "request_id": "req-oai-billing",
+            },
+            {
+                "route": "sampling.sample_once",
+                "dimension": "sample",
+                "request_id": "req-oai-billing",
+            },
         ]
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
-    monkeypatch.setattr(openai_compat, "build_sample_once_billing_observations", _build_billing_observations)
-    monkeypatch.setattr(openai_compat, "_append_billing_observations", _append_billing_observations)
+    monkeypatch.setattr(
+        openai_compat,
+        "build_sample_once_billing_observations",
+        _build_billing_observations,
+    )
+    monkeypatch.setattr(
+        openai_compat, "_append_billing_observations", _append_billing_observations
+    )
 
     client = TestClient(_build_app())
     response = client.post(
@@ -156,12 +191,18 @@ def test_openai_completions_appends_billing_outbox_before_response(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert seen["billing_before_response"] is True
     observations = seen["billing_observations"]
-    assert [obs["route"] for obs in observations] == ["sampling.sample_once", "sampling.sample_once"]
+    assert [obs["route"] for obs in observations] == [
+        "sampling.sample_once",
+        "sampling.sample_once",
+    ]
     assert [obs["dimension"] for obs in observations] == ["prefill", "sample"]
-    assert [obs["request_id"] for obs in observations] == ["req-oai-billing", "req-oai-billing"]
+    assert [obs["request_id"] for obs in observations] == [
+        "req-oai-billing",
+        "req-oai-billing",
+    ]
 
 
 def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
@@ -169,7 +210,9 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {"polls": 0}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         _ = (http_request, parent_session_id)
         seen["base_model"] = model_path
         return "remote-sample-235b", "Qwen/Qwen3-235B-A22B-Instruct-2507"
@@ -178,7 +221,12 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
         seen["tokenizer_base_model"] = base_model
         return tokenizer
 
-    async def _fake_forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s):
+    async def _fake_snapshot(_sid: str):
+        return None
+
+    async def _fake_forward_json(
+        *, upstream, method, path, incoming_headers, json_body, timeout_s
+    ):
         seen.setdefault("forward_calls", []).append(
             {
                 "alias": upstream.alias,
@@ -213,14 +261,28 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
             )
         raise AssertionError(f"unexpected path: {path}")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    async def _unexpected_local_billing_append(_observations):
+        raise AssertionError("remote OpenAI completions must not add local billing")
+
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
     monkeypatch.setattr(sampling_route, "session_manager", None)
+    monkeypatch.setattr(
+        sampling_route, "_async_get_http_sampling_snapshot", _fake_snapshot
+    )
 
     import mint_server.gateway as gw
 
+    async def _fake_async_remote_sampling_session(_sid: str):
+        return ("mint-prod-aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+
+    monkeypatch.setattr(
+        gw, "async_remote_sampling_session", _fake_async_remote_sampling_session
+    )
     monkeypatch.setattr(
         gw,
         "remote_sampling_session",
@@ -232,6 +294,9 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
         lambda alias: type("Upstream", (), {"alias": alias})(),
     )
     monkeypatch.setattr(gw, "forward_json", _fake_forward_json)
+    monkeypatch.setattr(
+        openai_compat, "_append_billing_observations", _unexpected_local_billing_append
+    )
 
     client = TestClient(_build_app())
     response = client.post(
@@ -243,14 +308,17 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
     assert body["choices"][0]["text"] == "31|32"
     assert seen["base_model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
     assert seen["tokenizer_base_model"] == "Qwen/Qwen3-235B-A22B-Instruct-2507"
     assert seen["forward_calls"][0]["path"] == "/api/v1/asample"
-    assert seen["forward_calls"][0]["json_body"]["sampling_session_id"] == "remote-sample-235b"
+    assert (
+        seen["forward_calls"][0]["json_body"]["sampling_session_id"]
+        == "remote-sample-235b"
+    )
     assert seen["forward_calls"][1]["path"] == "/api/v1/retrieve_future"
     assert seen["polls"] == 2
 
@@ -260,7 +328,9 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-2", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -272,18 +342,26 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
         return SampledSequence(tokens=[21, 22, 23], logprobs=None, stop_reason="length")
 
     async def _unexpected_billing_outbox_append(_events):
-        raise AssertionError("empty billing observations should not schedule outbox append")
+        raise AssertionError(
+            "empty billing observations should not schedule outbox append"
+        )
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
-    monkeypatch.setattr(openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append)
+    monkeypatch.setattr(
+        openai_compat, "_append_billing_observations", _unexpected_billing_outbox_append
+    )
 
     app = _build_app()
 
     async def _run():
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as http_client:
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver"
+        ) as http_client:
             client = AsyncOpenAI(
                 base_url="http://testserver/oai/api/v1",
                 api_key="dummy",
@@ -307,79 +385,125 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
     assert tokenizer.chat_tools == [None]
 
 
-def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
+def test_openai_completions_ignores_service_session_manager_fallback(monkeypatch):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
-
-    class _Engine:
-        async def generate(self, **_kwargs):
-            return SimpleNamespace(
-                token_ids=[41, 42],
-                logprobs=None,
-                routed_experts=None,
-                stop_reason="eos",
-            )
+    seen: dict[str, object] = {"polls": 0}
 
     class _Manager:
         def __init__(self):
-            self.engine = _Engine()
             self.inflight: list[tuple[str, int]] = []
 
         def get_sampling_session_snapshot(self, session_id: str):
-            return SimpleNamespace(
-                session_id=session_id,
-                uses_multi_lora=False,
-                uses_base_model=True,
-                base_model="Qwen/Qwen3-4B-Instruct-2507",
-                lora_rank=0,
-                adapter_path=None,
-                lora_loaded=False,
-                lora_int_id=None,
-                metadata_version=1,
+            raise AssertionError(
+                "OpenAI completions must not use service_route.session_manager as authority"
             )
 
         def mark_session_inflight(self, session_id: str, delta: int) -> None:
             self.inflight.append((session_id, int(delta)))
 
         def is_multi_lora_session(self, _session_id: str) -> bool:
-            return False
+            raise AssertionError(
+                "OpenAI completions must not use service_route.session_manager as authority"
+            )
 
         def get_engine(self, _session_id: str):
-            return self.engine
+            raise AssertionError(
+                "OpenAI completions must not use service_route.session_manager as authority"
+            )
 
         def get_session_base_model(self, _session_id: str) -> str:
-            return "Qwen/Qwen3-4B-Instruct-2507"
+            raise AssertionError(
+                "OpenAI completions must not use service_route.session_manager as authority"
+            )
 
     async def _fake_get_tokenizer(_base_model: str):
         return tokenizer
 
-    async def _fake_create_sampling_session(_request, _http_request):
-        return SimpleNamespace(sampling_session_id="sample-local")
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
+        _ = (http_request, parent_session_id)
+        seen["model_path"] = model_path
+        return "sample-local", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_no_billing_outbox(**_kwargs):
         return None
 
-    async def _fake_snapshot(_sid: str):
+    async def _fake_no_openai_billing_outbox(_observations):
         return None
+
+    async def _fake_snapshot(_sid: str):
+        return sampling_route.SamplingSessionSnapshot(
+            session_id="sample-local",
+            uses_multi_lora=False,
+            uses_base_model=True,
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            lora_rank=0,
+            adapter_path=None,
+            lora_loaded=False,
+            lora_int_id=None,
+            metadata_version=1,
+        )
+
+    async def _fake_asample_impl(
+        request, _http_request, request_id_override=None, suppress_billing=False
+    ):
+        seen["queued_session_id"] = request.sampling_session_id
+        seen["queued_prompt"] = request.prompt.to_token_ids()
+        seen["request_id_override"] = request_id_override
+        seen["suppress_billing"] = suppress_billing
+        return SimpleNamespace(request_id=request_id_override or "req-local")
+
+    async def _fake_retrieve_future(body, _http_request, response):
+        seen["last_request_id"] = body.request_id
+        seen["polls"] = int(seen["polls"]) + 1
+        response.status_code = 200
+        return {
+            "sequences": [
+                {
+                    "tokens": [41, 42],
+                    "logprobs": None,
+                    "routed_experts": None,
+                    "stop_reason": "eos",
+                }
+            ],
+            "prompt_logprobs": None,
+            "topk_prompt_logprobs": None,
+        }
 
     manager = _Manager()
 
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", service_route.ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
-    monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", manager)
     monkeypatch.setattr(sampling_route, "session_manager", None)
-    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
-    monkeypatch.setattr(sampling_route, "_append_billing_observations", _fake_no_billing_outbox)
-    monkeypatch.setattr(sampling_route, "build_billing_auth_context", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        sampling_route, "_async_get_http_sampling_snapshot", _fake_snapshot
+    )
+    monkeypatch.setattr(sampling_route, "_asample_impl", _fake_asample_impl)
+    monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
+    monkeypatch.setattr(
+        sampling_route, "_append_billing_observations", _fake_no_billing_outbox
+    )
+    monkeypatch.setattr(
+        openai_compat, "_append_billing_observations", _fake_no_openai_billing_outbox
+    )
+    monkeypatch.setattr(
+        sampling_route, "build_billing_auth_context", lambda *_a, **_k: None
+    )
 
     import mint_server.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
 
-    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(
+        gw, "async_remote_sampling_session", _fake_async_remote_sampling_session
+    )
     monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
 
     client = TestClient(_build_app())
@@ -392,18 +516,27 @@ def test_openai_completions_falls_back_to_service_session_manager(monkeypatch):
         },
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     body = response.json()
     assert body["choices"][0]["text"] == "41|42"
-    assert manager.inflight == [("sample-local", 1), ("sample-local", -1)]
+    assert manager.inflight == []
+    assert seen["model_path"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert seen["queued_session_id"] == "sample-local"
+    assert seen["last_request_id"] == seen["request_id_override"]
+    assert seen["suppress_billing"] is True
+    assert seen["polls"] == 1
 
 
-def test_openai_completions_uses_detached_queue_when_route_session_managers_unbound(monkeypatch):
+def test_openai_completions_uses_detached_queue_when_route_session_managers_unbound(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {"polls": 0}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-queue", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -423,12 +556,17 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
             metadata_version=1,
         )
 
-    async def _fake_asample(request, _http_request):
+    async def _fake_asample_impl(
+        request, _http_request, request_id_override=None, suppress_billing=False
+    ):
         seen["queued_session_id"] = request.sampling_session_id
         seen["queued_prompt"] = request.prompt.to_token_ids()
-        return SimpleNamespace(request_id="req-queue-1")
+        seen["request_id_override"] = request_id_override
+        seen["suppress_billing"] = suppress_billing
+        return SimpleNamespace(request_id=request_id_override or "req-queue-1")
 
     async def _fake_retrieve_future(body, _http_request, response):
+        seen["last_request_id"] = body.request_id
         seen["polls"] = int(seen["polls"]) + 1
         if int(seen["polls"]) == 1:
             response.status_code = 408
@@ -447,13 +585,17 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
             "topk_prompt_logprobs": None,
         }
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(sampling_route, "session_manager", None)
-    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
-    monkeypatch.setattr(sampling_route, "asample", _fake_asample)
+    monkeypatch.setattr(
+        sampling_route, "_async_get_http_sampling_snapshot", _fake_snapshot
+    )
+    monkeypatch.setattr(sampling_route, "_asample_impl", _fake_asample_impl)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
     import mint_server.gateway as gw
@@ -461,7 +603,9 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
 
-    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(
+        gw, "async_remote_sampling_session", _fake_async_remote_sampling_session
+    )
     monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
 
     client = TestClient(_build_app())
@@ -478,15 +622,21 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
     body = response.json()
     assert body["choices"][0]["text"] == "51|52"
     assert seen["queued_session_id"] == "sample-queue"
+    assert seen["last_request_id"] == seen["request_id_override"]
+    assert seen["suppress_billing"] is True
     assert seen["polls"] == 2
 
 
-def test_openai_chat_completions_uses_detached_queue_when_route_session_managers_unbound(monkeypatch):
+def test_openai_chat_completions_uses_detached_queue_when_route_session_managers_unbound(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {"polls": 0}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-chat-queue", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -506,10 +656,14 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
             metadata_version=1,
         )
 
-    async def _fake_asample(request, _http_request):
+    async def _fake_asample_impl(
+        request, _http_request, request_id_override=None, suppress_billing=False
+    ):
         seen["queued_session_id"] = request.sampling_session_id
         seen["queued_prompt"] = request.prompt.to_token_ids()
-        return SimpleNamespace(request_id="req-chat-queue-1")
+        seen["request_id_override"] = request_id_override
+        seen["suppress_billing"] = suppress_billing
+        return SimpleNamespace(request_id=request_id_override or "req-chat-queue-1")
 
     async def _fake_retrieve_future(body, _http_request, response):
         seen["last_request_id"] = body.request_id
@@ -531,13 +685,17 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
             "topk_prompt_logprobs": None,
         }
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", sampling_route.sample_once)
     monkeypatch.setattr(service_route, "session_manager", None)
     monkeypatch.setattr(sampling_route, "session_manager", None)
-    monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _fake_snapshot)
-    monkeypatch.setattr(sampling_route, "asample", _fake_asample)
+    monkeypatch.setattr(
+        sampling_route, "_async_get_http_sampling_snapshot", _fake_snapshot
+    )
+    monkeypatch.setattr(sampling_route, "_asample_impl", _fake_asample_impl)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
     import mint_server.gateway as gw
@@ -545,7 +703,9 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
 
-    monkeypatch.setattr(gw, "async_remote_sampling_session", _fake_async_remote_sampling_session)
+    monkeypatch.setattr(
+        gw, "async_remote_sampling_session", _fake_async_remote_sampling_session
+    )
     monkeypatch.setattr(gw, "remote_sampling_session", lambda _sid: None)
 
     client = TestClient(_build_app())
@@ -563,7 +723,8 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
     assert body["choices"][0]["message"]["content"] == "61|62|63"
     assert body["choices"][0]["finish_reason"] == "length"
     assert seen["queued_session_id"] == "sample-chat-queue"
-    assert seen["last_request_id"] == "req-chat-queue-1"
+    assert seen["last_request_id"] == seen["request_id_override"]
+    assert seen["suppress_billing"] is True
     assert seen["polls"] == 2
     assert tokenizer.chat_calls == [[{"role": "user", "content": "Say hi"}]]
 
@@ -578,7 +739,9 @@ def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch
 """.strip()
     seen: dict[str, object] = {}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-tool-1", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -589,7 +752,9 @@ def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch
         seen["sample_kwargs"] = kwargs
         return SampledSequence(tokens=[41, 42], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -623,19 +788,29 @@ def test_openai_chat_completions_accepts_tools_and_parses_tool_calls(monkeypatch
     assert body["choices"][0]["finish_reason"] == "tool_calls"
     assert body["choices"][0]["message"]["content"] is None
     assert body["choices"][0]["message"]["tool_calls"][0]["type"] == "function"
-    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "get_weather"
-    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == '{"location": "北京"}'
+    assert (
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+        == "get_weather"
+    )
+    assert (
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        == '{"location": "北京"}'
+    )
     assert seen["model_path"] == "mint://exp/sampler_weights/000084"
     assert tokenizer.chat_calls == [[{"role": "user", "content": "北京天气如何"}]]
     assert tokenizer.chat_tools[0][0]["function"]["name"] == "get_weather"
 
 
-def test_openai_chat_completions_retries_invalid_tool_name_with_explicit_prompt(monkeypatch):
+def test_openai_chat_completions_retries_invalid_tool_name_with_explicit_prompt(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
     seen: dict[str, object] = {"sample_calls": 0}
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         seen["model_path"] = model_path
         return "sample-tool-retry", "Qwen/Qwen3-4B-Instruct-2507"
 
@@ -657,9 +832,13 @@ def test_openai_chat_completions_retries_invalid_tool_name_with_explicit_prompt(
 {"name": "web_search", "arguments": {"query": "北京 天气", "count": 5}}
 </tool_call>
 """.strip()
-        return SampledSequence(tokens=[61 + call_index], logprobs=None, stop_reason="stop")
+        return SampledSequence(
+            tokens=[61 + call_index], logprobs=None, stop_reason="stop"
+        )
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -694,8 +873,14 @@ def test_openai_chat_completions_retries_invalid_tool_name_with_explicit_prompt(
     assert response.status_code == 200
     body = response.json()
     assert body["choices"][0]["finish_reason"] == "tool_calls"
-    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "web_search"
-    assert body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] == '{"query": "北京 天气", "count": 5}'
+    assert (
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+        == "web_search"
+    )
+    assert (
+        body["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        == '{"query": "北京 天气", "count": 5}'
+    )
     assert seen["sample_calls"] == 2
     assert tokenizer.chat_tools[0][0]["function"]["name"] == "web_search"
     assert tokenizer.chat_tools[1] is None
@@ -703,11 +888,15 @@ def test_openai_chat_completions_retries_invalid_tool_name_with_explicit_prompt(
     assert "must exactly match" in tokenizer.chat_calls[1][0]["content"]
 
 
-def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monkeypatch):
+def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-2", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -716,7 +905,9 @@ def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monk
     async def _fake_sample_once(**kwargs):
         return SampledSequence(tokens=[51], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -736,7 +927,7 @@ def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monk
                             "type": "function",
                             "function": {
                                 "name": "get_weather",
-                                "arguments": "{\"location\":\"北京\"}",
+                                "arguments": '{"location":"北京"}',
                             },
                         }
                     ],
@@ -745,7 +936,7 @@ def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monk
                     "role": "tool",
                     "name": "get_weather",
                     "tool_call_id": "call_123",
-                    "content": "{\"temp\":10}",
+                    "content": '{"temp":10}',
                 },
             ],
             "tools": [
@@ -766,36 +957,40 @@ def test_openai_chat_completions_passes_assistant_tool_call_and_tool_result(monk
     )
 
     assert response.status_code == 200
-    assert tokenizer.chat_calls == [[
-        {"role": "user", "content": "北京天气如何"},
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {
-                    "id": "call_123",
-                    "type": "function",
-                    "function": {
-                        "name": "get_weather",
-                        "arguments": "{\"location\":\"北京\"}",
-                    },
-                }
-            ],
-        },
-        {
-            "role": "tool",
-            "content": "{\"temp\":10}",
-            "name": "get_weather",
-            "tool_call_id": "call_123",
-        },
-    ]]
+    assert tokenizer.chat_calls == [
+        [
+            {"role": "user", "content": "北京天气如何"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"location":"北京"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "content": '{"temp":10}',
+                "name": "get_weather",
+                "tool_call_id": "call_123",
+            },
+        ]
+    ]
 
 
 def test_openai_chat_completions_tool_choice_none_does_not_pass_tools(monkeypatch):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-none", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -804,7 +999,9 @@ def test_openai_chat_completions_tool_choice_none_does_not_pass_tools(monkeypatc
     async def _fake_sample_once(**_kwargs):
         return SampledSequence(tokens=[61], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -836,7 +1033,9 @@ def test_openai_chat_completions_required_tool_choice_rejects_plain_text(monkeyp
     tokenizer = _DummyTokenizer()
     tokenizer.decode_text = "今天北京多云，10度。"
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-required", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -845,7 +1044,9 @@ def test_openai_chat_completions_required_tool_choice_rejects_plain_text(monkeyp
     async def _fake_sample_once(**_kwargs):
         return SampledSequence(tokens=[71], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -881,7 +1082,9 @@ def test_openai_chat_completions_specific_tool_choice_rejects_wrong_tool(monkeyp
 </tool_call>
 """.strip()
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-specific", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -890,7 +1093,9 @@ def test_openai_chat_completions_specific_tool_choice_rejects_wrong_tool(monkeyp
     async def _fake_sample_once(**_kwargs):
         return SampledSequence(tokens=[81], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -924,7 +1129,9 @@ def test_openai_chat_completions_specific_tool_choice_rejects_wrong_tool(monkeyp
     assert "required function" in response.json()["error"]["message"]
 
 
-def test_openai_chat_completions_parallel_tool_calls_false_rejects_multiple(monkeypatch):
+def test_openai_chat_completions_parallel_tool_calls_false_rejects_multiple(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
     tokenizer.decode_text = """
@@ -936,7 +1143,9 @@ def test_openai_chat_completions_parallel_tool_calls_false_rejects_multiple(monk
 </tool_call>
 """.strip()
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-multi", "Qwen/Qwen3-4B-Instruct-2507"
 
     async def _fake_get_tokenizer(_base_model: str):
@@ -945,7 +1154,9 @@ def test_openai_chat_completions_parallel_tool_calls_false_rejects_multiple(monk
     async def _fake_sample_once(**_kwargs):
         return SampledSequence(tokens=[91], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -980,7 +1191,7 @@ def test_openai_chat_completions_rejects_invalid_tool_message_shape():
             "model": "mint://exp/sampler_weights/000090",
             "messages": [
                 {"role": "user", "content": "北京天气如何"},
-                {"role": "tool", "content": "{\"temp\":10}"},
+                {"role": "tool", "content": '{"temp":10}'},
             ],
         },
     )
@@ -1013,7 +1224,9 @@ def test_openai_chat_completions_rejects_unknown_tool_choice_function():
     assert "must be declared in tools" in response.text
 
 
-def test_openai_chat_completions_returns_501_when_tokenizer_lacks_tool_support(monkeypatch):
+def test_openai_chat_completions_returns_501_when_tokenizer_lacks_tool_support(
+    monkeypatch,
+):
     _reset_openai_compat_state(monkeypatch)
 
     class _TokenizerWithoutToolSupport:
@@ -1021,19 +1234,27 @@ def test_openai_chat_completions_returns_501_when_tokenizer_lacks_tool_support(m
             assert skip_special_tokens is True
             return "ignored"
 
-        def apply_chat_template(self, messages, tokenize: bool = True, add_generation_prompt: bool = True):
+        def apply_chat_template(
+            self, messages, tokenize: bool = True, add_generation_prompt: bool = True
+        ):
             raise RuntimeError("tool role is unsupported")
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         return "sample-tool-unsupported", "Legacy/Model"
 
     async def _fake_get_tokenizer(_base_model: str):
         return _TokenizerWithoutToolSupport()
 
     async def _fake_sample_once(**_kwargs):
-        raise AssertionError("sample_once should not be called when tokenizer cannot render tool prompt")
+        raise AssertionError(
+            "sample_once should not be called when tokenizer cannot render tool prompt"
+        )
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -1056,7 +1277,10 @@ def test_openai_chat_completions_returns_501_when_tokenizer_lacks_tool_support(m
     )
 
     assert response.status_code == 501
-    assert "Tool calling is not supported by tokenizer chat template" in response.json()["error"]["message"]
+    assert (
+        "Tool calling is not supported by tokenizer chat template"
+        in response.json()["error"]["message"]
+    )
 
 
 def test_openai_route_cache_is_scoped_by_user(monkeypatch):
@@ -1064,7 +1288,9 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
     tokenizer = _DummyTokenizer()
     ensure_calls: list[tuple[str | None, str]] = []
 
-    async def _fake_ensure_sampling_session(*, model_path: str, http_request: Request, parent_session_id=None):
+    async def _fake_ensure_sampling_session(
+        *, model_path: str, http_request: Request, parent_session_id=None
+    ):
         user_data = getattr(http_request.state, "user_data", None) or {}
         user_id = user_data.get("user_id")
         ensure_calls.append((user_id, model_path))
@@ -1076,7 +1302,9 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
     async def _fake_sample_once(**_kwargs):
         return SampledSequence(tokens=[31], logprobs=None, stop_reason="stop")
 
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", _fake_ensure_sampling_session
+    )
     monkeypatch.setattr(openai_compat, "_get_tokenizer", _fake_get_tokenizer)
     monkeypatch.setattr(openai_compat, "sample_once", _fake_sample_once)
 
@@ -1087,9 +1315,15 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
         "max_tokens": 5,
     }
 
-    first = client.post("/oai/api/v1/completions", json=payload, headers={"x-user-id": "alice"})
-    second = client.post("/oai/api/v1/completions", json=payload, headers={"x-user-id": "alice"})
-    third = client.post("/oai/api/v1/completions", json=payload, headers={"x-user-id": "bob"})
+    first = client.post(
+        "/oai/api/v1/completions", json=payload, headers={"x-user-id": "alice"}
+    )
+    second = client.post(
+        "/oai/api/v1/completions", json=payload, headers={"x-user-id": "alice"}
+    )
+    third = client.post(
+        "/oai/api/v1/completions", json=payload, headers={"x-user-id": "bob"}
+    )
 
     assert first.status_code == 200
     assert second.status_code == 200
@@ -1103,14 +1337,20 @@ def test_openai_route_cache_is_scoped_by_user(monkeypatch):
 def test_openai_route_returns_oai_error_for_stream_and_n(monkeypatch):
     _reset_openai_compat_state(monkeypatch)
     monkeypatch.setattr(openai_compat, "_get_tokenizer", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(openai_compat, "ensure_sampling_session", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        openai_compat, "ensure_sampling_session", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(openai_compat, "sample_once", lambda *_args, **_kwargs: None)
 
     client = TestClient(_build_app())
 
     stream_resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "mint://exp/sampler_weights/000083", "prompt": "hello", "stream": True},
+        json={
+            "model": "mint://exp/sampler_weights/000083",
+            "prompt": "hello",
+            "stream": True,
+        },
     )
     n_resp = client.post(
         "/oai/api/v1/completions",
@@ -1145,10 +1385,22 @@ def test_different_models_same_user_have_separate_cache(monkeypatch):
 
     client = TestClient(_build_app())
     headers = {"x-user-id": "alice"}
-    client.post("/oai/api/v1/completions", json={"model": "mint://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
-    client.post("/oai/api/v1/completions", json={"model": "mint://y/sampler_weights/2", "prompt": "hi"}, headers=headers)
+    client.post(
+        "/oai/api/v1/completions",
+        json={"model": "mint://x/sampler_weights/1", "prompt": "hi"},
+        headers=headers,
+    )
+    client.post(
+        "/oai/api/v1/completions",
+        json={"model": "mint://y/sampler_weights/2", "prompt": "hi"},
+        headers=headers,
+    )
     # 第三次命中第一个 model 的 cache，不产生新 ensure 调用
-    client.post("/oai/api/v1/completions", json={"model": "mint://x/sampler_weights/1", "prompt": "hi"}, headers=headers)
+    client.post(
+        "/oai/api/v1/completions",
+        json={"model": "mint://x/sampler_weights/1", "prompt": "hi"},
+        headers=headers,
+    )
 
     assert len(ensure_calls) == 2
     assert "mint://x/sampler_weights/1" in ensure_calls
@@ -1235,7 +1487,9 @@ def test_gateway_http_exception_invalidates_cached_session_and_recreates(monkeyp
     async def _fake_sample(**kwargs):
         sample_calls.append(kwargs["session_id"])
         if kwargs["session_id"] == "stale-gateway-session":
-            raise HTTPException(status_code=404, detail="Unknown request_id for stale upstream session")
+            raise HTTPException(
+                status_code=404, detail="Unknown request_id for stale upstream session"
+            )
         return SampledSequence(tokens=[7, 8], logprobs=None, stop_reason="eos")
 
     monkeypatch.setattr(openai_compat, "ensure_sampling_session", _fake_ensure)
@@ -1245,7 +1499,11 @@ def test_gateway_http_exception_invalidates_cached_session_and_recreates(monkeyp
     client = TestClient(_build_app())
     resp = client.post(
         "/oai/api/v1/completions",
-        json={"model": "Qwen/Qwen3-235B-A22B-Instruct-2507", "prompt": "hi", "max_tokens": 4},
+        json={
+            "model": "Qwen/Qwen3-235B-A22B-Instruct-2507",
+            "prompt": "hi",
+            "max_tokens": 4,
+        },
         headers={"x-user-id": "alice"},
     )
 
@@ -1255,7 +1513,9 @@ def test_gateway_http_exception_invalidates_cached_session_and_recreates(monkeyp
         "Qwen/Qwen3-235B-A22B-Instruct-2507",
     ]
     assert sample_calls == ["stale-gateway-session", "fresh-gateway-session"]
-    cached = openai_compat._session_cache[("alice", "Qwen/Qwen3-235B-A22B-Instruct-2507")]
+    cached = openai_compat._session_cache[
+        ("alice", "Qwen/Qwen3-235B-A22B-Instruct-2507")
+    ]
     assert cached.session_id == "fresh-gateway-session"
 
 
@@ -1300,7 +1560,6 @@ def test_prompt_as_list_is_rejected_with_422(monkeypatch):
     assert resp.status_code == 422
 
 
-
 # ---------------------------------------------------------------------------
 # New tests for bug fixes
 # ---------------------------------------------------------------------------
@@ -1336,7 +1595,7 @@ def test_extract_tool_calls_skips_bad_json_keeps_valid(monkeypatch):
         monkeypatch,
         decode_texts=[
             '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>\n'
-            '<tool_call>NOT VALID JSON</tool_call>\n'
+            "<tool_call>NOT VALID JSON</tool_call>\n"
             '<tool_call>{"name":"search","arguments":{"query":"test"}}</tool_call>',
         ],
     )
@@ -1348,8 +1607,17 @@ def test_extract_tool_calls_skips_bad_json_keeps_valid(monkeypatch):
             "model": "mint://x/sampler_weights/1",
             "messages": [{"role": "user", "content": "test"}],
             "tools": [
-                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
-                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "search", "parameters": {"type": "object"}},
+                },
             ],
             "max_tokens": 32,
         },
@@ -1367,7 +1635,9 @@ def test_system_message_merged_not_duplicated_native_path(monkeypatch):
     only one system message is sent to apply_chat_template."""
     tokenizer, _ = _tool_monkeypatch(
         monkeypatch,
-        decode_texts=['<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'],
+        decode_texts=[
+            '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'
+        ],
     )
 
     client = TestClient(_build_app())
@@ -1380,7 +1650,13 @@ def test_system_message_merged_not_duplicated_native_path(monkeypatch):
                 {"role": "user", "content": "北京天气如何"},
             ],
             "tools": [
-                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
             ],
             "max_tokens": 32,
         },
@@ -1406,7 +1682,9 @@ def test_system_message_merged_in_fallback_path(monkeypatch):
             return [900, 901]
 
     tokenizer = _RaisingTokenizer()
-    tokenizer.decode_text = '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'
+    tokenizer.decode_text = (
+        '<tool_call>{"name":"get_weather","arguments":{"location":"北京"}}</tool_call>'
+    )
 
     async def _fake_ensure(*, model_path, http_request, parent_session_id=None):
         return "sess-y", "Qwen/Qwen3-4B-Instruct-2507"
@@ -1431,7 +1709,13 @@ def test_system_message_merged_in_fallback_path(monkeypatch):
                 {"role": "user", "content": "北京天气如何"},
             ],
             "tools": [
-                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
             ],
             "max_tokens": 32,
         },
@@ -1484,16 +1768,27 @@ def test_multi_turn_tool_history_serialised_in_fallback(monkeypatch):
                 {
                     "role": "assistant",
                     "content": None,
-                    "tool_calls": [{
-                        "id": "call_abc",
-                        "type": "function",
-                        "function": {"name": "get_weather", "arguments": '{"location":"北京"}'},
-                    }],
+                    "tool_calls": [
+                        {
+                            "id": "call_abc",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": '{"location":"北京"}',
+                            },
+                        }
+                    ],
                 },
                 {"role": "tool", "tool_call_id": "call_abc", "content": '{"temp":10}'},
             ],
             "tools": [
-                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
             ],
             "max_tokens": 32,
         },
@@ -1505,7 +1800,8 @@ def test_multi_turn_tool_history_serialised_in_fallback(monkeypatch):
     assert "tool_calls" not in asst_msg
     assert "<tool_call>" in asst_msg["content"]
     tool_result_msgs = [
-        m for m in sent_msgs
+        m
+        for m in sent_msgs
         if m.get("role") == "user" and "<tool_result>" in (m.get("content") or "")
     ]
     assert len(tool_result_msgs) == 1
@@ -1524,7 +1820,12 @@ def test_required_tool_choice_retries_before_rejecting(monkeypatch):
         json={
             "model": "mint://x/1",
             "messages": [{"role": "user", "content": "call a tool"}],
-            "tools": [{"type": "function", "function": {"name": "fn", "parameters": {"type": "object"}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "fn", "parameters": {"type": "object"}},
+                }
+            ],
             "tool_choice": "required",
             "max_tokens": 16,
         },
@@ -1549,8 +1850,17 @@ def test_function_choice_wrong_tool_retries_then_rejects(monkeypatch):
             "model": "mint://x/1",
             "messages": [{"role": "user", "content": "use get_weather"}],
             "tools": [
-                {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object"}}},
-                {"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}},
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "get_weather",
+                        "parameters": {"type": "object"},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {"name": "search", "parameters": {"type": "object"}},
+                },
             ],
             "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
             "max_tokens": 16,
@@ -1574,14 +1884,16 @@ def test_function_definition_accepts_strict_field(monkeypatch):
         json={
             "model": "mint://x/1",
             "messages": [{"role": "user", "content": "go"}],
-            "tools": [{
-                "type": "function",
-                "function": {
-                    "name": "fn",
-                    "parameters": {"type": "object"},
-                    "strict": True,
-                },
-            }],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "fn",
+                        "parameters": {"type": "object"},
+                        "strict": True,
+                    },
+                }
+            ],
             "max_tokens": 16,
         },
     )
@@ -1630,10 +1942,20 @@ def test_assistant_tool_call_without_id_is_rejected(monkeypatch):
                     "role": "assistant",
                     "content": None,
                     # id intentionally omitted → should be rejected
-                    "tool_calls": [{"type": "function", "function": {"name": "fn", "arguments": "{}"}}],
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "fn", "arguments": "{}"},
+                        }
+                    ],
                 },
             ],
-            "tools": [{"type": "function", "function": {"name": "fn", "parameters": {"type": "object"}}}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "fn", "parameters": {"type": "object"}},
+                }
+            ],
             "max_tokens": 8,
         },
     )
@@ -1670,7 +1992,11 @@ def test_session_cache_evicts_oldest_when_full(monkeypatch):
     for i in range(3):
         client.post(
             "/oai/api/v1/completions",
-            json={"model": f"mint://m{i}/sampler_weights/1", "prompt": "hi", "max_tokens": 1},
+            json={
+                "model": f"mint://m{i}/sampler_weights/1",
+                "prompt": "hi",
+                "max_tokens": 1,
+            },
             headers={"x-user-id": "alice"},
         )
 
@@ -1763,7 +2089,9 @@ def test_extract_tool_calls_parses_json_code_block(monkeypatch):
     """当模型以 ```json {...} ``` 格式输出 tool call 时也能正确解析。"""
     _reset_openai_compat_state(monkeypatch)
     tokenizer = _DummyTokenizer()
-    tokenizer.decode_text = '```json\n{"name": "get_weather", "arguments": {"location": "Shanghai"}}\n```'
+    tokenizer.decode_text = (
+        '```json\n{"name": "get_weather", "arguments": {"location": "Shanghai"}}\n```'
+    )
 
     async def _fake_ensure(*, model_path, http_request, **_kw):
         return "sess-cb", "Qwen/Qwen3-4B-Instruct-2507"
@@ -1790,7 +2118,10 @@ def test_extract_tool_calls_parses_json_code_block(monkeypatch):
                     "function": {
                         "name": "get_weather",
                         "description": "Get weather",
-                        "parameters": {"type": "object", "properties": {"location": {"type": "string"}}},
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string"}},
+                        },
                     },
                 }
             ],
@@ -1804,4 +2135,5 @@ def test_extract_tool_calls_parses_json_code_block(monkeypatch):
     tc = body["choices"][0]["message"]["tool_calls"][0]
     assert tc["function"]["name"] == "get_weather"
     import json as _json
+
     assert _json.loads(tc["function"]["arguments"]) == {"location": "Shanghai"}
