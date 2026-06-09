@@ -62,7 +62,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
-# Global session manager reference (set by app lifespan)
+# Execution-runtime session manager reference (left unbound in API workers).
 session_manager: SessionManager | None = None
 
 _SAMPLING_BACKPRESSURE_HEADER = "X-Tinker-Sampling-Backpressure"
@@ -1009,7 +1009,6 @@ async def asample(
             detail="seq_id is required when sampling_session_id or model_id is provided",
         )
     session_id = request.get_session_id()
-    manager = _active_session_manager()
     snapshot = await _async_get_detached_sampling_snapshot(session_id)
     remote = None
     if snapshot is None:

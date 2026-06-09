@@ -12,9 +12,13 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
 
 ## State ownership
 
-- `TrainingSessionManager` keeps API-process working objects for active
-  `model_id`s, inflight counters, and create-time scratch state. It is not the
-  durable authority.
+- API workers do not bind local training managers or engines into route module
+  globals. HTTP routes validate requests, read durable metadata, and enqueue
+  work through detached scheduling paths.
+- `TrainingSessionManager` keeps runtime-actor-local working objects for active
+  `model_id`s, inflight counters, and create-time scratch state after
+  `ModelRuntimeActor` initializes execution bindings. It is not the durable
+  authority.
 - `TaskStateStore` owns durable per-`model_id` training-session metadata,
   session indexes, heartbeats, and restore records. The
   `training_session_store`, `session_index_store`, and
@@ -35,10 +39,14 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
 Training sessions (`model_id`) have a bounded lifecycle:
 
 - **Explicit deletion**: Client calls `DELETE /api/v1/models/{model_id}`.
-- **Idle cleanup**: `TrainingSessionManager` runs a background task (every 60s) that evicts sessions inactive for longer than `MINT_TRAINING_INACTIVITY_TIMEOUT` (default 3600s / 1 hour).
+- **Idle cleanup**: detached maintenance/control-plane cleanup invokes explicit
+  cleanup helpers for sessions inactive for longer than
+  `MINT_TRAINING_INACTIVITY_TIMEOUT` (default 3600s / 1 hour). The
+  `TrainingSessionManager` no longer starts its own process-local background
+  cleanup loop.
 - **Server shutdown**: `shutdown_all()` cleans up all sessions.
 
-The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern, including `inflight_ops` protection (analogous to `SessionInfo.inflight_requests`):
+Idle cleanup uses `inflight_ops` protection (analogous to `SessionInfo.inflight_requests`):
 
 - **Queued HTTP handlers** call `mark_inflight(+1)` before enqueue so queue delay cannot race idle cleanup.
 - **Background workers** for queued existing-session operations release that claim with `mark_inflight(-1)` in `finally`, which also refreshes `last_activity` on completion.
@@ -47,7 +55,7 @@ The idle cleanup mirrors the inference `SessionManager._cleanup_loop` pattern, i
 - **Read-only lookups** (`GET /models/{model_id}`, `GET /training_runs`, existence checks) do NOT extend the idle deadline.
 - **`_restore_training_session`** restores persisted `last_activity` when present, and falls back to `created_at` only for older store entries that predate that field.
 
-When cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the full deletion flow:
+When explicit cleanup fires, it skips sessions with `inflight_ops > 0`, then performs the full deletion flow:
 1. `engine.shutdown_session` (release GPU actor reference)
 2. `delete_session` (remove from in-memory manager)
 3. `delete_training_session` (remove TaskStateStore-backed training metadata)

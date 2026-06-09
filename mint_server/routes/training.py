@@ -156,7 +156,7 @@ async def _mark_checkpoint_failed_safe(ckpt_id: str | None, *, fail_reason: str)
             fail_reason,
         )
 
-# Global references (set by app lifespan)
+# Execution-runtime references (left unbound in API workers).
 training_manager: TrainingSessionManager | None = None
 training_engine: VerlTrainingEngine | None = None
 inference_manager: SessionManager | None = None  # For ephemeral flow
