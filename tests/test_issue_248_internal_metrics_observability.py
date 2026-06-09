@@ -352,7 +352,7 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
     dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
 
     class _FakeModelWorkScheduler:
-        async def stats(self, *, timeout_s: float = 10.0) -> dict:
+        async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
             return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
 
     class _FakeModelActorSupervisor:
@@ -360,14 +360,17 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
             return {}
 
     class _FakeSupervisor:
-        async def async_health_snapshot(self, *, timeout_s: float = 10.0) -> dict:
+        async def async_health_snapshot(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
             return {}
 
     class _FakeSessionHeartbeatStore:
-        async def async_size(self) -> int:
+        async def async_size(self, *, create_if_missing: bool = True) -> int:
             return 0
 
     class _FakeTaskFutureService:
+        async def async_stats(self) -> dict:
+            return {"pending": 0, "results": 0, "errors": 0}
+
         async def async_ensure_ready(self, *, timeout_s: float = 10.0) -> dict:
             return {"pending": 0, "results": 0, "errors": 0}
 

@@ -1130,14 +1130,17 @@ class FutureStateStore:
 
     def future_metrics_stats(self, *, now: float | None = None) -> dict[str, Any]:
         ts = _now(now)
-        records = self._records_from_ids(self._ids_from_index_prefix(_INDEX_CREATED_PREFIX))
         by_status: dict[str, int] = {}
         by_op: dict[str, dict[str, int]] = {}
         pending_ages: list[float] = []
         done_ages: list[float] = []
         refs = 0
         meta = 0
-        for record in records:
+        records_scanned = 0
+
+        def _consume(record: dict[str, Any]) -> None:
+            nonlocal refs, meta, records_scanned
+            records_scanned += 1
             status = str(record.get("status") or "unknown")
             op = str(record.get("op") or "unknown")
             by_status[status] = by_status.get(status, 0) + 1
@@ -1155,6 +1158,23 @@ class FutureStateStore:
                 refs += 1
             if record.get("metadata"):
                 meta += 1
+
+        seen: set[str] = set()
+        for status in ("pending", "queued", "assigned", "leased", "running", "finalizing", "done", "retrieved", "failed", "expired"):
+            for request_id in self._ids_from_index_prefix(f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:"):
+                if request_id in seen:
+                    continue
+                seen.add(request_id)
+                try:
+                    _consume(self.get_task(request_id))
+                except TaskStateNotFoundError:
+                    continue
+        for record in self._records_from_ids(self._ids_from_index_prefix(_INDEX_RESULT_PREFIX)):
+            request_id = str(record.get("request_id") or "")
+            if request_id in seen:
+                continue
+            seen.add(request_id)
+            _consume(record)
         from .task_state_store import future_timeout_metrics_snapshot
 
         errors = int(by_status.get("failed", 0))
@@ -1181,6 +1201,7 @@ class FutureStateStore:
                 "result_refs_count": refs,
                 "errors_count": errors,
                 "refs_count": refs,
+                "records_scanned": records_scanned,
             },
             "timeout_counts": future_timeout_metrics_snapshot(),
         }

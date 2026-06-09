@@ -65,9 +65,15 @@ async def test_issue_593_internal_admission_stats_observes_without_creating(monk
             return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "counters": {}}
 
     class _FakeTaskFutures:
+        async def async_stats(self) -> dict:
+            return {
+                "backend": "fake",
+                "task_state_rpc": {"total": 1.0, "error": 0.0, "inflight": 0.0, "by_method": {}},
+                "task_state_stats": {"calls": 1.0},
+            }
+
         async def async_ensure_ready(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
-            assert create_if_missing is False
-            return {"backend": "fake"}
+            raise AssertionError("admission_stats should collect TaskStateStore stats, not ping readiness")
 
         async def async_ping(self, *, timeout_s: float = 5.0) -> dict:
             return {"ok": True}
@@ -116,6 +122,7 @@ async def test_issue_593_internal_admission_stats_observes_without_creating(monk
 
     assert out["model_work_scheduler"]["depth"] == 0
     assert out["task_futures"]["backend"] == "fake"
+    assert out["task_futures"]["task_state_rpc"]["total"] == 1.0
     assert out["maintenance_cron_actor"]["actor_name"] == "mint_maintenance_cron"
 
 

@@ -274,7 +274,9 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
     fs = None
     try:
-        if hasattr(task_futures, "async_ensure_ready"):
+        if hasattr(task_futures, "async_stats"):
+            fs = await task_futures.async_stats()
+        elif hasattr(task_futures, "async_ensure_ready"):
             fs = await task_futures.async_ensure_ready(timeout_s=timeout_s, create_if_missing=False)
         elif not include_actor_rss and hasattr(task_futures, "metrics_snapshot"):
             fs = task_futures.metrics_snapshot()

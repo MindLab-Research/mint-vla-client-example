@@ -96,7 +96,6 @@ def test_task_state_store_client_async_cached_actor_survives_concurrent_reset(mo
 
 
 def test_task_state_store_client_sync_cached_actor_survives_reset(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as module
     import ray
 
     class _Actor:
@@ -207,6 +206,20 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
         {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
     )
     task_state_store_module._BILLING_FLUSH_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.update(
+        {"total": 0.0, "error": 0.0, "inflight": 0.0, "by_method": {}}
+    )
+    task_state_store_module._TASK_STATE_STATS_METRICS.clear()
+    task_state_store_module._TASK_STATE_STATS_METRICS.update(
+        {
+            "calls": 0.0,
+            "cache_hits": 0.0,
+            "total_duration_ms": 0.0,
+            "last_duration_ms": 0.0,
+            "max_duration_ms": 0.0,
+        }
+    )
     actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
     try:
         actor.create_task(
@@ -242,6 +255,9 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
         assert stats["age_stats"]["oldest_pending_s"] >= 0
         assert stats["payload_stats"]["result_refs_count"] == 1
         assert stats["timeout_counts"]["total"] == 0.0
+        assert stats["task_state_rpc"]["total"] == 0.0
+        assert stats["task_state_stats"]["calls"] >= 1.0
+        assert stats["task_state_stats"]["last_duration_ms"] >= 0.0
 
         expired = actor.expire_active_tasks(older_than_s=10.0, now=200.0)
         assert expired == ["req-pending"]
@@ -274,6 +290,20 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
         {"queue": 0.0, "execution": 0.0, "total": 0.0, "by_op": {}}
     )
     task_state_store_module._BILLING_FLUSH_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.update(
+        {"total": 0.0, "error": 0.0, "inflight": 0.0, "by_method": {}}
+    )
+    task_state_store_module._TASK_STATE_STATS_METRICS.clear()
+    task_state_store_module._TASK_STATE_STATS_METRICS.update(
+        {
+            "calls": 0.0,
+            "cache_hits": 0.0,
+            "total_duration_ms": 0.0,
+            "last_duration_ms": 0.0,
+            "max_duration_ms": 0.0,
+        }
+    )
 
     gauges: dict[str, list] = {}
 
@@ -311,6 +341,10 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
         assert "mint_billing_outbox_rows" in gauges
         assert "mint_billing_outbox_flush_attempts_total" in gauges
         assert "mint_billing_observation_skipped_total" in gauges
+        assert "mint_task_state_store_rpc_inflight" in gauges
+        assert "mint_task_state_store_rpc_total" in gauges
+        assert "mint_task_state_store_rpc_last_duration_ms" in gauges
+        assert "mint_task_state_store_stats_last_duration_ms" in gauges
 
         pending_obs = gauges["mint_task_futures_pending"][0](None)
         assert any(obs.value == 1.0 and obs.attributes.get("op") is None for obs in pending_obs)
@@ -334,8 +368,106 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
         for observations in (billing_flush_obs, billing_event_obs, skipped_obs):
             for obs in observations:
                 assert "request_id" not in obs.attributes
+        stats_obs = gauges["mint_task_state_store_stats_last_duration_ms"][0](None)
+        assert stats_obs[0].value >= 0.0
     finally:
         actor.close()
+
+
+def test_task_state_store_client_rpc_metrics_record_success_and_failure(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as task_state_store_module
+
+    task_state_store_module._TASK_STATE_RPC_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.update(
+        {"total": 0.0, "error": 0.0, "inflight": 0.0, "by_method": {}}
+    )
+
+    class _Remote:
+        def __init__(self, value=None, error: Exception | None = None) -> None:
+            self.value = value
+            self.error = error
+
+        def remote(self, **kwargs):
+            if self.error is not None:
+                raise self.error
+            return self.value
+
+    class _Actor:
+        future_get_task = _Remote({"request_id": "req-1"})
+        future_mark_task_retrieved = _Remote(error=RuntimeError("boom"))
+
+    async def _fake_get_ray_ref(ref, *, timeout_s=10.0):
+        return ref
+
+    monkeypatch.setattr(task_state_store_module, "async_get_ray_ref", _fake_get_ray_ref)
+    client = TaskStateStoreClient()
+
+    async def _fake_get_actor(*args, **kwargs):
+        return _Actor()
+
+    client._get_ray_actor_async = _fake_get_actor
+
+    assert asyncio.run(client._call("future_get_task", request_id="req-1")) == {"request_id": "req-1"}
+    with pytest.raises(RuntimeError):
+        asyncio.run(client._call("future_mark_task_retrieved", request_id="req-1"))
+
+    metrics = task_state_store_module.task_state_rpc_metrics_snapshot()
+    assert metrics["total"] == 2.0
+    assert metrics["error"] == 1.0
+    assert metrics["inflight"] == 0.0
+    assert metrics["by_method"]["future_get_task"]["total"] == 1.0
+    assert metrics["by_method"]["future_mark_task_retrieved"]["error"] == 1.0
+
+
+def test_task_state_store_client_stats_exposes_client_process_rpc_metrics(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as task_state_store_module
+
+    task_state_store_module._TASK_STATE_RPC_METRICS.clear()
+    task_state_store_module._TASK_STATE_RPC_METRICS.update(
+        {
+            "total": 7.0,
+            "error": 1.0,
+            "inflight": 0.0,
+            "by_method": {
+                "future_get_task": {
+                    "total": 7.0,
+                    "error": 1.0,
+                    "total_duration_ms": 70.0,
+                    "last_duration_ms": 10.0,
+                    "max_duration_ms": 20.0,
+                }
+            },
+        }
+    )
+
+    class _Remote:
+        def remote(self, **kwargs):
+            return {
+                "pending": 0,
+                "task_state_rpc": {"total": 0.0, "error": 0.0, "inflight": 0.0, "by_method": {}},
+            }
+
+    class _Actor:
+        stats = _Remote()
+
+    async def _fake_get_ray_ref(ref, *, timeout_s=10.0):
+        return ref
+
+    monkeypatch.setattr(task_state_store_module, "async_get_ray_ref", _fake_get_ray_ref)
+    client = TaskStateStoreClient()
+
+    async def _fake_get_actor(*args, **kwargs):
+        return _Actor()
+
+    client._get_ray_actor_async = _fake_get_actor
+
+    out = asyncio.run(client.async_stats())
+
+    assert out["pending"] == 0
+    assert out["task_state_rpc"]["total"] == 8.0
+    assert out["task_state_rpc"]["error"] == 1.0
+    assert out["task_state_rpc"]["by_method"]["stats"]["total"] == 1.0
+    assert out["task_state_rpc"]["by_method"]["future_get_task"]["total"] == 7.0
 
 
 def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:

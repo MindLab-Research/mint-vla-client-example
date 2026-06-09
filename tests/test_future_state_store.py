@@ -142,6 +142,40 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
     assert store.get_task("req-1")["request_json"] == b'{"x":1}'
 
 
+def test_future_state_store_metrics_use_status_indexes_not_created_full_scan() -> None:
+    store = FutureStateStore.in_memory()
+    store.create_task(
+        request_id="pending-1",
+        op="sampling.asample",
+        domain_key="vllm:model",
+        request_json=b"{}",
+        now=100.0,
+    )
+    store.create_task(
+        request_id="done-1",
+        op="sampling.asample",
+        domain_key="vllm:model",
+        request_json=b"{}",
+        now=90.0,
+    )
+    store.complete_task_success(
+        request_id="done-1",
+        result_path="/tmp/done.json",
+        result_checksum="sha256:abc",
+        result_size_bytes=12,
+        now=101.0,
+    )
+    store._kv.put("idx:created:000000000000000001.000000:missing-old", "missing-old")
+
+    stats = store.future_metrics_stats(now=200.0)
+
+    assert stats["pending"] == 1
+    assert stats["results"] == 1
+    assert stats["by_op"]["sampling.asample"]["pending"] == 1
+    assert stats["by_op"]["sampling.asample"]["results"] == 1
+    assert stats["payload_stats"]["records_scanned"] == 2
+
+
 def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()

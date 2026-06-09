@@ -47,6 +47,21 @@ _BILLING_FLUSH_METRICS: dict[str, float] = {
     "outbox_conflict": 0.0,
     "skipped_missing_billing_context": 0.0,
 }
+_TASK_STATE_RPC_METRICS: dict[str, Any] = {
+    "total": 0.0,
+    "error": 0.0,
+    "inflight": 0.0,
+    "by_method": {},
+}
+_TASK_STATE_RPC_METRICS_LOCK = threading.Lock()
+_TASK_STATE_STATS_METRICS: dict[str, float] = {
+    "calls": 0.0,
+    "cache_hits": 0.0,
+    "total_duration_ms": 0.0,
+    "last_duration_ms": 0.0,
+    "max_duration_ms": 0.0,
+}
+_TASK_STATE_STATS_METRICS_LOCK = threading.Lock()
 
 
 class TaskStateStoreError(RuntimeError):
@@ -373,6 +388,104 @@ def _inc_billing_metrics(metrics: dict[str, Any]) -> None:
 
 def billing_metrics_snapshot() -> dict[str, Any]:
     return dict(_BILLING_FLUSH_METRICS)
+
+
+def _bounded_task_state_method(method: str | None) -> str:
+    value = str(method or "unknown").strip() or "unknown"
+    allowed = {
+        "future_get_task",
+        "future_wait_task_status_change",
+        "future_ensure_task",
+        "future_update_task_metadata",
+        "future_complete_task_success",
+        "future_complete_task_failure",
+        "future_mark_task_retrieved",
+        "future_expire_active_tasks",
+        "future_list_terminal_payloads_for_eviction",
+        "future_mark_payload_evicted",
+        "future_list_staged_payloads_for_gc",
+        "future_mark_staged_payload_gc_deleted",
+        "future_delete_expired_tombstones",
+        "stats",
+        "future_stats",
+        "ping",
+        "future_ping",
+    }
+    if value in allowed:
+        return value
+    if value.startswith("future_"):
+        return "future_other"
+    return "other"
+
+
+def _record_task_state_rpc_metric(method: str, *, duration_ms: float, ok: bool) -> None:
+    bounded = _bounded_task_state_method(method)
+    with _TASK_STATE_RPC_METRICS_LOCK:
+        _TASK_STATE_RPC_METRICS["total"] = float(_TASK_STATE_RPC_METRICS.get("total", 0.0)) + 1.0
+        if not ok:
+            _TASK_STATE_RPC_METRICS["error"] = float(_TASK_STATE_RPC_METRICS.get("error", 0.0)) + 1.0
+        by_method = _TASK_STATE_RPC_METRICS.setdefault("by_method", {})
+        rec = by_method.setdefault(
+            bounded,
+            {
+                "total": 0.0,
+                "error": 0.0,
+                "total_duration_ms": 0.0,
+                "last_duration_ms": 0.0,
+                "max_duration_ms": 0.0,
+            },
+        )
+        rec["total"] = float(rec.get("total", 0.0)) + 1.0
+        if not ok:
+            rec["error"] = float(rec.get("error", 0.0)) + 1.0
+        duration = max(0.0, float(duration_ms))
+        rec["total_duration_ms"] = float(rec.get("total_duration_ms", 0.0)) + duration
+        rec["last_duration_ms"] = duration
+        rec["max_duration_ms"] = max(float(rec.get("max_duration_ms", 0.0)), duration)
+
+
+def _inc_task_state_rpc_inflight(delta: float) -> None:
+    with _TASK_STATE_RPC_METRICS_LOCK:
+        current = float(_TASK_STATE_RPC_METRICS.get("inflight", 0.0))
+        _TASK_STATE_RPC_METRICS["inflight"] = max(0.0, current + float(delta))
+
+
+def task_state_rpc_metrics_snapshot() -> dict[str, Any]:
+    with _TASK_STATE_RPC_METRICS_LOCK:
+        return {
+            "total": float(_TASK_STATE_RPC_METRICS.get("total", 0.0)),
+            "error": float(_TASK_STATE_RPC_METRICS.get("error", 0.0)),
+            "inflight": float(_TASK_STATE_RPC_METRICS.get("inflight", 0.0)),
+            "by_method": {
+                str(method): dict(rec)
+                for method, rec in dict(_TASK_STATE_RPC_METRICS.get("by_method") or {}).items()
+                if isinstance(rec, dict)
+            },
+        }
+
+
+def _record_task_state_stats_metric(*, duration_ms: float, cache_hit: bool) -> None:
+    duration = max(0.0, float(duration_ms))
+    with _TASK_STATE_STATS_METRICS_LOCK:
+        _TASK_STATE_STATS_METRICS["calls"] = float(_TASK_STATE_STATS_METRICS.get("calls", 0.0)) + 1.0
+        if cache_hit:
+            _TASK_STATE_STATS_METRICS["cache_hits"] = float(_TASK_STATE_STATS_METRICS.get("cache_hits", 0.0)) + 1.0
+        _TASK_STATE_STATS_METRICS["total_duration_ms"] = (
+            float(_TASK_STATE_STATS_METRICS.get("total_duration_ms", 0.0)) + duration
+        )
+        _TASK_STATE_STATS_METRICS["last_duration_ms"] = duration
+        _TASK_STATE_STATS_METRICS["max_duration_ms"] = max(
+            float(_TASK_STATE_STATS_METRICS.get("max_duration_ms", 0.0)),
+            duration,
+        )
+
+
+def task_state_stats_metrics_snapshot() -> dict[str, float]:
+    with _TASK_STATE_STATS_METRICS_LOCK:
+        out = dict(_TASK_STATE_STATS_METRICS)
+    calls = float(out.get("calls", 0.0))
+    out["avg_duration_ms"] = float(out.get("total_duration_ms", 0.0)) / calls if calls > 0 else 0.0
+    return out
 
 
 def task_future_reaper_metrics_snapshot() -> dict[str, Any]:
@@ -1381,7 +1494,6 @@ class TaskStateStore:
         now: float | None = None,
     ) -> dict[str, Any]:
         ts = _now(now)
-        out: dict[str, Any]
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -3100,11 +3212,14 @@ class _TaskStateStoreActor:
         now = time.monotonic()
         cached = self._stats_cache
         if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+            _record_task_state_stats_metric(duration_ms=0.0, cache_hit=True)
             return dict(cached)
         with self._stats_lock:
+            started = time.perf_counter()
             now = time.monotonic()
             cached = self._stats_cache
             if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
+                _record_task_state_stats_metric(duration_ms=0.0, cache_hit=True)
                 return dict(cached)
             active = self._store.list_active_tasks()
             by_status: dict[str, int] = {}
@@ -3123,7 +3238,11 @@ class _TaskStateStoreActor:
                 **future_stats,
                 "task_future_reaper": task_future_reaper_metrics_snapshot(),
                 "billing_outbox": self._store.billing_outbox_stats(),
+                "task_state_rpc": task_state_rpc_metrics_snapshot(),
             }
+            stats_duration_ms = (time.perf_counter() - started) * 1000.0
+            _record_task_state_stats_metric(duration_ms=stats_duration_ms, cache_hit=False)
+            out["task_state_stats"] = task_state_stats_metrics_snapshot()
             self._stats_cache = dict(out)
             self._stats_cache_at = time.monotonic()
             return out
@@ -3314,6 +3433,58 @@ class _TaskStateStoreActor:
                 "mint_billing_observation_skipped_total",
                 _billing_metric("skipped_missing_billing_context", {"reason": "missing_billing_context"}),
             )
+
+            def _rpc_scalar(field: str):
+                def _callback(_options):
+                    rpc = self.stats().get("task_state_rpc")
+                    if not isinstance(rpc, dict):
+                        return []
+                    value = _metric_number(rpc.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            def _rpc_method_field(field: str):
+                def _callback(_options):
+                    rpc = self.stats().get("task_state_rpc")
+                    by_method = rpc.get("by_method") if isinstance(rpc, dict) else None
+                    if not isinstance(by_method, dict):
+                        return []
+                    observations = []
+                    for method, rec in sorted(by_method.items()):
+                        if not isinstance(rec, dict):
+                            continue
+                        value = _metric_number(rec.get(field))
+                        if value is None:
+                            continue
+                        observations.append(Observation(value, _attrs(method=method)))
+                    return observations
+
+                return _callback
+
+            def _stats_metric(field: str):
+                def _callback(_options):
+                    metrics_map = self.stats().get("task_state_stats")
+                    if not isinstance(metrics_map, dict):
+                        return []
+                    value = _metric_number(metrics_map.get(field))
+                    if value is None:
+                        return []
+                    return [Observation(value, _attrs())]
+
+                return _callback
+
+            _gauge("mint_task_state_store_rpc_inflight", _rpc_scalar("inflight"))
+            _gauge("mint_task_state_store_rpc_total", _rpc_method_field("total"))
+            _gauge("mint_task_state_store_rpc_errors_total", _rpc_method_field("error"))
+            _gauge("mint_task_state_store_rpc_last_duration_ms", _rpc_method_field("last_duration_ms"), unit="ms")
+            _gauge("mint_task_state_store_rpc_max_duration_ms", _rpc_method_field("max_duration_ms"), unit="ms")
+            _gauge("mint_task_state_store_stats_calls_total", _stats_metric("calls"))
+            _gauge("mint_task_state_store_stats_cache_hits_total", _stats_metric("cache_hits"))
+            _gauge("mint_task_state_store_stats_last_duration_ms", _stats_metric("last_duration_ms"), unit="ms")
+            _gauge("mint_task_state_store_stats_max_duration_ms", _stats_metric("max_duration_ms"), unit="ms")
             self._otel_enabled = True
         except Exception as e:
             self._otel_error = f"{type(e).__name__}: {e}"
@@ -3704,12 +3875,38 @@ class TaskStateStoreClient:
     async def _call(self, method: str, **kwargs: Any) -> Any:
         actor = await self._get_ray_actor_async()
         remote = getattr(actor, method).remote
-        return await async_get_ray_ref(remote(**kwargs))
+        started = time.perf_counter()
+        _inc_task_state_rpc_inflight(1.0)
+        ok = False
+        try:
+            out = await async_get_ray_ref(remote(**kwargs))
+            ok = True
+            return out
+        finally:
+            _inc_task_state_rpc_inflight(-1.0)
+            _record_task_state_rpc_metric(
+                method,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                ok=ok,
+            )
 
     def _call_sync(self, method: str, **kwargs: Any) -> Any:
         actor = self._get_ray_actor_sync()
         remote = getattr(actor, method).remote
-        return sync_get_ray_ref(remote(**kwargs))
+        started = time.perf_counter()
+        _inc_task_state_rpc_inflight(1.0)
+        ok = False
+        try:
+            out = sync_get_ray_ref(remote(**kwargs))
+            ok = True
+            return out
+        finally:
+            _inc_task_state_rpc_inflight(-1.0)
+            _record_task_state_rpc_metric(
+                method,
+                duration_ms=(time.perf_counter() - started) * 1000.0,
+                ok=ok,
+            )
 
     def ensure_ready(
         self,
@@ -3789,6 +3986,8 @@ class TaskStateStoreClient:
         out = await self._call("stats")
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.stats returned non-dict: {type(out)}")
+        out = dict(out)
+        out["task_state_rpc"] = task_state_rpc_metrics_snapshot()
         return out
 
     async def async_integrity_check(self) -> str:
