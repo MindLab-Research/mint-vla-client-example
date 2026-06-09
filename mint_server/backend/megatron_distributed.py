@@ -8220,11 +8220,24 @@ class MegatronWorkerGroup:
         """Validate sampler export without performing a training-state session switch."""
         current_session = getattr(self, "_current_session", None)
         if current_session != session_id:
-            raise RuntimeError(
-                f"sampler LoRA export requires the requested session to already be active: "
-                f"requested={session_id!r}, current={current_session!r}. "
-                "Refusing to switch sessions during sampler export."
-            )
+            if current_session is None:
+                if getattr(self, "_session_unknown_due_to_partial_swap", False):
+                    raise RuntimeError(
+                        f"sampler LoRA export requires the requested session to already be active: "
+                        f"requested={session_id!r}, current={current_session!r}. "
+                        "Refusing to export while session state is unknown after a partial swap."
+                    )
+                logger.info(
+                    "[MegatronWorkerGroup] sampler LoRA export starting from no active session; "
+                    "allowing first materialized export for requested=%r",
+                    session_id,
+                )
+            else:
+                raise RuntimeError(
+                    f"sampler LoRA export requires the requested session to already be active: "
+                    f"requested={session_id!r}, current={current_session!r}. "
+                    "Refusing to switch sessions during sampler export."
+                )
         if actual_rank is not None and int(actual_rank) != int(self._actual_rank):
             raise RuntimeError(
                 f"Session {session_id} requested actual_rank={actual_rank}, "

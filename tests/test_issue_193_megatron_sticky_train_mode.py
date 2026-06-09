@@ -2790,6 +2790,7 @@ def test_issue_193_partial_swap_explicit_session_rejects_save_lora_weights(monke
     group._current_session = None
     group._step_count = 9
     group._actual_rank = 8
+    group._session_unknown_due_to_partial_swap = True
 
     ensure_calls: list[tuple[str, dict]] = []
 
@@ -2809,6 +2810,34 @@ def test_issue_193_partial_swap_explicit_session_rejects_save_lora_weights(monke
         )
 
     assert ensure_calls == []
+
+
+def test_issue_193_sampler_export_allows_initial_no_active_session():
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = None
+    group._actual_rank = 8
+    group._session_unknown_due_to_partial_swap = False
+    group._session_state_cached_on_workers = lambda session_id: True
+    group._session_manager = type(
+        "SessionMgr",
+        (),
+        {
+            "session_exists": staticmethod(lambda session_id: False),
+        },
+    )()
+
+    group._assert_session_active_for_sampler_export("initial_session", actual_rank=8)
+
+
+def test_issue_193_sampler_export_still_rejects_session_switch():
+    group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = object.__new__(group_cls)
+    group._current_session = "active_session"
+    group._actual_rank = 8
+
+    with pytest.raises(RuntimeError, match="Refusing to switch sessions"):
+        group._assert_session_active_for_sampler_export("other_session", actual_rank=8)
 
 
 def test_issue_17_save_lora_weights_active_session_skips_ensure_session_loaded(monkeypatch):
