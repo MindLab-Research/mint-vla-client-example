@@ -48,6 +48,7 @@ BUMBLEBEE_TRAIN_STATE_FILE = "adapter_train_state.pt"
 BUMBLEBEE_TRAIN_STATE_META_FILE = "training_meta.json"
 BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "MINT_BUMBLEBEE_REPO_PATH",
+    "MINT_BUMBLEBEE_MODEL_NAME",
     "MINT_BUMBLEBEE_IMPL",
     "MINT_BUMBLEBEE_OPTIMIZER",
     "MINT_BUMBLEBEE_SKIP_HF_LOAD",
@@ -173,6 +174,10 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("Ignoring invalid %s=%r; expected int", name, raw)
         return default
+
+
+def _bumblebee_model_name() -> str:
+    return os.environ.get("MINT_BUMBLEBEE_MODEL_NAME", "").strip() or "qwen3_moe"
 
 
 def _prepend_pythonpath_entry(pythonpath: str, entry: str | None) -> str:
@@ -547,7 +552,7 @@ class BumblebeeRankWorker:
 
             etp = _bumblebee_runtime_etp(self.base_model, self.config)
             bb_cfg = BBConfig(
-                model_name="qwen3_moe",
+                model_name=_bumblebee_model_name(),
                 impl=os.environ.get("MINT_BUMBLEBEE_IMPL", "lite"),
                 hf_path=self.base_model,
                 parallel=ParallelConfig(

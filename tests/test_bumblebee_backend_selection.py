@@ -21,6 +21,7 @@ from mint_server.backend.bumblebee_distributed import (
     BumblebeeSessionMeta,
     _bumblebee_attention_backend_override,
     _bumblebee_flash_attn_overlay_path,
+    _bumblebee_model_name,
     _bumblebee_runtime_pythonpath,
     _bumblebee_runtime_etp,
     _coerce_int,
@@ -94,6 +95,7 @@ def test_bumblebee_placement_group_name_is_namespace_scoped():
 
 def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
     assert "MINT_BUMBLEBEE_IMPL" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_MODEL_NAME" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_OPTIMIZER" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_SKIP_HF_LOAD" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_ATTENTION_BACKEND" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
@@ -101,6 +103,18 @@ def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
     assert "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "NVTE_FLASH_ATTN" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "BUMBLEBEE_TE_SDPA_FALLBACK" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+
+
+def test_bumblebee_model_name_defaults_to_qwen3_moe(monkeypatch):
+    monkeypatch.delenv("MINT_BUMBLEBEE_MODEL_NAME", raising=False)
+
+    assert _bumblebee_model_name() == "qwen3_moe"
+
+
+def test_bumblebee_model_name_reads_env(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_NAME", " qwen3_5 ")
+
+    assert _bumblebee_model_name() == "qwen3_5"
 
 
 def test_bumblebee_attention_backend_override_defaults_to_flash(monkeypatch):
