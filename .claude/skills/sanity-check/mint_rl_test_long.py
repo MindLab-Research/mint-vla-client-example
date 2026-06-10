@@ -662,7 +662,10 @@ def _env_object_id(name: str) -> str | None:
     return value
 
 
-def _checkpoint_owner_id() -> str | None:
+def _checkpoint_owner_id(explicit_owner_id: str | None = None) -> str | None:
+    explicit = str(explicit_owner_id or "").strip()
+    if explicit:
+        return explicit
     return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
 
 
@@ -680,8 +683,9 @@ def _create_sampling_client_for_checkpoint(
     model_path: str,
     base_model: str,
     retry_config: RetryConfig,
+    checkpoint_owner_id: str | None = None,
 ) -> Any:
-    owner_id = _checkpoint_owner_id()
+    owner_id = _checkpoint_owner_id(checkpoint_owner_id)
     if not owner_id:
         return service_client.create_sampling_client(
             model_path=model_path,
@@ -1055,19 +1059,22 @@ def _save_weights_and_get_sampling_client_with_retry(
         try:
             save_fut = training_client.save_weights_for_sampler(name=name)
             _dbg(f"save_weights_for_sampler submitted name={name!r}")
-            sampling_path = _result_with_heartbeat(
+            save_result = _result_with_heartbeat(
                 save_fut,
                 label="SaveWeightsForSampler",
                 timeout_s=TIMEOUT_S,
                 stage_name="save_weights_for_sampler",
                 extra={"name": name},
-            ).path
+            )
+            sampling_path = save_result.path
+            checkpoint_owner_id = getattr(save_result, "owner_id", None)
             sampling_client = _time_call(
                 lambda: _create_sampling_client_for_checkpoint(
                     service_client,
                     model_path=sampling_path,
                     base_model=base_model,
                     retry_config=SAMPLING_RETRY_CONFIG,
+                    checkpoint_owner_id=checkpoint_owner_id,
                 ),
                 stage_name="create_sampling_client",
                 extra={"name": name, "model_path": sampling_path},
@@ -1092,6 +1099,7 @@ def _save_weights_and_get_sampling_client_with_retry(
                                 model_path=str(sampling_path),
                                 base_model=base_model,
                                 retry_config=SAMPLING_RETRY_CONFIG,
+                                checkpoint_owner_id=checkpoint_owner_id,
                             ),
                             stage_name="create_sampling_client",
                             extra={"name": name, "model_path": str(sampling_path)},

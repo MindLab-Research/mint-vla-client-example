@@ -4221,12 +4221,14 @@ async def _do_save_weights_for_sampler(
             checkpoint_type="sampler",
         )
         path_uri = tinker_uri if prefer_tinker else mint_uri
+        checkpoint_owner_id = (None if is_admin else user_id) or "anonymous"
 
         if request.path is not None:
             # Named flow: Return path, caller creates session separately
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
                 sampling_session_id=None,
+                owner_id=checkpoint_owner_id,
             ).model_dump()
             response.update(
                 checkpoint_record_id=claimed_ckpt_id,
@@ -4434,6 +4436,7 @@ async def _do_save_weights_for_sampler(
             response = SaveWeightsForSamplerResponse(
                 path=None,  # Ephemeral - no path returned
                 sampling_session_id=sampling_session_id,
+                owner_id=checkpoint_owner_id,
             ).model_dump()
 
         await task_futures.async_resolve(request_id, response)

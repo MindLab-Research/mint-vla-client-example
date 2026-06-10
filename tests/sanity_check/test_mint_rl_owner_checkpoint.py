@@ -68,7 +68,9 @@ def test_owner_checkpoint_sampling_client_sends_owner_extra_body(monkeypatch):
             return SimpleNamespace(result=lambda: asyncio.run(coro))
 
     tinker_module = sys.modules["tinker"]
-    tinker_module.types = SimpleNamespace(CreateSamplingSessionRequest=_CreateSamplingSessionRequest)
+    tinker_module.types = SimpleNamespace(
+        CreateSamplingSessionRequest=_CreateSamplingSessionRequest
+    )
     sampling_module = types.ModuleType("tinker.lib.public_interfaces.sampling_client")
     sampling_module.SamplingClient = _SamplingClient
     sys.modules["tinker.lib.public_interfaces.sampling_client"] = sampling_module
@@ -134,7 +136,9 @@ def test_owner_checkpoint_sampling_client_accepts_mint_uri(monkeypatch):
             return SimpleNamespace(result=lambda: asyncio.run(coro))
 
     tinker_module = sys.modules["tinker"]
-    tinker_module.types = SimpleNamespace(CreateSamplingSessionRequest=_CreateSamplingSessionRequest)
+    tinker_module.types = SimpleNamespace(
+        CreateSamplingSessionRequest=_CreateSamplingSessionRequest
+    )
     sampling_module = types.ModuleType("tinker.lib.public_interfaces.sampling_client")
     sampling_module.SamplingClient = _SamplingClient
     sys.modules["tinker.lib.public_interfaces.sampling_client"] = sampling_module
@@ -213,6 +217,70 @@ def test_owner_checkpoint_sampling_client_converts_tinker_uri(monkeypatch):
     request, extra_body = calls[0]
     assert request.model_path == "mint://run-1/sampler_weights/ckpt-1"
     assert extra_body == {"owner_id": "0123456789abcdef01234567"}
+
+
+def test_owner_checkpoint_sampling_client_uses_explicit_owner_without_env(monkeypatch):
+    helper = _load_helper()
+    monkeypatch.delenv("MINT_TEST_CHECKPOINT_OWNER_ID", raising=False)
+
+    calls = []
+
+    class _CreateSamplingSessionRequest:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class _SamplingClient:
+        def __init__(self, holder, *, sampling_session_id, retry_config=None):
+            self._sampling_session_id = sampling_session_id
+            self._retry_config = retry_config
+
+    class _ServiceResource:
+        async def create_sampling_session(self, *, request, extra_body=None):
+            calls.append((request, extra_body))
+            return SimpleNamespace(sampling_session_id="sampling-session-1")
+
+    class _Client:
+        service = _ServiceResource()
+
+    class _ClientCtx:
+        def __enter__(self):
+            return _Client()
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _Holder:
+        _sampling_client_counter = 7
+
+        def aclient(self, _pool_type):
+            return _ClientCtx()
+
+        def get_session_id(self):
+            return "session-1"
+
+        def run_coroutine_threadsafe(self, coro):
+            import asyncio
+
+            return SimpleNamespace(result=lambda: asyncio.run(coro))
+
+    tinker_module = sys.modules["tinker"]
+    tinker_module.types = SimpleNamespace(CreateSamplingSessionRequest=_CreateSamplingSessionRequest)
+    sampling_module = types.ModuleType("tinker.lib.public_interfaces.sampling_client")
+    sampling_module.SamplingClient = _SamplingClient
+    sys.modules["tinker.lib.public_interfaces.sampling_client"] = sampling_module
+
+    out = helper(
+        SimpleNamespace(holder=_Holder()),
+        model_path="tinker://run-1/sampler_weights/ckpt-1",
+        base_model="Qwen/Qwen3-0.6B",
+        retry_config="retry",
+        checkpoint_owner_id="anonymous",
+    )
+
+    assert out._sampling_session_id == "sampling-session-1"
+    request, extra_body = calls[0]
+    assert request.model_path == "mint://run-1/sampler_weights/ckpt-1"
+    assert extra_body == {"owner_id": "anonymous"}
 
 
 def test_owner_checkpoint_sampling_client_falls_back_without_owner(monkeypatch):

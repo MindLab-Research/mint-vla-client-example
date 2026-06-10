@@ -784,6 +784,7 @@ class SaveWeightsForSamplerResponse(BaseModel):
 
     path: str | None = None  # mint:// or file:// URI (None for ephemeral)
     sampling_session_id: str | None = None  # For ephemeral flow
+    owner_id: str | None = None  # owner scope required for admin checkpoint references
     type: Literal["save_weights_for_sampler"] = "save_weights_for_sampler"
 
 
