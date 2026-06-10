@@ -174,6 +174,18 @@ class SchedulerClient:
         return self.actor.stats()
 
 
+class FaultingTaskPayloadStore(TaskPayloadStore):
+    def __init__(self, *args: Any, faults: FaultController, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.faults = faults
+        self.fail_writes = False
+
+    def write_json_payload(self, **kwargs: Any) -> dict[str, Any]:
+        if self.fail_writes:
+            raise RuntimeError("synthetic payload write failure")
+        return super().write_json_payload(**kwargs)
+
+
 @dataclass
 class SchedulerComponentWorld:
     tmp_path: Path
@@ -185,7 +197,10 @@ class SchedulerComponentWorld:
         self.faults = FaultController()
         self.task_store = TaskStateStore.in_memory()
         self.task_state = LocalAsyncTaskStateClient(self.task_store, self.faults)
-        self.payload_store = TaskPayloadStore(root_dir=self.tmp_path / "payloads")
+        self.payload_store = FaultingTaskPayloadStore(
+            root_dir=self.tmp_path / "payloads",
+            faults=self.faults,
+        )
         self.future_service = TaskFutureService(
             task_state_client=self.task_state,
             payload_store=self.payload_store,
@@ -197,6 +212,14 @@ class SchedulerComponentWorld:
         )
         self.scheduler = SchedulerClient(self.scheduler_actor)
         self.event_log: list[tuple[str, dict[str, Any]]] = []
+
+    def replace_scheduler(self, *, owner_id: str) -> None:
+        self.scheduler_actor = _ModelWorkSchedulerActor(
+            use_task_state_store=True,
+            task_state_store=self.task_state,
+            owner_id=owner_id,
+        )
+        self.scheduler = SchedulerClient(self.scheduler_actor)
 
     @property
     def consumer_id(self) -> str:
@@ -220,8 +243,8 @@ class SchedulerComponentWorld:
     async def start(self) -> None:
         await self.scheduler.sync_replicas([self.replica(status="healthy")])
 
-    async def enqueue_sampling(self, request_id: str, *, assign: bool = True) -> str:
-        await enqueue_model_work(
+    async def enqueue_sampling(self, request_id: str, *, assign: bool = True) -> dict[str, Any]:
+        return await enqueue_model_work(
             request_id=request_id,
             op="sampling.asample",
             request_json=b'{"prompt":"hello"}',
@@ -238,7 +261,32 @@ class SchedulerComponentWorld:
             assign_max_items=1,
             scheduler_client=self.scheduler,
         )
-        return request_id
+
+    async def claim_one(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
+        claimed = await self.scheduler.claim_from_replica_queue(
+            domain_key=self.domain_key,
+            replica_id=self.replica_id,
+            consumer_id=self.consumer_id,
+            consumer_generation=self.generation,
+            max_items=1,
+            lease_ttl_s=lease_ttl_s,
+        )
+        leases = claimed.get("leases") if isinstance(claimed, dict) else None
+        assert isinstance(leases, list)
+        assert len(leases) == 1
+        return leases[0]
+
+    async def claim_none(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
+        claimed = await self.scheduler.claim_from_replica_queue(
+            domain_key=self.domain_key,
+            replica_id=self.replica_id,
+            consumer_id=self.consumer_id,
+            consumer_generation=self.generation,
+            max_items=1,
+            lease_ttl_s=lease_ttl_s,
+        )
+        assert claimed.get("leases") == []
+        return claimed
 
     async def runtime_once(
         self,
