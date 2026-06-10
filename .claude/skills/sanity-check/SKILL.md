@@ -3,8 +3,8 @@ name: sanity-check
 description: |
   Production sanity-check runner for MinT/mint-server.
 
-  Objective: run non-trivial RL training loops against MinT production for the 5 production base models
-  (0.6B, 4B Instruct, 4B Thinking, 30B, 235B), collect timing evidence, perform only minimal ops remediation when justified,
+  Objective: run non-trivial RL training loops against MinT production for the 6 production base models
+  (0.6B, 4B Instruct, 4B Thinking, 30B, Qwen3.5, 235B), collect timing evidence, perform only minimal ops remediation when justified,
   and send exactly one final Feishu report.
 
   Triggers: "sanity check", "sanity-check", "prod sanity", "production sanity"
@@ -52,7 +52,7 @@ Wrapper contract:
 - Recursively discovers nested `timing_events.jsonl`, `timing_summary.json`, and `timing_summary.md`.
 - Writes `summary.json`, `summary.md`, and `final_feishu_report.md`.
 - Sends exactly one final Feishu report for `--all-models`, including preflight failures.
-- After `--all-models` completes with all 5 models passed, deletes checkpoints
+- After `--all-models` completes with all 6 models passed, deletes checkpoints
   created by that wrapper run for `MINT_TEST_CHECKPOINT_OWNER_ID` and records
   cleanup counts in the summary/report. Failed or partial runs preserve
   checkpoints for debugging.
@@ -65,7 +65,11 @@ The production matrix is exactly:
 2. `Qwen/Qwen3-4B-Instruct-2507`
 3. `Qwen/Qwen3-4B-Thinking-2507`
 4. `Qwen/Qwen3-30B-A3B-Instruct-2507`
-5. `Qwen/Qwen3-235B-A22B-Instruct-2507`
+5. `Qwen/Qwen3.5-27B`
+6. `Qwen/Qwen3-235B-A22B-Instruct-2507`
+
+Qwen3.5 operator aliases accepted by the wrapper include `qwen35`, `qwen3.5`,
+`qwen3-5`, and `qwen3_5`.
 
 Do not skip, reorder, parallelize, or replace models for the scheduled production sanity-check.
 

@@ -22,12 +22,17 @@ DEFAULT_BASE_URL = "https://mint.macaron.xin"
 DEFAULT_RESULTS_ROOT = "/root/run_results/mint"
 PROD_CONFIG_DIR = Path("/vePFS-Mindverse/share/mint/prod/config")
 FEISHU_TITLE = "MinT sanity-check report"
+QWEN35_MODEL = "Qwen/Qwen3.5-27B"
 DEFAULT_MODELS = {
     "0.6b": "Qwen/Qwen3-0.6B",
     "4b": "Qwen/Qwen3-4B-Instruct-2507",
     "4b-instruct": "Qwen/Qwen3-4B-Instruct-2507",
     "4b-thinking": "Qwen/Qwen3-4B-Thinking-2507",
     "30b": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "qwen35": QWEN35_MODEL,
+    "qwen3.5": QWEN35_MODEL,
+    "qwen3-5": QWEN35_MODEL,
+    "qwen3_5": QWEN35_MODEL,
     "235b": "Qwen/Qwen3-235B-A22B-Instruct-2507",
 }
 ALL_MODELS = [
@@ -35,6 +40,7 @@ ALL_MODELS = [
     "Qwen/Qwen3-4B-Instruct-2507",
     "Qwen/Qwen3-4B-Thinking-2507",
     "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    QWEN35_MODEL,
     "Qwen/Qwen3-235B-A22B-Instruct-2507",
 ]
 DEFAULT_DEGRADATION_THRESHOLDS = {
@@ -42,6 +48,7 @@ DEFAULT_DEGRADATION_THRESHOLDS = {
     "Qwen/Qwen3-4B-Instruct-2507": {"wall_clock_s": 180.0, "slowest_max_s": 90.0},
     "Qwen/Qwen3-4B-Thinking-2507": {"wall_clock_s": 180.0, "slowest_max_s": 90.0},
     "Qwen/Qwen3-30B-A3B-Instruct-2507": {"wall_clock_s": 1800.0, "slowest_max_s": 900.0},
+    QWEN35_MODEL: {"wall_clock_s": 1800.0, "slowest_max_s": 900.0},
     "Qwen/Qwen3-235B-A22B-Instruct-2507": {"wall_clock_s": 1500.0, "slowest_max_s": 900.0},
 }
 QUEUE_STAGE_TIMING_FIELDS = (
@@ -133,7 +140,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "models",
         nargs="*",
-        help="Model aliases or full model names. Aliases: 0.6b, 4b, 4b-instruct, 4b-thinking, 30b, 235b.",
+        help=(
+            "Model aliases or full model names. Aliases: 0.6b, 4b, 4b-instruct, "
+            "4b-thinking, 30b, qwen35, qwen3.5, 235b."
+        ),
     )
     parser.add_argument(
         "--model",
@@ -145,7 +155,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--all-models",
         action="store_true",
-        help="Run the standard 5-model production matrix.",
+        help="Run the standard 6-model production matrix.",
     )
     parser.add_argument("--num-rl-steps", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -209,7 +219,7 @@ def parse_args() -> argparse.Namespace:
         "--cleanup-pass-checkpoints",
         action="store_true",
         default=True,
-        help="Delete checkpoints created by a full 5-model sanity run after all models pass.",
+        help="Delete checkpoints created by a full 6-model sanity run after all models pass.",
     )
     parser.add_argument(
         "--no-cleanup-pass-checkpoints",

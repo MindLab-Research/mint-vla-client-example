@@ -17,6 +17,50 @@ def _load_train_check():
     return module
 
 
+def test_all_models_matrix_includes_qwen35_before_235b():
+    train_check = _load_train_check()
+    args = SimpleNamespace(all_models=True, models=[], models_flag=[])
+
+    assert train_check.selected_models(args) == [
+        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-4B-Instruct-2507",
+        "Qwen/Qwen3-4B-Thinking-2507",
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "Qwen/Qwen3.5-27B",
+        "Qwen/Qwen3-235B-A22B-Instruct-2507",
+    ]
+
+
+def test_qwen35_operator_aliases_resolve_to_production_model():
+    train_check = _load_train_check()
+
+    for alias in ("qwen35", "qwen3.5", "qwen3-5", "qwen3_5"):
+        assert train_check.resolve_model(alias) == "Qwen/Qwen3.5-27B"
+
+
+def test_qwen35_build_run_uses_public_model_name(monkeypatch, tmp_path):
+    train_check = _load_train_check()
+    monkeypatch.setenv("MINT_TEST_CHECKPOINT_OWNER_ID", "0123456789abcdef01234567")
+    monkeypatch.setenv("MINT_API_KEY", "redacted-test-key")
+    args = SimpleNamespace(
+        all_models=False,
+        models=["qwen35"],
+        models_flag=[],
+        base_url=train_check.DEFAULT_BASE_URL,
+        num_rl_steps=1,
+        batch_size=2,
+        group_size=4,
+        max_tokens=128,
+        timeout_s=7200.0,
+    )
+
+    runs = train_check.build_runs(args, tmp_path, create_dirs=False)
+
+    assert len(runs) == 1
+    assert runs[0].model == "Qwen/Qwen3.5-27B"
+    assert "--model=Qwen/Qwen3.5-27B" in runs[0].command
+
+
 def test_mint_uri_owner_sampling_error_is_client_workflow():
     train_check = _load_train_check()
     text = """
