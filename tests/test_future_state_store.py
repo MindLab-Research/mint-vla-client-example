@@ -114,6 +114,17 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         lease_ttl_s=30.0,
         now=103.0,
     )
+    renewed = store.renew_lease(
+        request_id="req-1",
+        lease_id="lease-1",
+        attempt_id="attempt-1",
+        scheduler_epoch=owner["epoch"],
+        runtime_generation=1,
+        lease_ttl_s=60.0,
+        now=104.0,
+    )
+    assert renewed["record"]["status"] == "leased"
+    assert renewed["record"]["lease_expires_at"] == 164.0
     store.begin_finalize(
         request_id="req-1",
         lease_id="lease-1",
@@ -122,7 +133,7 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         runtime_generation=1,
         finalize_ttl_s=30.0,
         staged_payload_path="/tmp/payload.json",
-        now=104.0,
+        now=105.0,
     )
     out = store.commit_finalize_success(
         request_id="req-1",
@@ -134,7 +145,7 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         result_checksum="sha256:abc",
         result_size_bytes=12,
         metadata={"billing_status": "outboxed"},
-        now=105.0,
+        now=106.0,
     )
 
     assert out["record"]["status"] == "done"

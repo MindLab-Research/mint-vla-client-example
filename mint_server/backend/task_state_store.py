@@ -2279,6 +2279,51 @@ class TaskStateStore:
             )
             return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
 
+    def renew_lease(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        lease_ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        expires_at = ts + max(1.0, float(lease_ttl_s))
+        with self._transaction() as conn:
+            self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
+            row = self._get_row(conn, request_id)
+            status = str(row["status"])
+            if status in TERMINAL_TASK_STATUSES:
+                return {"ok": False, "reason": "terminal", "record": self._row_to_record(row)}
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = ?,
+                    updated_at = ?
+                WHERE request_id = ?
+                  AND status IN ('leased', 'running')
+                  AND lease_id = ?
+                  AND attempt_id = ?
+                  AND scheduler_epoch = ?
+                  AND runtime_generation = ?
+                """,
+                (
+                    expires_at,
+                    ts,
+                    str(request_id),
+                    str(lease_id),
+                    str(attempt_id),
+                    int(scheduler_epoch),
+                    int(runtime_generation),
+                ),
+            )
+            if cur.rowcount != 1:
+                self._raise_task_transition_error(conn, request_id, "renew lease")
+            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+
     def begin_finalize(
         self,
         *,
@@ -3211,6 +3256,9 @@ class _TaskStateStoreActor:
     def future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("claim_task", **kwargs)
 
+    def future_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("renew_lease", **kwargs)
+
     def future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("begin_finalize", **kwargs)
 
@@ -3645,6 +3693,11 @@ class _TaskStateStoreActor:
 
     def claim_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.claim_task(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return out
+
+    def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        out = self._store.renew_lease(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
         return out
 
@@ -4138,6 +4191,9 @@ class TaskStateStoreClient:
     async def async_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("claim_task", **kwargs)
 
+    async def async_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("renew_lease", **kwargs)
+
     async def async_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("begin_finalize", **kwargs)
 
@@ -4255,6 +4311,9 @@ class TaskStateStoreClient:
 
     async def async_future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_claim_task", **kwargs)
+
+    async def async_future_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_renew_lease", **kwargs)
 
     async def async_future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_begin_finalize", **kwargs)

@@ -373,10 +373,20 @@ class _ModelWorkSchedulerActor:
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
         )
+        owner_ttl_s = float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0))
+        self._task_state_owner_lock = asyncio.Lock()
+        self._owner_heartbeat_task: asyncio.Task | None = None
+        self._owner_heartbeat_interval_s = float(
+            os.environ.get(
+                "MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S",
+                str(max(1.0, min(10.0, owner_ttl_s / 3.0))),
+            )
+        )
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
         self._ensure_assignment_loop_started()
+        self._ensure_owner_heartbeat_started()
 
     def _init_otel_metrics(self) -> None:
         endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
@@ -638,25 +648,51 @@ class _ModelWorkSchedulerActor:
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:
             return None
-        if self._scheduler_epoch is not None:
-            renewed = await self._task_state_call(
-                "renew_scheduler_owner",
+        async with self._task_state_owner_lock:
+            if self._scheduler_epoch is not None:
+                renewed = await self._task_state_call(
+                    "renew_scheduler_owner",
+                    owner_id=self._owner_id,
+                    epoch=int(self._scheduler_epoch),
+                    ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
+                )
+                if isinstance(renewed, dict) and bool(renewed.get("ok")):
+                    return int(self._scheduler_epoch)
+                self._scheduler_epoch = None
+            acquired = await self._task_state_call(
+                "acquire_scheduler_owner",
                 owner_id=self._owner_id,
-                epoch=int(self._scheduler_epoch),
                 ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
             )
-            if isinstance(renewed, dict) and bool(renewed.get("ok")):
-                return int(self._scheduler_epoch)
-            self._scheduler_epoch = None
-        acquired = await self._task_state_call(
-            "acquire_scheduler_owner",
-            owner_id=self._owner_id,
-            ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
-        )
-        if not isinstance(acquired, dict) or not bool(acquired.get("ok")):
-            raise ModelWorkSchedulerConflictError(f"failed to acquire scheduler owner: {acquired}")
-        self._scheduler_epoch = int(acquired["epoch"])
-        return int(self._scheduler_epoch)
+            if not isinstance(acquired, dict) or not bool(acquired.get("ok")):
+                raise ModelWorkSchedulerConflictError(f"failed to acquire scheduler owner: {acquired}")
+            self._scheduler_epoch = int(acquired["epoch"])
+            return int(self._scheduler_epoch)
+
+    async def _owner_heartbeat_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._owner_heartbeat_interval_s)
+            try:
+                await self._ensure_task_state_owner()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[model_work_scheduler] owner heartbeat failed error_type=%s error=%s",
+                    type(e).__name__,
+                    e,
+                )
+
+    def _ensure_owner_heartbeat_started(self) -> None:
+        if not self._use_task_state_store or self._owner_heartbeat_interval_s <= 0:
+            return
+        if self._owner_heartbeat_task is not None and not self._owner_heartbeat_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._owner_heartbeat_task = loop.create_task(self._owner_heartbeat_loop())
 
     async def _assignment_loop(self) -> None:
         while True:
@@ -843,6 +879,7 @@ class _ModelWorkSchedulerActor:
 
     async def _ensure_task_state_ready(self) -> int | None:
         self._ensure_assignment_loop_started()
+        self._ensure_owner_heartbeat_started()
         epoch = await self._ensure_task_state_owner()
         if not self._use_task_state_store or self._task_state_hydrated:
             return epoch
@@ -1618,6 +1655,8 @@ class _ModelWorkSchedulerActor:
         consumer_generation: int,
         lease_ttl_s: float = 30.0,
     ) -> dict[str, Any]:
+        if self._use_task_state_store:
+            await self._ensure_task_state_ready()
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
@@ -1626,7 +1665,47 @@ class _ModelWorkSchedulerActor:
                 consumer_generation
             ):
                 return {"ok": False, "reason": "stale_consumer"}
-            lease.lease_expires_at = time.time() + max(1.0, float(lease_ttl_s))
+            request_id = lease.item.request_id
+            attempt_id = lease.attempt_id
+            scheduler_epoch = int(self._scheduler_epoch or 0)
+            new_expires_at = time.time() + max(1.0, float(lease_ttl_s))
+        renew_rejected: dict[str, Any] | None = None
+        if self._use_task_state_store:
+            renewed = await self._task_state_call(
+                "renew_lease",
+                request_id=request_id,
+                lease_id=str(lease_id),
+                attempt_id=attempt_id,
+                scheduler_epoch=scheduler_epoch,
+                runtime_generation=int(consumer_generation),
+                lease_ttl_s=max(1.0, float(lease_ttl_s)),
+            )
+            if isinstance(renewed, dict):
+                if not bool(renewed.get("ok")):
+                    renew_rejected = {
+                        "ok": False,
+                        "reason": str(renewed.get("reason") or "renew_rejected"),
+                    }
+                record = renewed.get("record")
+                if isinstance(record, dict) and record.get("lease_expires_at") is not None:
+                    new_expires_at = float(record["lease_expires_at"])
+        async with self._cv:
+            lease = self._leases_by_id.get(str(lease_id))
+            if lease is None:
+                return {"ok": False, "reason": "unknown_lease"}
+            if (
+                lease.item.request_id != request_id
+                or lease.attempt_id != attempt_id
+                or lease.consumer_id != consumer_id
+                or int(lease.consumer_generation) != int(consumer_generation)
+            ):
+                return {"ok": False, "reason": "stale_consumer"}
+            if renew_rejected is not None:
+                if renew_rejected["reason"] == "terminal":
+                    self._remove_request_from_memory_locked(request_id)
+                    self._cv.notify_all()
+                return renew_rejected
+            lease.lease_expires_at = new_expires_at
             return {"ok": True, "lease": lease.to_dict()}
 
     async def complete_lease(
@@ -1764,6 +1843,8 @@ class _ModelWorkSchedulerActor:
             "task_state_store_enabled": self._use_task_state_store,
             "assignment_loop_interval_s": self._assignment_loop_interval_s,
             "assignment_loop_running": self._assignment_loop_task is not None and not self._assignment_loop_task.done(),
+            "owner_heartbeat_interval_s": self._owner_heartbeat_interval_s,
+            "owner_heartbeat_running": self._owner_heartbeat_task is not None and not self._owner_heartbeat_task.done(),
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -1806,6 +1887,7 @@ class _ModelWorkSchedulerActor:
 
     def stats(self) -> dict[str, Any]:
         self._ensure_assignment_loop_started()
+        self._ensure_owner_heartbeat_started()
         return self._stats_snapshot()
 
     def ping(self) -> dict[str, Any]:

@@ -1033,6 +1033,43 @@ class FutureStateStore:
             self._save_indexed(record, old_record=old_record)
             return {"ok": True, "record": dict(record)}
 
+    def renew_lease(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        lease_ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        ts = _now(now)
+        expires_at = ts + max(1.0, float(lease_ttl_s))
+        with self._lock_for_request(request_id):
+            self._assert_scheduler_owner(scheduler_epoch=scheduler_epoch, now=ts)
+            record = self._load(str(request_id))
+            old_record = dict(record)
+            status = str(record.get("status"))
+            if status in TERMINAL_TASK_STATUSES:
+                return {"ok": False, "reason": "terminal", "record": dict(record)}
+            if (
+                status not in {"leased", "running"}
+                or str(record.get("lease_id")) != str(lease_id)
+                or str(record.get("attempt_id")) != str(attempt_id)
+                or int(record.get("scheduler_epoch") or 0) != int(scheduler_epoch)
+                or int(record.get("runtime_generation") or 0) != int(runtime_generation)
+            ):
+                raise TaskStateConflictError(f"cannot renew lease; current status={record.get('status')!r}")
+            record.update(
+                {
+                    "lease_expires_at": expires_at,
+                    "updated_at": ts,
+                }
+            )
+            self._save_indexed(record, old_record=old_record)
+            return {"ok": True, "record": dict(record)}
+
     def begin_finalize(self, *, request_id: str, lease_id: str, attempt_id: str, scheduler_epoch: int, runtime_generation: int, finalize_ttl_s: float, staged_payload_path: str | None = None, now: float | None = None) -> dict[str, Any]:
         ts = _now(now)
         finalizing_until = ts + max(1.0, float(finalize_ttl_s))

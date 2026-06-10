@@ -67,6 +67,111 @@ def _replica(
     }
 
 
+class _MockTaskStateStoreClient:
+    def __init__(self, store: TaskStateStore | None = None) -> None:
+        self.store = store or TaskStateStore.in_memory()
+        self.calls: list[tuple[str, dict]] = []
+        self.blockers: dict[str, tuple[asyncio.Event, asyncio.Event]] = {}
+        self.overrides: dict[str, object] = {}
+
+    def block_method(self, method: str) -> tuple[asyncio.Event, asyncio.Event]:
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        self.blockers[str(method)] = (entered, release)
+        return entered, release
+
+    def count(self, method: str) -> int:
+        return sum(1 for name, _kwargs in self.calls if name == method)
+
+    async def _call(self, method: str, **kwargs):
+        method = str(method)
+        self.calls.append((method, dict(kwargs)))
+        blocker = self.blockers.get(method)
+        if blocker is not None:
+            entered, release = blocker
+            entered.set()
+            await release.wait()
+        override = self.overrides.get(method)
+        if override is not None:
+            if callable(override):
+                out = override(**kwargs)
+                if asyncio.iscoroutine(out):
+                    return await out
+                return out
+            return override
+        return getattr(self.store, method)(**kwargs)
+
+    def __getattr__(self, name: str):
+        if name.startswith("async_future_"):
+            method = name[len("async_future_") :]
+        elif name.startswith("async_"):
+            method = name[len("async_") :]
+        else:
+            raise AttributeError(name)
+
+        async def _method(**kwargs):
+            return await self._call(method, **kwargs)
+
+        return _method
+
+    def close(self) -> None:
+        self.store.close()
+
+
+class _SchedulerMockHarness:
+    def __init__(self, *, owner_id: str = "scheduler-mock") -> None:
+        self.task_state = _MockTaskStateStoreClient()
+        self.actor = _ModelWorkSchedulerActor(
+            use_task_state_store=True,
+            task_state_store=self.task_state,
+            owner_id=owner_id,
+        )
+
+    async def claim_one(self, request_id: str = "req-mock") -> dict:
+        await self.actor.sync_replicas([_replica("replica-0")])
+        assert (await self.actor.append(_work(request_id), assign=True))["ok"] is True
+        claimed = await self.actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        return claimed["leases"][0]
+
+    def close(self) -> None:
+        self.task_state.close()
+
+
+def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S", "0.01")
+
+    async def _run() -> None:
+        store = _MockTaskStateStoreClient()
+        actor = _ModelWorkSchedulerActor(
+            use_task_state_store=True,
+            task_state_store=store,
+            owner_id="scheduler-heartbeat",
+        )
+        try:
+            await actor._ensure_task_state_ready()
+            deadline = time.time() + 1.0
+            while store.count("renew_scheduler_owner") < 1 and time.time() < deadline:
+                await asyncio.sleep(0.01)
+            assert store.count("acquire_scheduler_owner") >= 1
+            assert store.count("renew_scheduler_owner") >= 1
+            assert actor.stats()["owner_heartbeat_running"] is True
+        finally:
+            task = actor._owner_heartbeat_task
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            store.close()
+
+    asyncio.run(_run())
+
+
 def test_scheduler_assigns_to_registered_replica_queue() -> None:
     actor = _ModelWorkSchedulerActor()
 
@@ -1031,6 +1136,19 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         assert record["lease_id"] == lease["lease_id"]
         assert record["attempt_id"] == lease["attempt_id"]
         assert record["runtime_generation"] == 10
+        claimed_expires_at = float(record["lease_expires_at"])
+
+        renewed = await actor.renew_lease(
+            lease_id=lease["lease_id"],
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            lease_ttl_s=120.0,
+        )
+        assert renewed["ok"] is True
+        record = store.get_task("req-persisted")
+        assert record["status"] == "leased"
+        assert float(record["lease_expires_at"]) > claimed_expires_at
+        assert renewed["lease"]["lease_expires_at"] == record["lease_expires_at"]
 
         finalizing = await actor.begin_finalize_lease(
             lease_id=lease["lease_id"],
@@ -1050,6 +1168,83 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         asyncio.run(_run())
     finally:
         store.close()
+
+
+def test_scheduler_renew_lease_rejects_durable_terminal_task_state() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        assert (await actor.append(_work("req-terminal-renew"), assign=True))["ok"] is True
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        lease = claimed["leases"][0]
+        store.complete_task_failure(
+            request_id="req-terminal-renew",
+            error="external terminalization",
+        )
+
+        renewed = await actor.renew_lease(
+            lease_id=lease["lease_id"],
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            lease_ttl_s=30.0,
+        )
+
+        assert renewed == {"ok": False, "reason": "terminal"}
+        assert actor.stats()["leases"] == []
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_scheduler_renew_lease_task_state_rpc_does_not_hold_scheduler_lock() -> None:
+    harness = _SchedulerMockHarness()
+
+    async def _run() -> None:
+        lease = await harness.claim_one("req-renew-lock")
+        entered, release = harness.task_state.block_method("renew_lease")
+        renew_task = asyncio.create_task(
+            harness.actor.renew_lease(
+                lease_id=lease["lease_id"],
+                consumer_id="consumer-replica-0",
+                consumer_generation=10,
+                lease_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        validated = await asyncio.wait_for(
+            harness.actor.validate_lease(
+                lease_id=lease["lease_id"],
+                consumer_id="consumer-replica-0",
+                consumer_generation=10,
+            ),
+            timeout=0.2,
+        )
+        assert validated["ok"] is True
+
+        release.set()
+        renewed = await asyncio.wait_for(renew_task, timeout=1.0)
+        assert renewed["ok"] is True
+
+    try:
+        asyncio.run(_run())
+    finally:
+        harness.close()
 
 
 def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> None:

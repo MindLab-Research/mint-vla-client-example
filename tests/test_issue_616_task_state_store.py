@@ -770,6 +770,29 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
         assert claimed["record"]["lease_id"] == "lease-1"
         assert claimed["record"]["attempt_id"] == "attempt-1"
 
+        renewed = store.renew_lease(
+            request_id="req-1",
+            lease_id="lease-1",
+            attempt_id="attempt-1",
+            scheduler_epoch=epoch,
+            runtime_generation=7,
+            lease_ttl_s=60.0,
+            now=104.0,
+        )
+        assert renewed["record"]["status"] == "leased"
+        assert renewed["record"]["lease_expires_at"] == 164.0
+
+        with pytest.raises(TaskStateConflictError):
+            store.renew_lease(
+                request_id="req-1",
+                lease_id="lease-1",
+                attempt_id="attempt-1",
+                scheduler_epoch=epoch,
+                runtime_generation=8,
+                lease_ttl_s=60.0,
+                now=105.0,
+            )
+
         active = store.list_active_tasks()
         assert [record["request_id"] for record in active] == ["req-1"]
         assert active[0]["metadata"]["queue_kind"] == "model_work_scheduler"
