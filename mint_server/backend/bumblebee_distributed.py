@@ -49,6 +49,7 @@ BUMBLEBEE_TRAIN_STATE_META_FILE = "training_meta.json"
 BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "MINT_BUMBLEBEE_REPO_PATH",
     "MINT_BUMBLEBEE_MODEL_NAME",
+    "MINT_BUMBLEBEE_MEGATRON_LM_PATH",
     "MINT_BUMBLEBEE_IMPL",
     "MINT_BUMBLEBEE_OPTIMIZER",
     "MINT_BUMBLEBEE_SKIP_HF_LOAD",
@@ -206,6 +207,10 @@ def _bumblebee_runtime_pythonpath() -> str:
     runtime_pythonpath = PFS_PYTHONPATH
     repo = _bumblebee_repo_path()
     runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, repo)
+    runtime_pythonpath = _prepend_pythonpath_entry(
+        runtime_pythonpath,
+        os.environ.get("MINT_BUMBLEBEE_MEGATRON_LM_PATH"),
+    )
     runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, _bumblebee_flash_attn_overlay_path())
     return runtime_pythonpath
 

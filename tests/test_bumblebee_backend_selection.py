@@ -96,6 +96,7 @@ def test_bumblebee_placement_group_name_is_namespace_scoped():
 def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
     assert "MINT_BUMBLEBEE_IMPL" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_MODEL_NAME" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+    assert "MINT_BUMBLEBEE_MEGATRON_LM_PATH" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_OPTIMIZER" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_SKIP_HF_LOAD" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "MINT_BUMBLEBEE_ATTENTION_BACKEND" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
@@ -153,13 +154,16 @@ def test_bumblebee_flash_attn_overlay_path_auto_detects_runtime_overlay(monkeypa
 
 def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tmp_path):
     overlay = tmp_path / "flash-overlay"
+    megatron = tmp_path / "Megatron-LM"
     repo = tmp_path / "bumblebee"
     monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
+    monkeypatch.setenv("MINT_BUMBLEBEE_MEGATRON_LM_PATH", str(megatron))
     monkeypatch.setenv("MINT_BUMBLEBEE_REPO_PATH", str(repo))
     monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
 
-    assert _bumblebee_runtime_pythonpath().split(":")[:3] == [
+    assert _bumblebee_runtime_pythonpath().split(":")[:4] == [
         str(overlay),
+        str(megatron),
         str(repo),
         "/runtime/site-packages",
     ]
