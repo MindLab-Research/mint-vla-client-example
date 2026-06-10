@@ -1693,13 +1693,14 @@ if rl_metrics:
 
 if args.save_ckpt:
     # Save final RL checkpoint
-    save_state_future = training_client.save_state(name="arithmetic-rl-final")
+    final_state_name = "arithmetic-rl-final-state"
+    save_state_future = training_client.save_state(name=final_state_name)
     rl_checkpoint = _result_with_heartbeat(
         save_state_future,
         label="SaveState",
         timeout_s=TIMEOUT_S,
         stage_name="save_state",
-        extra={"name": "arithmetic-rl-final"},
+        extra={"name": final_state_name},
     )
     print(f"Final checkpoint: {rl_checkpoint.path}")
 
