@@ -27,6 +27,35 @@ async def _assert_stats_progress_while_blocked(world: SchedulerComponentWorld, c
     return result
 
 
+async def _assert_scheduler_surfaces_progress_while_blocked(
+    world: SchedulerComponentWorld,
+    call,
+    block_name: str,
+):
+    block = world.faults.block(block_name)
+    task = asyncio.create_task(call())
+    await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+    contains = await asyncio.wait_for(world.observe_scheduler("component-progress-probe"), timeout=0.5)
+    stats = await asyncio.wait_for(world.scheduler.stats(), timeout=0.5)
+    appended = await asyncio.wait_for(
+        world.enqueue_sampling(f"component-progress-{block_name}", assign=False),
+        timeout=0.5,
+    )
+    synced = await asyncio.wait_for(
+        world.scheduler.sync_replicas([world.replica(status="healthy")]),
+        timeout=0.5,
+    )
+
+    block.release.set()
+    result = await task
+    assert contains["ok"] is True
+    assert stats["scheduler_instance_id"]
+    assert appended.scheduler_result["ok"] is True
+    assert synced["ok"] is True
+    return result
+
+
 @pytest.mark.anyio
 async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, monkeypatch) -> None:
     world = SchedulerComponentWorld(tmp_path)
@@ -36,7 +65,7 @@ async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, 
 
         await world.runtime_once()
 
-        assert await world.future_service.async_get_status("component-happy") == FutureStatus.DONE
+        assert await world.observe_future_status("component-happy") == FutureStatus.DONE
         status_code, payload = await world.retrieve("component-happy", monkeypatch)
         assert status_code == 200
         assert payload == {"ok": True, "request_id": "component-happy"}
@@ -197,7 +226,7 @@ async def test_scheduler_component_executor_failure_commits_failed_terminal(tmp_
         actor = await world.runtime_once(executor=_failing_executor)
 
         assert actor.health_snapshot()["failed_total"] == 1
-        assert await world.future_service.async_get_status("component-exec-failed") == FutureStatus.FAILED
+        assert await world.observe_future_status("component-exec-failed") == FutureStatus.FAILED
         record = await world.observe_task("component-exec-failed")
         assert record["status"] == "failed"
         assert "synthetic executor failure" in str(record["error"])
@@ -216,7 +245,7 @@ async def test_scheduler_component_payload_write_failure_requeues_without_termin
     try:
         await world.start()
         await world.enqueue_sampling("component-payload-write-failed")
-        world.payload_store.fail_writes = True
+        world.inject_payload_write_failure(True)
 
         actor = await world.runtime_once()
 
@@ -229,11 +258,11 @@ async def test_scheduler_component_payload_write_failure_requeues_without_termin
             await world.scheduler.contains(request_id="component-payload-write-failed")
         )["present"] is True
 
-        world.payload_store.fail_writes = False
+        world.inject_payload_write_failure(False)
         assigned = await world.scheduler.assign_pending(max_items=1)
         await world.runtime_once()
         assert assigned["assigned"] == 1
-        assert await world.future_service.async_get_status("component-payload-write-failed") == FutureStatus.DONE
+        assert await world.observe_future_status("component-payload-write-failed") == FutureStatus.DONE
         await assert_terminal_not_scheduled(world, "component-payload-write-failed")
     finally:
         world.close()
@@ -507,6 +536,58 @@ async def test_scheduler_component_blocked_assign_task_does_not_block_stats(tmp_
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_blocked_assign_task_does_not_block_scheduler_surfaces(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-progress-probe", assign=False)
+
+        assigned = await _assert_scheduler_surfaces_progress_while_blocked(
+            world,
+            lambda: world.scheduler.assign_pending(max_items=1),
+            "task_state.assign_task",
+        )
+
+        assert assigned["assigned"] == 1
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_blocked_assign_task_keeps_claim_nonblocking_and_empty(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-assigning-not-claimable", assign=False)
+
+        block = world.faults.block("task_state.assign_task")
+        assign_task = asyncio.create_task(world.scheduler.assign_pending(max_items=1))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+        claimed = await asyncio.wait_for(
+            world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            ),
+            timeout=0.5,
+        )
+
+        block.release.set()
+        assigned = await assign_task
+
+        assert claimed["leases"] == []
+        assert assigned["assigned"] == 1
+        lease = await world.claim_one()
+        assert lease["item"]["request_id"] == "component-assigning-not-claimable"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_blocked_begin_finalize_does_not_block_stats(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
@@ -531,6 +612,32 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_stats(t
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_blocked_begin_finalize_does_not_block_scheduler_surfaces(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-progress-probe")
+        lease = await world.claim_one()
+
+        finalized = await _assert_scheduler_surfaces_progress_while_blocked(
+            world,
+            lambda: world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=30.0,
+            ),
+            "task_state.begin_finalize",
+        )
+
+        assert finalized["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_blocked_requeue_task_does_not_block_stats(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
@@ -539,6 +646,32 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_stats(tmp
         lease = await world.claim_one()
 
         failed = await _assert_stats_progress_while_blocked(
+            world,
+            lambda: world.scheduler.fail(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                requeue=True,
+                reason="component-test",
+            ),
+            "task_state.requeue_task",
+        )
+
+        assert failed["ok"] is True
+        assert failed["requeued"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_blocked_requeue_task_does_not_block_scheduler_surfaces(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-progress-probe")
+        lease = await world.claim_one()
+
+        failed = await _assert_scheduler_surfaces_progress_while_blocked(
             world,
             lambda: world.scheduler.fail(
                 lease_id=lease["lease_id"],

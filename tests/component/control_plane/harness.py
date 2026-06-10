@@ -38,7 +38,7 @@ class LocalAsyncTaskStateClient:
         method = str(method)
         self.calls.append((method, {"args": args, **dict(kwargs)}))
         await self.faults.before_call(f"task_state.{method}", **kwargs)
-        return getattr(self.store, method)(*args, **kwargs)
+        return await asyncio.to_thread(getattr(self.store, method), *args, **kwargs)
 
     async def async_ensure_ready(
         self,
@@ -54,7 +54,7 @@ class LocalAsyncTaskStateClient:
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
         _ = timeout_s
-        return self.store.ping()
+        return await asyncio.to_thread(self.store.ping)
 
     async def async_acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call("acquire_scheduler_owner", **kwargs)
@@ -143,11 +143,12 @@ class LocalAsyncTaskStateClient:
         _ = terminal_only
         await asyncio.sleep(max(0.0, min(float(timeout_s), 0.01)))
         try:
+            record = await asyncio.to_thread(self.store.get_task, str(request_id))
             return {
                 "changed": False,
                 "timeout": True,
                 "missing": False,
-                "record": self.store.get_task(str(request_id)),
+                "record": record,
             }
         except KeyError:
             return {"changed": False, "timeout": False, "missing": True}
@@ -313,6 +314,12 @@ class SchedulerComponentWorld:
 
     async def observe_scheduler(self, request_id: str) -> dict[str, Any]:
         return await self.scheduler.contains(request_id=str(request_id))
+
+    async def observe_future_status(self, request_id: str) -> FutureStatus:
+        return await self.future_service.async_get_status(str(request_id))
+
+    def inject_payload_write_failure(self, enabled: bool) -> None:
+        self.payload_store.fail_writes = bool(enabled)
 
     async def retrieve(self, request_id: str, monkeypatch: Any) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)

@@ -316,6 +316,12 @@ class ModelWorkLease:
         }
 
 
+@dataclass
+class _PendingRequeue:
+    assigned: _AssignedWork
+    lease: ModelWorkLease | None = None
+
+
 def _queue_key(domain_key: str, replica_id: str) -> tuple[str, str]:
     return str(domain_key), str(replica_id)
 
@@ -367,7 +373,10 @@ class _ModelWorkSchedulerActor:
         self._claimed = 0
         self._sampling_inflight_by_domain: dict[str, int] = {}
         self._sampling_inflight_by_principal_domain: dict[tuple[str, str], int] = {}
+        self._sampling_inflight_tokens_by_domain: dict[str, int] = {}
+        self._sampling_inflight_tokens_by_principal_domain: dict[tuple[str, str], int] = {}
         self._sampling_principal_domain_by_request_id: dict[str, tuple[str, str]] = {}
+        self._sampling_token_cost_by_request_id: dict[str, int] = {}
         self._sampling_admission_would_reject: dict[tuple[str, str], int] = {}
         self._sampling_admission_reject: dict[tuple[str, str], int] = {}
         self._assignment_loop_task: asyncio.Task | None = None
@@ -760,9 +769,17 @@ class _ModelWorkSchedulerActor:
         principal = self._sampling_principal(item)
         key = (principal, domain_key)
         self._sampling_principal_domain_by_request_id[request_id] = key
+        token_cost = max(1, int(item.token_cost))
+        self._sampling_token_cost_by_request_id[request_id] = token_cost
         self._sampling_inflight_by_domain[domain_key] = self._sampling_inflight_by_domain.get(domain_key, 0) + 1
         self._sampling_inflight_by_principal_domain[key] = (
             self._sampling_inflight_by_principal_domain.get(key, 0) + 1
+        )
+        self._sampling_inflight_tokens_by_domain[domain_key] = (
+            self._sampling_inflight_tokens_by_domain.get(domain_key, 0) + token_cost
+        )
+        self._sampling_inflight_tokens_by_principal_domain[key] = (
+            self._sampling_inflight_tokens_by_principal_domain.get(key, 0) + token_cost
         )
 
     def _untrack_sampling_inflight_locked(self, request_id: str) -> None:
@@ -770,6 +787,7 @@ class _ModelWorkSchedulerActor:
         if key is None:
             return
         principal, domain_key = key
+        token_cost = max(1, int(self._sampling_token_cost_by_request_id.pop(str(request_id), 1)))
         current_domain = self._sampling_inflight_by_domain.get(domain_key, 0) - 1
         if current_domain > 0:
             self._sampling_inflight_by_domain[domain_key] = current_domain
@@ -780,6 +798,19 @@ class _ModelWorkSchedulerActor:
             self._sampling_inflight_by_principal_domain[(principal, domain_key)] = current_principal
         else:
             self._sampling_inflight_by_principal_domain.pop((principal, domain_key), None)
+        current_domain_tokens = self._sampling_inflight_tokens_by_domain.get(domain_key, 0) - token_cost
+        if current_domain_tokens > 0:
+            self._sampling_inflight_tokens_by_domain[domain_key] = current_domain_tokens
+        else:
+            self._sampling_inflight_tokens_by_domain.pop(domain_key, None)
+        current_principal_tokens = (
+            self._sampling_inflight_tokens_by_principal_domain.get((principal, domain_key), 0)
+            - token_cost
+        )
+        if current_principal_tokens > 0:
+            self._sampling_inflight_tokens_by_principal_domain[(principal, domain_key)] = current_principal_tokens
+        else:
+            self._sampling_inflight_tokens_by_principal_domain.pop((principal, domain_key), None)
 
     def _sampling_inflight_limit_decision_locked(self, item: ModelWorkItem) -> dict[str, Any]:
         mode = _sampling_inflight_admission_mode()
@@ -790,6 +821,11 @@ class _ModelWorkSchedulerActor:
         principal_key = (principal, domain_key)
         principal_current = int(self._sampling_inflight_by_principal_domain.get(principal_key, 0))
         domain_current = int(self._sampling_inflight_by_domain.get(domain_key, 0))
+        token_cost = max(1, int(item.token_cost))
+        principal_token_current = int(
+            self._sampling_inflight_tokens_by_principal_domain.get(principal_key, 0)
+        )
+        domain_token_current = int(self._sampling_inflight_tokens_by_domain.get(domain_key, 0))
         principal_limit = _sampling_inflight_limit(
             "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
             "sampling_max_inflight_per_principal_domain",
@@ -799,6 +835,16 @@ class _ModelWorkSchedulerActor:
             "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
             "sampling_max_inflight_per_domain",
             10240,
+        )
+        principal_token_limit = _sampling_inflight_limit(
+            "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
+            "sampling_max_inflight_tokens_per_principal_domain",
+            0,
+        )
+        domain_token_limit = _sampling_inflight_limit(
+            "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
+            "sampling_max_inflight_tokens_per_domain",
+            0,
         )
         reason: str | None = None
         current = 0
@@ -811,6 +857,14 @@ class _ModelWorkSchedulerActor:
             reason = "domain_inflight_limit_exceeded"
             current = domain_current
             limit = domain_limit
+        elif principal_token_limit > 0 and principal_token_current + token_cost > principal_token_limit:
+            reason = "principal_domain_token_budget_exceeded"
+            current = principal_token_current + token_cost
+            limit = principal_token_limit
+        elif domain_token_limit > 0 and domain_token_current + token_cost > domain_token_limit:
+            reason = "domain_token_budget_exceeded"
+            current = domain_token_current + token_cost
+            limit = domain_token_limit
         if reason is None:
             return {
                 "ok": True,
@@ -821,6 +875,11 @@ class _ModelWorkSchedulerActor:
                 "principal_limit": principal_limit,
                 "domain_current": domain_current,
                 "domain_limit": domain_limit,
+                "token_cost": token_cost,
+                "principal_token_current": principal_token_current,
+                "principal_token_limit": principal_token_limit,
+                "domain_token_current": domain_token_current,
+                "domain_token_limit": domain_token_limit,
             }
         counter_key = (domain_key, reason)
         if mode == "observe":
@@ -840,6 +899,11 @@ class _ModelWorkSchedulerActor:
                 "principal_limit": principal_limit,
                 "domain_current": domain_current,
                 "domain_limit": domain_limit,
+                "token_cost": token_cost,
+                "principal_token_current": principal_token_current,
+                "principal_token_limit": principal_token_limit,
+                "domain_token_current": domain_token_current,
+                "domain_token_limit": domain_token_limit,
             }
         self._sampling_admission_reject[counter_key] = self._sampling_admission_reject.get(counter_key, 0) + 1
         return {
@@ -854,18 +918,28 @@ class _ModelWorkSchedulerActor:
             "principal_limit": principal_limit,
             "domain_current": domain_current,
             "domain_limit": domain_limit,
+            "token_cost": token_cost,
+            "principal_token_current": principal_token_current,
+            "principal_token_limit": principal_token_limit,
+            "domain_token_current": domain_token_current,
+            "domain_token_limit": domain_token_limit,
             "retry_after_s": 5,
         }
 
     async def _persist_requeue_task(self, request_id: str, *, reason: str) -> bool:
         if not self._use_task_state_store:
             return True
-        out = await self._task_state_call(
-            "requeue_task",
-            request_id=str(request_id),
-            scheduler_epoch=int(self._scheduler_epoch or 0),
-            reason=str(reason),
-        )
+        try:
+            out = await self._task_state_call(
+                "requeue_task",
+                request_id=str(request_id),
+                scheduler_epoch=int(self._scheduler_epoch or 0),
+                reason=str(reason),
+            )
+        except Exception as exc:
+            if self._task_not_found_cause(exc) is not None:
+                return False
+            raise
         if isinstance(out, dict) and bool(out.get("ok")):
             return True
         if isinstance(out, dict) and out.get("reason") == "terminal":
@@ -881,23 +955,27 @@ class _ModelWorkSchedulerActor:
         active = await self._task_state_call("list_active_tasks")
         if not isinstance(active, list):
             raise TypeError(f"TaskStateStore.list_active_tasks returned non-list: {type(active)}")
+        to_requeue: list[tuple[ModelWorkItem, str]] = []
+        pending_items: list[ModelWorkItem] = []
+        for record in active:
+            if not isinstance(record, dict):
+                continue
+            status = str(record.get("status") or "")
+            item = self._work_item_from_task_record(record)
+            if status != "pending":
+                to_requeue.append((item, "scheduler_hydrate_requeue"))
+            else:
+                pending_items.append(item)
+        for item, reason in to_requeue:
+            should_requeue = await self._persist_requeue_task(item.request_id, reason=reason)
+            if should_requeue:
+                pending_items.append(item)
         async with self._cv:
             if self._task_state_hydrated:
                 return epoch
-            for record in active:
-                if not isinstance(record, dict):
-                    continue
-                status = str(record.get("status") or "")
-                item = self._work_item_from_task_record(record)
+            for item in pending_items:
                 if item.request_id in self._all_request_ids():
                     continue
-                if status != "pending":
-                    should_requeue = await self._persist_requeue_task(
-                        item.request_id,
-                        reason="scheduler_hydrate_requeue",
-                    )
-                    if not should_requeue:
-                        continue
                 self._backlog(item.domain_key).append(item)
                 self._request_locations[item.request_id] = "backlog"
                 self._track_sampling_inflight_locked(item)
@@ -936,6 +1014,45 @@ class _ModelWorkSchedulerActor:
             return False
         return str(record.get("status") or "") in {"pending", "queued", "assigned"}
 
+    async def _forget_created_task_after_append_cancel(
+        self,
+        item: ModelWorkItem,
+        *,
+        append_attempt_id: str,
+    ) -> None:
+        if not self._use_task_state_store:
+            return
+        if not append_attempt_id:
+            return
+        try:
+            record = await self._task_state_call("get_task", request_id=item.request_id)
+        except Exception as exc:
+            if self._task_not_found_cause(exc) is not None:
+                return
+            logger.exception(
+                "[model_work_scheduler] failed to inspect task before append cancellation rollback request_id=%s",
+                item.request_id,
+            )
+            return
+        if not isinstance(record, dict):
+            return
+        if not self._task_record_matches_work_item(record, item):
+            return
+        metadata = record.get("metadata")
+        if not isinstance(metadata, dict) or str(
+            metadata.get("model_work_scheduler_append_attempt_id") or ""
+        ) != str(append_attempt_id):
+            return
+        if str(record.get("status") or "") not in {"pending", "queued"}:
+            return
+        try:
+            await self._task_state_call("forget_task", request_id=item.request_id)
+        except Exception:
+            logger.exception(
+                "[model_work_scheduler] failed to roll back task after append cancellation request_id=%s",
+                item.request_id,
+            )
+
     def _backlog(self, domain_key: str) -> deque[ModelWorkItem]:
         return self._domain_backlog.setdefault(str(domain_key), deque())
 
@@ -947,6 +1064,14 @@ class _ModelWorkSchedulerActor:
         if not prefixes:
             return False
         return str(domain_key).startswith(prefixes)
+
+    def _ordering_key_has_active_lease_locked(self, ordering_key: str | None) -> bool:
+        if not ordering_key:
+            return False
+        for lease in self._leases_by_id.values():
+            if lease.item.ordering_key == ordering_key:
+                return True
+        return False
 
     def _cluster_queue_head_affinity(self, queue: deque[_AssignedWork]) -> None:
         if not queue:
@@ -969,6 +1094,161 @@ class _ModelWorkSchedulerActor:
         backlog = self._domain_backlog.get(domain_key)
         if backlog is not None and not backlog:
             self._domain_backlog.pop(domain_key, None)
+
+    def _has_inflight_scheduler_transition_locked(self) -> bool:
+        return any(
+            location in {"assigning", "claiming", "requeueing", "finalizing"}
+            for location in self._request_locations.values()
+        )
+
+    def _assigned_matches_locked(self, assigned: _AssignedWork, *, location: str = "assigning") -> bool:
+        request_id = assigned.item.request_id
+        if self._request_locations.get(request_id) != location:
+            return False
+        if location != "assigning":
+            for queue in self._replica_queues.values():
+                if any(current.item.request_id == request_id for current in queue):
+                    return False
+        return not any(item.request_id == request_id for backlog in self._domain_backlog.values() for item in backlog)
+
+    def _commit_assigned_locked(self, assigned: _AssignedWork) -> None:
+        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
+        if not any(current.item.request_id == assigned.item.request_id for current in queue):
+            queue.append(assigned)
+        self._request_locations[assigned.item.request_id] = "assigned"
+        self._assigned += 1
+
+    def _restore_assigned_to_queue_locked(self, assigned: _AssignedWork) -> None:
+        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
+        queue.appendleft(assigned)
+        self._request_locations[assigned.item.request_id] = "assigned"
+
+    def _restore_assigning_to_backlog_locked(self, assigned: _AssignedWork) -> bool:
+        if self._request_locations.get(assigned.item.request_id) != "assigning":
+            return False
+        key = _queue_key(assigned.item.domain_key, assigned.replica_id)
+        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
+        kept = deque(
+            current
+            for current in queue
+            if current.item.request_id != assigned.item.request_id
+        )
+        self._replica_queues[key] = kept
+        self._backlog(assigned.item.domain_key).appendleft(assigned.item)
+        self._request_locations[assigned.item.request_id] = "backlog"
+        return True
+
+    async def _restore_or_commit_assigning_after_cancel(self, pending: list[_AssignedWork]) -> None:
+        async with self._cv:
+            if not self._use_task_state_store:
+                for assigned in reversed(pending):
+                    self._restore_assigning_to_backlog_locked(assigned)
+                self._cv.notify_all()
+                return
+        for assigned in pending:
+            durable_assigned = False
+            try:
+                record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
+                durable_assigned = (
+                    isinstance(record, dict)
+                    and str(record.get("status") or "") == "assigned"
+                    and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
+                    and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+                )
+            except Exception:
+                durable_assigned = False
+            async with self._cv:
+                if self._request_locations.get(assigned.item.request_id) != "assigning":
+                    continue
+                if durable_assigned:
+                    self._commit_assigned_locked(assigned)
+                else:
+                    self._restore_assigning_to_backlog_locked(assigned)
+                self._cv.notify_all()
+
+    def _prepare_assignments_locked(self, *, max_items: int | None = None) -> tuple[list[_AssignedWork], list[str]]:
+        pending: list[_AssignedWork] = []
+        skipped_domains: list[str] = []
+        limit = None if max_items is None else max(0, int(max_items))
+        for domain_key in sorted(list(self._domain_backlog)):
+            backlog = self._domain_backlog.get(domain_key)
+            while backlog:
+                if limit is not None and len(pending) >= limit:
+                    return pending, skipped_domains
+                item = backlog[0]
+                replica = self._choose_replica(item)
+                if replica is None:
+                    skipped_domains.append(domain_key)
+                    break
+                backlog.popleft()
+                assigned = _AssignedWork(
+                    item=item,
+                    replica_id=replica.replica_id,
+                    queue_id=replica.effective_queue_id,
+                    assigned_at=time.time(),
+                    assignment_generation=replica.generation,
+                    assignment_reason="least_loaded_affinity",
+                )
+                pending.append(assigned)
+                queue = self._queue(replica.domain_key, replica.replica_id)
+                queue.append(assigned)
+                self._request_locations[item.request_id] = "assigning"
+            self._drop_empty_backlog(domain_key)
+        return pending, skipped_domains
+
+    async def _assign_pending_unlocked(self, *, max_items: int | None = None) -> dict[str, Any]:
+        async with self._cv:
+            pending, skipped_domains = self._prepare_assignments_locked(max_items=max_items)
+            if not pending:
+                return {"ok": True, "assigned": 0, "skipped_domains": skipped_domains}
+        assigned_count = 0
+        for index, assigned in enumerate(pending):
+            try:
+                if self._use_task_state_store:
+                    await self._task_state_call(
+                        "assign_task",
+                        request_id=assigned.item.request_id,
+                        subqueue_id=assigned.queue_id,
+                        scheduler_epoch=int(self._scheduler_epoch or 0),
+                    )
+            except asyncio.CancelledError:
+                await self._restore_or_commit_assigning_after_cancel(pending[index:])
+                raise
+            except Exception as exc:
+                conflict = self._claim_conflict_cause(exc)
+                if conflict is not None:
+                    reconciled = await self._reconcile_pending_assign_conflict(
+                        assigned.item,
+                        conflict=conflict,
+                    )
+                    if reconciled is not None:
+                        continue
+                async with self._cv:
+                    for unprocessed in reversed(pending[index:]):
+                        self._restore_assigning_to_backlog_locked(unprocessed)
+                    self._cv.notify_all()
+                raise
+            async with self._cv:
+                if self._assigned_matches_locked(assigned, location="assigning"):
+                    self._commit_assigned_locked(assigned)
+                    assigned_count += 1
+                    self._cv.notify_all()
+        return {"ok": True, "assigned": assigned_count, "skipped_domains": skipped_domains}
+
+    async def _assign_pending_if_no_inflight_unlocked(
+        self,
+        *,
+        hydrate_task_state: bool = True,
+    ) -> dict[str, Any]:
+        async with self._cv:
+            if self._has_inflight_scheduler_transition_locked():
+                return {
+                    "ok": True,
+                    "assigned": 0,
+                    "skipped_domains": [],
+                    "deferred": "inflight_scheduler_transition",
+                }
+        return await self.assign_pending(hydrate_task_state=hydrate_task_state)
 
     def _remove_request_from_memory_locked(self, request_id: str) -> bool:
         request_id = str(request_id)
@@ -1065,6 +1345,87 @@ class _ModelWorkSchedulerActor:
             return cause
         return None
 
+    def _task_not_found_cause(self, exc: BaseException) -> TaskStateNotFoundError | None:
+        if isinstance(exc, TaskStateNotFoundError):
+            return exc
+        as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+        if callable(as_instanceof_cause):
+            try:
+                cause = as_instanceof_cause()
+            except Exception:
+                cause = None
+            if isinstance(cause, TaskStateNotFoundError):
+                return cause
+        cause = getattr(exc, "cause", None)
+        if isinstance(cause, TaskStateNotFoundError):
+            return cause
+        return None
+
+    def _drop_claiming_request_locked(self, assigned: _AssignedWork) -> bool:
+        if self._request_locations.get(assigned.item.request_id) != "claiming":
+            return False
+        self._remove_request_location(assigned.item.request_id)
+        self._stale_dropped += 1
+        return True
+
+    async def _restore_or_commit_claiming_after_cancel(
+        self,
+        assigned: _AssignedWork,
+        *,
+        lease_id: str,
+        attempt_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        lease_ttl_s: float,
+    ) -> None:
+        durable_record: dict[str, Any] | None = None
+        if self._use_task_state_store:
+            try:
+                record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
+                if (
+                    isinstance(record, dict)
+                    and str(record.get("status") or "") in {"leased", "running"}
+                    and str(record.get("lease_id") or "") == str(lease_id)
+                    and str(record.get("attempt_id") or "") == str(attempt_id)
+                    and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+                    and int(record.get("runtime_generation") or 0) == int(consumer_generation)
+                ):
+                    durable_record = record
+            except Exception:
+                durable_record = None
+        async with self._cv:
+            if self._request_locations.get(assigned.item.request_id) != "claiming":
+                return
+            if durable_record is None:
+                self._restore_assigned_to_queue_locked(assigned)
+                self._cv.notify_all()
+                return
+            now = time.time()
+            lease_expires_at = durable_record.get("lease_expires_at")
+            lease = ModelWorkLease(
+                lease_id=str(lease_id),
+                item=assigned.item,
+                domain_key=assigned.item.domain_key,
+                replica_id=assigned.replica_id,
+                queue_id=assigned.queue_id,
+                attempt_id=str(attempt_id),
+                scheduler_epoch=self._scheduler_epoch,
+                consumer_id=str(consumer_id),
+                consumer_generation=int(consumer_generation),
+                leased_at=float(durable_record.get("leased_at") or now),
+                lease_expires_at=(
+                    float(lease_expires_at)
+                    if lease_expires_at is not None
+                    else now + max(1.0, float(lease_ttl_s))
+                ),
+                claim_attempt=int(assigned.item.extra.get("claim_attempt") or 0) + 1,
+                last_requeue_reason=assigned.item.extra.get("last_requeue_reason"),
+            )
+            self._leases_by_id[str(lease_id)] = lease
+            self._lease_id_by_request_id[assigned.item.request_id] = str(lease_id)
+            self._request_locations[assigned.item.request_id] = "leased"
+            self._cv.notify_all()
+
     async def _reconcile_assigned_claim_conflict(
         self,
         assigned: _AssignedWork,
@@ -1076,8 +1437,9 @@ class _ModelWorkSchedulerActor:
         try:
             record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
         except TaskStateNotFoundError:
-            self._remove_request_location(assigned.item.request_id)
-            self._stale_dropped += 1
+            async with self._cv:
+                if self._drop_claiming_request_locked(assigned):
+                    self._cv.notify_all()
             logger.warning(
                 "[model_work_scheduler] dropped stale assigned queue item with missing task state request_id=%s queue_id=%s",
                 assigned.item.request_id,
@@ -1085,25 +1447,31 @@ class _ModelWorkSchedulerActor:
             )
             return "missing"
         status = str(record.get("status") or "")
+        scheduler_epoch = int(self._scheduler_epoch or 0)
         same_assignment = (
             status == "assigned"
             and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
-            and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+            and int(record.get("scheduler_epoch") or 0) == scheduler_epoch
         )
         if same_assignment:
             return None
-        if status == "pending":
-            self._backlog(assigned.item.domain_key).appendleft(assigned.item)
-            self._request_locations[assigned.item.request_id] = "backlog"
-            self._requeued += 1
-            logger.warning(
-                "[model_work_scheduler] requeued stale assigned queue item whose task state is pending request_id=%s queue_id=%s",
-                assigned.item.request_id,
-                assigned.queue_id,
-            )
-            return "pending_requeued"
-        self._remove_request_location(assigned.item.request_id)
-        self._stale_dropped += 1
+        async with self._cv:
+            if self._request_locations.get(assigned.item.request_id) != "claiming":
+                return "changed"
+            if status == "pending":
+                self._backlog(assigned.item.domain_key).appendleft(assigned.item)
+                self._request_locations[assigned.item.request_id] = "backlog"
+                self._requeued += 1
+                self._cv.notify_all()
+                logger.warning(
+                    "[model_work_scheduler] requeued stale assigned queue item whose task state is pending request_id=%s queue_id=%s",
+                    assigned.item.request_id,
+                    assigned.queue_id,
+                )
+                return "pending_requeued"
+            self._remove_request_location(assigned.item.request_id)
+            self._stale_dropped += 1
+            self._cv.notify_all()
         logger.warning(
             "[model_work_scheduler] dropped stale assigned queue item after task-state claim conflict request_id=%s queue_id=%s status=%s terminal=%s",
             assigned.item.request_id,
@@ -1124,8 +1492,11 @@ class _ModelWorkSchedulerActor:
         try:
             record = await self._task_state_call("get_task", request_id=item.request_id)
         except TaskStateNotFoundError:
-            self._remove_request_location(item.request_id)
-            self._stale_dropped += 1
+            async with self._cv:
+                if self._request_locations.get(item.request_id) == "assigning":
+                    self._remove_request_from_memory_locked(item.request_id)
+                    self._stale_dropped += 1
+                    self._cv.notify_all()
             logger.warning(
                 "[model_work_scheduler] dropped stale backlog item with missing task state request_id=%s domain_key=%s",
                 item.request_id,
@@ -1135,8 +1506,11 @@ class _ModelWorkSchedulerActor:
         status = str(record.get("status") or "")
         if status == "pending":
             return None
-        self._remove_request_location(item.request_id)
-        self._stale_dropped += 1
+        async with self._cv:
+            if self._request_locations.get(item.request_id) == "assigning":
+                self._remove_request_from_memory_locked(item.request_id)
+                self._stale_dropped += 1
+                self._cv.notify_all()
         logger.warning(
             "[model_work_scheduler] dropped stale backlog item after task-state assign conflict request_id=%s domain_key=%s status=%s terminal=%s",
             item.request_id,
@@ -1146,9 +1520,16 @@ class _ModelWorkSchedulerActor:
         )
         return status or "unknown"
 
-    async def _expire_leases_locked(self, *, now: float) -> int:
-        expired = 0
-        for lease_id, lease in list(self._leases_by_id.items()):
+    def _prepare_expired_leases_locked(self, *, now: float) -> list[_PendingRequeue]:
+        expired: list[_PendingRequeue] = []
+        lease_items = sorted(
+            list(self._leases_by_id.items()),
+            key=lambda item: (float(item[1].leased_at), str(item[0])),
+            reverse=True,
+        )
+        for lease_id, lease in lease_items:
+            if self._request_locations.get(lease.item.request_id) == "finalizing":
+                continue
             expires_at = (
                 max(float(lease.lease_expires_at), float(lease.finalizing_until))
                 if lease.finalizing_until is not None
@@ -1166,68 +1547,94 @@ class _ModelWorkSchedulerActor:
                 assignment_generation=lease.consumer_generation,
                 assignment_reason="lease_expired_requeue",
             )
-            should_requeue = await self._persist_requeue_task(
-                lease.item.request_id,
-                reason="lease_expired",
-            )
-            if should_requeue:
-                self._requeue_assigned(assigned, reason="lease_expired")
-                expired += 1
-            else:
-                self._remove_request_location(lease.item.request_id)
+            self._request_locations[lease.item.request_id] = "requeueing"
+            expired.append(_PendingRequeue(assigned=assigned, lease=lease))
         return expired
 
-    async def _assign_pending_locked(self, *, max_items: int | None = None) -> dict[str, Any]:
-        assigned = 0
-        skipped_domains: list[str] = []
-        limit = None if max_items is None else max(0, int(max_items))
-        for domain_key in sorted(list(self._domain_backlog)):
-            backlog = self._domain_backlog.get(domain_key)
-            while backlog:
-                if limit is not None and assigned >= limit:
-                    return {"ok": True, "assigned": assigned, "skipped_domains": skipped_domains}
-                item = backlog[0]
-                replica = self._choose_replica(item)
-                if replica is None:
-                    skipped_domains.append(domain_key)
-                    break
-                if self._use_task_state_store:
-                    try:
-                        await self._task_state_call(
-                            "assign_task",
-                            request_id=item.request_id,
-                            subqueue_id=replica.effective_queue_id,
-                            scheduler_epoch=int(self._scheduler_epoch or 0),
-                        )
-                    except Exception as e:
-                        conflict = self._claim_conflict_cause(e)
-                        if conflict is None:
-                            raise
-                        reconciled = await self._reconcile_pending_assign_conflict(
-                            item,
-                            conflict=conflict,
-                        )
-                        if reconciled is None:
-                            raise
-                        backlog.popleft()
-                        continue
-                backlog.popleft()
-                queue = self._queue(replica.domain_key, replica.replica_id)
-                queue.append(
-                    _AssignedWork(
-                        item=item,
-                        replica_id=replica.replica_id,
-                        queue_id=replica.effective_queue_id,
-                        assigned_at=time.time(),
-                        assignment_generation=replica.generation,
-                        assignment_reason="least_loaded_affinity",
-                    )
+    def _restore_pending_requeue_locked(self, pending: _PendingRequeue) -> None:
+        assigned = pending.assigned
+        if self._request_locations.get(assigned.item.request_id) != "requeueing":
+            return
+        if pending.lease is not None:
+            lease = pending.lease
+            self._leases_by_id[lease.lease_id] = lease
+            self._lease_id_by_request_id[lease.item.request_id] = lease.lease_id
+            self._request_locations[lease.item.request_id] = "leased"
+            return
+        self._restore_assigned_to_queue_locked(assigned)
+
+    async def _restore_or_commit_requeues_after_cancel(self, requeue_items: list[_PendingRequeue]) -> set[str]:
+        committed_request_ids: set[str] = set()
+        for pending in requeue_items:
+            assigned = pending.assigned
+            durable_pending = False
+            durable_terminal = False
+            if self._use_task_state_store:
+                try:
+                    record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
+                    if isinstance(record, dict):
+                        status = str(record.get("status") or "")
+                        durable_pending = status == "pending"
+                        durable_terminal = status in TERMINAL_TASK_STATUSES
+                except Exception:
+                    durable_pending = False
+                    durable_terminal = False
+            async with self._cv:
+                if self._request_locations.get(assigned.item.request_id) != "requeueing":
+                    continue
+                if durable_pending:
+                    self._requeue_assigned(assigned, reason="cancelled_after_requeue_commit")
+                    committed_request_ids.add(assigned.item.request_id)
+                elif durable_terminal:
+                    self._remove_request_location(assigned.item.request_id)
+                    committed_request_ids.add(assigned.item.request_id)
+                else:
+                    self._restore_pending_requeue_locked(pending)
+                self._cv.notify_all()
+        return committed_request_ids
+
+    async def _commit_requeues_unlocked(self, requeue_items: list[_PendingRequeue], *, reason: str) -> int:
+        requeued = 0
+        committed_request_ids: set[str] = set()
+        for index, pending in enumerate(requeue_items):
+            assigned = pending.assigned
+            try:
+                should_requeue = await self._persist_requeue_task(
+                    assigned.item.request_id,
+                    reason=reason,
                 )
-                self._request_locations[item.request_id] = "assigned"
-                assigned += 1
-                self._assigned += 1
-            self._drop_empty_backlog(domain_key)
-        return {"ok": True, "assigned": assigned, "skipped_domains": skipped_domains}
+            except asyncio.CancelledError as exc:
+                committed_request_ids.update(
+                    await self._restore_or_commit_requeues_after_cancel(requeue_items[index:])
+                )
+                setattr(exc, "_model_work_requeue_committed_request_ids", set(committed_request_ids))
+                raise
+            except Exception as exc:
+                async with self._cv:
+                    for unprocessed in requeue_items[index:]:
+                        self._restore_pending_requeue_locked(unprocessed)
+                    self._cv.notify_all()
+                setattr(exc, "_model_work_requeue_committed_request_ids", set(committed_request_ids))
+                raise
+            async with self._cv:
+                if self._request_locations.get(assigned.item.request_id) != "requeueing":
+                    continue
+                if should_requeue:
+                    self._requeue_assigned(assigned, reason=reason)
+                    requeued += 1
+                else:
+                    self._remove_request_location(assigned.item.request_id)
+                committed_request_ids.add(assigned.item.request_id)
+                self._cv.notify_all()
+        return requeued
+
+    async def _expire_leases_unlocked(self, *, now: float) -> int:
+        async with self._cv:
+            expired = self._prepare_expired_leases_locked(now=now)
+            if not expired:
+                return 0
+            self._cv.notify_all()
+        return await self._commit_requeues_unlocked(expired, reason="lease_expired")
 
     async def append(
         self,
@@ -1239,28 +1646,32 @@ class _ModelWorkSchedulerActor:
         self._ensure_assignment_loop_started()
         work = ModelWorkItem.from_dict(item)
         async with self._cv:
-            if work.request_id in self._all_request_ids():
-                if not await self._duplicate_append_matches_hydrated_pending_task(work):
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
-                assigned = (
-                    await self._assign_pending_locked(max_items=assign_max_items)
-                    if bool(assign)
-                    else {"ok": True, "assigned": 0, "skipped_domains": []}
-                )
-                self._cv.notify_all()
+            duplicate_in_memory = work.request_id in self._all_request_ids()
+        if duplicate_in_memory:
+            if not await self._duplicate_append_matches_hydrated_pending_task(work):
                 return {
-                    "ok": True,
+                    "ok": False,
+                    "reason": "duplicate_request_id",
                     "request_id": work.request_id,
-                    "domain_key": work.domain_key,
-                    "scheduler_instance_id": self._instance_id,
-                    "backlog_depth": len(self._backlog(work.domain_key)),
-                    "assigned": assigned,
-                    "idempotent": True,
                 }
+            assigned = (
+                await self.assign_pending(max_items=assign_max_items)
+                if bool(assign)
+                else {"ok": True, "assigned": 0, "skipped_domains": []}
+            )
+            async with self._cv:
+                backlog_depth = len(self._backlog(work.domain_key))
+            return {
+                "ok": True,
+                "request_id": work.request_id,
+                "domain_key": work.domain_key,
+                "scheduler_instance_id": self._instance_id,
+                "backlog_depth": backlog_depth,
+                "assigned": assigned,
+                "idempotent": True,
+            }
+        created: dict[str, Any] | None = None
+        async with self._cv:
             admission = self._sampling_inflight_limit_decision_locked(work)
             if not bool(admission.get("ok")):
                 return {
@@ -1268,8 +1679,9 @@ class _ModelWorkSchedulerActor:
                     "request_id": work.request_id,
                     "scheduler_instance_id": self._instance_id,
                 }
-            created: dict[str, Any] | None = None
-            if self._use_task_state_store:
+        append_attempt_id = uuid.uuid4().hex
+        if self._use_task_state_store:
+            try:
                 created = await self._task_state_call(
                     "create_task",
                     request_id=work.request_id,
@@ -1287,59 +1699,106 @@ class _ModelWorkSchedulerActor:
                         "ordering_key": work.ordering_key,
                         "token_cost": work.token_cost,
                         "model_work_scheduler_instance_id": self._instance_id,
+                        "model_work_scheduler_append_attempt_id": append_attempt_id,
                     },
                 )
-                if isinstance(created, dict) and not bool(created.get("created", True)):
-                    record = created.get("record")
-                    if not isinstance(record, dict) or not self._task_record_matches_work_item(record, work):
-                        return {
-                            "ok": False,
-                            "reason": "duplicate_request_id",
-                            "request_id": work.request_id,
-                        }
-                    if str(record.get("status") or "") not in {"pending", "queued"}:
-                        return {
-                            "ok": False,
-                            "reason": "duplicate_request_id",
-                            "request_id": work.request_id,
-                        }
-            try:
+            except asyncio.CancelledError:
+                await self._forget_created_task_after_append_cancel(
+                    work,
+                    append_attempt_id=append_attempt_id,
+                )
+                raise
+            if isinstance(created, dict) and not bool(created.get("created", True)):
+                record = created.get("record")
+                if not isinstance(record, dict) or not self._task_record_matches_work_item(record, work):
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
+                if str(record.get("status") or "") not in {"pending", "queued"}:
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
+        try:
+            async with self._cv:
+                if work.request_id in self._all_request_ids():
+                    return {
+                        "ok": False,
+                        "reason": "duplicate_request_id",
+                        "request_id": work.request_id,
+                    }
                 self._backlog(work.domain_key).append(work)
                 self._request_locations[work.request_id] = "backlog"
                 self._appended += 1
-                assigned = (
-                    await self._assign_pending_locked(max_items=assign_max_items)
-                    if bool(assign)
-                    else {"ok": True, "assigned": 0, "skipped_domains": []}
-                )
                 self._track_sampling_inflight_locked(work)
-            except Exception:
+                self._cv.notify_all()
+                backlog_depth = len(self._backlog(work.domain_key))
+            assigned = (
+                await self.assign_pending(max_items=assign_max_items)
+                if bool(assign)
+                else {"ok": True, "assigned": 0, "skipped_domains": []}
+            )
+        except asyncio.CancelledError:
+            async with self._cv:
+                location = self._request_locations.get(work.request_id)
+                durable_transition_committed = location in {"assigned", "leased", "finalizing"}
+                if not durable_transition_committed:
+                    self._remove_request_from_memory_locked(work.request_id)
+                self._cv.notify_all()
+            if self._use_task_state_store and isinstance(created, dict) and bool(created.get("created")):
+                await self._forget_created_task_after_append_cancel(
+                    work,
+                    append_attempt_id=append_attempt_id,
+                )
+            raise
+        except Exception:
+            async with self._cv:
                 self._remove_request_from_memory_locked(work.request_id)
-                if self._use_task_state_store and isinstance(created, dict) and bool(created.get("created")):
-                    try:
-                        await self._task_state_call("forget_task", request_id=work.request_id)
-                    except Exception:
-                        logger.exception(
-                            "[model_work_scheduler] failed to roll back task after append failure request_id=%s",
-                            work.request_id,
-                        )
-                raise
-            self._cv.notify_all()
-            return {
-                "ok": True,
-                "request_id": work.request_id,
-                "domain_key": work.domain_key,
-                "scheduler_instance_id": self._instance_id,
-                "backlog_depth": len(self._backlog(work.domain_key)),
-                "assigned": assigned,
-                "sampling_inflight_admission": admission,
-            }
+                self._cv.notify_all()
+            if self._use_task_state_store and isinstance(created, dict) and bool(created.get("created")):
+                await self._forget_created_task_after_append_cancel(
+                    work,
+                    append_attempt_id=append_attempt_id,
+                )
+            raise
+        return {
+            "ok": True,
+            "request_id": work.request_id,
+            "domain_key": work.domain_key,
+            "scheduler_instance_id": self._instance_id,
+            "backlog_depth": backlog_depth,
+            "assigned": assigned,
+            "sampling_inflight_admission": admission,
+        }
 
     async def cancel_request(self, *, request_id: str, reason: str = "cancelled") -> dict[str, Any]:
         request_id = str(request_id)
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
-        removed = False
+            try:
+                await self._task_state_call(
+                    "complete_task_failure",
+                    request_id=request_id,
+                    error=f"Model work request cancelled: {reason}",
+                    metadata={
+                        "terminal_status": "cancelled",
+                        "cancelled_at": time.time(),
+                        "cancel_reason": str(reason),
+                    },
+                )
+            except Exception as exc:
+                if self._task_not_found_cause(exc) is not None:
+                    pass
+                else:
+                    try:
+                        record = await self._task_state_call("get_task", request_id=request_id)
+                    except Exception:
+                        raise exc
+                    if not isinstance(record, dict) or str(record.get("status") or "") not in TERMINAL_TASK_STATUSES:
+                        raise exc
         async with self._cv:
             removed = self._remove_request_from_memory_locked(request_id)
             if removed:
@@ -1397,6 +1856,26 @@ class _ModelWorkSchedulerActor:
         }
         requeued = 0
         async with self._cv:
+            if self._has_inflight_scheduler_transition_locked():
+                return {
+                    "ok": True,
+                    "replicas": len(self._replicas),
+                    "removed": 0,
+                    "requeued": 0,
+                    "expired": 0,
+                    "assigned": {
+                        "ok": True,
+                        "assigned": 0,
+                        "skipped_domains": [],
+                        "deferred": "inflight_scheduler_transition",
+                    },
+                    "deferred": "inflight_scheduler_transition",
+                }
+            previous_replicas = dict(self._replicas)
+            previous_queues = {
+                key: deque(queue)
+                for key, queue in self._replica_queues.items()
+            }
             removed = set(self._replicas) - set(incoming)
             changed_unclaimable: set[tuple[str, str]] = set()
             for key, old in self._replicas.items():
@@ -1410,26 +1889,23 @@ class _ModelWorkSchedulerActor:
                 ):
                     changed_unclaimable.add(key)
 
-            for key in removed:
-                self._replica_queues.pop(key, None)
             self._replicas = incoming
             for key in incoming:
                 self._replica_queues.setdefault(key, deque())
 
+            requeue_items: list[_PendingRequeue] = []
             for key in changed_unclaimable:
                 queue = self._replica_queues.get(key)
                 while queue:
                     assigned = queue.pop()
-                    should_requeue = await self._persist_requeue_task(
-                        assigned.item.request_id,
-                        reason="replica_unclaimable",
-                    )
-                    if should_requeue:
-                        self._requeue_assigned(assigned, reason="replica_unclaimable")
-                        requeued += 1
-                    else:
-                        self._remove_request_location(assigned.item.request_id)
-                for lease_id, lease in list(self._leases_by_id.items()):
+                    self._request_locations[assigned.item.request_id] = "requeueing"
+                    requeue_items.append(_PendingRequeue(assigned=assigned))
+                lease_items = sorted(
+                    list(self._leases_by_id.items()),
+                    key=lambda item: (float(item[1].leased_at), str(item[0])),
+                    reverse=True,
+                )
+                for lease_id, lease in lease_items:
                     if _queue_key(lease.domain_key, lease.replica_id) == key:
                         if lease.finalizing_until is not None and lease.finalizing_until > now:
                             continue
@@ -1443,38 +1919,83 @@ class _ModelWorkSchedulerActor:
                             assignment_generation=lease.consumer_generation,
                             assignment_reason="lease_requeued_replica_unclaimable",
                         )
-                        should_requeue = await self._persist_requeue_task(
-                            lease.item.request_id,
-                            reason="replica_unclaimable",
-                        )
-                        if should_requeue:
-                            self._requeue_assigned(assigned, reason="replica_unclaimable")
-                            requeued += 1
-                        else:
-                            self._remove_request_location(lease.item.request_id)
+                        self._request_locations[lease.item.request_id] = "requeueing"
+                        requeue_items.append(_PendingRequeue(assigned=assigned, lease=lease))
 
-            expired = await self._expire_leases_locked(now=now)
-            assigned_pending = await self._assign_pending_locked()
+            for key in removed:
+                self._replica_queues.pop(key, None)
+
+            expired_items = self._prepare_expired_leases_locked(now=now)
             self._cv.notify_all()
-            return {
-                "ok": True,
-                "replicas": len(self._replicas),
-                "removed": len(removed),
-                "requeued": requeued + expired,
-                "expired": expired,
-                "assigned": assigned_pending,
-            }
+            replica_count = len(self._replicas)
+            removed_count = len(removed)
+        try:
+            requeued += await self._commit_requeues_unlocked(requeue_items, reason="replica_unclaimable")
+        except asyncio.CancelledError as exc:
+            committed_request_ids = set(getattr(exc, "_model_work_requeue_committed_request_ids", set()))
+            if committed_request_ids:
+                previous_queues = {
+                    key: deque(
+                        assigned
+                        for assigned in queue
+                        if assigned.item.request_id not in committed_request_ids
+                    )
+                    for key, queue in previous_queues.items()
+                }
+            async with self._cv:
+                for expired_pending in expired_items:
+                    self._restore_pending_requeue_locked(expired_pending)
+                self._replicas = previous_replicas
+                self._replica_queues = previous_queues
+                self._cv.notify_all()
+            raise
+        except Exception as exc:
+            committed_request_ids = set(getattr(exc, "_model_work_requeue_committed_request_ids", set()))
+            if committed_request_ids:
+                previous_queues = {
+                    key: deque(
+                        assigned
+                        for assigned in queue
+                        if assigned.item.request_id not in committed_request_ids
+                    )
+                    for key, queue in previous_queues.items()
+                }
+            async with self._cv:
+                for expired_pending in expired_items:
+                    self._restore_pending_requeue_locked(expired_pending)
+                self._replicas = previous_replicas
+                self._replica_queues = previous_queues
+                self._cv.notify_all()
+            raise
+        expired = await self._commit_requeues_unlocked(expired_items, reason="lease_expired")
+        assigned_pending = await self._assign_pending_if_no_inflight_unlocked(
+            hydrate_task_state=hydrate_task_state,
+        )
+        return {
+            "ok": True,
+            "replicas": replica_count,
+            "removed": removed_count,
+            "requeued": requeued + expired,
+            "expired": expired,
+            "assigned": assigned_pending,
+        }
 
-    async def assign_pending(self, *, max_items: int | None = None) -> dict[str, Any]:
+    async def assign_pending(
+        self,
+        *,
+        max_items: int | None = None,
+        hydrate_task_state: bool = True,
+    ) -> dict[str, Any]:
         self._ensure_assignment_loop_started()
         if self._use_task_state_store:
-            await self._ensure_task_state_owner()
-        async with self._cv:
-            expired = await self._expire_leases_locked(now=time.time())
-            out = await self._assign_pending_locked(max_items=max_items)
-            out["expired"] = expired
-            self._cv.notify_all()
-            return out
+            if hydrate_task_state:
+                await self._ensure_task_state_ready()
+            else:
+                await self._ensure_task_state_owner()
+        expired = await self._expire_leases_unlocked(now=time.time())
+        out = await self._assign_pending_unlocked(max_items=max_items)
+        out["expired"] = expired
+        return out
 
     def _validate_claimer(
         self,
@@ -1521,22 +2042,28 @@ class _ModelWorkSchedulerActor:
         now = time.time()
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
-        async with self._cv:
-            self._validate_claimer(
-                domain_key=domain_key,
-                replica_id=replica_id,
-                consumer_id=consumer_id,
-                consumer_generation=consumer_generation,
-            )
-            queue = self._queue(domain_key, replica_id)
-            claimed: list[dict[str, Any]] = []
-            spent = 0
-            claim_affinity_group: str | None = None
-            same_affinity_only = self._claim_requires_same_affinity(domain_key)
-            if same_affinity_only and max(1, int(max_items)) > 1:
-                self._cluster_queue_head_affinity(queue)
-            while queue and len(claimed) < max(1, int(max_items)):
+        claimed: list[dict[str, Any]] = []
+        spent = 0
+        claim_affinity_group: str | None = None
+        while len(claimed) < max(1, int(max_items)):
+            async with self._cv:
+                self._validate_claimer(
+                    domain_key=domain_key,
+                    replica_id=replica_id,
+                    consumer_id=consumer_id,
+                    consumer_generation=consumer_generation,
+                )
+                queue = self._queue(domain_key, replica_id)
+                same_affinity_only = self._claim_requires_same_affinity(domain_key)
+                if same_affinity_only and max(1, int(max_items)) > 1:
+                    self._cluster_queue_head_affinity(queue)
+                if not queue:
+                    break
                 assigned = queue[0]
+                if self._request_locations.get(assigned.item.request_id) == "assigning":
+                    break
+                if self._ordering_key_has_active_lease_locked(assigned.item.ordering_key):
+                    break
                 assigned_affinity_group = assigned.item.affinity_group
                 if same_affinity_only and claimed and assigned_affinity_group != claim_affinity_group:
                     break
@@ -1556,32 +2083,62 @@ class _ModelWorkSchedulerActor:
                         }
                     )
                     assigned.item = item
-                if self._use_task_state_store:
-                    try:
-                        await self._task_state_call(
-                            "claim_task",
-                            request_id=item.request_id,
-                            subqueue_id=assigned.queue_id,
-                            lease_id=lease_id,
-                            attempt_id=attempt_id,
-                            consumer_id=consumer_id,
-                            scheduler_epoch=int(self._scheduler_epoch or 0),
-                            runtime_generation=int(consumer_generation),
-                            lease_ttl_s=max(1.0, float(lease_ttl_s)),
-                        )
-                    except Exception as e:
-                        conflict = self._claim_conflict_cause(e)
-                        if conflict is None:
-                            raise
-                        reconciled = await self._reconcile_assigned_claim_conflict(
-                            assigned,
-                            conflict=conflict,
-                        )
-                        if reconciled is None:
-                            raise
-                        queue.popleft()
-                        continue
                 queue.popleft()
+                self._request_locations[assigned.item.request_id] = "claiming"
+                self._cv.notify_all()
+            if self._use_task_state_store:
+                try:
+                    await self._task_state_call(
+                        "claim_task",
+                        request_id=item.request_id,
+                        subqueue_id=assigned.queue_id,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        consumer_id=consumer_id,
+                        scheduler_epoch=int(self._scheduler_epoch or 0),
+                        runtime_generation=int(consumer_generation),
+                        lease_ttl_s=max(1.0, float(lease_ttl_s)),
+                    )
+                except asyncio.CancelledError:
+                    await self._restore_or_commit_claiming_after_cancel(
+                        assigned,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        consumer_id=consumer_id,
+                        consumer_generation=int(consumer_generation),
+                        lease_ttl_s=lease_ttl_s,
+                    )
+                    raise
+                except Exception as e:
+                    if self._task_not_found_cause(e) is not None:
+                        async with self._cv:
+                            if self._drop_claiming_request_locked(assigned):
+                                self._cv.notify_all()
+                        logger.warning(
+                            "[model_work_scheduler] dropped stale assigned queue item with missing task state during claim request_id=%s queue_id=%s",
+                            assigned.item.request_id,
+                            assigned.queue_id,
+                        )
+                        continue
+                    conflict = self._claim_conflict_cause(e)
+                    if conflict is None:
+                        async with self._cv:
+                            if self._request_locations.get(assigned.item.request_id) == "claiming":
+                                self._restore_assigned_to_queue_locked(assigned)
+                                self._cv.notify_all()
+                        raise
+                    reconciled = await self._reconcile_assigned_claim_conflict(
+                        assigned,
+                        conflict=conflict,
+                    )
+                    async with self._cv:
+                        self._cv.notify_all()
+                    if reconciled is None:
+                        raise
+                    continue
+            async with self._cv:
+                if self._request_locations.get(assigned.item.request_id) != "claiming":
+                    continue
                 lease = ModelWorkLease(
                     lease_id=lease_id,
                     item=item,
@@ -1604,8 +2161,11 @@ class _ModelWorkSchedulerActor:
                 if claim_affinity_group is None:
                     claim_affinity_group = assigned_affinity_group
                 spent += cost
+                self._cv.notify_all()
+        async with self._cv:
             self._claimed += 1
-            return {"ok": True, "leases": claimed, "remaining_queue_depth": len(queue)}
+            remaining_queue_depth = len(self._queue(domain_key, replica_id))
+        return {"ok": True, "leases": claimed, "remaining_queue_depth": remaining_queue_depth}
 
     async def begin_finalize_lease(
         self,
@@ -1627,19 +2187,82 @@ class _ModelWorkSchedulerActor:
             ):
                 return {"ok": False, "reason": "stale_consumer"}
             now = time.time()
-            if self._use_task_state_store:
+            request_id = lease.item.request_id
+            attempt_id = lease.attempt_id
+            scheduler_epoch = int(self._scheduler_epoch or 0)
+            self._request_locations[request_id] = "finalizing"
+            self._cv.notify_all()
+        if self._use_task_state_store:
+            try:
                 await self._task_state_call(
                     "begin_finalize",
-                    request_id=lease.item.request_id,
-                    lease_id=lease.lease_id,
-                    attempt_id=lease.attempt_id,
-                    scheduler_epoch=int(self._scheduler_epoch or 0),
+                    request_id=request_id,
+                    lease_id=str(lease_id),
+                    attempt_id=attempt_id,
+                    scheduler_epoch=scheduler_epoch,
                     runtime_generation=int(consumer_generation),
                     finalize_ttl_s=max(1.0, float(finalize_ttl_s)),
                     staged_payload_path=staged_payload_path,
                 )
+            except asyncio.CancelledError:
+                durable_finalizing = False
+                try:
+                    record = await self._task_state_call("get_task", request_id=request_id)
+                    durable_finalizing = (
+                        isinstance(record, dict)
+                        and str(record.get("status") or "") == "finalizing"
+                        and str(record.get("lease_id") or "") == str(lease_id)
+                        and str(record.get("attempt_id") or "") == str(attempt_id)
+                        and int(record.get("scheduler_epoch") or 0) == scheduler_epoch
+                        and int(record.get("runtime_generation") or 0) == int(consumer_generation)
+                    )
+                except Exception:
+                    durable_finalizing = False
+                async with self._cv:
+                    lease = self._leases_by_id.get(str(lease_id))
+                    if (
+                        lease is not None
+                        and lease.item.request_id == request_id
+                        and lease.attempt_id == attempt_id
+                        and lease.consumer_id == consumer_id
+                        and int(lease.consumer_generation) == int(consumer_generation)
+                        and self._request_locations.get(request_id) == "finalizing"
+                    ):
+                        if durable_finalizing:
+                            lease.finalizing_until = time.time() + max(1.0, float(finalize_ttl_s))
+                            lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
+                        self._request_locations[request_id] = "leased"
+                        self._cv.notify_all()
+                raise
+            except Exception:
+                async with self._cv:
+                    lease = self._leases_by_id.get(str(lease_id))
+                    if (
+                        lease is not None
+                        and lease.item.request_id == request_id
+                        and lease.attempt_id == attempt_id
+                        and lease.consumer_id == consumer_id
+                        and int(lease.consumer_generation) == int(consumer_generation)
+                        and self._request_locations.get(request_id) == "finalizing"
+                    ):
+                        self._request_locations[request_id] = "leased"
+                        self._cv.notify_all()
+                raise
+        async with self._cv:
+            lease = self._leases_by_id.get(str(lease_id))
+            if lease is None:
+                return {"ok": False, "reason": "unknown_lease"}
+            if (
+                lease.item.request_id != request_id
+                or lease.attempt_id != attempt_id
+                or lease.consumer_id != consumer_id
+                or int(lease.consumer_generation) != int(consumer_generation)
+            ):
+                return {"ok": False, "reason": "stale_consumer"}
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
+            self._request_locations[request_id] = "leased"
+            self._cv.notify_all()
             return {"ok": True, "lease": lease.to_dict()}
 
     async def renew_lease(
@@ -1666,15 +2289,25 @@ class _ModelWorkSchedulerActor:
             new_expires_at = time.time() + max(1.0, float(lease_ttl_s))
         renew_rejected: dict[str, Any] | None = None
         if self._use_task_state_store:
-            renewed = await self._task_state_call(
-                "renew_lease",
-                request_id=request_id,
-                lease_id=str(lease_id),
-                attempt_id=attempt_id,
-                scheduler_epoch=scheduler_epoch,
-                runtime_generation=int(consumer_generation),
-                lease_ttl_s=max(1.0, float(lease_ttl_s)),
-            )
+            try:
+                renewed = await self._task_state_call(
+                    "renew_lease",
+                    request_id=request_id,
+                    lease_id=str(lease_id),
+                    attempt_id=attempt_id,
+                    scheduler_epoch=scheduler_epoch,
+                    runtime_generation=int(consumer_generation),
+                    lease_ttl_s=max(1.0, float(lease_ttl_s)),
+                )
+            except Exception as exc:
+                if self._task_not_found_cause(exc) is not None:
+                    async with self._cv:
+                        current = self._leases_by_id.get(str(lease_id))
+                        if current is not None and current.item.request_id == request_id:
+                            self._remove_request_from_memory_locked(request_id)
+                            self._cv.notify_all()
+                    return {"ok": False, "reason": "unknown_lease"}
+                raise
             if isinstance(renewed, dict):
                 if not bool(renewed.get("ok")):
                     renew_rejected = {
@@ -1703,6 +2336,50 @@ class _ModelWorkSchedulerActor:
             lease.lease_expires_at = new_expires_at
             return {"ok": True, "lease": lease.to_dict()}
 
+    async def _terminal_task_state_for_lease(self, lease: ModelWorkLease) -> dict[str, Any]:
+        if not self._use_task_state_store:
+            return {"ok": True, "status": "unknown"}
+        try:
+            record = await self._task_state_call("get_task", request_id=lease.item.request_id)
+        except Exception as exc:
+            if self._task_not_found_cause(exc) is not None:
+                return {"ok": True, "status": "missing"}
+            raise
+        if not isinstance(record, dict):
+            return {"ok": False, "reason": "task_state_invalid"}
+        status = str(record.get("status") or "")
+        if status not in TERMINAL_TASK_STATUSES:
+            return {"ok": False, "reason": "not_terminal"}
+        if str(record.get("lease_id") or "") != str(lease.lease_id):
+            return {"ok": False, "reason": "stale_consumer"}
+        if str(record.get("attempt_id") or "") != str(lease.attempt_id):
+            return {"ok": False, "reason": "stale_consumer"}
+        if int(record.get("scheduler_epoch") or 0) != int(lease.scheduler_epoch or 0):
+            return {"ok": False, "reason": "stale_consumer"}
+        if int(record.get("runtime_generation") or 0) != int(lease.consumer_generation):
+            return {"ok": False, "reason": "stale_consumer"}
+        return {"ok": True, "status": status, "record": record}
+
+    def _current_lease_matches_locked(
+        self,
+        current: ModelWorkLease,
+        *,
+        expected: ModelWorkLease,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+    ) -> bool:
+        request_id = expected.item.request_id
+        return (
+            str(current.lease_id) == str(lease_id)
+            and current.item.request_id == request_id
+            and str(current.attempt_id) == str(expected.attempt_id)
+            and int(current.scheduler_epoch or 0) == int(expected.scheduler_epoch or 0)
+            and current.consumer_id == consumer_id
+            and int(current.consumer_generation) == int(consumer_generation)
+            and self._lease_id_by_request_id.get(request_id) == str(lease_id)
+        )
+
     async def complete_lease(
         self,
         *,
@@ -1718,10 +2395,261 @@ class _ModelWorkSchedulerActor:
                 consumer_generation
             ):
                 return {"ok": False, "reason": "stale_consumer"}
+            if self._request_locations.get(lease.item.request_id) == "finalizing":
+                return {"ok": False, "reason": "finalize_inflight"}
+            request_id = lease.item.request_id
+        terminal = await self._terminal_task_state_for_lease(lease)
+        if not bool(terminal.get("ok")):
+            return {"ok": False, "reason": str(terminal.get("reason") or "not_terminal")}
+        async with self._cv:
+            current = self._leases_by_id.get(str(lease_id))
+            if current is None:
+                if self._request_locations.get(request_id) is not None:
+                    return {"ok": False, "reason": "stale_consumer"}
+                return {"ok": False, "reason": "unknown_lease"}
+            if not self._current_lease_matches_locked(
+                current,
+                expected=lease,
+                lease_id=str(lease_id),
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+            ):
+                return {"ok": False, "reason": "stale_consumer"}
+            if self._request_locations.get(request_id) == "finalizing":
+                return {"ok": False, "reason": "finalize_inflight"}
             self._leases_by_id.pop(lease.lease_id, None)
-            self._remove_request_location(lease.item.request_id)
+            self._remove_request_location(request_id)
             self._completed += 1
-            return {"ok": True, "request_id": lease.item.request_id}
+            return {"ok": True, "request_id": request_id}
+
+    async def _finish_lease_terminal(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        success: bool,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        error: str | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        request_id = str(request_id)
+        lease_id = str(lease_id)
+        attempt_id = str(attempt_id)
+        scheduler_epoch = int(scheduler_epoch)
+        consumer_generation = int(consumer_generation)
+        if self._use_task_state_store:
+            await self._ensure_task_state_ready()
+        async with self._cv:
+            lease = self._leases_by_id.get(lease_id)
+            if lease is not None:
+                if lease.consumer_id != consumer_id or int(lease.consumer_generation) != consumer_generation:
+                    return {"ok": False, "reason": "stale_consumer"}
+                if (
+                    lease.item.request_id != request_id
+                    or str(lease.attempt_id) != attempt_id
+                    or int(lease.scheduler_epoch or 0) != scheduler_epoch
+                ):
+                    return {"ok": False, "reason": "stale_consumer"}
+            elif self._request_locations.get(request_id) is not None:
+                return {"ok": False, "reason": "stale_consumer"}
+        if self._use_task_state_store:
+            try:
+                record = await self._task_state_call("get_task", request_id=request_id)
+                if not isinstance(record, dict):
+                    return {"ok": False, "reason": "task_state_invalid"}
+                status = str(record.get("status") or "")
+                expected_status = "done" if success else "failed"
+                if status in TERMINAL_TASK_STATUSES and status != expected_status:
+                    return {"ok": False, "reason": "task_state_invalid"}
+                if status != "finalizing" and status not in TERMINAL_TASK_STATUSES:
+                    return {"ok": False, "reason": "not_finalizing"}
+                elif str(record.get("lease_id") or "") != lease_id:
+                    return {"ok": False, "reason": "stale_consumer"}
+                elif str(record.get("attempt_id") or "") != attempt_id:
+                    return {"ok": False, "reason": "stale_consumer"}
+                elif int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
+                    return {"ok": False, "reason": "stale_consumer"}
+                elif int(record.get("runtime_generation") or 0) != consumer_generation:
+                    return {"ok": False, "reason": "stale_consumer"}
+                elif str(record.get("consumer_id") or "") != str(consumer_id):
+                    return {"ok": False, "reason": "stale_consumer"}
+                elif success:
+                    committed = await self._task_state_call(
+                        "commit_finalize_success",
+                        request_id=request_id,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        scheduler_epoch=scheduler_epoch,
+                        runtime_generation=consumer_generation,
+                        result_path=str(result_path),
+                        result_checksum=result_checksum,
+                        result_size_bytes=result_size_bytes,
+                        billing_observations=billing_observations,
+                    )
+                else:
+                    committed = await self._task_state_call(
+                        "commit_finalize_failure",
+                        request_id=request_id,
+                        lease_id=lease_id,
+                        attempt_id=attempt_id,
+                        scheduler_epoch=scheduler_epoch,
+                        runtime_generation=consumer_generation,
+                        error=str(error or "failed"),
+                        result_path=result_path,
+                        result_checksum=result_checksum,
+                        result_size_bytes=result_size_bytes,
+                    )
+            except asyncio.CancelledError:
+                if lease is not None:
+                    terminal = await self._terminal_task_state_for_lease(lease)
+                    if bool(terminal.get("ok")):
+                        await self._release_finished_lease_projection(
+                            lease,
+                            lease_id=lease_id,
+                            consumer_id=consumer_id,
+                            consumer_generation=consumer_generation,
+                            success=str(terminal.get("status") or "") == "done",
+                        )
+                raise
+            except Exception as exc:
+                if self._task_not_found_cause(exc) is not None:
+                    return {"ok": False, "reason": "unknown_lease"}
+                raise
+            if isinstance(committed, dict):
+                record = committed.get("record")
+                if not isinstance(record, dict):
+                    return {"ok": False, "reason": "task_state_invalid"}
+                status = str(record.get("status") or "")
+                expected_status = "done" if success else "failed"
+                if status != expected_status:
+                    return {"ok": False, "reason": "task_state_invalid"}
+                if str(record.get("lease_id") or "") != lease_id:
+                    return {"ok": False, "reason": "stale_consumer"}
+                if str(record.get("attempt_id") or "") != attempt_id:
+                    return {"ok": False, "reason": "stale_consumer"}
+                if int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
+                    return {"ok": False, "reason": "stale_consumer"}
+                if int(record.get("runtime_generation") or 0) != consumer_generation:
+                    return {"ok": False, "reason": "stale_consumer"}
+                if str(record.get("consumer_id") or "") != str(consumer_id):
+                    return {"ok": False, "reason": "stale_consumer"}
+                idempotent = bool(committed.get("idempotent"))
+            else:
+                idempotent = False
+        else:
+            idempotent = False
+        if lease is None:
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "status": "done" if success else "failed",
+                "idempotent": True,
+            }
+        released = await self._release_finished_lease_projection(
+            lease,
+            lease_id=lease_id,
+            consumer_id=consumer_id,
+            consumer_generation=consumer_generation,
+            success=success,
+        )
+        if bool(released.get("ok")) and idempotent:
+            released["idempotent"] = True
+        return released
+
+    async def _release_finished_lease_projection(
+        self,
+        lease: ModelWorkLease,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        success: bool,
+    ) -> dict[str, Any]:
+        request_id = lease.item.request_id
+        async with self._cv:
+            current = self._leases_by_id.get(str(lease_id))
+            if current is None:
+                if self._request_locations.get(request_id) is not None:
+                    return {"ok": False, "reason": "stale_consumer"}
+                return {"ok": False, "reason": "unknown_lease"}
+            if not self._current_lease_matches_locked(
+                current,
+                expected=lease,
+                lease_id=str(lease_id),
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+            ):
+                return {"ok": False, "reason": "stale_consumer"}
+            self._leases_by_id.pop(current.lease_id, None)
+            self._lease_id_by_request_id.pop(request_id, None)
+            self._remove_request_location(request_id)
+            if success:
+                self._completed += 1
+            else:
+                self._failed += 1
+            return {"ok": True, "request_id": request_id, "status": "done" if success else "failed"}
+
+    async def finish_lease_success(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        return await self._finish_lease_terminal(
+            request_id=request_id,
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=scheduler_epoch,
+            consumer_id=consumer_id,
+            consumer_generation=consumer_generation,
+            success=True,
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            billing_observations=billing_observations,
+        )
+
+    async def finish_lease_failure(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+    ) -> dict[str, Any]:
+        return await self._finish_lease_terminal(
+            request_id=request_id,
+            lease_id=lease_id,
+            attempt_id=attempt_id,
+            scheduler_epoch=scheduler_epoch,
+            consumer_id=consumer_id,
+            consumer_generation=consumer_generation,
+            success=False,
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            error=error,
+        )
 
     async def validate_lease(
         self,
@@ -1748,6 +2676,7 @@ class _ModelWorkSchedulerActor:
         consumer_generation: int,
         requeue: bool = True,
         reason: str = "failed",
+        abort_finalize: bool = False,
     ) -> dict[str, Any]:
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -1759,6 +2688,57 @@ class _ModelWorkSchedulerActor:
                 consumer_generation
             ):
                 return {"ok": False, "reason": "stale_consumer"}
+            if self._request_locations.get(lease.item.request_id) == "finalizing":
+                return {"ok": False, "reason": "finalize_inflight"}
+            request_id = lease.item.request_id
+        if not requeue:
+            terminal = await self._terminal_task_state_for_lease(lease)
+            if not bool(terminal.get("ok")):
+                return {"ok": False, "reason": str(terminal.get("reason") or "not_terminal")}
+        elif lease.finalizing_until is not None:
+            if self._use_task_state_store:
+                try:
+                    record = await self._task_state_call("get_task", request_id=request_id)
+                except Exception as exc:
+                    if self._task_not_found_cause(exc) is not None:
+                        async with self._cv:
+                            current = self._leases_by_id.get(str(lease_id))
+                            if current is not None and current.item.request_id == request_id:
+                                self._remove_request_from_memory_locked(request_id)
+                                self._cv.notify_all()
+                        return {"ok": False, "reason": "unknown_lease"}
+                    raise
+                if isinstance(record, dict):
+                    status = str(record.get("status") or "")
+                    if status == "finalizing" and not abort_finalize:
+                        try:
+                            durable_finalizing_until = float(record.get("finalizing_until") or 0.0)
+                        except Exception:
+                            durable_finalizing_until = 0.0
+                        if durable_finalizing_until > time.time():
+                            return {"ok": False, "reason": "finalize_in_progress"}
+                    if status == "finalizing":
+                        pass
+                    elif status in TERMINAL_TASK_STATUSES:
+                        terminal = await self._terminal_task_state_for_lease(lease)
+                        if bool(terminal.get("ok")):
+                            requeue = False
+        async with self._cv:
+            current = self._leases_by_id.get(str(lease_id))
+            if current is None:
+                if self._request_locations.get(request_id) is not None:
+                    return {"ok": False, "reason": "stale_consumer"}
+                return {"ok": False, "reason": "unknown_lease"}
+            if not self._current_lease_matches_locked(
+                current,
+                expected=lease,
+                lease_id=str(lease_id),
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+            ):
+                return {"ok": False, "reason": "stale_consumer"}
+            if self._request_locations.get(request_id) == "finalizing":
+                return {"ok": False, "reason": "finalize_inflight"}
             self._leases_by_id.pop(lease.lease_id, None)
             self._lease_id_by_request_id.pop(lease.item.request_id, None)
             requeued_out = False
@@ -1771,30 +2751,26 @@ class _ModelWorkSchedulerActor:
                     assignment_generation=lease.consumer_generation,
                     assignment_reason="lease_failed_requeue",
                 )
-                should_requeue = await self._persist_requeue_task(
-                    lease.item.request_id,
-                    reason=reason,
-                )
-                if should_requeue:
-                    self._requeue_assigned(assigned, reason=reason)
-                    requeued_out = True
-                else:
-                    self._remove_request_location(lease.item.request_id)
+                self._request_locations[request_id] = "requeueing"
             else:
-                self._remove_request_location(lease.item.request_id)
+                self._remove_request_location(request_id)
                 self._failed += 1
             self._cv.notify_all()
-            return {"ok": True, "request_id": lease.item.request_id, "requeued": requeued_out}
+        if requeue:
+            requeued_out = bool(
+                await self._commit_requeues_unlocked(
+                    [_PendingRequeue(assigned=assigned, lease=lease)],
+                    reason=reason,
+                )
+            )
+        return {"ok": True, "request_id": request_id, "requeued": requeued_out}
 
     async def expire_leases(self, *, now: float | None = None) -> dict[str, Any]:
         ts = time.time() if now is None else float(now)
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
-        async with self._cv:
-            expired = await self._expire_leases_locked(now=ts)
-            if expired:
-                self._cv.notify_all()
-            return {"ok": True, "expired": expired}
+        expired = await self._expire_leases_unlocked(now=ts)
+        return {"ok": True, "expired": expired}
 
     def _stats_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -1803,12 +2779,18 @@ class _ModelWorkSchedulerActor:
         }
         principal_domain_max_by_domain: dict[str, int] = {}
         active_principals_by_domain: dict[str, int] = {}
+        principal_domain_token_max_by_domain: dict[str, int] = {}
         for (_principal, domain_key), count in self._sampling_inflight_by_principal_domain.items():
             principal_domain_max_by_domain[domain_key] = max(
                 principal_domain_max_by_domain.get(domain_key, 0),
                 int(count),
             )
             active_principals_by_domain[domain_key] = active_principals_by_domain.get(domain_key, 0) + 1
+        for (_principal, domain_key), tokens in self._sampling_inflight_tokens_by_principal_domain.items():
+            principal_domain_token_max_by_domain[domain_key] = max(
+                principal_domain_token_max_by_domain.get(domain_key, 0),
+                int(tokens),
+            )
 
         def _counter_records(counters: dict[tuple[str, str], int]) -> list[dict[str, Any]]:
             return [
@@ -1861,9 +2843,23 @@ class _ModelWorkSchedulerActor:
                     "sampling_max_inflight_per_domain",
                     10240,
                 ),
+                "per_principal_domain_token_limit": _sampling_inflight_limit(
+                    "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
+                    "sampling_max_inflight_tokens_per_principal_domain",
+                    0,
+                ),
+                "per_domain_token_limit": _sampling_inflight_limit(
+                    "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
+                    "sampling_max_inflight_tokens_per_domain",
+                    0,
+                ),
                 "by_domain": dict(sorted(self._sampling_inflight_by_domain.items())),
                 "principal_domain_max_by_domain": dict(sorted(principal_domain_max_by_domain.items())),
                 "active_principals_by_domain": dict(sorted(active_principals_by_domain.items())),
+                "tokens_by_domain": dict(sorted(self._sampling_inflight_tokens_by_domain.items())),
+                "principal_domain_token_max_by_domain": dict(
+                    sorted(principal_domain_token_max_by_domain.items())
+                ),
             },
             "sampling_admission_counters": {
                 "would_reject": _counter_records(self._sampling_admission_would_reject),
@@ -1899,7 +2895,7 @@ def _await_ray_ref_sync(ref: Any, *, timeout_s: float | None = None) -> Any:
     return sync_get_ray_ref(ref, timeout_s=timeout_s)
 
 
-def _create_ray_actor(*, require_ready: bool = True):
+def _create_ray_actor_handle():
     import ray
 
     actor_name = _ray_model_work_scheduler_actor_name()
@@ -1947,8 +2943,22 @@ def _create_ray_actor(*, require_ready: bool = True):
         use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),
         same_affinity_multi_claim_domains=_same_affinity_multi_claim_domains_from_env(),
     )
+    return actor
+
+
+def _create_ray_actor(*, require_ready: bool = True):
+    actor = _create_ray_actor_handle()
     if require_ready:
         out = _await_ray_ref_sync(actor.ping.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
+    return actor
+
+
+async def _create_ray_actor_async(*, require_ready: bool = True):
+    actor = await asyncio.to_thread(_create_ray_actor_handle)
+    if require_ready:
+        out = await async_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.ping returned non-dict: {type(out)}")
     return actor
@@ -2054,7 +3064,7 @@ class ModelWorkSchedulerClient:
             logger.info("[model_work_scheduler] failed to fetch actor %s; creating", actor_name)
 
         try:
-            self._ray_actor = _create_ray_actor(require_ready=require_ready)
+            self._ray_actor = await _create_ray_actor_async(require_ready=require_ready)
         except Exception as e:
             raise ModelWorkSchedulerUnavailableError(
                 "Failed to get/create detached Ray ModelWorkScheduler actor"
@@ -2280,6 +3290,82 @@ class ModelWorkSchedulerClient:
     async def complete(self, **kwargs: Any) -> dict[str, Any]:
         return await self.complete_lease(**kwargs)
 
+    async def finish_lease_success(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(create_if_missing=False)
+        out = await self._await_ray_ref(
+            actor.finish_lease_success.remote(
+                request_id=str(request_id),
+                lease_id=str(lease_id),
+                attempt_id=str(attempt_id),
+                scheduler_epoch=int(scheduler_epoch),
+                consumer_id=str(consumer_id),
+                consumer_generation=int(consumer_generation),
+                result_path=str(result_path),
+                result_checksum=result_checksum,
+                result_size_bytes=result_size_bytes,
+                billing_observations=billing_observations,
+            ),
+            timeout_s=timeout_s,
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.finish_lease_success returned non-dict: {type(out)}")
+        return out
+
+    async def finish_lease_failure(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(create_if_missing=False)
+        out = await self._await_ray_ref(
+            actor.finish_lease_failure.remote(
+                request_id=str(request_id),
+                lease_id=str(lease_id),
+                attempt_id=str(attempt_id),
+                scheduler_epoch=int(scheduler_epoch),
+                consumer_id=str(consumer_id),
+                consumer_generation=int(consumer_generation),
+                error=str(error),
+                result_path=result_path,
+                result_checksum=result_checksum,
+                result_size_bytes=result_size_bytes,
+            ),
+            timeout_s=timeout_s,
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.finish_lease_failure returned non-dict: {type(out)}")
+        return out
+
+    async def finish_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.finish_lease_success(**kwargs)
+
+    async def finish_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.finish_lease_failure(**kwargs)
+
     async def begin_finalize_lease(
         self,
         *,
@@ -2340,6 +3426,7 @@ class ModelWorkSchedulerClient:
         consumer_generation: int,
         requeue: bool = True,
         reason: str = "failed",
+        abort_finalize: bool = False,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(create_if_missing=False)
@@ -2350,6 +3437,7 @@ class ModelWorkSchedulerClient:
                 consumer_generation=int(consumer_generation),
                 requeue=bool(requeue),
                 reason=str(reason),
+                abort_finalize=bool(abort_finalize),
             ),
             timeout_s=timeout_s,
         )

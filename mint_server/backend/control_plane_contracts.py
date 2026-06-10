@@ -50,60 +50,247 @@ class AsyncTaskLedger(Protocol):
 
     async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]: ...
 
-    async def acquire_owner(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def acquire_owner(
+        self,
+        *,
+        owner_id: str,
+        ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def renew_owner(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def renew_owner(
+        self,
+        *,
+        owner_id: str,
+        epoch: int,
+        ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def create_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def create_task(
+        self,
+        *,
+        request_id: str,
+        op: str,
+        domain_key: str,
+        request_json: bytes,
+        payload_hash: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def assign_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def assign_task(
+        self,
+        *,
+        request_id: str,
+        subqueue_id: str,
+        scheduler_epoch: int,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def claim_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def claim_task(
+        self,
+        *,
+        request_id: str,
+        subqueue_id: str,
+        lease_id: str,
+        attempt_id: str,
+        consumer_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        lease_ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def renew_lease(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def renew_lease(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        lease_ttl_s: float,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def begin_finalize(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        finalize_ttl_s: float,
+        staged_payload_path: str | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def commit_finalize_success(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def commit_finalize_failure(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        error: str,
+        result_path: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def requeue_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def requeue_task(
+        self,
+        *,
+        request_id: str,
+        scheduler_epoch: int,
+        reason: str,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def forget_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def forget_task(self, *, request_id: str) -> dict[str, Any]: ...
 
-    async def get_task(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def get_task(self, *, request_id: str) -> dict[str, Any]: ...
 
-    async def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]: ...
+    async def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]: ...
 
-    async def wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def wait_task_status_change(
+        self,
+        *,
+        request_id: str,
+        timeout_s: float,
+        observed_status: str | None = None,
+        observed_updated_at: float | None = None,
+        terminal_only: bool = False,
+    ) -> dict[str, Any]: ...
 
-    async def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def update_task_metadata(
+        self,
+        *,
+        request_id: str,
+        metadata: dict[str, Any],
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
 
 
 @runtime_checkable
 class AsyncSchedulerQueue(Protocol):
-    async def append_work(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def append_work(
+        self,
+        *,
+        request_id: str,
+        op: str,
+        request_json: bytes,
+        domain_key: str,
+        user_id: str | None = None,
+        apikey_id: str | None = None,
+        throttle_principal: str | None = None,
+        webhook_url: str | None = None,
+        extra: dict[str, Any] | None = None,
+        created_at: float | None = None,
+        affinity_group: str | None = None,
+        ordering_key: str | None = None,
+        token_cost: int = 1,
+        assign: bool = False,
+        assign_max_items: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
     async def sync_replicas(self, replicas: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]: ...
 
-    async def assign_pending(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def assign_pending(
+        self,
+        *,
+        max_items: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def claim(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def claim(
+        self,
+        *,
+        domain_key: str,
+        replica_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        max_items: int = 1,
+        token_budget: int | None = None,
+        lease_ttl_s: float = 30.0,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def renew(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def renew(
+        self,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        lease_ttl_s: float = 30.0,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def begin_finalize(
+        self,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        finalize_ttl_s: float = 30.0,
+        staged_payload_path: str | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def complete(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def complete(
+        self,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def fail(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def fail(
+        self,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        requeue: bool = True,
+        reason: str = "failed",
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def validate(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def validate(
+        self,
+        *,
+        lease_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def expire(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def expire(
+        self,
+        *,
+        now: float | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
 
-    async def contains(self, **kwargs: Any) -> dict[str, Any]: ...
+    async def contains(self, *, request_id: str, timeout_s: float | None = None) -> dict[str, Any]: ...
 
     async def stats(self, **kwargs: Any) -> dict[str, Any]: ...
 
@@ -274,15 +461,63 @@ class InProcessTaskLedgerAdapter:
         return await self._call_dict("update_task_metadata", **kwargs)
 
 
+_ASYNC_TASK_LEDGER_METHODS = (
+    "ensure_ready",
+    "ping",
+    "acquire_owner",
+    "renew_owner",
+    "create_task",
+    "assign_task",
+    "claim_task",
+    "renew_lease",
+    "begin_finalize",
+    "commit_finalize_success",
+    "commit_finalize_failure",
+    "requeue_task",
+    "forget_task",
+    "get_task",
+    "list_active_tasks",
+    "wait_task_status_change",
+    "update_task_metadata",
+)
+
+
+_SYNC_TASK_LEDGER_METHODS = (
+    "ping",
+    "acquire_scheduler_owner",
+    "renew_scheduler_owner",
+    "create_task",
+    "assign_task",
+    "claim_task",
+    "renew_lease",
+    "begin_finalize",
+    "commit_finalize_success",
+    "commit_finalize_failure",
+    "requeue_task",
+    "forget_task",
+    "get_task",
+    "list_active_tasks",
+    "update_task_metadata",
+)
+
+
+def _has_methods(client: Any, names: tuple[str, ...]) -> bool:
+    return all(callable(getattr(client, name, None)) for name in names)
+
+
 def as_task_ledger(client: Any) -> AsyncTaskLedger:
-    if callable(getattr(client, "acquire_owner", None)) and callable(
-        getattr(client, "commit_finalize_success", None)
-    ):
+    if _has_methods(client, _ASYNC_TASK_LEDGER_METHODS):
         return client
-    if callable(getattr(client, "acquire_scheduler_owner", None)) and callable(
-        getattr(client, "commit_finalize_success", None)
-    ):
+    if _has_methods(client, _SYNC_TASK_LEDGER_METHODS):
         return InProcessTaskLedgerAdapter(client)
+    missing_async = [name for name in _ASYNC_TASK_LEDGER_METHODS if not callable(getattr(client, name, None))]
+    missing_sync = [name for name in _SYNC_TASK_LEDGER_METHODS if not callable(getattr(client, name, None))]
+    has_async_client_surface = any(callable(getattr(client, f"async_{name}", None)) for name in _ASYNC_TASK_LEDGER_METHODS)
+    if not has_async_client_surface:
+        raise TypeError(
+            "task ledger client does not implement AsyncTaskLedger or TaskStateStore sync surface; "
+            f"missing_async={missing_async[:5]} missing_sync={missing_sync[:5]}"
+        )
     return TaskStateStoreLedgerAdapter(client)
 
 
