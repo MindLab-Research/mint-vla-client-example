@@ -25,6 +25,7 @@ def _work(
     *,
     domain_key: str = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
     affinity_group: str | None = "lora:session-a:generation:1",
+    ordering_key: str | None = "session:session-a",
     token_cost: int = 1,
     throttle_principal: str | None = "apikey:key-a",
 ) -> dict:
@@ -40,7 +41,7 @@ def _work(
         "created_at": 100.0,
         "domain_key": domain_key,
         "affinity_group": affinity_group,
-        "ordering_key": "session:session-a",
+        "ordering_key": ordering_key,
         "token_cost": token_cost,
     }
 
@@ -97,6 +98,8 @@ class _MockTaskStateStoreClient:
             await release.wait()
         override = self.overrides.get(method, self.overrides.get(store_method))
         if override is not None:
+            if isinstance(override, BaseException):
+                raise override
             if callable(override):
                 out = override(**kwargs)
                 if asyncio.iscoroutine(out):
@@ -137,6 +140,9 @@ class _MockTaskStateStoreClient:
 
     async def async_commit_finalize_failure(self, **kwargs):
         return await self._call("commit_finalize_failure", **kwargs)
+
+    async def async_complete_task_failure(self, **kwargs):
+        return await self._call("complete_task_failure", **kwargs)
 
     async def async_requeue_task(self, **kwargs):
         return await self._call("requeue_task", **kwargs)
@@ -197,7 +203,7 @@ def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: py
             owner_id="scheduler-heartbeat",
         )
         try:
-            await actor._ensure_task_state_ready()
+            assert actor.stats()["owner_heartbeat_running"] is True
             deadline = time.time() + 1.0
             while store.count("renew_owner") < 1 and time.time() < deadline:
                 await asyncio.sleep(0.01)
@@ -205,10 +211,6 @@ def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: py
             assert store.count("renew_owner") >= 1
             assert actor.stats()["owner_heartbeat_running"] is True
         finally:
-            task = actor._owner_heartbeat_task
-            if task is not None:
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
             store.close()
 
     asyncio.run(_run())
@@ -267,15 +269,68 @@ def test_scheduler_claims_first_item_when_it_exceeds_token_budget() -> None:
     asyncio.run(_run())
 
 
+def test_scheduler_same_ordering_key_is_claimed_serially() -> None:
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        await actor.append(_work("req-serial-1", ordering_key="session:serial"))
+        await actor.append(_work("req-serial-2", ordering_key="session:serial"))
+        await actor.assign_pending()
+
+        first = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=4,
+            lease_ttl_s=30.0,
+        )
+        blocked = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=4,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in first["leases"]] == ["req-serial-1"]
+        assert blocked["leases"] == []
+
+    asyncio.run(_run())
+
+
 def test_scheduler_multi_claim_for_training_domains_stays_on_same_affinity() -> None:
     domain_key = "bumblebee:Qwen/Qwen3-30B-A3B-Instruct-2507"
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
-        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="training_session:a"))
-        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="training_session:b"))
-        await actor.append(_work("req-a2", domain_key=domain_key, affinity_group="training_session:a"))
+        await actor.append(
+            _work(
+                "req-a1",
+                domain_key=domain_key,
+                affinity_group="training_session:a",
+                ordering_key="training_session:a:step-1",
+            )
+        )
+        await actor.append(
+            _work(
+                "req-b1",
+                domain_key=domain_key,
+                affinity_group="training_session:b",
+                ordering_key="training_session:b:step-1",
+            )
+        )
+        await actor.append(
+            _work(
+                "req-a2",
+                domain_key=domain_key,
+                affinity_group="training_session:a",
+                ordering_key="training_session:a:step-2",
+            )
+        )
         await actor.assign_pending()
 
         claimed = await actor.claim_from_replica_queue(
@@ -299,8 +354,22 @@ def test_scheduler_same_affinity_domains_can_be_disabled_by_constructor() -> Non
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
-        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="training_session:a"))
-        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="training_session:b"))
+        await actor.append(
+            _work(
+                "req-a1",
+                domain_key=domain_key,
+                affinity_group="training_session:a",
+                ordering_key="training_session:a",
+            )
+        )
+        await actor.append(
+            _work(
+                "req-b1",
+                domain_key=domain_key,
+                affinity_group="training_session:b",
+                ordering_key="training_session:b",
+            )
+        )
         await actor.assign_pending()
 
         claimed = await actor.claim_from_replica_queue(
@@ -326,9 +395,15 @@ def test_scheduler_same_affinity_domains_can_be_overridden_from_env(
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0", domain_key=domain_key)])
-        await actor.append(_work("req-a1", domain_key=domain_key, affinity_group="group-a"))
-        await actor.append(_work("req-b1", domain_key=domain_key, affinity_group="group-b"))
-        await actor.append(_work("req-a2", domain_key=domain_key, affinity_group="group-a"))
+        await actor.append(
+            _work("req-a1", domain_key=domain_key, affinity_group="group-a", ordering_key="group-a:1")
+        )
+        await actor.append(
+            _work("req-b1", domain_key=domain_key, affinity_group="group-b", ordering_key="group-b:1")
+        )
+        await actor.append(
+            _work("req-a2", domain_key=domain_key, affinity_group="group-a", ordering_key="group-a:2")
+        )
         await actor.assign_pending()
 
         claimed = await actor.claim_from_replica_queue(
@@ -666,6 +741,28 @@ def test_scheduler_append_can_assign_immediately() -> None:
     asyncio.run(_run())
 
 
+def test_sampling_token_budget_admission_enforce_rejects_principal_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "100")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN", "10")
+    actor = _ModelWorkSchedulerActor()
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-token-1", token_cost=7)))["ok"] is True
+        rejected = await actor.append(_work("req-token-2", token_cost=4))
+
+        assert rejected["ok"] is False
+        assert rejected["reason"] == "principal_domain_token_budget_exceeded"
+        assert rejected["current"] == 11
+        assert rejected["limit"] == 10
+        domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+        assert actor.stats()["sampling_inflight"]["tokens_by_domain"][domain] == 7
+
+    asyncio.run(_run())
+
+
 def test_contains_request_does_not_hydrate_task_state_store() -> None:
     actor = _ModelWorkSchedulerActor(use_task_state_store=True)
 
@@ -691,7 +788,7 @@ def test_append_does_not_hydrate_task_state_store_before_enqueue() -> None:
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1324,19 +1421,13 @@ def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> N
 
 def test_scheduler_rolls_back_new_task_when_assign_fails_after_create() -> None:
     store = TaskStateStore.in_memory()
+    task_state = _MockTaskStateStoreClient(store)
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=_MockTaskStateStoreClient(store),
+        task_state_store=task_state,
         owner_id="scheduler-test",
     )
-    original_task_state_call = actor._task_state_call
-
-    async def _task_state_call(method: str, **kwargs):
-        if method == "assign_task":
-            raise RuntimeError("assign failed after create")
-        return await original_task_state_call(method, **kwargs)
-
-    actor._task_state_call = _task_state_call  # type: ignore[method-assign]
+    task_state.overrides["assign_task"] = RuntimeError("assign failed after create")
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
@@ -1574,7 +1665,7 @@ def test_issue_645_scheduler_drops_terminal_stale_backlog_head_and_assigns_next(
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1620,23 +1711,65 @@ def test_issue_645_scheduler_recognizes_wrapped_task_state_conflict() -> None:
     assert isinstance(conflict, TaskStateConflictError)
 
 
-def test_issue_645_scheduler_does_not_reconcile_unrelated_assign_conflict() -> None:
+def test_issue_645_scheduler_reconciles_wrapped_task_state_conflict() -> None:
+    class _WrappedConflict(RuntimeError):
+        def as_instanceof_cause(self):
+            return TaskStateConflictError("cannot claim assigned task; current status='retrieved'")
+
     store = TaskStateStore.in_memory()
+    task_state = _MockTaskStateStoreClient(store)
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=task_state,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        await actor.sync_replicas([_replica("replica-0")])
+        assert (await actor.append(_work("req-wrapped-conflict"), assign=True))["ok"] is True
+        store.complete_task_failure(
+            request_id="req-wrapped-conflict",
+            error="client_abandoned",
+            result_path=None,
+        )
+        store.mark_task_retrieved(request_id="req-wrapped-conflict")
+
+        task_state.overrides["claim_task"] = _WrappedConflict("RayTaskError(TaskStateConflictError)")
+        claimed = await actor.claim_from_replica_queue(
+            domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+            replica_id="replica-0",
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        assert claimed["leases"] == []
+        assert store.get_task("req-wrapped-conflict")["status"] == "retrieved"
+        assert (await actor.contains_request(request_id="req-wrapped-conflict"))["present"] is False
+        assert actor.stats()["counters"]["stale_dropped"] == 1
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
+def test_issue_645_scheduler_does_not_reconcile_unrelated_assign_conflict() -> None:
+    store = TaskStateStore.in_memory()
+    task_state = _MockTaskStateStoreClient(store)
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=task_state,
         owner_id="scheduler-test",
     )
 
     async def _run() -> None:
         assert (await actor.append(_work("req-conflict"), assign=False))["ok"] is True
 
-        async def _raise_unrelated(method: str, **kwargs):
-            if method == "assign_task":
-                raise TaskStateConflictError("terminal task commit payload mismatch")
-            return getattr(store, method)(**kwargs)
-
-        actor._task_state_call = _raise_unrelated  # type: ignore[method-assign]
+        task_state.overrides["assign_task"] = TaskStateConflictError(
+            "terminal task commit payload mismatch"
+        )
 
         with pytest.raises(TaskStateConflictError, match="terminal task commit payload mismatch"):
             await actor.sync_replicas([_replica("replica-0")])
@@ -1649,9 +1782,10 @@ def test_issue_645_scheduler_does_not_reconcile_unrelated_assign_conflict() -> N
 
 def test_issue_645_scheduler_does_not_reconcile_unrelated_task_state_conflict() -> None:
     store = TaskStateStore.in_memory()
+    task_state = _MockTaskStateStoreClient(store)
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=_MockTaskStateStoreClient(store),
+        task_state_store=task_state,
         owner_id="scheduler-test",
     )
 
@@ -1664,10 +1798,9 @@ def test_issue_645_scheduler_does_not_reconcile_unrelated_task_state_conflict() 
             result_path=None,
         )
 
-        async def _raise_unrelated(_method: str, **_kwargs):
-            raise TaskStateConflictError("terminal task commit payload mismatch")
-
-        actor._task_state_call = _raise_unrelated  # type: ignore[method-assign]
+        task_state.overrides["claim_task"] = TaskStateConflictError(
+            "terminal task commit payload mismatch"
+        )
 
         with pytest.raises(TaskStateConflictError, match="terminal task commit payload mismatch"):
             await actor.claim_from_replica_queue(
