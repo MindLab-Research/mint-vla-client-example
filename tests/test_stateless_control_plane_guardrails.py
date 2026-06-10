@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import threading
 from pathlib import Path
 
 import pytest
 
 from mint_server.backend.control_plane_contracts import as_task_ledger
-from mint_server.backend.task_state_store import TaskStateStore
+from mint_server.backend.model_work_scheduler import ModelWorkSchedulerClient
+from mint_server.backend.task_state_store import TaskStateStore, TaskStateStoreClient
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -246,61 +248,77 @@ def _function_source(path: Path, function_name: str) -> str:
     raise AssertionError(f"function {function_name!r} not found in {path}")
 
 
-def test_async_ray_actor_create_paths_do_not_block_event_loop() -> None:
-    for path in (
-        REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py",
-        REPO_ROOT / "mint_server" / "backend" / "task_state_store.py",
-    ):
-        tree = ast.parse(path.read_text(), filename=str(path))
-        get_actor_async = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_get_ray_actor_async"
-        )
-        create_actor_async = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_create_ray_actor_async"
-        )
-        create_async_calls = 0
-        forbidden_sync_create_calls = 0
-        for node in ast.walk(get_actor_async):
-            if not isinstance(node, ast.Call):
-                continue
-            if isinstance(node.func, ast.Name) and node.func.id == "_create_ray_actor_async":
-                create_async_calls += 1
-            if (
-                isinstance(node.func, ast.Name)
-                and node.func.id in {"_create_ray_actor", "_create_ray_actor_handle"}
-            ):
-                forbidden_sync_create_calls += 1
+@pytest.mark.parametrize(
+    ("module_name", "client_factory", "call_client"),
+    [
+        (
+            "mint_server.backend.model_work_scheduler",
+            ModelWorkSchedulerClient,
+            lambda client: client.stats(timeout_s=1.0, create_if_missing=True),
+        ),
+        (
+            "mint_server.backend.task_state_store",
+            TaskStateStoreClient,
+            lambda client: client.async_ensure_ready(timeout_s=1.0, create_if_missing=True),
+        ),
+    ],
+)
+def test_async_ray_actor_create_paths_do_not_block_event_loop(
+    monkeypatch,
+    module_name: str,
+    client_factory,
+    call_client,
+) -> None:
+    module = __import__(module_name, fromlist=["unused"])
+    import ray
 
-        to_thread_handle_calls = 0
-        async_ready_waits = 0
-        sync_ready_waits = 0
-        for node in ast.walk(create_actor_async):
-            if not isinstance(node, ast.Call):
-                continue
-            if (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "to_thread"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "asyncio"
-                and node.args
-                and isinstance(node.args[0], ast.Name)
-                and node.args[0].id == "_create_ray_actor_handle"
-            ):
-                to_thread_handle_calls += 1
-            if isinstance(node.func, ast.Name) and node.func.id == "async_get_ray_ref":
-                async_ready_waits += 1
-            if isinstance(node.func, ast.Name) and node.func.id in {"sync_get_ray_ref", "_await_ray_ref_sync"}:
-                sync_ready_waits += 1
+    handle_entered = threading.Event()
+    release_handle = threading.Event()
 
-        assert create_async_calls == 1
-        assert forbidden_sync_create_calls == 0
-        assert to_thread_handle_calls == 1
-        assert async_ready_waits == 1
-        assert sync_ready_waits == 0
+    class _Remote:
+        def __init__(self, payload: dict):
+            self.payload = payload
+
+        def remote(self):
+            return dict(self.payload)
+
+    code_identity = getattr(module, "CURRENT_CODE_IDENTITY", None)
+
+    class _Actor:
+        ping = _Remote({"ok": True, "actor_name": "created", "code_identity": code_identity})
+        stats = _Remote({"ok": True, "scheduler_instance_id": "created", "code_identity": code_identity})
+
+    def _blocking_create_handle():
+        handle_entered.set()
+        assert release_handle.wait(timeout=2.0)
+        return _Actor()
+
+    async def _async_get_ray_ref(ref, *, timeout_s=None):
+        return ref
+
+    async def _run() -> tuple[bool, dict]:
+        task = asyncio.create_task(call_client(client_factory()))
+        await asyncio.wait_for(asyncio.to_thread(handle_entered.wait, 1.0), timeout=1.5)
+        progressed = False
+
+        async def _cheap() -> None:
+            nonlocal progressed
+            progressed = True
+
+        await asyncio.wait_for(_cheap(), timeout=0.1)
+        release_handle.set()
+        return progressed, await task
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing")))
+    monkeypatch.setattr(module, "_create_ray_actor_handle", _blocking_create_handle)
+    if hasattr(module, "async_get_ray_ref"):
+        monkeypatch.setattr(module, "async_get_ray_ref", _async_get_ray_ref)
+
+    progressed, out = asyncio.run(_run())
+
+    assert progressed is True
+    assert out["ok"] is True
 
 
 def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
