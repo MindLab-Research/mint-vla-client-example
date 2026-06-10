@@ -85,6 +85,7 @@ include = ["mint_server*"]
 
 [tool.pytest.ini_options]
 markers = [
+    "component: in-process multi-component tests with mocked external boundaries",
     "moe: tests requiring MoE resources",
     "slow: long-running tests",
 ]
