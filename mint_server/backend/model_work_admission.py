@@ -93,7 +93,7 @@ async def enqueue_model_work(
                 )
                 future_created = True
     try:
-        append_coro = scheduler.append(
+        append_coro = scheduler.append_work(
             request_id=request_id,
             op=op,
             request_json=request_json,

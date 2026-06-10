@@ -4104,8 +4104,14 @@ class TaskStateStoreClient:
     async def async_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("acquire_scheduler_owner", **kwargs)
 
+    async def async_acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.async_acquire_scheduler_owner(**kwargs)
+
     async def async_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("renew_scheduler_owner", **kwargs)
+
+    async def async_renew_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.async_renew_scheduler_owner(**kwargs)
 
     async def async_create_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("create_task", **kwargs)
@@ -4736,15 +4742,28 @@ class TaskStateStoreClient:
 
 
 class _FutureStateAccess:
-    """Map future-state calls onto TaskStateStore future methods.
-
-    Tests may inject a local object with the old async_* method names; in that
-    case this adapter falls back to the injected methods without creating any
-    Ray actor.
-    """
+    """Map future-state contract calls onto TaskStateStore future methods."""
 
     def __init__(self, client: Any) -> None:
         self._client = client
+
+    async def _call(self, future_method: str, **kwargs: Any) -> Any:
+        method = getattr(self._client, f"async_future_{future_method}", None)
+        if callable(method):
+            return await method(**kwargs)
+        raise AttributeError(f"future-state client missing async_future_{future_method}")
+
+    async def _dict_call(self, future_method: str, **kwargs: Any) -> dict[str, Any]:
+        out = await self._call(future_method, **kwargs)
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureState.{future_method} returned non-dict: {type(out)}")
+        return out
+
+    async def _list_call(self, future_method: str, **kwargs: Any) -> list[Any]:
+        out = await self._call(future_method, **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"FutureState.{future_method} returned non-list: {type(out)}")
+        return out
 
     async def async_ensure_started(self) -> None:
         ensure_started = getattr(self._client, "async_ensure_started", None)
@@ -4764,21 +4783,58 @@ class _FutureStateAccess:
         return await self.async_ping(timeout_s=timeout_s)
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
-        future_ping = getattr(self._client, "async_future_ping", None)
-        if callable(future_ping):
-            return await future_ping(timeout_s=timeout_s)
-        ping = getattr(self._client, "async_ping", None)
-        if callable(ping):
-            return await ping(timeout_s=timeout_s)
-        return {"ok": True, "store": "future_state_store"}
+        return await self._dict_call("ping", timeout_s=timeout_s)
 
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("async_"):
-            future_name = f"async_future_{name[len('async_'):]}"
-            future_method = getattr(self._client, future_name, None)
-            if callable(future_method):
-                return future_method
-        return getattr(self._client, name)
+    async def async_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("ensure_task", **kwargs)
+
+    async def async_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("update_task_metadata", **kwargs)
+
+    async def async_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("stage_payload", **kwargs)
+
+    async def async_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_success", **kwargs)
+
+    async def async_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_failure", **kwargs)
+
+    async def async_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_task_retrieved", **kwargs)
+
+    async def async_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("forget_task", **kwargs)
+
+    async def async_get_task(self, request_id: str) -> dict[str, Any]:
+        return await self._dict_call("get_task", request_id=str(request_id))
+
+    async def async_wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("wait_task_status_change", **kwargs)
+
+    async def async_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        return [str(x) for x in await self._list_call("expire_active_tasks", **kwargs)]
+
+    async def async_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_terminal_payloads_for_eviction", **kwargs)
+
+    async def async_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_payload_evicted", **kwargs)
+
+    async def async_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        return [str(x) for x in await self._list_call("delete_expired_tombstones", **kwargs)]
+
+    async def async_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("record_payload_evict_error", **kwargs)
+
+    async def async_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_staged_payloads_for_gc", **kwargs)
+
+    async def async_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_staged_payload_gc_deleted", **kwargs)
+
+    async def async_list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_tasks_by_metadata", **kwargs)
 
 
 class TaskFutureService:

@@ -256,7 +256,7 @@ def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -
         def __init__(self) -> None:
             self.seen_status: FutureStatus | None = None
 
-        async def append(self, **kwargs):
+        async def append_work(self, **kwargs):
             try:
                 self.seen_status = await service.async_get_status(kwargs["request_id"])
             except KeyError:

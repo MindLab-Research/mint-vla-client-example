@@ -76,7 +76,7 @@ async def test_scheduler_component_supervisor_syncs_real_scheduler(tmp_path) -> 
         replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
         generation = int(replica["generation"])
         await world.enqueue_sampling("component-supervisor")
-        claimed = await world.scheduler.claim_from_replica_queue(
+        claimed = await world.scheduler.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=replica["consumer_id"],
@@ -121,12 +121,12 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         await world.enqueue_sampling("component-stale-consumer")
         lease = await world.claim_one()
 
-        stale_finalize = await world.scheduler.begin_finalize_lease(
+        stale_finalize = await world.scheduler.begin_finalize(
             lease_id=lease["lease_id"],
             consumer_id="stale-consumer",
             consumer_generation=world.generation,
         )
-        stale_fail = await world.scheduler.fail_lease(
+        stale_fail = await world.scheduler.fail(
             lease_id=lease["lease_id"],
             consumer_id=world.consumer_id,
             consumer_generation=world.generation + 1,
@@ -137,13 +137,14 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         assert stale_finalize == {"ok": False, "reason": "stale_consumer"}
         assert stale_fail == {"ok": False, "reason": "stale_consumer"}
         assert (
-            await world.scheduler.validate_lease(
+            await world.scheduler.validate(
                 lease_id=lease["lease_id"],
                 consumer_id=world.consumer_id,
                 consumer_generation=world.generation,
             )
         )["ok"] is True
-        assert world.task_store.get_task("component-stale-consumer")["status"] == "leased"
+        record = await world.observe_task("component-stale-consumer")
+        assert record["status"] == "leased"
     finally:
         world.close()
 
@@ -159,7 +160,7 @@ async def test_scheduler_component_old_generation_cannot_claim_after_replica_syn
         await world.enqueue_sampling("component-old-generation")
 
         with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
-            await world.scheduler.claim_from_replica_queue(
+            await world.scheduler.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=old_consumer_id,
@@ -169,7 +170,7 @@ async def test_scheduler_component_old_generation_cannot_claim_after_replica_syn
             )
 
         new_consumer_id = world.replica(generation=old_generation + 1)["consumer_id"]
-        claimed = await world.scheduler.claim_from_replica_queue(
+        claimed = await world.scheduler.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=new_consumer_id,
@@ -197,7 +198,7 @@ async def test_scheduler_component_executor_failure_commits_failed_terminal(tmp_
 
         assert actor.health_snapshot()["failed_total"] == 1
         assert await world.future_service.async_get_status("component-exec-failed") == FutureStatus.FAILED
-        record = world.task_store.get_task("component-exec-failed")
+        record = await world.observe_task("component-exec-failed")
         assert record["status"] == "failed"
         assert "synthetic executor failure" in str(record["error"])
         status_code, payload = await world.retrieve("component-exec-failed", monkeypatch)
@@ -220,12 +221,12 @@ async def test_scheduler_component_payload_write_failure_requeues_without_termin
         actor = await world.runtime_once()
 
         assert actor.health_snapshot()["requeued_total"] == 1
-        record = world.task_store.get_task("component-payload-write-failed")
+        record = await world.observe_task("component-payload-write-failed")
         assert record["status"] == "pending"
         assert record["result_path"] is None
         assert record["staged_payload_path"] is None
         assert (
-            await world.scheduler.contains_request(request_id="component-payload-write-failed")
+            await world.scheduler.contains(request_id="component-payload-write-failed")
         )["present"] is True
 
         world.payload_store.fail_writes = False
@@ -246,7 +247,7 @@ async def test_scheduler_component_lease_expiry_requeues_for_retry(tmp_path) -> 
         await world.enqueue_sampling("component-expired-lease")
         first_lease = await world.claim_one(lease_ttl_s=1.0)
 
-        expired = await world.scheduler.expire_leases(now=time.time() + 2.0)
+        expired = await world.scheduler.expire(now=time.time() + 2.0)
         assigned = await world.scheduler.assign_pending(max_items=1)
         second_lease = await world.claim_one()
 
@@ -254,7 +255,8 @@ async def test_scheduler_component_lease_expiry_requeues_for_retry(tmp_path) -> 
         assert assigned["assigned"] == 1
         assert second_lease["item"]["request_id"] == "component-expired-lease"
         assert second_lease["lease_id"] != first_lease["lease_id"]
-        assert world.task_store.get_task("component-expired-lease")["status"] == "leased"
+        record = await world.observe_task("component-expired-lease")
+        assert record["status"] == "leased"
     finally:
         world.close()
 
@@ -266,7 +268,7 @@ async def test_scheduler_component_finalizing_expiry_requeues_for_retry(tmp_path
         await world.start()
         await world.enqueue_sampling("component-expired-finalize")
         first_lease = await world.claim_one(lease_ttl_s=1.0)
-        begin = await world.scheduler.begin_finalize_lease(
+        begin = await world.scheduler.begin_finalize(
             lease_id=first_lease["lease_id"],
             consumer_id=world.consumer_id,
             consumer_generation=world.generation,
@@ -274,7 +276,7 @@ async def test_scheduler_component_finalizing_expiry_requeues_for_retry(tmp_path
             staged_payload_path=str(world.tmp_path / "staged.json"),
         )
 
-        expired = await world.scheduler.expire_leases(now=time.time() + 2.0)
+        expired = await world.scheduler.expire(now=time.time() + 2.0)
         assigned = await world.scheduler.assign_pending(max_items=1)
         second_lease = await world.claim_one()
 
@@ -283,7 +285,7 @@ async def test_scheduler_component_finalizing_expiry_requeues_for_retry(tmp_path
         assert assigned["assigned"] == 1
         assert second_lease["item"]["request_id"] == "component-expired-finalize"
         assert second_lease["lease_id"] != first_lease["lease_id"]
-        record = world.task_store.get_task("component-expired-finalize")
+        record = await world.observe_task("component-expired-finalize")
         assert record["status"] == "leased"
         assert record["staged_payload_path"] is None
     finally:
@@ -297,22 +299,22 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
         await world.start()
         await world.enqueue_sampling("component-stale-finalizer")
         old_lease = await world.claim_one(lease_ttl_s=1.0)
-        expired = await world.scheduler.expire_leases(now=time.time() + 2.0)
+        expired = await world.scheduler.expire(now=time.time() + 2.0)
         assigned = await world.scheduler.assign_pending(max_items=1)
         new_lease = await world.claim_one()
 
-        stale_finalize = await world.scheduler.begin_finalize_lease(
+        stale_finalize = await world.scheduler.begin_finalize(
             lease_id=old_lease["lease_id"],
             consumer_id=world.consumer_id,
             consumer_generation=world.generation,
             finalize_ttl_s=30.0,
         )
-        stale_complete = await world.scheduler.complete_lease(
+        stale_complete = await world.scheduler.complete(
             lease_id=old_lease["lease_id"],
             consumer_id=world.consumer_id,
             consumer_generation=world.generation,
         )
-        valid_new = await world.scheduler.validate_lease(
+        valid_new = await world.scheduler.validate(
             lease_id=new_lease["lease_id"],
             consumer_id=world.consumer_id,
             consumer_generation=world.generation,
@@ -324,7 +326,7 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
         assert stale_finalize == {"ok": False, "reason": "unknown_lease"}
         assert stale_complete == {"ok": False, "reason": "unknown_lease"}
         assert valid_new["ok"] is True
-        record = world.task_store.get_task("component-stale-finalizer")
+        record = await world.observe_task("component-stale-finalizer")
         assert record["status"] == "leased"
         assert record["lease_id"] == new_lease["lease_id"]
         assert record["attempt_id"] == new_lease["attempt_id"]
@@ -341,7 +343,7 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         old_lease = await world.claim_one()
         old_scheduler = world.scheduler
 
-        takeover = world.task_store.acquire_scheduler_owner(
+        takeover = await world.acquire_owner(
             owner_id="component-scheduler-restarted",
             ttl_s=30.0,
             now=time.time() + 31.0,
@@ -350,7 +352,7 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         synced = await world.scheduler.sync_replicas([world.replica(status="healthy")])
 
         with pytest.raises(Exception, match="owner_active"):
-            await old_scheduler.renew_lease(
+            await old_scheduler.renew(
                 lease_id=old_lease["lease_id"],
                 consumer_id=world.consumer_id,
                 consumer_generation=world.generation,
@@ -370,6 +372,98 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_old_generation_cannot_renew_complete_or_fail_after_sync(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        old_consumer_id = world.consumer_id
+        old_generation = world.generation
+        await world.enqueue_sampling("component-stale-runtime-active")
+        lease = await world.claim_one()
+
+        await world.scheduler.sync_replicas([world.replica(status="healthy", generation=old_generation + 1)])
+
+        renewed = await world.scheduler.renew(
+            lease_id=lease["lease_id"],
+            consumer_id=old_consumer_id,
+            consumer_generation=old_generation,
+            lease_ttl_s=30.0,
+        )
+        completed = await world.scheduler.complete(
+            lease_id=lease["lease_id"],
+            consumer_id=old_consumer_id,
+            consumer_generation=old_generation,
+        )
+        failed = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=old_consumer_id,
+            consumer_generation=old_generation,
+            requeue=False,
+            reason="stale-runtime",
+        )
+
+        assert renewed == {"ok": False, "reason": "unknown_lease"}
+        assert completed == {"ok": False, "reason": "unknown_lease"}
+        assert failed == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_task("component-stale-runtime-active"))["status"] == "assigned"
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        assert assigned["assigned"] == 0
+        new_generation = old_generation + 1
+        new_consumer_id = world.replica(generation=new_generation)["consumer_id"]
+        claimed = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=new_consumer_id,
+            consumer_generation=new_generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert len(claimed["leases"]) == 1
+        assert claimed["leases"][0]["lease_id"] != lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_retrieve_pending_during_blocked_finalize_does_not_block(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-finalize-retrieve-race")
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.begin_finalize")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+        status_code, payload = await asyncio.wait_for(
+            world.retrieve("component-finalize-retrieve-race", monkeypatch),
+            timeout=0.5,
+        )
+        stats = await asyncio.wait_for(world.scheduler.stats(), timeout=0.5)
+
+        block.release.set()
+        finalized = await finalize_task
+
+        assert status_code == 408
+        assert payload["request_id"] == "component-finalize-retrieve-race"
+        assert stats["scheduler_instance_id"]
+        assert finalized["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_blocked_claim_task_does_not_block_stats(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
@@ -378,7 +472,7 @@ async def test_scheduler_component_blocked_claim_task_does_not_block_stats(tmp_p
 
         claimed = await _assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.claim_from_replica_queue(
+            lambda: world.scheduler.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.consumer_id,
@@ -422,7 +516,7 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_stats(t
 
         finalized = await _assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.begin_finalize_lease(
+            lambda: world.scheduler.begin_finalize(
                 lease_id=lease["lease_id"],
                 consumer_id=world.consumer_id,
                 consumer_generation=world.generation,
@@ -446,7 +540,7 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_stats(tmp
 
         failed = await _assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.fail_lease(
+            lambda: world.scheduler.fail(
                 lease_id=lease["lease_id"],
                 consumer_id=world.consumer_id,
                 consumer_generation=world.generation,

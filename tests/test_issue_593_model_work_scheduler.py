@@ -85,13 +85,17 @@ class _MockTaskStateStoreClient:
 
     async def _call(self, method: str, **kwargs):
         method = str(method)
+        store_method = {
+            "acquire_owner": "acquire_scheduler_owner",
+            "renew_owner": "renew_scheduler_owner",
+        }.get(method, method)
         self.calls.append((method, dict(kwargs)))
-        blocker = self.blockers.get(method)
+        blocker = self.blockers.get(method) or self.blockers.get(store_method)
         if blocker is not None:
             entered, release = blocker
             entered.set()
             await release.wait()
-        override = self.overrides.get(method)
+        override = self.overrides.get(method, self.overrides.get(store_method))
         if override is not None:
             if callable(override):
                 out = override(**kwargs)
@@ -99,20 +103,58 @@ class _MockTaskStateStoreClient:
                     return await out
                 return out
             return override
-        return getattr(self.store, method)(**kwargs)
+        return getattr(self.store, store_method)(**kwargs)
 
-    def __getattr__(self, name: str):
-        if name.startswith("async_future_"):
-            method = name[len("async_future_") :]
-        elif name.startswith("async_"):
-            method = name[len("async_") :]
-        else:
-            raise AttributeError(name)
+    async def async_ensure_ready(self, **_kwargs):
+        return self.store.ping()
 
-        async def _method(**kwargs):
-            return await self._call(method, **kwargs)
+    async def async_ping(self, **_kwargs):
+        return self.store.ping()
 
-        return _method
+    async def async_acquire_owner(self, **kwargs):
+        return await self._call("acquire_owner", **kwargs)
+
+    async def async_renew_owner(self, **kwargs):
+        return await self._call("renew_owner", **kwargs)
+
+    async def async_create_task(self, **kwargs):
+        return await self._call("create_task", **kwargs)
+
+    async def async_assign_task(self, **kwargs):
+        return await self._call("assign_task", **kwargs)
+
+    async def async_claim_task(self, **kwargs):
+        return await self._call("claim_task", **kwargs)
+
+    async def async_renew_lease(self, **kwargs):
+        return await self._call("renew_lease", **kwargs)
+
+    async def async_begin_finalize(self, **kwargs):
+        return await self._call("begin_finalize", **kwargs)
+
+    async def async_commit_finalize_success(self, **kwargs):
+        return await self._call("commit_finalize_success", **kwargs)
+
+    async def async_commit_finalize_failure(self, **kwargs):
+        return await self._call("commit_finalize_failure", **kwargs)
+
+    async def async_requeue_task(self, **kwargs):
+        return await self._call("requeue_task", **kwargs)
+
+    async def async_forget_task(self, **kwargs):
+        return await self._call("forget_task", **kwargs)
+
+    async def async_get_task(self, request_id: str):
+        return await self._call("get_task", request_id=str(request_id))
+
+    async def async_list_active_tasks(self, **kwargs):
+        return await self._call("list_active_tasks", **kwargs)
+
+    async def async_wait_task_status_change(self, **kwargs):
+        return await self._call("wait_task_status_change", **kwargs)
+
+    async def async_update_task_metadata(self, **kwargs):
+        return await self._call("update_task_metadata", **kwargs)
 
     def close(self) -> None:
         self.store.close()
@@ -157,10 +199,10 @@ def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: py
         try:
             await actor._ensure_task_state_ready()
             deadline = time.time() + 1.0
-            while store.count("renew_scheduler_owner") < 1 and time.time() < deadline:
+            while store.count("renew_owner") < 1 and time.time() < deadline:
                 await asyncio.sleep(0.01)
-            assert store.count("acquire_scheduler_owner") >= 1
-            assert store.count("renew_scheduler_owner") >= 1
+            assert store.count("acquire_owner") >= 1
+            assert store.count("renew_owner") >= 1
             assert actor.stats()["owner_heartbeat_running"] is True
         finally:
             task = actor._owner_heartbeat_task

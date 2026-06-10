@@ -84,29 +84,29 @@ class _FakeScheduler:
         self.failed: list[dict] = []
         self.assigned: list[dict] = []
 
-    async def claim_from_replica_queue(self, **kwargs):
+    async def claim(self, **kwargs):
         self.claim_calls.append(kwargs)
         if not self.claims:
             return {"ok": True, "leases": []}
         return {"ok": True, "leases": self.claims.pop(0)}
 
-    async def renew_lease(self, **kwargs):
+    async def renew(self, **kwargs):
         self.renewed.append(kwargs)
         return {"ok": True, **kwargs}
 
-    async def begin_finalize_lease(self, **kwargs):
+    async def begin_finalize(self, **kwargs):
         self.begin_finalized.append(kwargs)
         if not self.begin_finalize_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {"ok": True, **kwargs}
 
-    async def complete_lease(self, **kwargs):
+    async def complete(self, **kwargs):
         self.completed.append(kwargs)
         if not self.complete_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {"ok": True, **kwargs}
 
-    async def fail_lease(self, **kwargs):
+    async def fail(self, **kwargs):
         self.failed.append(kwargs)
         return {"ok": True, **kwargs}
 
@@ -193,12 +193,6 @@ class _FakeTaskStateStore:
     async def async_commit_finalize_failure(self, **kwargs):
         self.failures.append(dict(kwargs))
         return {"ok": True, "record": dict(kwargs)}
-
-    async def async_future_commit_finalize_success(self, **kwargs):
-        return await self.async_commit_finalize_success(**kwargs)
-
-    async def async_future_commit_finalize_failure(self, **kwargs):
-        return await self.async_commit_finalize_failure(**kwargs)
 
 
 @pytest.mark.anyio

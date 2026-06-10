@@ -23,6 +23,7 @@ from ..logging_context import (
     set_trace_id,
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .control_plane_contracts import as_task_ledger
 from .execution_context import ExecutionContext, bind_execution_context
 from .model_actor_supervisor import (
     _is_ray_get_timeout_error,
@@ -319,7 +320,7 @@ class ModelRuntimeActor:
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
         self._task_futures = task_futures_client if task_futures_client is not None else task_futures
-        self._task_state_store = (
+        self._task_state_store = as_task_ledger(
             task_state_store_client if task_state_store_client is not None else task_state_store
         )
         self._payload_store = payload_store if payload_store is not None else TaskPayloadStore()
@@ -353,14 +354,8 @@ class ModelRuntimeActor:
         self._empty_polls_total = 0
 
     async def _task_state_future_call(self, method: str, **kwargs: Any) -> Any:
-        async_method = getattr(self._task_state_store, f"async_future_{method}", None)
-        if callable(async_method):
-            return await async_method(**kwargs)
-        async_method = getattr(self._task_state_store, f"async_{method}", None)
-        if callable(async_method):
-            return await async_method(**kwargs)
-        sync_method = getattr(self._task_state_store, method)
-        return sync_method(**kwargs)
+        async_method = getattr(self._task_state_store, method)
+        return await async_method(**kwargs)
 
     @property
     def domain_key(self) -> str:
@@ -470,7 +465,7 @@ class ModelRuntimeActor:
         if self._draining:
             return {"claimed": 0, "executed": 0, "draining": True}
         max_items, token_budget = await self._claim_limits()
-        claimed = await self._scheduler.claim_from_replica_queue(
+        claimed = await self._scheduler.claim(
             domain_key=self._config.domain_key,
             replica_id=self._config.replica_id,
             consumer_id=self._config.consumer_id,
@@ -728,14 +723,14 @@ class ModelRuntimeActor:
         try:
             status = await self._task_futures.async_get_status(request_id)
         except KeyError:
-            await self._scheduler.complete_lease(
+            await self._scheduler.complete(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
             )
             return False
         if status is not None and status != FutureStatus.PENDING:
-            await self._scheduler.complete_lease(
+            await self._scheduler.complete(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
@@ -924,7 +919,7 @@ class ModelRuntimeActor:
                     raise TimeoutError(
                         f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
                     )
-                result = await self._scheduler.renew_lease(
+                result = await self._scheduler.renew(
                     lease_id=str(lease["lease_id"]),
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
@@ -942,7 +937,7 @@ class ModelRuntimeActor:
             await asyncio.sleep(interval_s)
             for lease_id in list(pending_lease_ids):
                 try:
-                    result = await self._scheduler.renew_lease(
+                    result = await self._scheduler.renew(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
@@ -1019,7 +1014,7 @@ class ModelRuntimeActor:
         except Exception as e:
             self._record_error(e)
             try:
-                await self._scheduler.fail_lease(
+                await self._scheduler.fail(
                     lease_id=lease_id,
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
@@ -1036,7 +1031,7 @@ class ModelRuntimeActor:
         if stale_generation_error is not None:
             self._record_error(stale_generation_error)
             try:
-                begin_finalize = await self._scheduler.begin_finalize_lease(
+                begin_finalize = await self._scheduler.begin_finalize(
                     lease_id=lease_id,
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
@@ -1047,7 +1042,7 @@ class ModelRuntimeActor:
                         lease,
                         error=f"executor failed: {stale_generation_error}",
                     )
-                    await self._scheduler.fail_lease(
+                    await self._scheduler.fail(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
@@ -1073,7 +1068,7 @@ class ModelRuntimeActor:
                     e,
                 )
                 try:
-                    await self._scheduler.fail_lease(
+                    await self._scheduler.fail(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
@@ -1134,7 +1129,7 @@ class ModelRuntimeActor:
                 )
             except Exception:
                 pass
-            begin_finalize = await self._scheduler.begin_finalize_lease(
+            begin_finalize = await self._scheduler.begin_finalize(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
@@ -1204,7 +1199,7 @@ class ModelRuntimeActor:
                     )
                 else:
                     try:
-                        await self._scheduler.fail_lease(
+                        await self._scheduler.fail(
                             lease_id=lease_id,
                             consumer_id=self._config.consumer_id,
                             consumer_generation=self._config.actor_generation,
@@ -1217,7 +1212,7 @@ class ModelRuntimeActor:
                     return
             try:
                 if finalization.kind == "resolve":
-                    completed = await self._scheduler.complete_lease(
+                    completed = await self._scheduler.complete(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
@@ -1237,7 +1232,7 @@ class ModelRuntimeActor:
                     return
             except Exception:
                 try:
-                    await self._scheduler.fail_lease(
+                    await self._scheduler.fail(
                         lease_id=lease_id,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
@@ -1249,7 +1244,7 @@ class ModelRuntimeActor:
                     pass
                 return
 
-            failed = await self._scheduler.fail_lease(
+            failed = await self._scheduler.fail(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
@@ -1271,7 +1266,7 @@ class ModelRuntimeActor:
         except asyncio.CancelledError:
             await self._cancel_executor_task(task, reason="runtime_cancelled")
             try:
-                await self._scheduler.fail_lease(
+                await self._scheduler.fail(
                     lease_id=lease_id,
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
@@ -1293,7 +1288,7 @@ class ModelRuntimeActor:
                 type(e).__name__,
                 classify_failure_reason(e),
             )
-            begin_finalize = await self._scheduler.begin_finalize_lease(
+            begin_finalize = await self._scheduler.begin_finalize(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,
@@ -1338,7 +1333,7 @@ class ModelRuntimeActor:
                 )
                 if not task_state_committed:
                     try:
-                        await self._scheduler.fail_lease(
+                        await self._scheduler.fail(
                             lease_id=lease_id,
                             consumer_id=self._config.consumer_id,
                             consumer_generation=self._config.actor_generation,
@@ -1349,7 +1344,7 @@ class ModelRuntimeActor:
                     except Exception:
                         pass
                     return
-            await self._scheduler.fail_lease(
+            await self._scheduler.fail(
                 lease_id=lease_id,
                 consumer_id=self._config.consumer_id,
                 consumer_generation=self._config.actor_generation,

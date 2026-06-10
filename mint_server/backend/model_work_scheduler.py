@@ -21,6 +21,7 @@ from ..config import (
 from ..runtime_env import env_nonempty
 from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .control_plane_contracts import as_task_ledger
 from .task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -338,7 +339,7 @@ class _ModelWorkSchedulerActor:
         self._instance_id = uuid.uuid4().hex
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
         self._use_task_state_store = bool(use_task_state_store)
-        self._task_state_store = task_state_store
+        self._task_state_store = as_task_ledger(task_state_store) if task_state_store is not None else None
         self._same_affinity_multi_claim_domains = tuple(
             str(part).strip()
             for part in (
@@ -635,15 +636,9 @@ class _ModelWorkSchedulerActor:
         if self._task_state_store is None:
             from .task_state_store import task_state_store
 
-            self._task_state_store = task_state_store
-        async_method = getattr(self._task_state_store, f"async_future_{method}", None)
-        if callable(async_method):
-            return await async_method(**kwargs)
-        async_method = getattr(self._task_state_store, f"async_{method}", None)
-        if callable(async_method):
-            return await async_method(**kwargs)
-        sync_method = getattr(self._task_state_store, method)
-        return sync_method(**kwargs)
+            self._task_state_store = as_task_ledger(task_state_store)
+        async_method = getattr(self._task_state_store, method)
+        return await async_method(**kwargs)
 
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:
@@ -651,7 +646,7 @@ class _ModelWorkSchedulerActor:
         async with self._task_state_owner_lock:
             if self._scheduler_epoch is not None:
                 renewed = await self._task_state_call(
-                    "renew_scheduler_owner",
+                    "renew_owner",
                     owner_id=self._owner_id,
                     epoch=int(self._scheduler_epoch),
                     ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
@@ -660,7 +655,7 @@ class _ModelWorkSchedulerActor:
                     return int(self._scheduler_epoch)
                 self._scheduler_epoch = None
             acquired = await self._task_state_call(
-                "acquire_scheduler_owner",
+                "acquire_owner",
                 owner_id=self._owner_id,
                 ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
             )
@@ -2117,6 +2112,9 @@ class ModelWorkSchedulerClient:
             raise ModelWorkSchedulerConflictError(f"duplicate request_id: {request_id}")
         return out
 
+    async def append_work(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.append(**kwargs)
+
     async def sync_replicas(
         self,
         replicas: list[ModelReplicaRegistration | dict[str, Any]],
@@ -2190,6 +2188,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.contains_request returned non-dict: {type(out)}")
         return out
 
+    async def contains(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.contains_request(**kwargs)
+
     async def is_empty(self, *, timeout_s: float = 10.0) -> bool:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(actor.is_empty.remote(), timeout_s=timeout_s)
@@ -2226,6 +2227,9 @@ class ModelWorkSchedulerClient:
             )
         return out
 
+    async def claim(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.claim_from_replica_queue(**kwargs)
+
     async def renew_lease(
         self,
         *,
@@ -2249,6 +2253,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.renew_lease returned non-dict: {type(out)}")
         return out
 
+    async def renew(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.renew_lease(**kwargs)
+
     async def complete_lease(
         self,
         *,
@@ -2269,6 +2276,9 @@ class ModelWorkSchedulerClient:
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.complete_lease returned non-dict: {type(out)}")
         return out
+
+    async def complete(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.complete_lease(**kwargs)
 
     async def begin_finalize_lease(
         self,
@@ -2295,6 +2305,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.begin_finalize_lease returned non-dict: {type(out)}")
         return out
 
+    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.begin_finalize_lease(**kwargs)
+
     async def validate_lease(
         self,
         *,
@@ -2315,6 +2328,9 @@ class ModelWorkSchedulerClient:
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.validate_lease returned non-dict: {type(out)}")
         return out
+
+    async def validate(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.validate_lease(**kwargs)
 
     async def fail_lease(
         self,
@@ -2341,6 +2357,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.fail_lease returned non-dict: {type(out)}")
         return out
 
+    async def fail(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.fail_lease(**kwargs)
+
     async def expire_leases(
         self,
         *,
@@ -2352,6 +2371,9 @@ class ModelWorkSchedulerClient:
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.expire_leases returned non-dict: {type(out)}")
         return out
+
+    async def expire(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.expire_leases(**kwargs)
 
     async def stats(
         self,

@@ -7,6 +7,9 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
+from mint_server.backend.control_plane_contracts import (
+    InProcessSchedulerQueueAdapter,
+)
 from mint_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisorCore,
@@ -53,6 +56,83 @@ class LocalAsyncTaskStateClient:
         _ = timeout_s
         return self.store.ping()
 
+    async def async_acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("acquire_scheduler_owner", **kwargs)
+
+    async def async_renew_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("renew_scheduler_owner", **kwargs)
+
+    async def async_create_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("create_task", **kwargs)
+
+    async def async_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        try:
+            record = await self.async_get_task(request_id=str(kwargs["request_id"]))
+            return {"ok": True, "created": False, "record": record}
+        except Exception:
+            return await self.async_create_task(**kwargs)
+
+    async def async_assign_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("assign_task", **kwargs)
+
+    async def async_claim_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("claim_task", **kwargs)
+
+    async def async_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("renew_lease", **kwargs)
+
+    async def async_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("begin_finalize", **kwargs)
+
+    async def async_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("commit_finalize_success", **kwargs)
+
+    async def async_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("commit_finalize_failure", **kwargs)
+
+    async def async_requeue_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("requeue_task", **kwargs)
+
+    async def async_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("forget_task", **kwargs)
+
+    async def async_get_task(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        if args:
+            if len(args) != 1 or "request_id" in kwargs:
+                raise TypeError("async_get_task accepts request_id as either positional or keyword")
+            kwargs["request_id"] = args[0]
+        return await self._call("get_task", **kwargs)
+
+    async def async_list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._call("list_active_tasks", **kwargs)
+
+    async def async_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("update_task_metadata", **kwargs)
+
+    async def async_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("stage_payload", **kwargs)
+
+    async def async_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("complete_task_success", **kwargs)
+
+    async def async_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("complete_task_failure", **kwargs)
+
+    async def async_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("mark_task_retrieved", **kwargs)
+
+    async def async_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        return await self._call("expire_active_tasks", **kwargs)
+
+    async def async_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._call("list_terminal_payloads_for_eviction", **kwargs)
+
+    async def async_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call("mark_payload_evicted", **kwargs)
+
+    async def async_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        return await self._call("delete_expired_tombstones", **kwargs)
+
     async def async_wait_task_status_change(
         self,
         *,
@@ -71,107 +151,6 @@ class LocalAsyncTaskStateClient:
             }
         except KeyError:
             return {"changed": False, "timeout": False, "missing": True}
-
-    def __getattr__(self, name: str) -> Callable[..., Awaitable[Any]]:
-        if name.startswith("async_future_"):
-            method = name[len("async_future_") :]
-        elif name.startswith("async_"):
-            method = name[len("async_") :]
-        else:
-            raise AttributeError(name)
-        if method == "wait_task_status_change":
-            return self.async_wait_task_status_change
-
-        async def _method(*args: Any, **kwargs: Any) -> Any:
-            return await self._call(method, *args, **kwargs)
-
-        return _method
-
-
-class SchedulerClient:
-    def __init__(self, actor: _ModelWorkSchedulerActor) -> None:
-        self.actor = actor
-
-    async def append(
-        self,
-        *,
-        request_id: str,
-        op: str,
-        request_json: bytes,
-        user_id: str | None,
-        apikey_id: str | None,
-        throttle_principal: str | None,
-        webhook_url: str | None,
-        domain_key: str,
-        affinity_group: str | None = None,
-        ordering_key: str | None = None,
-        token_cost: int = 1,
-        extra: dict[str, Any] | None = None,
-        assign: bool = False,
-        assign_max_items: int | None = None,
-        **_kwargs: Any,
-    ) -> dict[str, Any]:
-        item = {
-            "request_id": request_id,
-            "op": op,
-            "request_json": request_json,
-            "user_id": user_id,
-            "apikey_id": apikey_id,
-            "throttle_principal": throttle_principal,
-            "webhook_url": webhook_url,
-            "extra": dict(extra or {}),
-            "created_at": time.time(),
-            "domain_key": domain_key,
-            "affinity_group": affinity_group,
-            "ordering_key": ordering_key,
-            "token_cost": token_cost,
-        }
-        return await self.actor.append(
-            item,
-            assign=assign,
-            assign_max_items=assign_max_items,
-        )
-
-    async def sync_replicas(self, replicas: list[dict[str, Any]], **_kwargs: Any) -> dict[str, Any]:
-        return await self.actor.sync_replicas(replicas)
-
-    async def assign_pending(self, *, max_items: int | None = None, **_kwargs: Any) -> dict[str, Any]:
-        return await self.actor.assign_pending(max_items=max_items)
-
-    async def claim_from_replica_queue(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.claim_from_replica_queue(**kwargs)
-
-    async def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.renew_lease(**kwargs)
-
-    async def begin_finalize_lease(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.begin_finalize_lease(**kwargs)
-
-    async def complete_lease(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.complete_lease(**kwargs)
-
-    async def fail_lease(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.fail_lease(**kwargs)
-
-    async def validate_lease(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.validate_lease(**kwargs)
-
-    async def contains_request(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.contains_request(**kwargs)
-
-    async def expire_leases(self, **kwargs: Any) -> dict[str, Any]:
-        kwargs.pop("timeout_s", None)
-        return await self.actor.expire_leases(**kwargs)
-
-    async def stats(self, **_kwargs: Any) -> dict[str, Any]:
-        return self.actor.stats()
 
 
 class FaultingTaskPayloadStore(TaskPayloadStore):
@@ -203,6 +182,7 @@ class SchedulerComponentWorld:
         )
         self.future_service = TaskFutureService(
             task_state_client=self.task_state,
+            future_state_client=self.task_state,
             payload_store=self.payload_store,
         )
         self.scheduler_actor = _ModelWorkSchedulerActor(
@@ -210,7 +190,7 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id="component-scheduler",
         )
-        self.scheduler = SchedulerClient(self.scheduler_actor)
+        self.scheduler = InProcessSchedulerQueueAdapter(self.scheduler_actor)
         self.event_log: list[tuple[str, dict[str, Any]]] = []
 
     def replace_scheduler(self, *, owner_id: str) -> None:
@@ -219,7 +199,7 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id=owner_id,
         )
-        self.scheduler = SchedulerClient(self.scheduler_actor)
+        self.scheduler = InProcessSchedulerQueueAdapter(self.scheduler_actor)
 
     @property
     def consumer_id(self) -> str:
@@ -263,7 +243,7 @@ class SchedulerComponentWorld:
         )
 
     async def claim_one(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
-        claimed = await self.scheduler.claim_from_replica_queue(
+        claimed = await self.scheduler.claim(
             domain_key=self.domain_key,
             replica_id=self.replica_id,
             consumer_id=self.consumer_id,
@@ -277,7 +257,7 @@ class SchedulerComponentWorld:
         return leases[0]
 
     async def claim_none(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
-        claimed = await self.scheduler.claim_from_replica_queue(
+        claimed = await self.scheduler.claim(
             domain_key=self.domain_key,
             replica_id=self.replica_id,
             consumer_id=self.consumer_id,
@@ -287,6 +267,19 @@ class SchedulerComponentWorld:
         )
         assert claimed.get("leases") == []
         return claimed
+
+    async def acquire_owner(
+        self,
+        *,
+        owner_id: str,
+        ttl_s: float = 30.0,
+        now: float | None = None,
+    ) -> dict[str, Any]:
+        return await self.task_state.async_acquire_owner(
+            owner_id=str(owner_id),
+            ttl_s=float(ttl_s),
+            now=now,
+        )
 
     async def runtime_once(
         self,
@@ -314,6 +307,12 @@ class SchedulerComponentWorld:
         )
         await actor.run_once()
         return actor
+
+    async def observe_task(self, request_id: str) -> dict[str, Any]:
+        return await self.task_state.async_get_task(request_id=str(request_id))
+
+    async def observe_scheduler(self, request_id: str) -> dict[str, Any]:
+        return await self.scheduler.contains(request_id=str(request_id))
 
     async def retrieve(self, request_id: str, monkeypatch: Any) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)

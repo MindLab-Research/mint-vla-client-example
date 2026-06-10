@@ -2156,6 +2156,7 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
 
         service = TaskFutureService(
             task_state_client=_LocalTaskStateClient(),
+            future_state_client=_LocalTaskStateClient(),
             payload_store=TaskPayloadStore(tmp_path),
         )
 
@@ -2373,7 +2374,11 @@ def test_task_future_service_reaper_retries_payload_delete_failures(tmp_path, mo
         monkeypatch.setattr(config_module.config, "task_result_ttl_s", 1.0, raising=False)
         monkeypatch.setattr(config_module.config, "task_tombstone_ttl_s", 10**12, raising=False)
 
-        service = TaskFutureService(task_state_client=_LocalTaskStateClient(), payload_store=_FailingPayloadStore())
+        service = TaskFutureService(
+            task_state_client=_LocalTaskStateClient(),
+            future_state_client=_LocalTaskStateClient(),
+            payload_store=_FailingPayloadStore(),
+        )
         out = asyncio.run(service.async_reap())
 
         assert out["payload_evicted"] == []
@@ -2382,7 +2387,11 @@ def test_task_future_service_reaper_retries_payload_delete_failures(tmp_path, mo
         assert record["result_path"] == str(result_path)
         assert "payload_evicted_at" not in record["metadata"]
 
-        service = TaskFutureService(task_state_client=_LocalTaskStateClient(), payload_store=_WorkingPayloadStore())
+        service = TaskFutureService(
+            task_state_client=_LocalTaskStateClient(),
+            future_state_client=_LocalTaskStateClient(),
+            payload_store=_WorkingPayloadStore(),
+        )
         out = asyncio.run(service.async_reap())
 
         assert out["payload_evicted"] == ["req-fail-delete"]
@@ -2453,6 +2462,7 @@ def test_task_future_service_reaper_deletes_abandoned_staged_payload(tmp_path, m
         out = asyncio.run(
             TaskFutureService(
                 task_state_client=_LocalTaskStateClient(),
+                future_state_client=_LocalTaskStateClient(),
                 payload_store=payloads,
             ).async_reap()
         )
