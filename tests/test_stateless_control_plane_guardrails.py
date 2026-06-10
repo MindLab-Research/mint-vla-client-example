@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 from pathlib import Path
+
+import pytest
+
+from mint_server.backend.control_plane_contracts import as_task_ledger
+from mint_server.backend.task_state_store import TaskStateStore
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +80,121 @@ def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
     assert "bind_legacy_route_globals" not in runtime_source
     assert "bind_legacy_route_globals" not in context_source
     assert "from ..routes" not in context_source
+
+
+def test_task_ledger_contract_rejects_sync_task_state_store_surface() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        with pytest.raises(TypeError, match="AsyncTaskLedger"):
+            as_task_ledger(store)
+    finally:
+        store.close()
+
+
+def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
+    class _AsyncLedgerClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, dict]] = []
+
+        async def async_ensure_ready(self, **kwargs):
+            self.calls.append(("ensure_ready", kwargs))
+            return {"ok": True}
+
+        async def async_ping(self, **kwargs):
+            self.calls.append(("ping", kwargs))
+            return {"ok": True}
+
+        async def async_acquire_owner(self, **kwargs):
+            self.calls.append(("acquire_owner", kwargs))
+            return {"ok": True}
+
+        async def async_renew_owner(self, **kwargs):
+            self.calls.append(("renew_owner", kwargs))
+            return {"ok": True}
+
+        async def async_create_task(self, **kwargs):
+            self.calls.append(("create_task", kwargs))
+            return {"ok": True}
+
+        async def async_assign_task(self, **kwargs):
+            self.calls.append(("assign_task", kwargs))
+            return {"ok": True}
+
+        async def async_claim_task(self, **kwargs):
+            self.calls.append(("claim_task", kwargs))
+            return {"ok": True}
+
+        async def async_renew_lease(self, **kwargs):
+            self.calls.append(("renew_lease", kwargs))
+            return {"ok": True}
+
+        async def async_begin_finalize(self, **kwargs):
+            self.calls.append(("begin_finalize", kwargs))
+            return {"ok": True}
+
+        async def async_commit_finalize_success(self, **kwargs):
+            self.calls.append(("commit_finalize_success", kwargs))
+            return {"ok": True}
+
+        async def async_commit_finalize_failure(self, **kwargs):
+            self.calls.append(("commit_finalize_failure", kwargs))
+            return {"ok": True}
+
+        async def async_requeue_task(self, **kwargs):
+            self.calls.append(("requeue_task", kwargs))
+            return {"ok": True}
+
+        async def async_forget_task(self, **kwargs):
+            self.calls.append(("forget_task", kwargs))
+            return {"ok": True}
+
+        async def async_get_task(self, **kwargs):
+            self.calls.append(("get_task", kwargs))
+            return {"ok": True}
+
+        async def async_list_active_tasks(self, **kwargs):
+            self.calls.append(("list_active_tasks", kwargs))
+            return []
+
+        async def async_wait_task_status_change(self, **kwargs):
+            self.calls.append(("wait_task_status_change", kwargs))
+            return {"changed": False}
+
+        async def async_update_task_metadata(self, **kwargs):
+            self.calls.append(("update_task_metadata", kwargs))
+            return {"ok": True}
+
+    async def _run() -> list[tuple[str, dict]]:
+        client = _AsyncLedgerClient()
+        ledger = as_task_ledger(client)
+        await ledger.commit_finalize_success(
+            request_id="req-contract",
+            lease_id="lease-contract",
+            attempt_id="attempt-contract",
+            scheduler_epoch=7,
+            runtime_generation=11,
+            result_path="/tmp/result.json",
+            result_checksum="abc",
+            result_size_bytes=123,
+        )
+        return client.calls
+
+    calls = asyncio.run(_run())
+    assert calls == [
+        (
+            "commit_finalize_success",
+            {
+                "request_id": "req-contract",
+                "lease_id": "lease-contract",
+                "attempt_id": "attempt-contract",
+                "scheduler_epoch": 7,
+                "runtime_generation": 11,
+                "result_path": "/tmp/result.json",
+                "result_checksum": "abc",
+                "result_size_bytes": 123,
+            },
+        )
+    ]
 
 
 def _function_source(path: Path, function_name: str) -> str:

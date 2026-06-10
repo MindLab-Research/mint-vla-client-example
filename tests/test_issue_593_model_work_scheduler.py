@@ -1143,7 +1143,7 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1216,7 +1216,7 @@ def test_scheduler_renew_lease_rejects_durable_terminal_task_state() -> None:
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1293,7 +1293,7 @@ def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> N
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
     work = _work("req-pre-registered")
@@ -1326,7 +1326,7 @@ def test_scheduler_rolls_back_new_task_when_assign_fails_after_create() -> None:
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
     original_task_state_call = actor._task_state_call
@@ -1358,12 +1358,12 @@ def test_scheduler_hydrates_active_task_state_after_restart() -> None:
     store = TaskStateStore.in_memory()
     actor_a = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
     actor_b = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1397,7 +1397,7 @@ def test_scheduler_hydrates_sampling_inflight_counts_from_task_state_store() -> 
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
     domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
@@ -1441,7 +1441,7 @@ def test_scheduler_persists_requeue_before_reclaim() -> None:
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1489,7 +1489,7 @@ def test_issue_645_scheduler_drops_terminal_stale_head_and_claims_next() -> None
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1536,7 +1536,7 @@ def test_issue_645_scheduler_requeues_pending_stale_head() -> None:
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 
@@ -1651,7 +1651,7 @@ def test_issue_645_scheduler_does_not_reconcile_unrelated_task_state_conflict() 
     store = TaskStateStore.in_memory()
     actor = _ModelWorkSchedulerActor(
         use_task_state_store=True,
-        task_state_store=store,
+        task_state_store=_MockTaskStateStoreClient(store),
         owner_id="scheduler-test",
     )
 

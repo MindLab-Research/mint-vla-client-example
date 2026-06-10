@@ -15,6 +15,8 @@ class FaultController:
     def __init__(self) -> None:
         self._blocks: dict[str, BlockPoint] = {}
         self._errors: dict[str, BaseException | Callable[..., BaseException]] = {}
+        self._call_errors: dict[str, tuple[int, BaseException | Callable[..., BaseException]]] = {}
+        self._call_counts: dict[str, int] = {}
 
     def block(self, name: str) -> BlockPoint:
         point = BlockPoint(entered=asyncio.Event(), release=asyncio.Event())
@@ -24,14 +26,27 @@ class FaultController:
     def fail_next(self, name: str, error: BaseException | Callable[..., BaseException]) -> None:
         self._errors[str(name)] = error
 
+    def fail_on_call(
+        self,
+        name: str,
+        call_index: int,
+        error: BaseException | Callable[..., BaseException],
+    ) -> None:
+        self._call_errors[str(name)] = (max(1, int(call_index)), error)
+
     async def before_call(self, name: str, **kwargs: Any) -> None:
         name = str(name)
+        self._call_counts[name] = self._call_counts.get(name, 0) + 1
         point = self._blocks.get(name)
         if point is not None:
             point.entered.set()
             await point.release.wait()
             self._blocks.pop(name, None)
         error = self._errors.pop(name, None)
+        call_error = self._call_errors.get(name)
+        if error is None and call_error is not None and call_error[0] == self._call_counts[name]:
+            error = call_error[1]
+            self._call_errors.pop(name, None)
         if error is None:
             return
         if callable(error):

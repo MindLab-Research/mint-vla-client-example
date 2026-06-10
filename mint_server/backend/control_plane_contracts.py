@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
@@ -134,6 +133,7 @@ class AsyncTaskLedger(Protocol):
         lease_id: str,
         attempt_id: str,
         scheduler_epoch: int,
+        runtime_generation: int,
         result_path: str,
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
@@ -148,6 +148,7 @@ class AsyncTaskLedger(Protocol):
         lease_id: str,
         attempt_id: str,
         scheduler_epoch: int,
+        runtime_generation: int,
         error: str,
         result_path: str | None = None,
         metadata: dict[str, Any] | None = None,
@@ -380,87 +381,6 @@ class TaskStateStoreLedgerAdapter:
         return await self._call_dict("update_task_metadata", **kwargs)
 
 
-class InProcessTaskLedgerAdapter:
-    """Async task-ledger contract over an in-process TaskStateStore implementation."""
-
-    def __init__(self, store: Any) -> None:
-        self._store = store
-
-    async def _call_dict(self, method: str, **kwargs: Any) -> dict[str, Any]:
-        out = await self._call(method, **kwargs)
-        if not isinstance(out, dict):
-            raise TypeError(f"TaskLedger.{method} returned non-dict: {type(out)}")
-        return out
-
-    async def _call_list(self, method: str, **kwargs: Any) -> list[dict[str, Any]]:
-        out = await self._call(method, **kwargs)
-        if not isinstance(out, list):
-            raise TypeError(f"TaskLedger.{method} returned non-list: {type(out)}")
-        return out
-
-    async def _call(self, method: str, **kwargs: Any) -> Any:
-        sync_method = getattr(self._store, method)
-        return await asyncio.to_thread(sync_method, **kwargs)
-
-    async def ensure_ready(
-        self,
-        *,
-        timeout_s: float = 10.0,
-        create_if_missing: bool = False,
-    ) -> dict[str, Any]:
-        _ = timeout_s, create_if_missing
-        return await self.ping()
-
-    async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
-        _ = timeout_s
-        return await self._call_dict("ping")
-
-    async def acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("acquire_scheduler_owner", **kwargs)
-
-    async def renew_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("renew_scheduler_owner", **kwargs)
-
-    async def create_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("create_task", **kwargs)
-
-    async def assign_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("assign_task", **kwargs)
-
-    async def claim_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("claim_task", **kwargs)
-
-    async def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("renew_lease", **kwargs)
-
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("begin_finalize", **kwargs)
-
-    async def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("commit_finalize_success", **kwargs)
-
-    async def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("commit_finalize_failure", **kwargs)
-
-    async def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("requeue_task", **kwargs)
-
-    async def forget_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("forget_task", **kwargs)
-
-    async def get_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("get_task", **kwargs)
-
-    async def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return await self._call_list("list_active_tasks", **kwargs)
-
-    async def wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("wait_task_status_change", **kwargs)
-
-    async def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("update_task_metadata", **kwargs)
-
-
 _ASYNC_TASK_LEDGER_METHODS = (
     "ensure_ready",
     "ping",
@@ -482,25 +402,6 @@ _ASYNC_TASK_LEDGER_METHODS = (
 )
 
 
-_SYNC_TASK_LEDGER_METHODS = (
-    "ping",
-    "acquire_scheduler_owner",
-    "renew_scheduler_owner",
-    "create_task",
-    "assign_task",
-    "claim_task",
-    "renew_lease",
-    "begin_finalize",
-    "commit_finalize_success",
-    "commit_finalize_failure",
-    "requeue_task",
-    "forget_task",
-    "get_task",
-    "list_active_tasks",
-    "update_task_metadata",
-)
-
-
 def _has_methods(client: Any, names: tuple[str, ...]) -> bool:
     return all(callable(getattr(client, name, None)) for name in names)
 
@@ -508,15 +409,12 @@ def _has_methods(client: Any, names: tuple[str, ...]) -> bool:
 def as_task_ledger(client: Any) -> AsyncTaskLedger:
     if _has_methods(client, _ASYNC_TASK_LEDGER_METHODS):
         return client
-    if _has_methods(client, _SYNC_TASK_LEDGER_METHODS):
-        return InProcessTaskLedgerAdapter(client)
     missing_async = [name for name in _ASYNC_TASK_LEDGER_METHODS if not callable(getattr(client, name, None))]
-    missing_sync = [name for name in _SYNC_TASK_LEDGER_METHODS if not callable(getattr(client, name, None))]
     has_async_client_surface = any(callable(getattr(client, f"async_{name}", None)) for name in _ASYNC_TASK_LEDGER_METHODS)
     if not has_async_client_surface:
         raise TypeError(
-            "task ledger client does not implement AsyncTaskLedger or TaskStateStore sync surface; "
-            f"missing_async={missing_async[:5]} missing_sync={missing_sync[:5]}"
+            "task ledger client does not implement AsyncTaskLedger; "
+            f"missing_async={missing_async[:5]}"
         )
     return TaskStateStoreLedgerAdapter(client)
 
