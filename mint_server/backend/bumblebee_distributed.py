@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -58,6 +59,7 @@ BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "MINT_BUMBLEBEE_LORA_ALPHA",
     "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
     "MINT_MODEL_PLACEMENT_JSON",
+    "BUMBLEBEE_QWEN35_MEGATRON_VENDOR_PATH",
     "BUMBLEBEE_BUILD_TRACE",
     "BUMBLEBEE_CKPT_TRACE",
     "BUMBLEBEE_MEMORY_TRACE",
@@ -181,6 +183,48 @@ def _bumblebee_model_name() -> str:
     return os.environ.get("MINT_BUMBLEBEE_MODEL_NAME", "").strip() or "qwen3_moe"
 
 
+def _is_qwen35_model(model: str | None) -> bool:
+    return "qwen3.5-27b" in str(model or "").lower()
+
+
+def _bumblebee_model_name_for_base_model(base_model: str | None) -> str:
+    configured = os.environ.get("MINT_BUMBLEBEE_MODEL_NAME", "").strip()
+    if configured:
+        return configured
+    if _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+        return "qwen3_5"
+    return "qwen3_moe"
+
+
+def _bumblebee_default_megatron_lm_path(base_model: str | None) -> str | None:
+    if not _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+        return None
+    runtime_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
+    if runtime_root:
+        runtime_vendor = Path(runtime_root) / "vendor" / "Megatron-LM"
+        if (runtime_vendor / "megatron" / "core").is_dir():
+            return str(runtime_vendor)
+    return None
+
+
+def _bumblebee_runtime_env_defaults(base_model: str | None) -> dict[str, str]:
+    if not _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+        return {}
+    defaults = {
+        "MINT_BUMBLEBEE_MODEL_NAME": "qwen3_5",
+        "MINT_BUMBLEBEE_IMPL": "lite",
+        "MINT_BUMBLEBEE_OPTIMIZER": "mc_full",
+    }
+    megatron_lm_path = (
+        os.environ.get("MINT_BUMBLEBEE_MEGATRON_LM_PATH", "").strip()
+        or _bumblebee_default_megatron_lm_path(base_model)
+    )
+    if megatron_lm_path:
+        defaults["MINT_BUMBLEBEE_MEGATRON_LM_PATH"] = megatron_lm_path
+        defaults["BUMBLEBEE_QWEN35_MEGATRON_VENDOR_PATH"] = megatron_lm_path
+    return defaults
+
+
 def _prepend_pythonpath_entry(pythonpath: str, entry: str | None) -> str:
     value = str(entry or "").strip()
     if not value:
@@ -203,13 +247,14 @@ def _bumblebee_flash_attn_overlay_path() -> str | None:
     return candidate if os.path.isdir(candidate) else None
 
 
-def _bumblebee_runtime_pythonpath() -> str:
+def _bumblebee_runtime_pythonpath(base_model: str | None = None) -> str:
     runtime_pythonpath = PFS_PYTHONPATH
     repo = _bumblebee_repo_path()
     runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, repo)
     runtime_pythonpath = _prepend_pythonpath_entry(
         runtime_pythonpath,
-        os.environ.get("MINT_BUMBLEBEE_MEGATRON_LM_PATH"),
+        os.environ.get("MINT_BUMBLEBEE_MEGATRON_LM_PATH")
+        or _bumblebee_default_megatron_lm_path(base_model),
     )
     runtime_pythonpath = _prepend_pythonpath_entry(runtime_pythonpath, _bumblebee_flash_attn_overlay_path())
     return runtime_pythonpath
@@ -249,6 +294,11 @@ def _bumblebee_runtime_etp(base_model: str, config: DistributedConfig) -> int | 
     if _is_qwen3_235b_model(_model_key_from_base_model(base_model)):
         return 1
     return None
+
+
+def _bumblebee_lora_adapter_module(base_model: str | None):
+    model_name = _bumblebee_model_name_for_base_model(base_model)
+    return importlib.import_module(f"bumblebee.model.{model_name}.lite.lora_adapter")
 
 
 def _bumblebee_attention_backend_override() -> str | None:
@@ -557,7 +607,7 @@ class BumblebeeRankWorker:
 
             etp = _bumblebee_runtime_etp(self.base_model, self.config)
             bb_cfg = BBConfig(
-                model_name=_bumblebee_model_name(),
+                model_name=_bumblebee_model_name_for_base_model(self.base_model),
                 impl=os.environ.get("MINT_BUMBLEBEE_IMPL", "lite"),
                 hf_path=self.base_model,
                 parallel=ParallelConfig(
@@ -1434,7 +1484,7 @@ class BumblebeeRankWorker:
     ) -> dict[str, Any]:
         self._ensure_session_loaded(session_id, actual_rank)
         _, handle = self._require_runtime()
-        from bumblebee.model.qwen3_moe.lite.lora_adapter import save_lora_adapter
+        save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
 
         chunks = handle._extras.get("model_chunks", [handle._model])
         meta = save_lora_adapter(
@@ -1475,7 +1525,7 @@ class BumblebeeRankWorker:
         checkpoint_type: str,
     ) -> dict[str, Any]:
         _, handle = self._require_runtime()
-        from bumblebee.model.qwen3_moe.lite.lora_adapter import save_lora_adapter
+        save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
 
         logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
         chunks = handle._extras.get("model_chunks", [handle._model])
@@ -1656,7 +1706,7 @@ class BumblebeeRankWorker:
         if model_cfg is None or parallel_state is None:
             raise RuntimeError("Bumblebee runtime handle is missing model_cfg or parallel_state for adapter migration")
 
-        from bumblebee.model.qwen3_moe.lite.lora_adapter import load_lora_adapter
+        load_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).load_lora_adapter
 
         load_meta = load_lora_adapter(chunks, root, model_cfg, parallel_state, strict=True)
         self._reset_optimizer_state()
@@ -1975,7 +2025,7 @@ class BumblebeeWorkerGroup:
         ray.get(self.placement_group.ready())
         bundle_ips = [_bundle_node_ip(bundle) for bundle in bundles]
 
-        runtime_pythonpath = _bumblebee_runtime_pythonpath()
+        runtime_pythonpath = _bumblebee_runtime_pythonpath(self.base_model)
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
@@ -1996,6 +2046,7 @@ class BumblebeeWorkerGroup:
                 },
             )
         }
+        runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(self.base_model))
         for key in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS:
             value = os.environ.get(key)
             if value is not None:
@@ -2547,7 +2598,7 @@ def get_or_create_bumblebee_worker_group(
         except ValueError:
             logger.info("Creating new detached Bumblebee actor: %s for %s", actor_name, base_model)
 
-        runtime_pythonpath = _bumblebee_runtime_pythonpath()
+        runtime_pythonpath = _bumblebee_runtime_pythonpath(base_model)
         runtime_env = {
             "env_vars": actor_runtime_env_vars(
                 pythonpath=runtime_pythonpath,
@@ -2568,6 +2619,7 @@ def get_or_create_bumblebee_worker_group(
                 },
             )
         }
+        runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(base_model))
         for key in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS:
             value = os.environ.get(key)
             if value is not None:

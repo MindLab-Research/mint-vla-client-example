@@ -68,6 +68,21 @@ def _is_qwen3_235b_model(model: str | None) -> bool:
     return "qwen3-235b-a22b" in str(model or "").lower()
 
 
+def _is_qwen35_model(model: str | None) -> bool:
+    return "qwen3.5-27b" in str(model or "").lower()
+
+
+def _uses_distributed_training_backend(requested_model: str | None) -> bool:
+    try:
+        from .model_registry import get_model_config
+
+        if bool(getattr(get_model_config(requested_model or ""), "is_moe", False)):
+            return True
+    except Exception:
+        logger.debug("distributed training model config lookup failed for %s", requested_model, exc_info=True)
+    return _is_qwen35_model(requested_model)
+
+
 def _select_moe_training_backend(requested_model: str | None) -> str:
     """Select the resident MoE trainer for Mint text sessions.
 
@@ -79,6 +94,8 @@ def _select_moe_training_backend(requested_model: str | None) -> str:
         env_name = "MINT_QWEN3_30B_TRAINING_BACKEND"
     elif _is_qwen3_235b_model(requested_model):
         env_name = "MINT_QWEN3_235B_TRAINING_BACKEND"
+    elif _is_qwen35_model(requested_model):
+        env_name = "MINT_QWEN35_TRAINING_BACKEND"
     if env_name and os.environ.get(env_name):
         return _canonical_moe_training_backend(os.environ.get(env_name))
     return _canonical_moe_training_backend(os.environ.get("MINT_MOE_TRAINING_BACKEND"))
@@ -2512,6 +2529,8 @@ class VerlTrainingEngine:
         cfg = get_model_config(model_key)
         if _is_qwen3_30b_model(model_key):
             train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 4, 1, 1
+        elif _is_qwen35_model(model_key):
+            train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 1, 1, 1
         else:
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_key)
         return DistributedConfig(
@@ -3800,10 +3819,10 @@ class VerlTrainingEngine:
             session.lora_config.rank if session.lora_config else self.default_lora_rank
         )
 
-        model_is_moe = bool(get_model_config(requested_model or "").is_moe)
-        moe_backend = _select_moe_training_backend(requested_model) if model_is_moe else None
-        use_megatron = model_is_moe and moe_backend == "megatron"
-        use_bumblebee = model_is_moe and moe_backend == "bumblebee"
+        model_uses_distributed_training = _uses_distributed_training_backend(requested_model)
+        moe_backend = _select_moe_training_backend(requested_model) if model_uses_distributed_training else None
+        use_megatron = model_uses_distributed_training and moe_backend == "megatron"
+        use_bumblebee = model_uses_distributed_training and moe_backend == "bumblebee"
 
         # Resolve model path based on backend
         with start_as_current_span(
@@ -3819,11 +3838,11 @@ class VerlTrainingEngine:
                 "moe_backend": str(moe_backend or ""),
             },
         ):
-            if model_is_moe:
+            if model_uses_distributed_training:
                 resolver = self._resolve_megatron_base_model if use_megatron else self._resolve_bumblebee_base_model
                 base_model, requested_model = resolver(session)
                 logger.info(
-                    "[%s] Resolved %s MoE model to local: %s (requested=%s)",
+                    "[%s] Resolved %s distributed training model to local: %s (requested=%s)",
                     model_id,
                     moe_backend,
                     base_model,

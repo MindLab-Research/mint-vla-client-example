@@ -1318,9 +1318,9 @@ def _infer_training_backend_for_base_model(base_model: str) -> str:
         return "openpi_fast"
     if training_backend == "openpi_pi05":
         return "openpi_pi05"
-    if bool(getattr(cfg, "is_moe", False)):
-        from ..backend.verl_training import _select_moe_training_backend
+    from ..backend.verl_training import _select_moe_training_backend, _uses_distributed_training_backend
 
+    if _uses_distributed_training_backend(base_model):
         return _select_moe_training_backend(base_model)
     return "peft"
 

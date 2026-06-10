@@ -61,3 +61,22 @@ def test_moe_train_step_scheduler_extra_uses_session_backend_domain(monkeypatch)
     assert extra["scheduler_enabled"] is True
     assert extra["scheduler_domain"] == "bumblebee:mint_megatron_qwen3_30b_a3b_instruct_2507"
     assert extra["scheduler_session_key"] == "model-3"
+
+
+def test_qwen35_train_step_scheduler_extra_uses_bumblebee_domain(monkeypatch):
+    monkeypatch.setenv("MINT_SCHEDULER_ENABLE", "1")
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    session = SimpleNamespace(
+        backend="bumblebee",
+        base_model="Qwen/Qwen3.5-27B",
+    )
+
+    extra = _build_training_scheduler_extra(
+        session=session,
+        model_id="model-4",
+        training_op="forward_backward",
+    )
+
+    assert extra["scheduler_enabled"] is True
+    assert extra["scheduler_domain"] == "bumblebee:mint_megatron_qwen3_5_27b"
+    assert extra["scheduler_session_key"] == "model-4"
