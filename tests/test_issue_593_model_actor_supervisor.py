@@ -1990,6 +1990,45 @@ def test_issue_593_topology_specs_accept_bumblebee_training_alias(
     assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
 
 
+def test_issue_593_topology_specs_accept_qwen35_bumblebee_training_alias(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    base_model = "Qwen/Qwen3.5-27B"
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                base_model: {
+                    "bumblebee": {
+                        "placement": [
+                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4},
+                        ]
+                    }
+                }
+            },
+        ),
+    )
+
+    specs = desired_specs_from_env()
+    training_specs = [spec for spec in specs if spec.base_model == base_model and spec.launcher_key == "training"]
+
+    assert training_specs == [
+        ModelActorSpec(
+            domain_key="bumblebee:mint_megatron_qwen3_5_27b",
+            base_model=base_model,
+            launcher_key="training",
+            worker_aliases=("mint-worker-0",),
+            placement_alias_slices=(("replica-0", "mint-worker-0", 4),),
+            gpu_count=4,
+        )
+    ]
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+
+
 def test_topology_legacy_megatron_launcher_follows_selected_moe_backend(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,

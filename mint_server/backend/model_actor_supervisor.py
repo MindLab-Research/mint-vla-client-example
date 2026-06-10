@@ -453,9 +453,9 @@ def _normalize_megatron_domain_key(base_model: str) -> str:
 
 def _is_moe_training_model(model: str) -> bool:
     try:
-        from .model_registry import get_model_config
+        from .verl_training import _uses_distributed_training_backend
 
-        return bool(getattr(get_model_config(model), "is_moe", False))
+        return _uses_distributed_training_backend(model)
     except Exception:
         logger.debug("training domain model config lookup failed for %s", model, exc_info=True)
         return False

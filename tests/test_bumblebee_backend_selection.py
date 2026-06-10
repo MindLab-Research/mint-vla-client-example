@@ -11,17 +11,23 @@ from mint_server.backend.verl_training import (
     VerlTrainingEngine,
     _select_moe_training_backend,
 )
+from mint_server.routes.training import _infer_training_backend_for_base_model
+from mint_server.backend.model_actor_supervisor import domain_key_for_training_base_model
 from mint_server.backend.bumblebee_distributed import (
     BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS,
     BUMBLEBEE_TRAIN_STATE_CHECKPOINT_FORMAT,
     BUMBLEBEE_TRAIN_STATE_FILE,
     BUMBLEBEE_TRAIN_STATE_META_FILE,
+    _bumblebee_lora_adapter_module,
     BumblebeeRankWorker,
     BumblebeeWorkerGroup,
     BumblebeeSessionMeta,
     _bumblebee_attention_backend_override,
+    _bumblebee_default_megatron_lm_path,
     _bumblebee_flash_attn_overlay_path,
     _bumblebee_model_name,
+    _bumblebee_model_name_for_base_model,
+    _bumblebee_runtime_env_defaults,
     _bumblebee_runtime_pythonpath,
     _bumblebee_runtime_etp,
     _coerce_int,
@@ -49,6 +55,36 @@ def test_qwen3_235b_defaults_to_bumblebee(monkeypatch):
     monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
 
     assert _select_moe_training_backend("Qwen/Qwen3-235B-A22B-Instruct-2507") == "bumblebee"
+
+
+def test_qwen35_defaults_to_bumblebee(monkeypatch):
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+
+    assert _select_moe_training_backend("Qwen/Qwen3.5-27B") == "bumblebee"
+
+
+def test_qwen35_create_model_plans_bumblebee_backend(monkeypatch):
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+
+    assert _infer_training_backend_for_base_model("Qwen/Qwen3.5-27B") == "bumblebee"
+
+
+def test_qwen35_supervisor_training_domain_uses_bumblebee(monkeypatch):
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    monkeypatch.delenv("MINT_MOE_TRAINING_BACKEND", raising=False)
+
+    assert (
+        domain_key_for_training_base_model("Qwen/Qwen3.5-27B")
+        == "bumblebee:mint_megatron_qwen3_5_27b"
+    )
+
+
+def test_qwen35_can_roll_back_to_megatron(monkeypatch):
+    monkeypatch.setenv("MINT_QWEN35_TRAINING_BACKEND", "megatron")
+
+    assert _select_moe_training_backend("Qwen/Qwen3.5-27B") == "megatron"
 
 
 def test_bumblebee_30b_uses_folded_four_gpu_topology(monkeypatch):
@@ -80,6 +116,21 @@ def test_bumblebee_235b_keeps_existing_mint_topology_with_bumblebee_etp(monkeypa
     assert cfg.expert_tensor_parallel_size is None
     assert cfg.world_size == 32
     assert _bumblebee_runtime_etp("Qwen/Qwen3-235B-A22B-Instruct-2507", cfg) == 1
+
+
+def test_bumblebee_qwen35_uses_four_gpu_dense_topology(monkeypatch):
+    monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
+    engine = VerlTrainingEngine()
+
+    cfg = engine._build_bumblebee_distributed_config(
+        requested_model="Qwen/Qwen3.5-27B",
+        base_model=None,
+    )
+
+    assert cfg.tensor_parallel_size == 4
+    assert cfg.expert_parallel_size == 1
+    assert cfg.expert_tensor_parallel_size == 1
+    assert cfg.world_size == 4
 
 
 def test_bumblebee_placement_group_name_is_namespace_scoped():
@@ -116,6 +167,18 @@ def test_bumblebee_model_name_reads_env(monkeypatch):
     monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_NAME", " qwen3_5 ")
 
     assert _bumblebee_model_name() == "qwen3_5"
+
+
+def test_bumblebee_model_name_for_qwen35_defaults_to_qwen3_5(monkeypatch):
+    monkeypatch.delenv("MINT_BUMBLEBEE_MODEL_NAME", raising=False)
+
+    assert _bumblebee_model_name_for_base_model("Qwen/Qwen3.5-27B") == "qwen3_5"
+
+
+def test_bumblebee_model_name_for_qwen35_respects_env(monkeypatch):
+    monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_NAME", "qwen3_5_custom")
+
+    assert _bumblebee_model_name_for_base_model("Qwen/Qwen3.5-27B") == "qwen3_5_custom"
 
 
 def test_bumblebee_attention_backend_override_defaults_to_flash(monkeypatch):
@@ -167,6 +230,46 @@ def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tm
         str(repo),
         "/runtime/site-packages",
     ]
+
+
+def test_bumblebee_qwen35_runtime_defaults_use_runtime_vendor_megatron(monkeypatch, tmp_path):
+    vendor = tmp_path / "vendor" / "Megatron-LM" / "megatron" / "core"
+    vendor.mkdir(parents=True)
+    monkeypatch.delenv("MINT_BUMBLEBEE_MODEL_NAME", raising=False)
+    monkeypatch.delenv("MINT_BUMBLEBEE_MEGATRON_LM_PATH", raising=False)
+    monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(tmp_path))
+    monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
+
+    expected_vendor = str(tmp_path / "vendor" / "Megatron-LM")
+    assert _bumblebee_default_megatron_lm_path("Qwen/Qwen3.5-27B") == expected_vendor
+    assert _bumblebee_runtime_env_defaults("Qwen/Qwen3.5-27B") == {
+        "MINT_BUMBLEBEE_MODEL_NAME": "qwen3_5",
+        "MINT_BUMBLEBEE_IMPL": "lite",
+        "MINT_BUMBLEBEE_OPTIMIZER": "mc_full",
+        "MINT_BUMBLEBEE_MEGATRON_LM_PATH": expected_vendor,
+        "BUMBLEBEE_QWEN35_MEGATRON_VENDOR_PATH": expected_vendor,
+    }
+    pythonpath_parts = _bumblebee_runtime_pythonpath("Qwen/Qwen3.5-27B").split(":")
+    assert pythonpath_parts[0] == expected_vendor
+    assert pythonpath_parts[1].endswith("/code/bumblebee")
+
+
+def test_bumblebee_qwen35_runtime_defaults_mirror_explicit_megatron_path(monkeypatch, tmp_path):
+    explicit = tmp_path / "Megatron-LM"
+    monkeypatch.setenv("MINT_BUMBLEBEE_MEGATRON_LM_PATH", str(explicit))
+
+    defaults = _bumblebee_runtime_env_defaults("Qwen/Qwen3.5-27B")
+
+    assert defaults["MINT_BUMBLEBEE_MEGATRON_LM_PATH"] == str(explicit)
+    assert defaults["BUMBLEBEE_QWEN35_MEGATRON_VENDOR_PATH"] == str(explicit)
+
+
+def test_bumblebee_qwen35_adapter_module_dispatch(monkeypatch):
+    module = types.ModuleType("bumblebee.model.qwen3_5.lite.lora_adapter")
+    monkeypatch.setitem(sys.modules, "bumblebee.model.qwen3_5.lite.lora_adapter", module)
+    monkeypatch.delenv("MINT_BUMBLEBEE_MODEL_NAME", raising=False)
+
+    assert _bumblebee_lora_adapter_module("Qwen/Qwen3.5-27B") is module
 
 
 def test_bumblebee_optimizer_metric_coerces_missing_num_zeros():
