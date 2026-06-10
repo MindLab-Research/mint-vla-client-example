@@ -91,6 +91,15 @@ def test_task_ledger_contract_rejects_sync_task_state_store_surface() -> None:
         store.close()
 
 
+def test_task_ledger_contract_rejects_partial_async_surface() -> None:
+    class _PartialAsyncLedgerClient:
+        async def async_ping(self, **kwargs):
+            return {"ok": True}
+
+    with pytest.raises(TypeError, match="missing_async"):
+        as_task_ledger(_PartialAsyncLedgerClient())
+
+
 def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
     class _AsyncLedgerClient:
         def __init__(self) -> None:
@@ -176,6 +185,18 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
             result_path="/tmp/result.json",
             result_checksum="abc",
             result_size_bytes=123,
+            billing_observations=[{"model": "model-a", "tokens": 3}],
+        )
+        await ledger.commit_finalize_failure(
+            request_id="req-contract-fail",
+            lease_id="lease-contract-fail",
+            attempt_id="attempt-contract-fail",
+            scheduler_epoch=8,
+            runtime_generation=12,
+            error="boom",
+            result_path="/tmp/error.json",
+            result_checksum="def",
+            result_size_bytes=456,
         )
         return client.calls
 
@@ -192,6 +213,21 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
                 "result_path": "/tmp/result.json",
                 "result_checksum": "abc",
                 "result_size_bytes": 123,
+                "billing_observations": [{"model": "model-a", "tokens": 3}],
+            },
+        ),
+        (
+            "commit_finalize_failure",
+            {
+                "request_id": "req-contract-fail",
+                "lease_id": "lease-contract-fail",
+                "attempt_id": "attempt-contract-fail",
+                "scheduler_epoch": 8,
+                "runtime_generation": 12,
+                "error": "boom",
+                "result_path": "/tmp/error.json",
+                "result_checksum": "def",
+                "result_size_bytes": 456,
             },
         )
     ]
@@ -208,6 +244,39 @@ def _function_source(path: Path, function_name: str) -> str:
         ):
             return "\n".join(lines[node.lineno - 1 : node.end_lineno])
     raise AssertionError(f"function {function_name!r} not found in {path}")
+
+
+def test_async_ray_actor_create_paths_do_not_block_event_loop() -> None:
+    for path in (
+        REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py",
+        REPO_ROOT / "mint_server" / "backend" / "task_state_store.py",
+    ):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        function = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_get_ray_actor_async"
+        )
+        to_thread_calls = 0
+        direct_calls = 0
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name) and node.func.id == "_create_ray_actor":
+                direct_calls += 1
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "to_thread"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "asyncio"
+                and node.args
+                and isinstance(node.args[0], ast.Name)
+                and node.args[0].id == "_create_ray_actor"
+            ):
+                to_thread_calls += 1
+
+        assert direct_calls == 0
+        assert to_thread_calls == 1
 
 
 def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:

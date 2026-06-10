@@ -186,12 +186,57 @@ class _FakeTaskStateStore:
         self.successes: list[dict] = []
         self.failures: list[dict] = []
 
+    async def async_ensure_ready(self, **kwargs):
+        return {"ok": True}
+
+    async def async_ping(self, **kwargs):
+        return {"ok": True}
+
+    async def async_acquire_owner(self, **kwargs):
+        return {"ok": True}
+
+    async def async_renew_owner(self, **kwargs):
+        return {"ok": True}
+
+    async def async_create_task(self, **kwargs):
+        return {"ok": True, "created": True, "record": dict(kwargs)}
+
+    async def async_assign_task(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_claim_task(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_renew_lease(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_begin_finalize(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
     async def async_commit_finalize_success(self, **kwargs):
         self.successes.append(dict(kwargs))
         return {"ok": True, "record": dict(kwargs)}
 
     async def async_commit_finalize_failure(self, **kwargs):
         self.failures.append(dict(kwargs))
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_requeue_task(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_forget_task(self, **kwargs):
+        return {"ok": True, "record": dict(kwargs)}
+
+    async def async_get_task(self, **kwargs):
+        return {"ok": True, **dict(kwargs)}
+
+    async def async_list_active_tasks(self, **kwargs):
+        return []
+
+    async def async_wait_task_status_change(self, **kwargs):
+        return {"changed": False, "timeout": True}
+
+    async def async_update_task_metadata(self, **kwargs):
         return {"ok": True, "record": dict(kwargs)}
 
 

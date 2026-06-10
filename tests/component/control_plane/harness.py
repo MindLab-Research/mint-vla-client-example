@@ -38,7 +38,9 @@ class LocalAsyncTaskStateClient:
         method = str(method)
         self.calls.append((method, {"args": args, **dict(kwargs)}))
         await self.faults.before_call(f"task_state.{method}", **kwargs)
-        return await asyncio.to_thread(getattr(self.store, method), *args, **kwargs)
+        out = await asyncio.to_thread(getattr(self.store, method), *args, **kwargs)
+        await self.faults.before_call(f"task_state.{method}.after", **kwargs)
+        return out
 
     async def async_ensure_ready(
         self,

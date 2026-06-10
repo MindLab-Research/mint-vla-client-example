@@ -137,6 +137,7 @@ class AsyncTaskLedger(Protocol):
         result_path: str,
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> dict[str, Any]: ...
@@ -151,6 +152,8 @@ class AsyncTaskLedger(Protocol):
         runtime_generation: int,
         error: str,
         result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
     ) -> dict[str, Any]: ...
@@ -410,11 +413,15 @@ def as_task_ledger(client: Any) -> AsyncTaskLedger:
     if _has_methods(client, _ASYNC_TASK_LEDGER_METHODS):
         return client
     missing_async = [name for name in _ASYNC_TASK_LEDGER_METHODS if not callable(getattr(client, name, None))]
-    has_async_client_surface = any(callable(getattr(client, f"async_{name}", None)) for name in _ASYNC_TASK_LEDGER_METHODS)
-    if not has_async_client_surface:
+    missing_client_async = [
+        f"async_{name}"
+        for name in _ASYNC_TASK_LEDGER_METHODS
+        if not callable(getattr(client, f"async_{name}", None))
+    ]
+    if missing_client_async:
         raise TypeError(
             "task ledger client does not implement AsyncTaskLedger; "
-            f"missing_async={missing_async[:5]}"
+            f"missing_async={(missing_async + missing_client_async)[:5]}"
         )
     return TaskStateStoreLedgerAdapter(client)
 

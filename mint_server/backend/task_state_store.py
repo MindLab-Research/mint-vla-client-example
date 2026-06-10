@@ -3960,7 +3960,10 @@ class TaskStateStoreClient:
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
                 )
             try:
-                actor = _create_ray_actor(require_ready=require_ready)
+                actor = await asyncio.to_thread(
+                    _create_ray_actor,
+                    require_ready=require_ready,
+                )
             except Exception as e:
                 raise TaskStateStoreUnavailableError(
                     "Failed to get/create detached Ray TaskStateStore actor"

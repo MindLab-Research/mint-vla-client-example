@@ -179,6 +179,165 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_complete_requires_durable_terminal_commit(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-complete-before-commit")
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+            staged_payload_path=str(world.tmp_path / "staged.json"),
+        )
+
+        premature_complete = await world.scheduler.complete(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+        )
+
+        assert begin["ok"] is True
+        assert premature_complete == {"ok": False, "reason": "not_terminal"}
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_task("component-complete-before-commit"))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_fail_terminal_requires_durable_terminal_commit(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-fail-before-commit")
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+        )
+
+        premature_fail = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=False,
+            reason="premature-terminal-fail",
+        )
+
+        assert begin["ok"] is True
+        assert premature_fail == {"ok": False, "reason": "not_terminal"}
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_task("component-fail-before-commit"))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-complete-during-finalize")
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.begin_finalize")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+        completed = await world.scheduler.complete(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+        )
+
+        block.release.set()
+        finalized = await finalize_task
+
+        assert completed == {"ok": False, "reason": "finalize_inflight"}
+        assert finalized["ok"] is True
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_task("component-complete-during-finalize"))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
+    for requeue in (True, False):
+        world = SchedulerComponentWorld(tmp_path / str(requeue))
+        try:
+            await world.start()
+            request_id = f"component-fail-during-finalize-{requeue}"
+            await world.enqueue_sampling(request_id)
+            lease = await world.claim_one()
+
+            block = world.faults.block("task_state.begin_finalize")
+            finalize_task = asyncio.create_task(
+                world.scheduler.begin_finalize(
+                    lease_id=lease["lease_id"],
+                    consumer_id=world.consumer_id,
+                    consumer_generation=world.generation,
+                    finalize_ttl_s=30.0,
+                )
+            )
+            await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+            failed = await world.scheduler.fail(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                requeue=requeue,
+                reason="fail-during-finalize",
+            )
+
+            block.release.set()
+            finalized = await finalize_task
+
+            assert failed == {"ok": False, "reason": "finalize_inflight"}
+            assert finalized["ok"] is True
+            assert (
+                await world.scheduler.validate(
+                    lease_id=lease["lease_id"],
+                    consumer_id=world.consumer_id,
+                    consumer_generation=world.generation,
+                )
+            )["ok"] is True
+            assert (await world.observe_task(request_id))["status"] == "finalizing"
+        finally:
+            world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_old_generation_cannot_claim_after_replica_sync(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
