@@ -3847,7 +3847,7 @@ class _TaskStateStoreActor:
         return self._store.prune_session_heartbeats(**kwargs)
 
 
-def _create_ray_actor(*, require_ready: bool = True):
+def _create_ray_actor_handle():
     try:
         import ray
     except Exception as e:
@@ -3878,8 +3878,22 @@ def _create_ray_actor(*, require_ready: bool = True):
     }
     apply_detached_actor_resources(options, ray)
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
+    return actor
+
+
+def _create_ray_actor(*, require_ready: bool = True):
+    actor = _create_ray_actor_handle()
     if require_ready:
         out = sync_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+    return actor
+
+
+async def _create_ray_actor_async(*, require_ready: bool = True):
+    actor = await asyncio.to_thread(_create_ray_actor_handle)
+    if require_ready:
+        out = await async_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
     return actor
@@ -3960,10 +3974,7 @@ class TaskStateStoreClient:
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
                 )
             try:
-                actor = await asyncio.to_thread(
-                    _create_ray_actor,
-                    require_ready=require_ready,
-                )
+                actor = await _create_ray_actor_async(require_ready=require_ready)
             except Exception as e:
                 raise TaskStateStoreUnavailableError(
                     "Failed to get/create detached Ray TaskStateStore actor"

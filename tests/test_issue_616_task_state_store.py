@@ -51,20 +51,20 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
         calls["timeout_s"] = timeout_s
         return ref
 
-    def _fake_create_ray_actor(*, require_ready: bool = True):
-        calls["require_ready"] = require_ready
+    def _fake_create_ray_actor_handle():
+        calls["created_handle"] = True
         return _Actor()
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing")))
-    monkeypatch.setattr(module, "_create_ray_actor", _fake_create_ray_actor)
+    monkeypatch.setattr(module, "_create_ray_actor_handle", _fake_create_ray_actor_handle)
     monkeypatch.setattr(module, "async_get_ray_ref", _fake_async_get_ray_ref)
 
     client = TaskStateStoreClient()
     out = asyncio.run(client.async_ensure_ready(timeout_s=7.0, create_if_missing=True))
 
     assert out == {"ok": True, "actor_name": "mint_task_state_store"}
-    assert calls == {"require_ready": False, "timeout_s": 7.0}
+    assert calls == {"created_handle": True, "timeout_s": 7.0}
 
 
 def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypatch) -> None:

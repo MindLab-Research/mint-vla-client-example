@@ -252,18 +252,35 @@ def test_async_ray_actor_create_paths_do_not_block_event_loop() -> None:
         REPO_ROOT / "mint_server" / "backend" / "task_state_store.py",
     ):
         tree = ast.parse(path.read_text(), filename=str(path))
-        function = next(
+        get_actor_async = next(
             node
             for node in ast.walk(tree)
             if isinstance(node, ast.AsyncFunctionDef) and node.name == "_get_ray_actor_async"
         )
-        to_thread_calls = 0
-        direct_calls = 0
-        for node in ast.walk(function):
+        create_actor_async = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_create_ray_actor_async"
+        )
+        create_async_calls = 0
+        forbidden_sync_create_calls = 0
+        for node in ast.walk(get_actor_async):
             if not isinstance(node, ast.Call):
                 continue
-            if isinstance(node.func, ast.Name) and node.func.id == "_create_ray_actor":
-                direct_calls += 1
+            if isinstance(node.func, ast.Name) and node.func.id == "_create_ray_actor_async":
+                create_async_calls += 1
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in {"_create_ray_actor", "_create_ray_actor_handle"}
+            ):
+                forbidden_sync_create_calls += 1
+
+        to_thread_handle_calls = 0
+        async_ready_waits = 0
+        sync_ready_waits = 0
+        for node in ast.walk(create_actor_async):
+            if not isinstance(node, ast.Call):
+                continue
             if (
                 isinstance(node.func, ast.Attribute)
                 and node.func.attr == "to_thread"
@@ -271,12 +288,19 @@ def test_async_ray_actor_create_paths_do_not_block_event_loop() -> None:
                 and node.func.value.id == "asyncio"
                 and node.args
                 and isinstance(node.args[0], ast.Name)
-                and node.args[0].id == "_create_ray_actor"
+                and node.args[0].id == "_create_ray_actor_handle"
             ):
-                to_thread_calls += 1
+                to_thread_handle_calls += 1
+            if isinstance(node.func, ast.Name) and node.func.id == "async_get_ray_ref":
+                async_ready_waits += 1
+            if isinstance(node.func, ast.Name) and node.func.id in {"sync_get_ray_ref", "_await_ray_ref_sync"}:
+                sync_ready_waits += 1
 
-        assert direct_calls == 0
-        assert to_thread_calls == 1
+        assert create_async_calls == 1
+        assert forbidden_sync_create_calls == 0
+        assert to_thread_handle_calls == 1
+        assert async_ready_waits == 1
+        assert sync_ready_waits == 0
 
 
 def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFunctionDef]:
