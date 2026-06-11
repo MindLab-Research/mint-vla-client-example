@@ -176,6 +176,32 @@ def test_future_state_store_metrics_use_status_indexes_not_created_full_scan() -
     assert stats["payload_stats"]["records_scanned"] == 2
 
 
+def test_future_state_store_list_active_tasks_limit_bounds_index_scans(monkeypatch) -> None:
+    store = FutureStateStore.in_memory()
+    for idx in range(3):
+        store.create_task(
+            request_id=f"pending-{idx}",
+            op="sampling.asample",
+            domain_key="vllm:model",
+            request_json=b"{}",
+            now=float(idx),
+        )
+
+    calls: list[int | None] = []
+    original = store._ids_from_index_prefix
+
+    def _tracked(prefix: str, *, limit: int | None = None):
+        calls.append(limit)
+        return original(prefix, limit=limit)
+
+    monkeypatch.setattr(store, "_ids_from_index_prefix", _tracked)
+
+    active = store.list_active_tasks(limit=1)
+
+    assert [record["request_id"] for record in active] == ["pending-0"]
+    assert calls == [1]
+
+
 def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()

@@ -3253,18 +3253,19 @@ class _TaskStateStoreActor:
             if cached is not None and now - self._stats_cache_at <= self._stats_cache_ttl_s:
                 _record_task_state_stats_metric(duration_ms=0.0, cache_hit=True)
                 return dict(cached)
-            active = self._store.list_active_tasks()
-            by_status: dict[str, int] = {}
-            for record in active:
-                status = str(record.get("status") or "unknown")
-                by_status[status] = by_status.get(status, 0) + 1
             future_stats = self._store.future_metrics_stats()
+            by_status = {
+                status: int(future_stats.get(status) or 0)
+                for status in ACTIVE_TASK_STATUSES
+                if int(future_stats.get(status) or 0) > 0
+            }
+            active_tasks = sum(by_status.values())
             out = {
                 "actor_name": _ray_task_state_store_actor_name(),
                 "namespace": _ray_namespace(),
                 "db_path": self._store.db_path,
                 "started_at": self._started_at,
-                "active_tasks": len(active),
+                "active_tasks": int(active_tasks),
                 "active_by_status": by_status,
                 "watchers": self._watcher_count,
                 **future_stats,

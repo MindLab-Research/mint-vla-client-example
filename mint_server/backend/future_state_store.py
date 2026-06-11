@@ -1104,8 +1104,20 @@ class FutureStateStore:
 
     def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
         ids: list[str] = []
+        remaining = None if limit is None else max(0, int(limit))
+        if remaining == 0:
+            return []
         for status in ("pending", "queued", "assigned", "leased", "running", "finalizing"):
-            ids.extend(self._ids_from_index_prefix(f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:"))
+            ids.extend(
+                self._ids_from_index_prefix(
+                    f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:",
+                    limit=remaining,
+                )
+            )
+            if remaining is not None:
+                remaining = max(0, int(limit) - len(ids))
+                if remaining == 0:
+                    break
         return self._records_from_ids(ids, limit=limit)
 
     def list_expired_leases(self, *, now: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:

@@ -1945,6 +1945,30 @@ def test_task_state_store_actor_uses_single_db_path(tmp_path) -> None:
         reopened.close()
 
 
+def test_task_state_store_actor_stats_uses_future_metrics_not_active_task_scan(tmp_path) -> None:
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state-stats-no-active-scan.sqlite3"))
+    try:
+        actor.create_task(
+            request_id="req-actor",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            now=101.0,
+        )
+
+        def _unexpected_list_active_tasks(*_args, **_kwargs):
+            raise AssertionError("stats must not scan active task rows")
+
+        actor._store.list_active_tasks = _unexpected_list_active_tasks  # type: ignore[method-assign]
+
+        stats = actor.stats()
+
+        assert stats["active_tasks"] == 1
+        assert stats["active_by_status"] == {"pending": 1}
+    finally:
+        actor.close()
+
+
 def test_task_state_store_owns_sampling_session_metadata() -> None:
     store = TaskStateStore.in_memory()
     try:
