@@ -34,6 +34,38 @@ def _create_task(store: TaskStateStore, request_id: str = "req-1") -> None:
     assert created["created"] is True
 
 
+def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        first = store.create_task(
+            request_id="append-owner",
+            op="sampling.asample",
+            domain_key="vllm:model-a",
+            request_json=b"{}",
+            metadata={
+                "model_work_scheduler_append_attempt_id": "attempt-a",
+                "stage": "first",
+            },
+        )
+        second = store.create_task(
+            request_id="append-owner",
+            op="sampling.asample",
+            domain_key="vllm:model-a",
+            request_json=b"{}",
+            metadata={
+                "model_work_scheduler_append_attempt_id": "attempt-b",
+                "stage": "duplicate",
+            },
+        )
+
+        assert first["created"] is True
+        assert second["created"] is False
+        assert second["record"]["metadata"]["model_work_scheduler_append_attempt_id"] == "attempt-a"
+        assert second["record"]["metadata"]["stage"] == "duplicate"
+    finally:
+        store.close()
+
+
 def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch) -> None:
     import mint_server.backend.task_state_store as module
     import ray

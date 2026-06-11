@@ -373,6 +373,39 @@ async def test_scheduler_component_fail_requeue_recovers_after_durable_finalize_
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_duplicate_append_cancel_does_not_forget_existing_pending(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-duplicate-append-cancel-pending"
+        block = world.faults.block("task_state.create_task.after")
+        first_task = asyncio.create_task(world.enqueue_sampling(request_id, assign=False))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        duplicate_task = asyncio.create_task(world.enqueue_sampling(request_id, assign=False))
+
+        while sum(1 for method, _ in world.task_state.calls if method == "create_task") < 2:
+            await asyncio.sleep(0.001)
+        duplicate_task.cancel()
+        block.release.set()
+        created = await first_task
+        with pytest.raises(asyncio.CancelledError):
+            await duplicate_task
+
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        lease = await world.claim_one()
+
+        assert created.scheduler_result["ok"] is True
+        assert (await world.observe_task(request_id))["status"] == "leased"
+        assert assigned["assigned"] == 1
+        assert lease["item"]["request_id"] == request_id
+        assert (await world.claim_none())["leases"] == []
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
