@@ -173,7 +173,15 @@ def init_megatron_group_runtime_otel_metrics(
 
             return _callback
 
-        for field in ("active_sessions", "session_unknown", "session_step", "learning_rate"):
+        for field in (
+            "active_sessions",
+            "session_unknown",
+            "session_step",
+            "learning_rate",
+            "training_requests_total",
+            "input_tokens_total",
+            "output_tokens_total",
+        ):
             _register_observable_gauge(
                 meter,
                 f"mint_megatron_{field}",

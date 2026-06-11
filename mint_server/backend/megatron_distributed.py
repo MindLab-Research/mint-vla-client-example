@@ -105,6 +105,25 @@ def _json_debug_value(value: Any) -> Any:
     return str(value)
 
 
+def _count_data_item_input_tokens(data_items: list[dict]) -> int:
+    total = 0
+    for item in data_items:
+        if not isinstance(item, dict):
+            continue
+        try:
+            total += len(flatten_encoded_text_chunks(item.get("model_input", {})))
+        except Exception:
+            continue
+    return max(0, int(total))
+
+
+def _safe_nonnegative_int(value: object) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _tensor_debug_signature(name: str, tensor: Any) -> dict[str, Any]:
     import torch
 
@@ -7256,6 +7275,9 @@ class MegatronWorkerGroup:
         self._last_session_switch_stats: dict[str, object] | None = None
         self._observability_gpu_bindings_cache: list[dict[str, object]] = []
         self._observability_memory_cache: dict[str, int] = {}
+        self._training_requests_total = 0
+        self._input_tokens_total = 0
+        self._output_tokens_total = 0
         self._session_manager = MegatronSessionStateManager()  # Issue #44: session state management
         self._contaminated_sessions: dict[str, str] = {}
         self._blocked_sessions: dict[str, str] = {}
@@ -7298,6 +7320,16 @@ class MegatronWorkerGroup:
     def _bind_traceparent(self, traceparent: str | None) -> None:
         if isinstance(traceparent, str) and traceparent:
             restore_trace_id_from_traceparent(traceparent)
+
+    def _record_training_token_observability(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> None:
+        self._training_requests_total += 1
+        self._input_tokens_total += max(0, int(input_tokens))
+        self._output_tokens_total += max(0, int(output_tokens))
 
     def _start_slow_group_watchdog(
         self,
@@ -8614,6 +8646,12 @@ class MegatronWorkerGroup:
         rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
         loss_value = rank0_result.get("loss_value", 0.0)
         num_tokens = rank0_result.get("num_tokens", 0)
+        input_tokens = _count_data_item_input_tokens(data_items)
+        output_tokens = _safe_nonnegative_int(num_tokens)
+        self._record_training_token_observability(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         valid_count = rank0_result.get("valid_count")
         if valid_count is None:
             valid_count = len(data_items)
@@ -8820,6 +8858,12 @@ class MegatronWorkerGroup:
         rank0_result = next((r for r in results if isinstance(r, dict) and r), {})
         loss_value = rank0_result.get("loss_value", 0.0)
         num_tokens = rank0_result.get("num_tokens", 0)
+        input_tokens = _count_data_item_input_tokens(data_items)
+        output_tokens = _safe_nonnegative_int(num_tokens)
+        self._record_training_token_observability(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
         valid_count = rank0_result.get("valid_count")
         if valid_count is None:
             valid_count = len(data_items)
@@ -10267,6 +10311,9 @@ class MegatronWorkerGroup:
             "session_unknown": int(bool(self._session_unknown_due_to_partial_swap)),
             "session_step": max(0, int(self._step_count)),
             "learning_rate": max(0.0, float(self.learning_rate)),
+            "training_requests_total": max(0, int(self._training_requests_total)),
+            "input_tokens_total": max(0, int(self._input_tokens_total)),
+            "output_tokens_total": max(0, int(self._output_tokens_total)),
         }
 
 

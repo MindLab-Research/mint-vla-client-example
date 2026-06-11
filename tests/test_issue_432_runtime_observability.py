@@ -830,6 +830,9 @@ def test_issue_638_megatron_runtime_actor_registers_group_and_rank_otel_gauges(m
             "session_unknown": 0,
             "session_step": 17,
             "learning_rate": 5e-5,
+            "training_requests_total": 2,
+            "input_tokens_total": 1024,
+            "output_tokens_total": 512,
         },
         actor_name="mint_megatron_qwen3_30b_replica_0",
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -849,6 +852,9 @@ def test_issue_638_megatron_runtime_actor_registers_group_and_rank_otel_gauges(m
     assert active.value == pytest.approx(1.0)
     assert active.attributes["actor_name"] == "mint_megatron_qwen3_30b_replica_0"
     assert active.attributes["base_model"] == "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert gauges["mint_megatron_training_requests_total"][0](None)[0].value == pytest.approx(2.0)
+    assert gauges["mint_megatron_input_tokens_total"][0](None)[0].value == pytest.approx(1024.0)
+    assert gauges["mint_megatron_output_tokens_total"][0](None)[0].value == pytest.approx(512.0)
 
     memory = gauges["mint_megatron_gpu_memory_reserved_bytes"][0](None)[0]
     assert memory.value == pytest.approx(52_000_000_000.0)

@@ -101,6 +101,9 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
         _ensure_session_loaded=lambda *args, **kwargs: {},
         _ensure_session_for_request=lambda **_kwargs: ("sess-1", {}),
         _ray_get_group_results=lambda futures, **_kwargs: distributed.ray.get(futures),
+        _record_training_token_observability=(
+            lambda **kwargs: setattr(dummy_group, "_recorded_tokens", dict(kwargs))
+        ),
         workers=[types.SimpleNamespace(forward=_RemoteForward())],
     )
 
@@ -137,3 +140,30 @@ def test_issue_332_megatron_group_forward_preserves_top_level_log_probs(monkeypa
     assert result["log_probs"] == {"data": [-1.0, -2.0], "shape": [2], "dtype": "torch.float32"}
     assert "loss:sum" not in result["metrics"]
     assert result["metrics"]["loss:mean"] == 0.5
+    assert dummy_group._recorded_tokens == {"input_tokens": 2, "output_tokens": 2}
+
+
+def test_issue_638_megatron_group_runtime_snapshot_tracks_training_tokens(monkeypatch) -> None:
+    _, distributed = _import_megatron_modules(monkeypatch)
+    group_cls = distributed.MegatronWorkerGroup.__ray_metadata__.modified_class
+    group = group_cls.__new__(group_cls)
+    group._current_session = "sess-1"
+    group._session_unknown_due_to_partial_swap = False
+    group._step_count = 7
+    group.learning_rate = 1e-4
+    group._training_requests_total = 0
+    group._input_tokens_total = 0
+    group._output_tokens_total = 0
+
+    group._record_training_token_observability(input_tokens=11, output_tokens=5)
+    group._record_training_token_observability(input_tokens=13, output_tokens=7)
+
+    assert group._runtime_observability_snapshot() == {
+        "active_sessions": 1,
+        "session_unknown": 0,
+        "session_step": 7,
+        "learning_rate": 1e-4,
+        "training_requests_total": 2,
+        "input_tokens_total": 24,
+        "output_tokens_total": 12,
+    }
