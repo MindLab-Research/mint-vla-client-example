@@ -2741,24 +2741,24 @@ class _ModelWorkSchedulerActor:
         requeue: bool = True,
         reason: str = "failed",
         abort_finalize: bool = False,
-    ) -> dict[str, Any]:
+    ) -> FailLeaseResult:
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return FailLeaseResult(ok=False, reason="unknown_lease")
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return FailLeaseResult(ok=False, reason="stale_consumer")
             if self._request_locations.get(lease.item.request_id) == "finalizing":
-                return {"ok": False, "reason": "finalize_inflight"}
+                return FailLeaseResult(ok=False, reason="finalize_inflight")
             request_id = lease.item.request_id
         if not requeue:
             terminal = await self._terminal_task_state_for_lease(lease)
             if not terminal.ok:
-                return {"ok": False, "reason": str(terminal.reason or "not_terminal")}
+                return FailLeaseResult(ok=False, reason=str(terminal.reason or "not_terminal"))
         elif lease.finalizing_until is not None:
             if self._use_task_state_store:
                 try:
@@ -2771,7 +2771,7 @@ class _ModelWorkSchedulerActor:
                             if current is not None and current.item.request_id == request_id:
                                 self._remove_request_from_memory_locked(request_id)
                                 self._cv.notify_all()
-                        return {"ok": False, "reason": "unknown_lease"}
+                        return FailLeaseResult(ok=False, reason="unknown_lease")
                     raise
                 status = str(record.get("status") or "")
                 if status == "finalizing" and not abort_finalize:
@@ -2780,7 +2780,7 @@ class _ModelWorkSchedulerActor:
                     except Exception:
                         durable_finalizing_until = 0.0
                     if durable_finalizing_until > time.time():
-                        return {"ok": False, "reason": "finalize_in_progress"}
+                        return FailLeaseResult(ok=False, reason="finalize_in_progress")
                 if status == "finalizing":
                     pass
                 elif status in TERMINAL_TASK_STATUSES:
@@ -2791,8 +2791,8 @@ class _ModelWorkSchedulerActor:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return {"ok": False, "reason": "stale_consumer"}
-                return {"ok": False, "reason": "unknown_lease"}
+                    return FailLeaseResult(ok=False, reason="stale_consumer")
+                return FailLeaseResult(ok=False, reason="unknown_lease")
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2800,9 +2800,9 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return FailLeaseResult(ok=False, reason="stale_consumer")
             if self._request_locations.get(request_id) == "finalizing":
-                return {"ok": False, "reason": "finalize_inflight"}
+                return FailLeaseResult(ok=False, reason="finalize_inflight")
             self._leases_by_id.pop(lease.lease_id, None)
             self._lease_id_by_request_id.pop(lease.item.request_id, None)
             requeued_out = False
@@ -2827,7 +2827,7 @@ class _ModelWorkSchedulerActor:
                     reason=reason,
                 )
             )
-        return {"ok": True, "request_id": request_id, "requeued": requeued_out}
+        return FailLeaseResult(ok=True, request_id=request_id, requeued=requeued_out)
 
     async def expire_leases(self, *, now: float | None = None) -> ExpireResult:
         ts = time.time() if now is None else float(now)
@@ -3167,6 +3167,26 @@ def _create_ray_actor_handle():
                 result_path=result_path,
                 result_checksum=result_checksum,
                 result_size_bytes=result_size_bytes,
+            )
+            return out.to_wire()
+
+        async def fail_lease(
+            self,
+            *,
+            lease_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+            requeue: bool = True,
+            reason: str = "failed",
+            abort_finalize: bool = False,
+        ) -> dict[str, Any]:
+            out = await super().fail_lease(
+                lease_id=lease_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                requeue=requeue,
+                reason=reason,
+                abort_finalize=abort_finalize,
             )
             return out.to_wire()
 

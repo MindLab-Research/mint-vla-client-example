@@ -1272,7 +1272,10 @@ class InProcessSchedulerQueueAdapter:
 
     async def fail(self, **kwargs: Any) -> FailLeaseResult:
         kwargs.pop("timeout_s", None)
-        return FailLeaseResult.from_wire(await self.actor.fail_lease(**kwargs))
+        out = await self.actor.fail_lease(**kwargs)
+        if isinstance(out, FailLeaseResult):
+            return out
+        return FailLeaseResult.from_wire(out)
 
     async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
         kwargs.pop("timeout_s", None)
