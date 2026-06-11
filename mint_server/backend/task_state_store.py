@@ -80,6 +80,21 @@ class TaskStateStoreUnavailableError(TaskStateStoreError):
     pass
 
 
+def _task_state_cause_from_ray_error(exc: BaseException) -> TaskStateStoreError | None:
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            cause = as_instanceof_cause()
+        except Exception:
+            cause = None
+        if isinstance(cause, TaskStateStoreError):
+            return cause
+    cause = getattr(exc, "cause", None)
+    if isinstance(cause, TaskStateStoreError):
+        return cause
+    return None
+
+
 class FutureStatus(Enum):
     PENDING = "pending"
     DONE = "done"
@@ -3906,7 +3921,13 @@ class TaskStateStoreClient:
         _inc_task_state_rpc_inflight(1.0)
         ok = False
         try:
-            out = await async_get_ray_ref(remote(**kwargs))
+            try:
+                out = await async_get_ray_ref(remote(**kwargs))
+            except Exception as exc:
+                cause = _task_state_cause_from_ray_error(exc)
+                if cause is not None:
+                    raise cause from exc
+                raise
             ok = True
             return out
         finally:
@@ -3924,7 +3945,13 @@ class TaskStateStoreClient:
         _inc_task_state_rpc_inflight(1.0)
         ok = False
         try:
-            out = sync_get_ray_ref(remote(**kwargs))
+            try:
+                out = sync_get_ray_ref(remote(**kwargs))
+            except Exception as exc:
+                cause = _task_state_cause_from_ray_error(exc)
+                if cause is not None:
+                    raise cause from exc
+                raise
             ok = True
             return out
         finally:
