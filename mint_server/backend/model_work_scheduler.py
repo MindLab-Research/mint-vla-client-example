@@ -1681,18 +1681,18 @@ class _ModelWorkSchedulerActor:
         *,
         assign: bool = False,
         assign_max_items: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> AppendWorkResult:
         self._ensure_assignment_loop_started()
         work = ModelWorkItem.from_dict(item)
         async with self._cv:
             duplicate_in_memory = work.request_id in self._all_request_ids()
         if duplicate_in_memory:
             if not await self._duplicate_append_matches_hydrated_pending_task(work):
-                return {
-                    "ok": False,
-                    "reason": "duplicate_request_id",
-                    "request_id": work.request_id,
-                }
+                return AppendWorkResult(
+                    ok=False,
+                    reason="duplicate_request_id",
+                    request_id=work.request_id,
+                )
             assigned = (
                 await self.assign_pending(max_items=assign_max_items)
                 if bool(assign)
@@ -1700,24 +1700,26 @@ class _ModelWorkSchedulerActor:
             )
             async with self._cv:
                 backlog_depth = len(self._backlog(work.domain_key))
-            return {
-                "ok": True,
-                "request_id": work.request_id,
-                "domain_key": work.domain_key,
-                "scheduler_instance_id": self._instance_id,
-                "backlog_depth": backlog_depth,
-                "assigned": assigned,
-                "idempotent": True,
-            }
+            return AppendWorkResult(
+                ok=True,
+                request_id=work.request_id,
+                domain_key=work.domain_key,
+                scheduler_instance_id=self._instance_id,
+                backlog_depth=backlog_depth,
+                assigned=assigned,
+                idempotent=True,
+            )
         created: CreateTaskResult | None = None
         async with self._cv:
             admission = self._sampling_inflight_limit_decision_locked(work)
             if not bool(admission.get("ok")):
-                return {
-                    **admission,
-                    "request_id": work.request_id,
-                    "scheduler_instance_id": self._instance_id,
-                }
+                return AppendWorkResult.from_wire(
+                    {
+                        **admission,
+                        "request_id": work.request_id,
+                        "scheduler_instance_id": self._instance_id,
+                    }
+                )
         append_attempt_id = uuid.uuid4().hex
         if self._use_task_state_store:
             try:
@@ -1750,25 +1752,25 @@ class _ModelWorkSchedulerActor:
             if isinstance(created, CreateTaskResult) and not created.created:
                 record = created.record
                 if not self._task_record_matches_work_item(record, work):
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
+                    return AppendWorkResult(
+                        ok=False,
+                        reason="duplicate_request_id",
+                        request_id=work.request_id,
+                    )
                 if str(record.get("status") or "") not in {"pending", "queued"}:
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
+                    return AppendWorkResult(
+                        ok=False,
+                        reason="duplicate_request_id",
+                        request_id=work.request_id,
+                    )
         try:
             async with self._cv:
                 if work.request_id in self._all_request_ids():
-                    return {
-                        "ok": False,
-                        "reason": "duplicate_request_id",
-                        "request_id": work.request_id,
-                    }
+                    return AppendWorkResult(
+                        ok=False,
+                        reason="duplicate_request_id",
+                        request_id=work.request_id,
+                    )
                 self._backlog(work.domain_key).append(work)
                 self._request_locations[work.request_id] = "backlog"
                 self._appended += 1
@@ -1803,15 +1805,15 @@ class _ModelWorkSchedulerActor:
                     append_attempt_id=append_attempt_id,
                 )
             raise
-        return {
-            "ok": True,
-            "request_id": work.request_id,
-            "domain_key": work.domain_key,
-            "scheduler_instance_id": self._instance_id,
-            "backlog_depth": backlog_depth,
-            "assigned": assigned,
-            "sampling_inflight_admission": admission,
-        }
+        return AppendWorkResult(
+            ok=True,
+            request_id=work.request_id,
+            domain_key=work.domain_key,
+            scheduler_instance_id=self._instance_id,
+            backlog_depth=backlog_depth,
+            assigned=assigned,
+            extra={"sampling_inflight_admission": admission},
+        )
 
     async def cancel_request(self, *, request_id: str, reason: str = "cancelled") -> CancelTaskResult:
         request_id = str(request_id)
@@ -2988,6 +2990,20 @@ def _create_ray_actor_handle():
             out = await super().contains_request(
                 request_id=request_id,
                 hydrate_task_state=hydrate_task_state,
+            )
+            return out.to_wire()
+
+        async def append(
+            self,
+            item: dict[str, Any],
+            *,
+            assign: bool = False,
+            assign_max_items: int | None = None,
+        ) -> dict[str, Any]:
+            out = await super().append(
+                item,
+                assign=assign,
+                assign_max_items=assign_max_items,
             )
             return out.to_wire()
 

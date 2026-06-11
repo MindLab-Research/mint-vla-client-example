@@ -1209,13 +1209,14 @@ class InProcessSchedulerQueueAdapter:
             "ordering_key": kwargs.get("ordering_key"),
             "token_cost": kwargs.get("token_cost", 1),
         }
-        return AppendWorkResult.from_wire(
-            await self.actor.append(
-                item,
-                assign=bool(kwargs.get("assign", False)),
-                assign_max_items=kwargs.get("assign_max_items"),
-            )
+        out = await self.actor.append(
+            item,
+            assign=bool(kwargs.get("assign", False)),
+            assign_max_items=kwargs.get("assign_max_items"),
         )
+        if isinstance(out, AppendWorkResult):
+            return out
+        return AppendWorkResult.from_wire(out)
 
     async def sync_replicas(self, replicas: list[dict[str, Any]], **_kwargs: Any) -> SyncReplicasResult:
         return SyncReplicasResult.from_wire(await self.actor.sync_replicas(replicas))
