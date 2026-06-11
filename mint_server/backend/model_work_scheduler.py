@@ -857,6 +857,8 @@ class _ModelWorkSchedulerActor:
                     continue
                 status = str(record.get("status") or "")
                 item = self._work_item_from_task_record(record)
+                if item.request_id in self._all_request_ids():
+                    continue
                 if status != "pending":
                     should_requeue = await self._persist_requeue_task(
                         item.request_id,
@@ -1204,8 +1206,6 @@ class _ModelWorkSchedulerActor:
     ) -> dict[str, Any]:
         self._ensure_assignment_loop_started()
         work = ModelWorkItem.from_dict(item)
-        if self._use_task_state_store:
-            await self._ensure_task_state_ready()
         async with self._cv:
             if work.request_id in self._all_request_ids():
                 if not await self._duplicate_append_matches_hydrated_pending_task(work):
@@ -1836,12 +1836,26 @@ def _create_ray_actor(*, require_ready: bool = True):
         num_cpus=0,
         max_concurrency=max_concurrency,
         max_restarts=0,
-        concurrency_groups={"health": 8, "lookup": 16},
+        concurrency_groups={"health": 8, "lookup": 16, "enqueue": 16},
     )
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
         @ray.method(concurrency_group="health")
         def ping(self) -> dict[str, Any]:
             return super().ping()
+
+        @ray.method(concurrency_group="enqueue")
+        async def append(
+            self,
+            item: dict[str, Any],
+            *,
+            assign: bool = False,
+            assign_max_items: int | None = None,
+        ) -> dict[str, Any]:
+            return await super().append(
+                item,
+                assign=assign,
+                assign_max_items=assign_max_items,
+            )
 
         @ray.method(concurrency_group="lookup")
         async def contains_request(

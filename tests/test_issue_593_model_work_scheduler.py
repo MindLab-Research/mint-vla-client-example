@@ -385,13 +385,17 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
             actor = self._cls(**kwargs)
 
             class _RemoteMethod:
-                def __init__(self, fn):
+                def __init__(self, fn, *, accepts_item: bool = False):
                     self._fn = fn
+                    self._accepts_item = accepts_item
 
-                def remote(self, **method_kwargs):
+                def remote(self, *args, **method_kwargs):
+                    if self._accepts_item:
+                        return self._fn(*args, **method_kwargs)
                     return self._fn(**method_kwargs)
 
             actor.ping = _RemoteMethod(actor.ping)
+            actor.append = _RemoteMethod(actor.append, accepts_item=True)
             actor.contains_request = _RemoteMethod(actor.contains_request)
             return actor
 
@@ -428,8 +432,13 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
 
     module._create_ray_actor(require_ready=True)
 
-    assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
+    assert captured["remote_kwargs"]["concurrency_groups"] == {
+        "health": 8,
+        "lookup": 16,
+        "enqueue": 16,
+    }
     assert captured["methods"]["ping"] == {"concurrency_group": "health"}
+    assert captured["methods"]["append"] == {"concurrency_group": "enqueue"}
     assert captured["methods"]["contains_request"] == {"concurrency_group": "lookup"}
 
 
@@ -476,6 +485,32 @@ def test_contains_request_does_not_hydrate_task_state_store() -> None:
         assert contains["location"] is None
 
     asyncio.run(_run())
+
+
+def test_append_does_not_hydrate_task_state_store_before_enqueue() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _unexpected_hydrate():
+        raise AssertionError("append must not scan active task-state before enqueueing new work")
+
+    actor._ensure_task_state_ready = _unexpected_hydrate  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        out = await actor.append(_work("req-append-no-hydrate"))
+
+        assert out["ok"] is True
+        assert out["request_id"] == "req-append-no-hydrate"
+        assert store.get_task("req-append-no-hydrate")["request_id"] == "req-append-no-hydrate"
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
 
 
 def test_sampling_inflight_admission_observe_records_would_reject(
