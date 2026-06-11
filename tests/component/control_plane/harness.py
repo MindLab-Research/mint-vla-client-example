@@ -258,11 +258,12 @@ class SchedulerComponentWorld:
         affinity_group: str = "lora:session-a:generation:1",
         ordering_key: str | None = None,
         token_cost: int = 1,
+        request_json: bytes = b'{"prompt":"hello"}',
     ) -> dict[str, Any]:
         return await enqueue_model_work(
             request_id=request_id,
             op="sampling.asample",
-            request_json=b'{"prompt":"hello"}',
+            request_json=request_json,
             domain_key=self.domain_key,
             queued_meta=sampling_meta(self.domain_key),
             user_id="user-a",

@@ -41,7 +41,7 @@ def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> Non
             request_id="append-owner",
             op="sampling.asample",
             domain_key="vllm:model-a",
-            request_json=b"{}",
+            request_json=b'{"prompt":"first"}',
             metadata={
                 "model_work_scheduler_append_attempt_id": "attempt-a",
                 "stage": "first",
@@ -51,7 +51,7 @@ def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> Non
             request_id="append-owner",
             op="sampling.asample",
             domain_key="vllm:model-a",
-            request_json=b"{}",
+            request_json=b'{"prompt":"second"}',
             metadata={
                 "model_work_scheduler_append_attempt_id": "attempt-b",
                 "stage": "duplicate",
@@ -60,8 +60,9 @@ def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> Non
 
         assert first["created"] is True
         assert second["created"] is False
+        assert second["record"]["request_json"] == b'{"prompt":"first"}'
         assert second["record"]["metadata"]["model_work_scheduler_append_attempt_id"] == "attempt-a"
-        assert second["record"]["metadata"]["stage"] == "duplicate"
+        assert second["record"]["metadata"]["stage"] == "first"
     finally:
         store.close()
 

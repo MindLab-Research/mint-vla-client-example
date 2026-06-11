@@ -406,6 +406,42 @@ async def test_scheduler_component_duplicate_append_cancel_does_not_forget_exist
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_duplicate_append_cancel_does_not_rewrite_existing_payload(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-duplicate-append-cancel-payload"
+        first_payload = b'{"prompt":"first"}'
+        second_payload = b'{"prompt":"second"}'
+        block = world.faults.block("task_state.create_task.after")
+        first_task = asyncio.create_task(
+            world.enqueue_sampling(request_id, assign=False, request_json=first_payload)
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        duplicate_task = asyncio.create_task(
+            world.enqueue_sampling(request_id, assign=False, request_json=second_payload)
+        )
+
+        while sum(1 for method, _ in world.task_state.calls if method == "create_task") < 2:
+            await asyncio.sleep(0.001)
+        duplicate_task.cancel()
+        block.release.set()
+        created = await first_task
+        with pytest.raises(asyncio.CancelledError):
+            await duplicate_task
+
+        task = await world.observe_task(request_id)
+
+        assert created.scheduler_result["ok"] is True
+        assert task["status"] == "pending"
+        assert task["request_json"] == first_payload
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:

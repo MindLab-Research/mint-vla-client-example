@@ -1349,10 +1349,14 @@ class TaskStateStore:
                 if str(existing["op"]) != str(op) or str(existing["domain_key"]) != str(domain_key):
                     raise TaskStateConflictError("duplicate request_id with different task identity")
                 existing_metadata = _json_loads(existing["metadata_json"])
-                merged = {**existing_metadata, **dict(metadata or {})}
                 append_attempt_key = "model_work_scheduler_append_attempt_id"
                 if append_attempt_key in existing_metadata:
-                    merged[append_attempt_key] = existing_metadata[append_attempt_key]
+                    return {
+                        "ok": True,
+                        "created": False,
+                        "record": self._row_to_record(existing),
+                    }
+                merged = {**existing_metadata, **dict(metadata or {})}
                 if existing_hash is None and payload_hash is not None:
                     conn.execute(
                         """
