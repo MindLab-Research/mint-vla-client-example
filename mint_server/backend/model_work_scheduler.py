@@ -1831,12 +1831,16 @@ def _create_ray_actor(*, require_ready: bool = True):
         num_cpus=0,
         max_concurrency=max_concurrency,
         max_restarts=0,
-        concurrency_groups={"health": 8},
+        concurrency_groups={"health": 8, "lookup": 16},
     )
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
         @ray.method(concurrency_group="health")
         def ping(self) -> dict[str, Any]:
             return super().ping()
+
+        @ray.method(concurrency_group="lookup")
+        async def contains_request(self, *, request_id: str) -> dict[str, Any]:
+            return await super().contains_request(request_id=request_id)
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
         use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),

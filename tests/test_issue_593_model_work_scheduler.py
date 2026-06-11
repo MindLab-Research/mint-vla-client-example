@@ -370,6 +370,69 @@ def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
     assert gauges["mint_model_work_scheduler_depth"][0](None)[0].value == 0.0
 
 
+def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(monkeypatch) -> None:
+    import mint_server.backend.model_work_scheduler as module
+    import ray
+
+    captured: dict[str, object] = {"methods": {}}
+
+    class _OptionsProxy:
+        def __init__(self, cls):
+            self._cls = cls
+
+        def remote(self, **kwargs):
+            captured["init_kwargs"] = kwargs
+            actor = self._cls(**kwargs)
+
+            class _RemoteMethod:
+                def __init__(self, fn):
+                    self._fn = fn
+
+                def remote(self, **method_kwargs):
+                    return self._fn(**method_kwargs)
+
+            actor.ping = _RemoteMethod(actor.ping)
+            actor.contains_request = _RemoteMethod(actor.contains_request)
+            return actor
+
+    class _RemoteClass:
+        def __init__(self, cls):
+            self._cls = cls
+
+        def options(self, **options):
+            captured["options"] = options
+            return _OptionsProxy(self._cls)
+
+    def _fake_remote(**remote_kwargs):
+        captured["remote_kwargs"] = remote_kwargs
+
+        def _decorator(cls):
+            captured["actor_cls"] = cls
+            return _RemoteClass(cls)
+
+        return _decorator
+
+    def _fake_method(**method_kwargs):
+        def _decorator(fn):
+            captured["methods"][fn.__name__] = method_kwargs
+            return fn
+
+        return _decorator
+
+    monkeypatch.setattr(ray, "remote", _fake_remote)
+    monkeypatch.setattr(ray, "method", _fake_method)
+    monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {})
+    monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "_model_work_scheduler_actor_resources", lambda: None)
+    monkeypatch.setattr(module, "_await_ray_ref_sync", lambda ref, *, timeout_s=None: ref)
+
+    module._create_ray_actor(require_ready=True)
+
+    assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
+    assert captured["methods"]["ping"] == {"concurrency_group": "health"}
+    assert captured["methods"]["contains_request"] == {"concurrency_group": "lookup"}
+
+
 def test_scheduler_append_can_assign_immediately() -> None:
     actor = _ModelWorkSchedulerActor()
 
