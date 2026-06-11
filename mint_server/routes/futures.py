@@ -158,10 +158,31 @@ def _record_retrieve_wait(*, path: str, outcome: str, waited: bool) -> None:
     record_retrieve_future_wait_metric(path=path, outcome=outcome, waited=waited)
 
 
+def _is_model_work_scheduler_meta(meta: Any) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    queue_kind = meta.get("queue_kind")
+    if queue_kind in {"model_work_scheduler", "scheduled"}:
+        return True
+    op = meta.get("op")
+    queue_state = meta.get("queue_state")
+    return isinstance(op, str) and op.startswith("sampling.") and queue_state in {"queued", "running"}
+
+
+async def _present_gateway_terminal_result(result: Any, http_request: Request) -> Any:
+    from ..backend.task_payload_presenter import present_terminal_retrieve_result
+
+    payload = await present_terminal_retrieve_result(
+        result,
+        error_presenter=lambda error: _failed_payload(error, http_request),
+    )
+    _recent_put(result.request_id, payload, ttl_s=_local_hot_ttl_s())
+    return payload
+
+
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
         from ..backend.model_work_task_gateway import model_work_task_gateway
-        from ..backend.task_payload_presenter import present_terminal_retrieve_result
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup unavailable request_id=%s", request_id)
         return None
@@ -173,12 +194,7 @@ async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Requ
 
     if result.status not in {"ready", "failed"}:
         return None
-    payload = await present_terminal_retrieve_result(
-        result,
-        error_presenter=lambda error: _failed_payload(error, http_request),
-    )
-    _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
-    return payload
+    return await _present_gateway_terminal_result(result, http_request)
 
 
 async def _wait_until_not_pending(request_id: str, http_request: Request) -> FutureStatus | None:
@@ -443,6 +459,34 @@ async def retrieve_future(
             meta = await task_futures.async_get_meta(body.request_id)
         except Exception:
             meta = None
+        if _is_model_work_scheduler_meta(meta):
+            try:
+                from ..backend.model_work_task_gateway import model_work_task_gateway
+
+                retrieve_result = await model_work_task_gateway.retrieve_task(
+                    request_id=body.request_id,
+                    wait_timeout_s=0.0 if waited_for_status_change else _retrieve_wait_timeout_s(),
+                    privileged=_is_privileged(http_request),
+                )
+            except Exception:
+                logger.exception(
+                    "[retrieve_future] model-work retrieve gateway failed request_id=%s",
+                    body.request_id,
+                )
+            else:
+                if retrieve_result.status in {"ready", "failed"}:
+                    _pending_hint_clear(body.request_id)
+                    payload = await _present_gateway_terminal_result(retrieve_result, http_request)
+                    logger.info(
+                        "[retrieve_future] request_id=%s status=%s served=model_work_gateway",
+                        body.request_id,
+                        retrieve_result.status,
+                    )
+                    _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                    return payload
+                if retrieve_result.status == "unavailable":
+                    _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
+                    raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
         if isinstance(meta, dict):
             actor_name = meta.get("actor_name")
             tracked_session_id = meta.get("model_id")

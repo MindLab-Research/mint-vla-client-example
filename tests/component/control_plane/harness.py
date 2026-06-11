@@ -19,6 +19,7 @@ from mint_server.backend.model_actor_supervisor import (
 from mint_server.backend.model_runtime_actor import ModelRuntimeActor
 from mint_server.backend.model_work_admission import enqueue_model_work
 from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
+from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
 from mint_server.backend.task_payload_store import TaskPayloadStore
 from mint_server.backend.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
 from mint_server.models.types import FutureRetrieveRequest
@@ -383,8 +384,17 @@ class SchedulerComponentWorld:
     ) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)
         import mint_server.backend.model_work_scheduler as scheduler_module
+        import mint_server.backend.model_work_task_gateway as gateway_module
 
         monkeypatch.setattr(scheduler_module, "model_work_scheduler", scheduler_override or self.scheduler)
+        monkeypatch.setattr(
+            gateway_module,
+            "model_work_task_gateway",
+            SchedulerModelWorkTaskGateway(
+                scheduler_client=scheduler_override or self.scheduler,
+                task_ledger_client=self.task_state,
+            ),
+        )
         monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: float(wait_timeout_s))
         monkeypatch.setattr(futures_route, "_is_privileged", lambda _request: bool(admin))
         response = SimpleNamespace(status_code=200, headers={})
