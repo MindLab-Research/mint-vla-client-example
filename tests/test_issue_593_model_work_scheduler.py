@@ -9,6 +9,7 @@ from mint_server.backend.model_work_scheduler import (
     ModelWorkSchedulerCodeIdentityMismatchError,
     ModelWorkSchedulerClient,
     _ModelWorkSchedulerActor,
+    _model_work_scheduler_use_task_state_store_from_env,
     _ray_model_work_scheduler_actor_name,
 )
 from mint_server.backend.task_state_store import TaskStateConflictError, TaskStateStore
@@ -209,6 +210,22 @@ def test_scheduler_snapshots_include_code_identity() -> None:
 
     assert actor.ping()["code_identity"] == CURRENT_CODE_IDENTITY
     assert actor.stats()["code_identity"] == CURRENT_CODE_IDENTITY
+
+
+def test_scheduler_actor_task_state_store_env_gate_defaults_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINT_MODEL_WORK_SCHEDULER_USE_TASK_STATE_STORE", raising=False)
+
+    assert _model_work_scheduler_use_task_state_store_from_env() is True
+
+
+def test_scheduler_actor_task_state_store_env_gate_can_disable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for value in ("0", "false", "False", "no", "off", "disabled"):
+        monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_USE_TASK_STATE_STORE", value)
+        assert _model_work_scheduler_use_task_state_store_from_env() is False
 
 
 def test_scheduler_client_rejects_stale_code_identity() -> None:

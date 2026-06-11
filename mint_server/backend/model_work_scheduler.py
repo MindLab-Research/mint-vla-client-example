@@ -29,6 +29,7 @@ CLAIMABLE_REPLICA_STATUSES = frozenset({"healthy", "ready"})
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 TRAINING_SAME_AFFINITY_MULTI_CLAIM_DOMAINS = ("bumblebee:", "megatron:")
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "n", "off", "disabled", "disable"})
 
 
 class ModelWorkSchedulerUnavailableError(RuntimeError):
@@ -87,6 +88,13 @@ def _same_affinity_multi_claim_domains_from_env() -> tuple[str, ...]:
     if raw is None:
         return TRAINING_SAME_AFFINITY_MULTI_CLAIM_DOMAINS
     return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
+def _model_work_scheduler_use_task_state_store_from_env() -> bool:
+    raw = os.environ.get("MINT_MODEL_WORK_SCHEDULER_USE_TASK_STATE_STORE")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() not in _FALSE_ENV_VALUES
 
 
 def _sampling_inflight_admission_mode() -> str:
@@ -1831,7 +1839,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             return super().ping()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
-        use_task_state_store=True,
+        use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),
         same_affinity_multi_claim_domains=_same_affinity_multi_claim_domains_from_env(),
     )
     if require_ready:
