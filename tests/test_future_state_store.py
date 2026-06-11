@@ -295,7 +295,7 @@ def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path
     ).TaskPayloadStore(root_dir=tmp_path)
 
     class _Scheduler:
-        async def append(self, **kwargs):
+        async def append_work(self, **kwargs):
             raise RuntimeError("scheduler append failed")
 
     async def _run() -> None:
