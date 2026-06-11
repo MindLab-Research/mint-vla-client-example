@@ -647,7 +647,12 @@ class _ModelWorkSchedulerActor:
 
             self._task_state_store = as_task_ledger(task_state_store)
         async_method = getattr(self._task_state_store, method)
-        return await async_method(**kwargs)
+        out = await async_method(**kwargs)
+        if hasattr(out, "to_wire"):
+            return out.to_wire()
+        if isinstance(out, list):
+            return [item.to_wire() if hasattr(item, "to_wire") else item for item in out]
+        return out
 
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:

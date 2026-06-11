@@ -992,53 +992,55 @@ class TaskStateStoreLedgerAdapter:
     async def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
         return await self._call_dict("ping", timeout_s=timeout_s)
 
-    async def acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("acquire_owner", **kwargs)
+    async def acquire_owner(self, **kwargs: Any) -> OwnerLeaseResult:
+        return OwnerLeaseResult.from_wire(await self._call_dict("acquire_owner", **kwargs))
 
-    async def renew_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("renew_owner", **kwargs)
+    async def renew_owner(self, **kwargs: Any) -> OwnerLeaseResult:
+        return OwnerLeaseResult.from_wire(await self._call_dict("renew_owner", **kwargs))
 
-    async def create_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("create_task", **kwargs)
+    async def create_task(self, **kwargs: Any) -> CreateTaskResult:
+        return CreateTaskResult.from_wire(await self._call_dict("create_task", **kwargs))
 
-    async def assign_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("assign_task", **kwargs)
+    async def assign_task(self, **kwargs: Any) -> AssignTaskResult:
+        return AssignTaskResult.from_wire(await self._call_dict("assign_task", **kwargs))
 
-    async def claim_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("claim_task", **kwargs)
+    async def claim_task(self, **kwargs: Any) -> ClaimTaskResult:
+        return ClaimTaskResult.from_wire(await self._call_dict("claim_task", **kwargs))
 
-    async def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("renew_lease", **kwargs)
+    async def renew_lease(self, **kwargs: Any) -> RenewLeaseResult:
+        return RenewLeaseResult.from_wire(await self._call_dict("renew_lease", **kwargs))
 
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("begin_finalize", **kwargs)
+    async def begin_finalize(self, **kwargs: Any) -> BeginFinalizeResult:
+        return BeginFinalizeResult.from_wire(await self._call_dict("begin_finalize", **kwargs))
 
-    async def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("commit_finalize_success", **kwargs)
+    async def commit_finalize_success(self, **kwargs: Any) -> CommitFinalizeResult:
+        return CommitFinalizeResult.from_wire(await self._call_dict("commit_finalize_success", **kwargs))
 
-    async def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("commit_finalize_failure", **kwargs)
+    async def commit_finalize_failure(self, **kwargs: Any) -> CommitFinalizeResult:
+        return CommitFinalizeResult.from_wire(await self._call_dict("commit_finalize_failure", **kwargs))
 
-    async def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("complete_task_failure", **kwargs)
+    async def complete_task_failure(self, **kwargs: Any) -> CommitFinalizeResult:
+        return CommitFinalizeResult.from_wire(await self._call_dict("complete_task_failure", **kwargs))
 
-    async def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("requeue_task", **kwargs)
+    async def requeue_task(self, **kwargs: Any) -> RequeueTaskResult:
+        return RequeueTaskResult.from_wire(await self._call_dict("requeue_task", **kwargs))
 
-    async def forget_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("forget_task", **kwargs)
+    async def forget_task(self, **kwargs: Any) -> TaskMutationResult:
+        return TaskMutationResult.from_wire(await self._call_dict("forget_task", **kwargs))
 
-    async def get_task(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("get_task", **kwargs)
+    async def get_task(self, **kwargs: Any) -> TaskRecord:
+        return TaskRecord.from_wire(await self._call_dict("get_task", **kwargs))
 
-    async def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
-        return await self._call_list("list_active_tasks", **kwargs)
+    async def list_active_tasks(self, **kwargs: Any) -> list[TaskRecord]:
+        return [TaskRecord.from_wire(item) for item in await self._call_list("list_active_tasks", **kwargs)]
 
-    async def wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("wait_task_status_change", **kwargs)
+    async def wait_task_status_change(self, **kwargs: Any) -> TaskStatusChange:
+        out = await self._call_dict("wait_task_status_change", **kwargs)
+        out.setdefault("request_id", kwargs.get("request_id"))
+        return TaskStatusChange.from_wire(out)
 
-    async def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
-        return await self._call_dict("update_task_metadata", **kwargs)
+    async def update_task_metadata(self, **kwargs: Any) -> TaskMutationResult:
+        return TaskMutationResult.from_wire(await self._call_dict("update_task_metadata", **kwargs))
 
 
 _ASYNC_TASK_LEDGER_METHODS = (
