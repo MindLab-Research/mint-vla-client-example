@@ -25,6 +25,7 @@ from .control_plane_contracts import (
     AppendWorkResult,
     AssignPendingResult,
     CancelTaskResult,
+    ConflictReason,
     ClaimResult,
     ContainsResult,
     CreateTaskResult,
@@ -346,7 +347,7 @@ class _TerminalTaskState:
     ok: bool
     status: str | None = None
     record: dict[str, Any] | None = None
-    reason: str | None = None
+    reason: ConflictReason | None = None
 
 
 def _queue_key(domain_key: str, replica_id: str) -> tuple[str, str]:
@@ -1785,7 +1786,7 @@ class _ModelWorkSchedulerActor:
             if not await self._duplicate_append_matches_hydrated_pending_task(work):
                 return AppendWorkResult(
                     ok=False,
-                    reason="duplicate_request_id",
+                    reason=ConflictReason.DUPLICATE_REQUEST_ID,
                     request_id=work.request_id,
                 )
             assigned = (
@@ -1849,13 +1850,13 @@ class _ModelWorkSchedulerActor:
                 if not self._task_record_matches_work_item(record, work):
                     return AppendWorkResult(
                         ok=False,
-                        reason="duplicate_request_id",
+                        reason=ConflictReason.DUPLICATE_REQUEST_ID,
                         request_id=work.request_id,
                     )
                 if str(record.get("status") or "") not in {"pending", "queued"}:
                     return AppendWorkResult(
                         ok=False,
-                        reason="duplicate_request_id",
+                        reason=ConflictReason.DUPLICATE_REQUEST_ID,
                         request_id=work.request_id,
                     )
         try:
@@ -1863,7 +1864,7 @@ class _ModelWorkSchedulerActor:
                 if work.request_id in self._all_request_ids():
                     return AppendWorkResult(
                         ok=False,
-                        reason="duplicate_request_id",
+                        reason=ConflictReason.DUPLICATE_REQUEST_ID,
                         request_id=work.request_id,
                     )
                 self._backlog(work.domain_key).append(work)
@@ -2199,7 +2200,7 @@ class _ModelWorkSchedulerActor:
         while len(claimed) < max(1, int(max_items)):
             async with self._cv:
                 if str(consumer_id) in self._self_failed_consumers:
-                    return ClaimResult(ok=False, reason="stale_consumer")
+                    return ClaimResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 self._validate_claimer(
                     domain_key=domain_key,
                     replica_id=replica_id,
@@ -2334,11 +2335,11 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return LeaseResult(ok=False, reason="unknown_lease")
+                return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return LeaseResult(ok=False, reason="stale_consumer")
+                return LeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             now = time.time()
             request_id = lease.item.request_id
             attempt_id = lease.attempt_id
@@ -2404,14 +2405,14 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return LeaseResult(ok=False, reason="unknown_lease")
+                return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if (
                 lease.item.request_id != request_id
                 or lease.attempt_id != attempt_id
                 or lease.consumer_id != consumer_id
                 or int(lease.consumer_generation) != int(consumer_generation)
             ):
-                return LeaseResult(ok=False, reason="stale_consumer")
+                return LeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
             self._request_locations[request_id] = "leased"
@@ -2431,11 +2432,11 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return LeaseResult(ok=False, reason="unknown_lease")
+                return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return LeaseResult(ok=False, reason="stale_consumer")
+                return LeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             request_id = lease.item.request_id
             attempt_id = lease.attempt_id
             scheduler_epoch = int(self._scheduler_epoch or 0)
@@ -2459,7 +2460,7 @@ class _ModelWorkSchedulerActor:
                         if current is not None and current.item.request_id == request_id:
                             self._remove_request_from_memory_locked(request_id)
                             self._cv.notify_all()
-                    return LeaseResult(ok=False, reason="unknown_lease")
+                    return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
                 raise
             if isinstance(renewed, TaskMutationResult):
                 if not renewed.ok:
@@ -2470,14 +2471,14 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return LeaseResult(ok=False, reason="unknown_lease")
+                return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if (
                 lease.item.request_id != request_id
                 or lease.attempt_id != attempt_id
                 or lease.consumer_id != consumer_id
                 or int(lease.consumer_generation) != int(consumer_generation)
             ):
-                return LeaseResult(ok=False, reason="stale_consumer")
+                return LeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if renew_rejected is not None:
                 if renew_rejected == "terminal":
                     self._remove_request_from_memory_locked(request_id)
@@ -2496,19 +2497,19 @@ class _ModelWorkSchedulerActor:
                 return _TerminalTaskState(ok=True, status="missing")
             raise
         if not isinstance(task_record, TaskRecord):
-            return _TerminalTaskState(ok=False, reason="task_state_invalid")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
         record = self._task_record_data(task_record)
         status = str(record.get("status") or "")
         if status not in TERMINAL_TASK_STATUSES:
-            return _TerminalTaskState(ok=False, reason="not_terminal")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.NOT_TERMINAL)
         if str(record.get("lease_id") or "") != str(lease.lease_id):
-            return _TerminalTaskState(ok=False, reason="stale_consumer")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if str(record.get("attempt_id") or "") != str(lease.attempt_id):
-            return _TerminalTaskState(ok=False, reason="stale_consumer")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if int(record.get("scheduler_epoch") or 0) != int(lease.scheduler_epoch or 0):
-            return _TerminalTaskState(ok=False, reason="stale_consumer")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if int(record.get("runtime_generation") or 0) != int(lease.consumer_generation):
-            return _TerminalTaskState(ok=False, reason="stale_consumer")
+            return _TerminalTaskState(ok=False, reason=ConflictReason.STALE_CONSUMER)
         return _TerminalTaskState(ok=True, status=status, record=record)
 
     def _current_lease_matches_locked(
@@ -2541,23 +2542,23 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return FinishResult(ok=False, reason="unknown_lease")
+                return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if self._request_locations.get(lease.item.request_id) == "finalizing":
-                return FinishResult(ok=False, reason="finalize_inflight")
+                return FinishResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
             request_id = lease.item.request_id
         terminal = await self._terminal_task_state_for_lease(lease)
         if not terminal.ok:
-            return FinishResult(ok=False, reason=str(terminal.reason or "not_terminal"))
+            return FinishResult(ok=False, reason=terminal.reason or ConflictReason.NOT_TERMINAL)
         async with self._cv:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return FinishResult(ok=False, reason="stale_consumer")
-                return FinishResult(ok=False, reason="unknown_lease")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2565,9 +2566,9 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if self._request_locations.get(request_id) == "finalizing":
-                return FinishResult(ok=False, reason="finalize_inflight")
+                return FinishResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
             self._leases_by_id.pop(lease.lease_id, None)
             self._remove_request_location(request_id)
             self._completed += 1
@@ -2600,37 +2601,37 @@ class _ModelWorkSchedulerActor:
             lease = self._leases_by_id.get(lease_id)
             if lease is not None:
                 if lease.consumer_id != consumer_id or int(lease.consumer_generation) != consumer_generation:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 if (
                     lease.item.request_id != request_id
                     or str(lease.attempt_id) != attempt_id
                     or int(lease.scheduler_epoch or 0) != scheduler_epoch
                 ):
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             elif self._request_locations.get(request_id) is not None:
-                return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if self._use_task_state_store:
             try:
                 task_record = await self._task_state_call("get_task", request_id=request_id)
                 if not isinstance(task_record, TaskRecord):
-                    return FinishResult(ok=False, reason="task_state_invalid")
+                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
                 record = self._task_record_data(task_record)
                 status = str(record.get("status") or "")
                 expected_status = "done" if success else "failed"
                 if status in TERMINAL_TASK_STATUSES and status != expected_status:
-                    return FinishResult(ok=False, reason="task_state_invalid")
+                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
                 if status != "finalizing" and status not in TERMINAL_TASK_STATUSES:
-                    return FinishResult(ok=False, reason="not_finalizing")
+                    return FinishResult(ok=False, reason=ConflictReason.NOT_FINALIZING)
                 elif str(record.get("lease_id") or "") != lease_id:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 elif str(record.get("attempt_id") or "") != attempt_id:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 elif int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 elif int(record.get("runtime_generation") or 0) != consumer_generation:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 elif str(record.get("consumer_id") or "") != str(consumer_id):
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 elif success:
                     committed = await self._task_state_call(
                         "commit_finalize_success",
@@ -2671,26 +2672,26 @@ class _ModelWorkSchedulerActor:
                 raise
             except Exception as exc:
                 if self._task_not_found_cause(exc) is not None:
-                    return FinishResult(ok=False, reason="unknown_lease")
+                    return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
                 raise
             if isinstance(committed, TaskMutationResult):
                 record = committed.record
                 if not isinstance(record, dict):
-                    return FinishResult(ok=False, reason="task_state_invalid")
+                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
                 status = str(record.get("status") or "")
                 expected_status = "done" if success else "failed"
                 if status != expected_status:
-                    return FinishResult(ok=False, reason="task_state_invalid")
+                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
                 if str(record.get("lease_id") or "") != lease_id:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 if str(record.get("attempt_id") or "") != attempt_id:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 if int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 if int(record.get("runtime_generation") or 0) != consumer_generation:
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 if str(record.get("consumer_id") or "") != str(consumer_id):
-                    return FinishResult(ok=False, reason="stale_consumer")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
                 idempotent = bool(committed.idempotent)
             else:
                 idempotent = False
@@ -2735,8 +2736,8 @@ class _ModelWorkSchedulerActor:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return FinishResult(ok=False, reason="stale_consumer")
-                return FinishResult(ok=False, reason="unknown_lease")
+                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2744,7 +2745,7 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             self._leases_by_id.pop(current.lease_id, None)
             self._lease_id_by_request_id.pop(request_id, None)
             self._remove_request_location(request_id)
@@ -2824,11 +2825,11 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return ValidateLeaseResult(ok=False, reason="unknown_lease")
+                return ValidateLeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return ValidateLeaseResult(ok=False, reason="stale_consumer")
+                return ValidateLeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             return ValidateLeaseResult(ok=True, request_id=lease.item.request_id)
 
     async def fail_lease(
@@ -2846,18 +2847,18 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return FailLeaseResult(ok=False, reason="unknown_lease")
+                return FailLeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return FailLeaseResult(ok=False, reason="stale_consumer")
+                return FailLeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if self._request_locations.get(lease.item.request_id) == "finalizing":
-                return FailLeaseResult(ok=False, reason="finalize_inflight")
+                return FailLeaseResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
             request_id = lease.item.request_id
         if not requeue:
             terminal = await self._terminal_task_state_for_lease(lease)
             if not terminal.ok:
-                return FailLeaseResult(ok=False, reason=str(terminal.reason or "not_terminal"))
+                return FailLeaseResult(ok=False, reason=terminal.reason or ConflictReason.NOT_TERMINAL)
         elif lease.finalizing_until is not None:
             if self._use_task_state_store:
                 try:
@@ -2870,7 +2871,7 @@ class _ModelWorkSchedulerActor:
                             if current is not None and current.item.request_id == request_id:
                                 self._remove_request_from_memory_locked(request_id)
                                 self._cv.notify_all()
-                        return FailLeaseResult(ok=False, reason="unknown_lease")
+                        return FailLeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
                     raise
                 status = str(record.get("status") or "")
                 if status == "finalizing" and not abort_finalize:
@@ -2879,7 +2880,7 @@ class _ModelWorkSchedulerActor:
                     except Exception:
                         durable_finalizing_until = 0.0
                     if durable_finalizing_until > time.time():
-                        return FailLeaseResult(ok=False, reason="finalize_in_progress")
+                        return FailLeaseResult(ok=False, reason=ConflictReason.FINALIZE_IN_PROGRESS)
                 if status == "finalizing":
                     pass
                 elif status in TERMINAL_TASK_STATUSES:
@@ -2890,8 +2891,8 @@ class _ModelWorkSchedulerActor:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return FailLeaseResult(ok=False, reason="stale_consumer")
-                return FailLeaseResult(ok=False, reason="unknown_lease")
+                    return FailLeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                return FailLeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2899,9 +2900,9 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return FailLeaseResult(ok=False, reason="stale_consumer")
+                return FailLeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if self._request_locations.get(request_id) == "finalizing":
-                return FailLeaseResult(ok=False, reason="finalize_inflight")
+                return FailLeaseResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
             if str(reason) == "gpu_actor_died":
                 self._self_failed_consumers.add(str(consumer_id))
             self._leases_by_id.pop(lease.lease_id, None)

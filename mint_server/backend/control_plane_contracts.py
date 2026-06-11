@@ -69,7 +69,7 @@ class ConflictReason(StrEnum):
     UNKNOWN_LEASE = "unknown_lease"
 
 
-def _reason_from_wire(value: Any) -> ConflictReason | str | None:
+def _reason_from_wire(value: Any) -> ConflictReason | None:
     if value is None:
         return None
     if isinstance(value, ConflictReason):
@@ -77,7 +77,7 @@ def _reason_from_wire(value: Any) -> ConflictReason | str | None:
     try:
         return ConflictReason(str(value))
     except ValueError:
-        return str(value)
+        return ConflictReason.UNKNOWN
 
 
 def _reason_to_wire(value: Any) -> str | None:
@@ -85,7 +85,7 @@ def _reason_to_wire(value: Any) -> str | None:
         return None
     if isinstance(value, ConflictReason):
         return value.value
-    return str(value)
+    return ConflictReason.UNKNOWN.value
 
 
 class WireCompatibleResult:
@@ -146,7 +146,7 @@ class SubmitTaskResult(WireCompatibleResult):
     request_id: str
     created: bool = False
     assigned: bool = False
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     record: dict[str, Any] | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -185,7 +185,7 @@ class CancelTaskResult(WireCompatibleResult):
     ok: bool
     request_id: str
     was_terminal: bool = False
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     cancelled: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -286,7 +286,7 @@ class OwnerLeaseResult(WireCompatibleResult):
     epoch: int | None = None
     expires_at: float | None = None
     fencing_token: str | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -315,7 +315,7 @@ class CreateTaskResult(WireCompatibleResult):
     ok: bool
     created: bool
     record: dict[str, Any]
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -339,7 +339,7 @@ class CreateTaskResult(WireCompatibleResult):
 class TaskMutationResult(WireCompatibleResult):
     ok: bool
     record: dict[str, Any] | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     idempotent: bool = False
     retry_required: bool = False
     deleted: bool | None = None
@@ -413,7 +413,7 @@ class AppendWorkResult(WireCompatibleResult):
     backlog_depth: int | None = None
     assigned: dict[str, Any] | None = None
     idempotent: bool = False
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     retry_after_s: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -467,7 +467,7 @@ class AssignPendingResult(WireCompatibleResult):
     ok: bool
     assigned: int
     skipped_domains: list[str] = field(default_factory=list)
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
@@ -495,7 +495,7 @@ class ClaimResult(WireCompatibleResult):
     ok: bool
     leases: list[dict[str, Any]] = field(default_factory=list)
     remaining_queue_depth: int = 0
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -519,7 +519,7 @@ class ClaimResult(WireCompatibleResult):
 class LeaseResult(WireCompatibleResult):
     ok: bool
     lease: dict[str, Any] | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
@@ -548,7 +548,7 @@ class FinishResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
     status: str | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     idempotent: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -579,7 +579,7 @@ class FailLeaseResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
     requeued: bool = False
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
@@ -606,7 +606,7 @@ class FailLeaseResult(WireCompatibleResult):
 class ValidateLeaseResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
@@ -682,7 +682,7 @@ class SyncReplicasResult(WireCompatibleResult):
     requeued: int = 0
     expired: int = 0
     assigned: dict[str, Any] | None = None
-    reason: ConflictReason | str | None = None
+    reason: ConflictReason | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:

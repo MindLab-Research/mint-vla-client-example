@@ -674,16 +674,13 @@ async def test_issue_593_model_runtime_executor_exception_requeues_lease() -> No
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_dead_actor_exception_requeues_gpu_actor_died() -> None:
+async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_requeues_gpu_actor_died() -> None:
     lease = _lease("runtime-req-gpu-actor-died")
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    class ActorDiedError(RuntimeError):
-        pass
-
-    async def _executor(_lease: dict) -> None:
-        raise ActorDiedError("backend actor died")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="fatal_backend_death", error="backend actor died")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1606,6 +1603,7 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
         assert current_execution_context().inference_manager is inference_manager
         assert sampling.session_manager is original_sampling_manager
         calls.append(f"execute:{item.op}")
+        return ExecutorOutcome(kind="success")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
@@ -1648,6 +1646,7 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
         assert current_execution_context().train_manager is train_manager
         assert training.training_manager is original_training_manager
         calls.append(f"execute:{item.op}")
+        return ExecutorOutcome(kind="success")
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(

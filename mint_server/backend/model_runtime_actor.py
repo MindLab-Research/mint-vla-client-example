@@ -62,35 +62,28 @@ def _scheduler_claim_leases(result: Any) -> list[dict[str, Any]] | None:
     return leases if isinstance(leases, list) else None
 
 
-def _lease_token(lease: dict[str, Any]) -> LeaseToken:
+def _lease_wire_to_token(lease: dict[str, Any], *, require_full: bool) -> LeaseToken:
     item = lease.get("item") if isinstance(lease, dict) else None
-    if not isinstance(item, dict):
+    if require_full and not isinstance(item, dict):
         raise RuntimeError(f"model work lease missing item: {lease!r}")
+    item_wire = item if isinstance(item, dict) else {}
     token_wire = {
-        "request_id": item["request_id"],
+        "request_id": item_wire["request_id"] if require_full else item_wire.get("request_id", ""),
         "lease_id": lease["lease_id"],
-        "attempt_id": lease["attempt_id"],
-        "scheduler_epoch": lease["scheduler_epoch"],
+        "attempt_id": lease["attempt_id"] if require_full else lease.get("attempt_id", ""),
+        "scheduler_epoch": lease["scheduler_epoch"] if require_full else lease.get("scheduler_epoch", 0),
         "consumer_id": lease.get("consumer_id", ""),
         "consumer_generation": lease.get("consumer_generation", 0),
     }
     return LeaseToken.from_wire(token_wire)
 
 
-def _lease_id(lease: dict[str, Any]) -> str:
-    return str(lease["lease_id"])
+def _lease_token(lease: dict[str, Any]) -> LeaseToken:
+    return _lease_wire_to_token(lease, require_full=True)
 
 
 def _legacy_lease_token(lease: dict[str, Any]) -> LeaseToken:
-    item = lease.get("item") if isinstance(lease, dict) else {}
-    return LeaseToken(
-        request_id=str(item.get("request_id") or ""),
-        lease_id=str(lease["lease_id"]),
-        attempt_id=str(lease.get("attempt_id") or ""),
-        scheduler_epoch=int(lease.get("scheduler_epoch") or 0),
-        consumer_id=str(lease.get("consumer_id", "")),
-        consumer_generation=int(lease.get("consumer_generation") or 0),
-    )
+    return _lease_wire_to_token(lease, require_full=False)
 
 
 def _scheduler_lease_token(lease: dict[str, Any]) -> LeaseToken:
@@ -135,17 +128,6 @@ def _finalization_from_outcome(
             billing_observations=None,
         )
     raise RuntimeError(f"cannot convert executor outcome to terminal finalization: {outcome.kind!r}")
-
-
-def _looks_like_dead_actor_error(exc: BaseException) -> bool:
-    name = type(exc).__name__
-    text = str(exc)
-    return (
-        name in {"ActorDiedError", "ActorUnavailableError", "RayActorError"}
-        or "actor died" in text.lower()
-        or "actor is dead" in text.lower()
-        or "actor is temporarily unavailable" in text.lower()
-    )
 
 
 @dataclass(frozen=True)
@@ -333,7 +315,7 @@ async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
         consumer_generation=token.consumer_generation,
         finalize_buffer=finalize_buffer,
     ):
-        await execute_model_work_item(
+        outcome = await execute_model_work_item(
             SimpleNamespace(
                 request_id=str(item["request_id"]),
                 op=op,
@@ -351,7 +333,9 @@ async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
             ),
             component="model_runtime_actor",
         )
-    return _outcome_from_finalize_buffer(finalize_buffer) or ExecutorOutcome(kind="success")
+    if outcome.kind == "success":
+        return _outcome_from_finalize_buffer(finalize_buffer) or outcome
+    return outcome
 
 
 async def _ensure_execution_bindings() -> ExecutionContext:
@@ -624,17 +608,14 @@ class ModelRuntimeActor:
         return self._is_vllm_domain()
 
     async def _execute_leases_sequentially(self, leases: list[dict[str, Any]]) -> None:
-        pending_leases = {
-            _scheduler_lease_token(lease).lease_id: _scheduler_lease_token(lease)
-            for lease in leases
-            if isinstance(lease, dict) and lease.get("lease_id") is not None
-        }
+        lease_tokens = [_scheduler_lease_token(lease) for lease in leases if isinstance(lease, dict)]
+        pending_leases = {token.lease_id: token for token in lease_tokens}
         renew_task: asyncio.Task | None = None
         if len(pending_leases) > 1:
             renew_task = asyncio.create_task(self._renew_pending_leases_until_done(pending_leases))
         try:
             for lease in leases:
-                lease_id = str(lease.get("lease_id"))
+                lease_id = _scheduler_lease_token(lease).lease_id
                 await self._execute_lease(lease)
                 pending_leases.pop(lease_id, None)
         finally:
@@ -878,7 +859,7 @@ class ModelRuntimeActor:
         )
 
     def _lease_attempt_id(self, lease: dict[str, Any]) -> str | None:
-        attempt_id = str(lease.get("attempt_id") or "") or None
+        attempt_id = _scheduler_lease_token(lease).attempt_id or None
         if attempt_id:
             return attempt_id
         item = lease.get("item") if isinstance(lease, dict) else {}
@@ -933,7 +914,7 @@ class ModelRuntimeActor:
                 "domain_key": self._config.domain_key,
                 "replica_id": self._config.replica_id,
                 "queue_id": self._config.queue_id,
-                "lease_id": _lease_id(lease),
+                "lease_id": _scheduler_lease_token(lease).lease_id,
                 "op": op,
                 "queue_state": "running",
                 "stage": "prefill",
@@ -1069,10 +1050,7 @@ class ModelRuntimeActor:
             try:
                 out = await self._call_executor(lease)
             except Exception as e:
-                return ExecutorOutcome(
-                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
-                    error=str(e),
-                )
+                return ExecutorOutcome(kind="retryable_failure", error=str(e))
             return out or ExecutorOutcome(kind="success")
         try:
             from opentelemetry.propagate import extract
@@ -1081,10 +1059,7 @@ class ModelRuntimeActor:
             try:
                 out = await self._call_executor(lease)
             except Exception as e:
-                return ExecutorOutcome(
-                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
-                    error=str(e),
-                )
+                return ExecutorOutcome(kind="retryable_failure", error=str(e))
             return out or ExecutorOutcome(kind="success")
 
         span_context = None
@@ -1111,18 +1086,15 @@ class ModelRuntimeActor:
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
-                return ExecutorOutcome(
-                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
-                    error=str(e),
-                )
+                return ExecutorOutcome(kind="retryable_failure", error=str(e))
             return out or ExecutorOutcome(kind="success")
 
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
         request_id = str(item["request_id"])
-        lease_id = _lease_id(lease)
-        token: LeaseToken | None = None
         legacy_token = _legacy_lease_token(lease)
+        lease_id = legacy_token.lease_id
+        token: LeaseToken | None = None
         attempt_id = self._lease_attempt_id(lease)
         self._active_leases[lease_id] = request_id
         self._active_request_id = request_id
