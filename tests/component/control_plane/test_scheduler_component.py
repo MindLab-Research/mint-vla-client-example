@@ -352,6 +352,75 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_complete_cleans_scheduler_lease_for_missing_task(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-runtime-missing-task"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        await world.task_state.async_forget_task(request_id=request_id)
+
+        completed = await world.scheduler.complete(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+        )
+
+        assert completed == {"ok": True, "request_id": request_id}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_runtime_drops_assigned_missing_task_without_crashing(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-runtime-assigned-missing-task"
+        await world.enqueue_sampling(request_id)
+        await world.task_state.async_forget_task(request_id=request_id)
+
+        actor = await world.runtime_once()
+
+        assert actor.health_snapshot()["processed_total"] == 0
+        assert actor.health_snapshot()["last_error"] is None
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert (await world.scheduler.stats())["counters"]["stale_dropped"] == 1
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_claim_skips_missing_stale_head_and_claims_next(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        stale_request_id = "component-missing-head"
+        valid_request_id = "component-after-missing-head"
+        await world.enqueue_sampling(stale_request_id)
+        await world.enqueue_sampling(valid_request_id)
+        await world.task_state.async_forget_task(request_id=stale_request_id)
+
+        claimed = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == [valid_request_id]
+        assert (await world.observe_scheduler(stale_request_id))["present"] is False
+        assert (await world.observe_task(valid_request_id))["status"] == "leased"
+        assert (await world.scheduler.stats())["counters"]["stale_dropped"] == 1
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
     for requeue in (True, False):
         world = SchedulerComponentWorld(tmp_path / str(requeue))
@@ -1118,6 +1187,90 @@ async def test_scheduler_component_direct_fail_requeue_failure_preserves_retryab
         assert new_lease["item"]["request_id"] == request_id
         assert new_lease["lease_id"] != old_lease["lease_id"]
         assert (await world.observe_task(request_id))["status"] == "leased"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_direct_fail_requeue_drops_missing_task_projection(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-direct-fail-requeue-missing"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one()
+        await world.task_state.async_forget_task(request_id=request_id)
+
+        failed = await world.scheduler.fail(
+            lease_id=old_lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="direct-fail-requeue-missing",
+        )
+
+        assert failed == {"ok": True, "request_id": request_id, "requeued": False}
+        assert (
+            await world.scheduler.validate(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        ) == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_retryable_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-direct-fail-requeue-cancel"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one()
+
+        block = world.faults.block("task_state.requeue_task")
+        fail_task = asyncio.create_task(
+            world.scheduler.fail(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                requeue=True,
+                reason="direct-fail-requeue-cancel",
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        fail_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await fail_task
+
+        assert (
+            await world.scheduler.validate(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_scheduler(request_id))["location"] == "leased"
+        assert (await world.observe_task(request_id))["status"] == "leased"
+
+        retried = await world.scheduler.fail(
+            lease_id=old_lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="direct-fail-requeue-retry-after-cancel",
+        )
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        new_lease = await world.claim_one()
+
+        assert retried == {"ok": True, "request_id": request_id, "requeued": True}
+        assert assigned["assigned"] == 1
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
     finally:
         world.close()
 
