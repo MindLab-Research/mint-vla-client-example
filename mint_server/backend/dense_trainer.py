@@ -569,10 +569,53 @@ def get_or_create_dense_trainer(
                     learning_rate=learning_rate,
                 )
 
+                # Register immediately (creating=True) to account for GPU usage
+                # and protect the actor from the placement reconciler's
+                # undesired-GPU-actor reaper during the (up to 600s) init window.
+                # The richer publish below marks it ready (creating=False) once
+                # __ray_ready__ completes. Mirrors the megatron create path.
+                # Best-effort: the authoritative publish after readiness remains
+                # load-bearing, so a transient supervisor RPC failure here must
+                # not abort trainer creation.
+                try:
+                    publish_backend_model_actor(
+                        BackendModelActorLaunch(
+                            actor_name=actor_name,
+                            actor_type=ActorType.DENSE,
+                            num_gpus=DEFAULT_NUM_GPUS,
+                            actor_handle=actor,
+                            namespace=PERSISTENT_DENSE_NAMESPACE,
+                            base_model=base_model,
+                            session_id=session_id,
+                            protected=is_topology_desired,
+                            metadata={
+                                **_base_dense_metadata(
+                                    actual_rank=int(lora_rank),
+                                    max_lora_rank=effective_max_rank,
+                                    model_key=name_key,
+                                ),
+                            },
+                        ),
+                        ready=False,
+                        refresh_observability=False,
+                    )
+                except Exception as reg_error:
+                    logger.warning(
+                        "[dense_trainer] early creating-registration failed actor_name=%s "
+                        "error_type=%s error=%s; actor unprotected during init",
+                        actor_name,
+                        type(reg_error).__name__,
+                        reg_error,
+                    )
+
                 init_timeout_s = float(os.environ.get("MINT_DENSE_ACTOR_INIT_TIMEOUT_S", "600"))
                 try:
                     ray.get(actor.__ray_ready__.remote(), timeout=init_timeout_s)
                 except GetTimeoutError:
+                    try:
+                        get_model_actor_supervisor().unregister(actor_name)
+                    except Exception:
+                        pass
                     try:
                         ray_kill.kill(
                             actor,
