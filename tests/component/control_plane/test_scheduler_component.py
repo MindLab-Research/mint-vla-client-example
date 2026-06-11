@@ -2586,6 +2586,31 @@ async def test_scheduler_component_assign_cancellation_after_durable_commit_pres
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_append_assign_cancellation_after_durable_assign_preserves_claimability(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-append-assign-cancel-after"
+
+        block = world.faults.block("task_state.assign_task.after")
+        append_task = asyncio.create_task(world.enqueue_sampling(request_id, assign=True))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        append_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "assigned"
+        assert (await world.observe_task(request_id))["status"] == "assigned"
+        lease = await world.claim_one()
+        assert lease["item"]["request_id"] == request_id
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_claim_cancellation_after_durable_commit_preserves_lease(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
