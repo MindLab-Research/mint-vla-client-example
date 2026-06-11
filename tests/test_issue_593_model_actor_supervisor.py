@@ -258,6 +258,7 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     fake_ray_util = types.SimpleNamespace(get_node_ip_address=lambda: "10.1.2.3")
     monkeypatch.setitem(sys.modules, "ray.util", fake_ray_util)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("RAY_ADDRESS", "10.1.2.3:6379")
     monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
     monkeypatch.setattr(
         supervisor_module,
@@ -292,8 +293,9 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
             "MINT_GIT_SHA": supervisor_module.CURRENT_CODE_IDENTITY,
         }
     }
-    assert created["options"]["resources"] == {"node:10.1.2.3": 0.001}
+    assert created["options"]["resources"] == {"node:__internal_head__": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
+    assert created["remote_kwargs"]["ray_address"] == "10.1.2.3:6379"
     assert actor.calls == [("snapshot", (), {})]
 
 
@@ -2299,7 +2301,9 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
             "context": "model_actor_supervisor placement domain='vllm:Qwen/Test' replica='replica-1'",
             "ignore_pg_names": {
                 "mint_model_runtime_vllm-Qwen-Test_replica-1_pg",
+                "mint_model_runtime_vllm-Qwen-Test_replica-1_mint_pg",
                 "mint_vllm_test_pg",
+                "mint_vllm_test_mint_pg",
             },
             "namespace": "mint",
         }

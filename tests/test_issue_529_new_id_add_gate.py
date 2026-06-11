@@ -7,6 +7,7 @@ import types
 import pytest
 
 import mint_server.backend.lora_utils as lora_utils
+import mint_server.backend.multi_lora_engine as mle
 import mint_server.backend.multinode_inference as mni
 
 
@@ -104,13 +105,48 @@ def test_mint_vllm_multinode_runtime_env_drops_driver_ray_attach_hints():
     env_vars = {
         "MINT_RAY_TEMP_DIR": "/tmp/mph/t",
         "MINT_RAY_NODE_IP_ADDRESS": "192.168.39.234",
+        "RAY_TMPDIR": "/tmp/mph/t",
+        "TMPDIR": "/tmp/mph/t",
+        "TMP": "/tmp/mph/t",
+        "TEMP": "/tmp/mph/t",
+        "RAY_ADDRESS": "192.168.39.234:6379",
+        "RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+        "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
     }
 
     mni._prepare_mint_vllm_multinode_runtime_env(env_vars)
 
-    assert "MINT_RAY_TEMP_DIR" not in env_vars
-    assert "MINT_RAY_NODE_IP_ADDRESS" not in env_vars
+    for key in (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    ):
+        assert key not in env_vars
     assert env_vars["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"
+
+
+def test_mint_vllm_single_node_runtime_env_drops_driver_ray_attach_hints():
+    env_vars = {
+        "MINT_RAY_TEMP_DIR": "/tmp/mph/t",
+        "MINT_RAY_NODE_IP_ADDRESS": "192.168.39.234",
+        "RAY_TMPDIR": "/tmp/mph/t",
+        "TMPDIR": "/tmp/mph/t",
+        "TMP": "/tmp/mph/t",
+        "TEMP": "/tmp/mph/t",
+        "RAY_ADDRESS": "192.168.39.234:6379",
+        "RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+        "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+    }
+
+    mle._prepare_vllm_actor_runtime_env(env_vars)
+
+    assert env_vars == {}
 
 
 def test_mint_vllm_child_environment_sets_worker_local_ray_node_ip(monkeypatch):

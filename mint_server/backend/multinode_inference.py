@@ -150,8 +150,18 @@ def _prepare_mint_vllm_multinode_runtime_env(env_vars: dict[str, str]) -> None:
     _set_default_vllm_runtime_env(env_vars)
     # Driver/head temp-dir hints are not portable into Ray worker-hosted vLLM
     # EngineCore subprocesses. Let each controller actor stamp its local node IP.
-    env_vars.pop("MINT_RAY_TEMP_DIR", None)
-    env_vars.pop("MINT_RAY_NODE_IP_ADDRESS", None)
+    for key in (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    ):
+        env_vars.pop(key, None)
 
 
 def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: set[str] | None = None) -> str:

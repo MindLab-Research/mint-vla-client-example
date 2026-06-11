@@ -199,6 +199,11 @@ def preferred_control_plane_resources(cluster_resources: dict[str, float] | None
         configured_node_key = f"node:{configured_node_ip}"
         if configured_node_key in cluster_resources:
             return {configured_node_key: 0.001}
+        if "node:__internal_head__" in cluster_resources:
+            return {"node:__internal_head__": 0.001}
+        return None
+    if "node:__internal_head__" in cluster_resources:
+        return {"node:__internal_head__": 0.001}
     try:
         from ray.util import get_node_ip_address
 
@@ -207,8 +212,6 @@ def preferred_control_plane_resources(cluster_resources: dict[str, float] | None
         driver_node_key = ""
     if driver_node_key and driver_node_key in cluster_resources:
         return {driver_node_key: 0.001}
-    if "node:__internal_head__" in cluster_resources:
-        return {"node:__internal_head__": 0.001}
     return None
 
 def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None, str | None]:
@@ -219,11 +222,27 @@ def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None,
     return None, None
 
 
+_RAY_ATTACH_RUNTIME_ENV_KEYS = frozenset(
+    {
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    }
+)
+
+
 def actor_runtime_env_vars(
     *,
     pythonpath: str,
     extra: dict[str, str] | None = None,
     include_config_snapshot: bool = True,
+    include_ray_attach_hints: bool = True,
 ) -> dict[str, str]:
     if not PFS_RUNTIME_ENV_ROOT:
         raise RuntimeError("PFS_RUNTIME_ENV_ROOT is required")
@@ -232,7 +251,7 @@ def actor_runtime_env_vars(
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
     ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if ray_address is None:
+    if include_ray_attach_hints and ray_address is None:
         raise RuntimeError("RAY_ADDRESS is required")
 
     out = {
@@ -241,8 +260,9 @@ def actor_runtime_env_vars(
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "MINT_CODE_ROOT": MINT_CODE_ROOT,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
-        "RAY_ADDRESS": ray_address,
     }
+    if include_ray_attach_hints and ray_address is not None:
+        out["RAY_ADDRESS"] = ray_address
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
@@ -267,11 +287,16 @@ def actor_runtime_env_vars(
         "MINT_TASK_STATE_STORE_DB_PATH",
         "MINT_FUTURE_STATE_STORE_DB_PATH",
     ):
+        if not include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
+            continue
         value = _env_nonempty(os.environ, key)
         if value is not None:
             out[key] = value
     if extra:
         out.update(extra)
+    if not include_ray_attach_hints:
+        for key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
+            out.pop(key, None)
     if include_config_snapshot:
         out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out
@@ -294,12 +319,14 @@ def actor_runtime_env(
     pythonpath: str,
     extra: dict[str, str] | None = None,
     include_config_snapshot: bool = True,
+    include_ray_attach_hints: bool = True,
 ) -> dict[str, object]:
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=pythonpath,
             extra=extra,
             include_config_snapshot=include_config_snapshot,
+            include_ray_attach_hints=include_ray_attach_hints,
         )
     }
     allow_local_paths = _actor_runtime_env_allows_local_paths()
@@ -330,7 +357,14 @@ def detached_actor_resource_key(ray_module: Any | None = None) -> str | None:
     return None
 
 
-def apply_detached_actor_resources(options: dict[str, object], ray_module: Any | None = None) -> None:
+def apply_detached_actor_resources(
+    options: dict[str, object],
+    ray_module: Any | None = None,
+    *,
+    pin_to_control_plane: bool = True,
+) -> None:
+    if not pin_to_control_plane:
+        return
     key = detached_actor_resource_key(ray_module)
     if key is not None:
         options["resources"] = {key: 0.001}

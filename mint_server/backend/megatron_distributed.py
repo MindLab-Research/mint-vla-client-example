@@ -31,6 +31,8 @@ from mint_server.backend.model_registry import get_model_config
 from mint_server.backend.node_placement import (ModelGpuPlacement,
                                                 assert_node_ip_capacity,
                                                 parse_model_gpu_placement)
+from mint_server.backend.model_actor_pg_names import (
+    namespace_actor_placement_group_name, namespace_pg_suffix)
 from mint_server.backend.ray_placement_groups import (
     PlacementGroupMismatchError, get_named_placement_group)
 # Import centralized PFS paths from config
@@ -637,14 +639,7 @@ def _node_affinity_resources(node_ip: str | None) -> dict[str, float]:
 
 
 def _make_namespace_pg_suffix(namespace: str) -> str:
-    raw = str(namespace).strip().lower()
-    if not raw:
-        return "default"
-    sanitized = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_")
-    if len(sanitized) <= 24:
-        return sanitized or "default"
-    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]
-    return f"{sanitized[:15]}_{digest}"
+    return namespace_pg_suffix(namespace)
 
 
 def _make_megatron_pg_name_from_actor_name(
@@ -652,7 +647,7 @@ def _make_megatron_pg_name_from_actor_name(
     *,
     namespace: str = PERSISTENT_NAMESPACE,
 ) -> str:
-    return f"{actor_name}_{_make_namespace_pg_suffix(namespace)}_pg"
+    return namespace_actor_placement_group_name(actor_name, namespace)
 
 
 def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
@@ -11088,7 +11083,11 @@ def get_or_create_megatron_worker_group(
                     "lifetime": "detached",
                     "runtime_env": runtime_env,
                 }
-                apply_detached_actor_resources(actor_options, ray)
+                apply_detached_actor_resources(
+                    actor_options,
+                    ray,
+                    pin_to_control_plane=False,
+                )
                 actor = MegatronWorkerGroup.options(**actor_options).remote(
                     base_model=base_model,
                     lora_rank=lora_rank,

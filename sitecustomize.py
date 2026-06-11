@@ -19,6 +19,19 @@ import sys
 import sysconfig
 
 
+_DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS = (
+    "MINT_RAY_TEMP_DIR",
+    "MINT_RAY_NODE_IP_ADDRESS",
+    "RAY_TMPDIR",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "RAY_ADDRESS",
+    "RAY_CLIENT_ADDRESS",
+    "MINT_RAY_CLIENT_ADDRESS",
+)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
@@ -65,6 +78,40 @@ def _sanitize_vllm_worker_pythonpath(raw: str | None) -> str:
         )
     except Exception:
         return ":".join(p for p in str(raw).split(":") if p)
+
+
+def _sanitize_vllm_ray_runtime_env_dict(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    env_vars = out.get("env_vars")
+    if isinstance(env_vars, dict):
+        cleaned = dict(env_vars)
+        for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
+            cleaned.pop(key, None)
+        out["env_vars"] = cleaned
+    return out
+
+
+def _patch_ray_runtime_env_to_dict_drop_driver_attach_hints() -> None:
+    try:
+        from ray.runtime_env import RuntimeEnv
+    except Exception:
+        return
+
+    original = getattr(RuntimeEnv, "to_dict", None)
+    if not callable(original) or getattr(
+        original, "_mint_drops_driver_attach_hints", False
+    ):
+        return
+
+    def to_dict(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        return _sanitize_vllm_ray_runtime_env_dict(
+            original(self, *args, **kwargs)
+        )
+
+    to_dict._mint_drops_driver_attach_hints = True  # type: ignore[attr-defined]
+    RuntimeEnv.to_dict = to_dict  # type: ignore[method-assign]
 
 
 def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
@@ -1991,6 +2038,7 @@ def _apply_vllm_worker_patches() -> None:
     # processes on Ray worker nodes).
     os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
 
+    _patch_ray_runtime_env_to_dict_drop_driver_attach_hints()
     _patch_vllm_ray_env_carry_over_pythonpath()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
         _patch_vllm_pack_moe_sparse_ok()

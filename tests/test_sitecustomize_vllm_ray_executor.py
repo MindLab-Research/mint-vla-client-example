@@ -125,6 +125,46 @@ def test_initialize_ray_cluster_prefers_ray_address_env_for_original(monkeypatch
     assert calls["ray_address"] == "192.168.39.87:6379"
 
 
+def test_runtime_env_to_dict_drops_driver_attach_hints(monkeypatch):
+    class FakeRuntimeEnv:
+        def to_dict(self):
+            return {
+                "env_vars": {
+                    "PYTHONPATH": "/runtime:/repo",
+                    "MINT_RAY_NAMESPACE": "mint",
+                    "MINT_RAY_TEMP_DIR": "/tmp/ray-driver",
+                    "MINT_RAY_NODE_IP_ADDRESS": "192.168.39.234",
+                    "RAY_TMPDIR": "/tmp/ray",
+                    "TMPDIR": "/tmp/driver",
+                    "TMP": "/tmp/driver",
+                    "TEMP": "/tmp/driver",
+                    "RAY_ADDRESS": "192.168.39.234:6379",
+                    "RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+                    "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+                },
+                "py_executable": "/repo/scripts/vllm_worker_python.py",
+            }
+
+    fake_ray = _fake_package("ray")
+    fake_runtime_env_mod = types.ModuleType("ray.runtime_env")
+    fake_runtime_env_mod.RuntimeEnv = FakeRuntimeEnv  # type: ignore[attr-defined]
+    fake_ray.runtime_env = fake_runtime_env_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setitem(sys.modules, "ray.runtime_env", fake_runtime_env_mod)
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_runtime_env_to_dict_drop_driver_attach_hints()
+
+    data = FakeRuntimeEnv().to_dict()
+    env_vars = data["env_vars"]
+    assert env_vars == {
+        "PYTHONPATH": "/runtime:/repo",
+        "MINT_RAY_NAMESPACE": "mint",
+    }
+    assert data["py_executable"] == "/repo/scripts/vllm_worker_python.py"
+
+
 def test_qwen35_text_only_adapter_patch_runs_from_sitecustomize(monkeypatch):
     import torch
 

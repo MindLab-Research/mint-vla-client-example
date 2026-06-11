@@ -153,6 +153,10 @@ def get_or_create_model_runtime_actor(
         except Exception:
             pass
 
+    ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is None:
+        raise RuntimeError("RAY_ADDRESS is required")
+
     remote_cls = ray.remote(num_cpus=0, max_concurrency=64, max_restarts=-1)(ModelRuntimeActor)
     options: dict[str, Any] = {
         "name": name,
@@ -167,6 +171,7 @@ def get_or_create_model_runtime_actor(
                     **otel_env_vars(),
                     **(runtime_env_extra or {}),
                 },
+                include_ray_attach_hints=False,
             )
         },
     }
@@ -183,6 +188,7 @@ def get_or_create_model_runtime_actor(
         token_budget=token_budget,
         execution_timeout_s=execution_timeout_s,
         runtime_env_fingerprint=expected_runtime_env_fingerprint,
+        ray_address=ray_address,
     )
 
 
@@ -248,6 +254,7 @@ class ModelRuntimeActor:
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
         token_budget_provider: TokenBudgetProvider | None = None,
+        ray_address: str | None = None,
     ) -> None:
         domain = str(domain_key).strip()
         replica = str(replica_id).strip()
@@ -255,6 +262,9 @@ class ModelRuntimeActor:
             raise ValueError("domain_key is required")
         if not replica:
             raise ValueError("replica_id is required")
+        ray_address_value = str(ray_address or "").strip()
+        if ray_address_value:
+            os.environ["RAY_ADDRESS"] = ray_address_value
         self._config = ModelRuntimeActorConfig(
             domain_key=domain,
             replica_id=replica,

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import os
-import sys
-import types
 from pathlib import Path
 
 
@@ -16,38 +14,33 @@ def _load_wrapper():
     return module
 
 
-def test_default_worker_bootstrap_disables_ray_client_mode(monkeypatch, tmp_path):
+def test_default_worker_bootstrap_clears_driver_temp_hints(monkeypatch, tmp_path):
     wrapper = _load_wrapper()
 
-    calls: list[tuple[str, object]] = []
-    hook = types.ModuleType("ray._private.client_mode_hook")
-
-    def _explicitly_disable_client_mode():
-        calls.append(("disable", None))
-
-    def _set_client_hook_status(value):
-        calls.append(("status", value))
-
-    hook._explicitly_disable_client_mode = _explicitly_disable_client_mode
-    hook._set_client_hook_status = _set_client_hook_status
-
-    ray_mod = types.ModuleType("ray")
-    private_mod = types.ModuleType("ray._private")
-    ray_mod._private = private_mod
-    private_mod.client_mode_hook = hook
-
-    monkeypatch.setitem(sys.modules, "ray", ray_mod)
-    monkeypatch.setitem(sys.modules, "ray._private", private_mod)
-    monkeypatch.setitem(sys.modules, "ray._private.client_mode_hook", hook)
-    monkeypatch.setenv("RAY_CLIENT_MODE", "1")
+    env_keys = (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    )
+    address_keys = (
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    )
+    for key in (*env_keys, *address_keys):
+        monkeypatch.setenv(key, "/tmp/mph/t")
+    monkeypatch.setattr(wrapper.runpy, "run_path", lambda *_args, **_kwargs: None)
 
     script = tmp_path / "ray" / "_private" / "workers" / "default_worker.py"
     script.parent.mkdir(parents=True)
     script.write_text("raise SystemExit(0)\n", encoding="utf-8")
 
-    monkeypatch.setattr(wrapper.runpy, "run_path", lambda *_args, **_kwargs: None)
-
     wrapper._run_as_python([str(script)])
 
-    assert os.environ["RAY_CLIENT_MODE"] == "0"
-    assert calls == [("disable", None), ("status", False)]
+    for key in env_keys:
+        assert key not in os.environ
+    for key in address_keys:
+        assert os.environ[key] == "/tmp/mph/t"

@@ -66,6 +66,22 @@ def _read_process_env_var(name: str) -> str:
     return os.environ.get(name, "")
 
 
+def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
+    # Ray worker bootstrap must use node-local Ray state, not driver/API host hints.
+    for key in (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    ):
+        env_vars.pop(key, None)
+
+
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
@@ -468,6 +484,7 @@ class MultiLoRAInferenceEngine:
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
+            _prepare_vllm_actor_runtime_env(env_vars)
             preferred_python = (preferred_vllm_python_executable() or "").strip()
 
             actor_options: dict[str, object] = {

@@ -18,19 +18,19 @@ def _load_repo_sitecustomize() -> None:
     spec.loader.exec_module(module)
 
 
-def _prepare_ray_worker_bootstrap(script_path: str) -> None:
-    norm = script_path.replace("\\", "/")
-    if not norm.endswith("/ray/_private/workers/default_worker.py"):
-        return
-
-    os.environ["RAY_CLIENT_MODE"] = "0"
-    try:
-        import ray._private.client_mode_hook as client_mode_hook
-
-        client_mode_hook._explicitly_disable_client_mode()
-        client_mode_hook._set_client_hook_status(False)
-    except Exception:
-        pass
+def _sanitize_worker_temp_environment() -> None:
+    # Ray worker bootstrap must not inherit the driver's temp-dir hints.
+    # Those point at the API host's tmp tree and break node-local startup
+    # checks inside the worker process.
+    for key in (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+    ):
+        os.environ.pop(key, None)
 
 
 def _run_as_python(argv: list[str]) -> None:
@@ -70,7 +70,7 @@ def _run_as_python(argv: list[str]) -> None:
         return
 
     script_path = os.fspath(Path(head).resolve())
-    _prepare_ray_worker_bootstrap(script_path)
+    _sanitize_worker_temp_environment()
     sys.argv = [script_path, *tail]
     runpy.run_path(script_path, run_name="__main__")
 

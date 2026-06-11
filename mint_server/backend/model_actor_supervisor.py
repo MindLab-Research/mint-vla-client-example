@@ -914,7 +914,11 @@ class ModelActorSupervisorCore:
         owner_id: str | None = None,
         owner_ttl_s: float | None = None,
         state_event_limit: int | None = None,
+        ray_address: str | None = None,
     ) -> None:
+        ray_address_value = str(ray_address or "").strip()
+        if ray_address_value:
+            os.environ["RAY_ADDRESS"] = ray_address_value
         try:
             from ..logging_context import init_actor_observability
 
@@ -2725,19 +2729,29 @@ def _create_ray_actor(*, require_ready: bool = True):
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
     if "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" in os.environ:
         extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
+    ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
+    if ray_address is None:
+        raise RuntimeError("RAY_ADDRESS is required")
 
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=extra_env),
+        "runtime_env": actor_runtime_env(
+            pythonpath=PFS_PYTHONPATH,
+            extra=extra_env,
+            include_ray_attach_hints=False,
+        ),
     }
     resources = _model_actor_supervisor_actor_resources()
     if resources:
         options["resources"] = resources
 
-    actor = _RayModelActorSupervisorActor.options(**options).remote(specs=desired_specs_from_env())
+    actor = _RayModelActorSupervisorActor.options(**options).remote(
+        specs=desired_specs_from_env(),
+        ray_address=ray_address,
+    )
     if require_ready:
         out = sync_get_ray_ref(actor.snapshot.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
