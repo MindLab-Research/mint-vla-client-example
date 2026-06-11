@@ -160,47 +160,25 @@ def _record_retrieve_wait(*, path: str, outcome: str, waited: bool) -> None:
 
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
-        from ..backend.task_payload_store import TaskPayloadStore
-        from ..backend.task_state_store import TaskStateNotFoundError, task_state_store
+        from ..backend.model_work_task_gateway import model_work_task_gateway
+        from ..backend.task_payload_presenter import present_terminal_retrieve_result
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup unavailable request_id=%s", request_id)
         return None
     try:
-        record = await task_state_store.async_get_task(request_id)
-    except (KeyError, TaskStateNotFoundError):
-        return None
+        result = await model_work_task_gateway.retrieve_task(request_id=request_id)
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup failed request_id=%s", request_id)
         return None
 
-    status = str(record.get("status") or "")
-    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    if status in {"done", "retrieved"}:
-        result_path = record.get("result_path")
-        terminal_status = str(meta.get("terminal_status") or status)
-        if terminal_status == "failed" or record.get("error") is not None:
-            error = str(record.get("error") or "Task failed")
-            payload = _failed_payload(error, http_request)
-            _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
-            return payload
-        if isinstance(result_path, str) and result_path:
-            try:
-                result = await TaskPayloadStore().async_read_json_payload(
-                    path=result_path,
-                    expected_checksum=record.get("result_checksum"),
-                )
-            except Exception:
-                logger.exception("[retrieve_future] legacy task_state_store payload read failed request_id=%s", request_id)
-                return _terminal_evicted_payload(record)
-            _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
-            return result
-        return _terminal_evicted_payload(record)
-    if status == "failed":
-        error = str(record.get("error") or "Task failed")
-        payload = _failed_payload(error, http_request)
-        _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
-        return payload
-    return None
+    if result.status not in {"ready", "failed"}:
+        return None
+    payload = await present_terminal_retrieve_result(
+        result,
+        error_presenter=lambda error: _failed_payload(error, http_request),
+    )
+    _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
+    return payload
 
 
 async def _wait_until_not_pending(request_id: str, http_request: Request) -> FutureStatus | None:
@@ -252,28 +230,6 @@ def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
     if _is_privileged(request):
         return {"error": error, "category": "system"}
     return {"error": _public_error(error), "category": "system"}
-
-
-def _terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
-    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    done_at = meta.get("done_at") or meta.get("failed_at") or record.get("updated_at")
-    retrieved_at = record.get("updated_at") if str(record.get("status") or "") == "retrieved" else None
-    try:
-        done_at_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(done_at)))
-    except Exception:
-        done_at_s = None
-    try:
-        retrieved_at_s = None if retrieved_at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(retrieved_at)))
-    except Exception:
-        retrieved_at_s = None
-    return {
-        "error": "Known terminal future evicted",
-        "category": "system",
-        "request_id": str(record.get("request_id") or ""),
-        "op": str(meta.get("op") or record.get("op") or ""),
-        "done_at": done_at_s,
-        "retrieved_at": retrieved_at_s,
-    }
 
 
 @router.post("/retrieve_future")
@@ -634,34 +590,6 @@ async def retrieve_future(
             affinity_group = None
         if not isinstance(ordering_key, str) or not ordering_key:
             ordering_key = None
-
-        if status_field == "queued" and queue_kind == "model_work_scheduler":
-            try:
-                from ..backend.model_work_scheduler import model_work_scheduler
-
-                contains = await model_work_scheduler.contains_request(
-                    request_id=body.request_id,
-                    hydrate_task_state=True,
-                )
-                if not bool(contains.get("present")):
-                    await task_futures.async_fail(
-                        body.request_id,
-                        "model work scheduler recovered without this request; request must be retried",
-                    )
-                    error = await task_futures.async_get_error(body.request_id)
-                    payload = _failed_payload(error, http_request)
-                    _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
-                    logger.warning(
-                        "[retrieve_future] request_id=%s status=model_work_orphan_failed",
-                        body.request_id,
-                    )
-                    _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-                    return payload
-            except Exception:
-                logger.exception(
-                    "[retrieve_future] model_work_scheduler orphan probe failed request_id=%s",
-                    body.request_id,
-                )
 
         if queue_state_reason is None and status_field == "queued":
             if queue_kind == "model_work_scheduler":

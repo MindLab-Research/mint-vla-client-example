@@ -2378,7 +2378,7 @@ async def test_scheduler_component_retrieve_pending_survives_scheduler_restart(t
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path, monkeypatch) -> None:
+async def test_scheduler_component_retrieve_orphan_pending_waits_for_reaper(tmp_path, monkeypatch) -> None:
     class AbsentScheduler:
         async def contains_request(
             self,
@@ -2405,10 +2405,11 @@ async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path
             scheduler_override=AbsentScheduler(),
         )
 
-        assert status_code == 200
-        assert payload["category"] == "system"
-        assert "request must be retried" in payload["error"]
-        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+        assert status_code == 408
+        assert payload["request_id"] == request_id
+        assert payload["type"] == "try_again"
+        assert payload["queue_kind"] == "model_work_scheduler"
+        assert await world.observe_future_status(request_id) == FutureStatus.PENDING
     finally:
         world.close()
 

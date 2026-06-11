@@ -210,9 +210,11 @@ class RetrieveTaskResult(WireCompatibleResult):
     result_size_bytes: int | None = None
     error: dict[str, Any] | None = None
     retry_after_s: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "status": self.status,
             "request_id": self.request_id,
             "result_path": self.result_path,
@@ -234,6 +236,18 @@ class RetrieveTaskResult(WireCompatibleResult):
             ),
             error=data.get("error") if isinstance(data.get("error"), dict) else None,
             retry_after_s=float(data["retry_after_s"]) if data.get("retry_after_s") is not None else None,
+            extra=_extra_wire_fields(
+                data,
+                {
+                    "status",
+                    "request_id",
+                    "result_path",
+                    "result_checksum",
+                    "result_size_bytes",
+                    "error",
+                    "retry_after_s",
+                },
+            ),
         )
 
 

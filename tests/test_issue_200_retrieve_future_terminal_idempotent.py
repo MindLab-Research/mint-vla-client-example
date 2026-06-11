@@ -36,8 +36,70 @@ class _TaskStateTerminalStub:
     def __init__(self, record):
         self._record = record
 
-    async def async_get_task(self, request_id: str):
+    async def async_get_task(self, *, request_id: str):
+        if self._record.get("request_id") != request_id:
+            raise KeyError(request_id)
         return self._record
+
+    async def async_wait_task_status_change(self, *, request_id: str, timeout_s: float, **_kwargs):
+        _ = timeout_s
+        if self._record.get("request_id") != request_id:
+            return {"changed": False, "missing": True, "request_id": request_id}
+        return {
+            "changed": False,
+            "timeout": True,
+            "missing": False,
+            "record": dict(self._record),
+            "request_id": request_id,
+        }
+
+    async def async_ensure_ready(self, **_kwargs):
+        return {"ok": True}
+
+    async def async_ping(self, **_kwargs):
+        return {"ok": True}
+
+    async def async_acquire_owner(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_renew_owner(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_create_task(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_assign_task(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_claim_task(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_renew_lease(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_begin_finalize(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_commit_finalize_success(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_commit_finalize_failure(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_complete_task_failure(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_requeue_task(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_forget_task(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_list_active_tasks(self, **_kwargs):
+        raise NotImplementedError
+
+    async def async_update_task_metadata(self, **_kwargs):
+        raise NotImplementedError
 
 
 def _request_with_admin_user():
