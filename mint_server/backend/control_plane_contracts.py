@@ -1254,6 +1254,10 @@ class InProcessSchedulerQueueAdapter:
             return out
         return AssignPendingResult.from_wire(out)
 
+    async def reap_lost_pending_tasks(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("timeout_s", None)
+        return await self.actor.reap_lost_pending_tasks(**kwargs)
+
     async def claim(self, **kwargs: Any) -> ClaimResult:
         kwargs.pop("timeout_s", None)
         out = await self.actor.claim_from_replica_queue(**kwargs)

@@ -409,6 +409,12 @@ class _ModelWorkSchedulerActor:
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
         )
+        self._reaper_loop_task: asyncio.Task | None = None
+        self._reaper_loop_interval_s = float(
+            os.environ.get("MINT_MODEL_WORK_SCHEDULER_REAPER_INTERVAL_S", "10.0")
+        )
+        self._reaper_recovered = 0
+        self._reaper_scanned = 0
         owner_ttl_s = float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0))
         self._task_state_owner_lock = asyncio.Lock()
         self._owner_heartbeat_task: asyncio.Task | None = None
@@ -423,6 +429,7 @@ class _ModelWorkSchedulerActor:
         self._init_otel_metrics()
         self._ensure_assignment_loop_started()
         self._ensure_owner_heartbeat_started()
+        self._ensure_reaper_loop_started()
 
     def _init_otel_metrics(self) -> None:
         endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
@@ -752,6 +759,31 @@ class _ModelWorkSchedulerActor:
             return
         self._assignment_loop_task = loop.create_task(self._assignment_loop())
 
+    async def _reaper_loop(self) -> None:
+        while True:
+            await asyncio.sleep(self._reaper_loop_interval_s)
+            try:
+                await self.reap_lost_pending_tasks(reason="scheduler_reaper_requeue")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[model_work_scheduler] reaper loop failed error_type=%s error=%s",
+                    type(e).__name__,
+                    e,
+                )
+
+    def _ensure_reaper_loop_started(self) -> None:
+        if not self._use_task_state_store or self._reaper_loop_interval_s <= 0:
+            return
+        if self._reaper_loop_task is not None and not self._reaper_loop_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._reaper_loop_task = loop.create_task(self._reaper_loop())
+
     def _work_item_from_task_record(self, record: dict[str, Any]) -> ModelWorkItem:
         metadata = dict(record.get("metadata") or {})
         extra = dict(metadata)
@@ -978,6 +1010,7 @@ class _ModelWorkSchedulerActor:
     async def _ensure_task_state_ready(self) -> int | None:
         self._ensure_assignment_loop_started()
         self._ensure_owner_heartbeat_started()
+        self._ensure_reaper_loop_started()
         epoch = await self._ensure_task_state_owner()
         if not self._use_task_state_store or self._task_state_hydrated:
             return epoch
@@ -1011,6 +1044,66 @@ class _ModelWorkSchedulerActor:
                 self._track_sampling_inflight_locked(item)
             self._task_state_hydrated = True
         return epoch
+
+    async def reap_lost_pending_tasks(
+        self,
+        *,
+        limit: int | None = None,
+        reason: str = "scheduler_reaper_requeue",
+    ) -> dict[str, Any]:
+        epoch = await self._ensure_task_state_ready()
+        if not self._use_task_state_store:
+            return {
+                "ok": True,
+                "scanned": 0,
+                "recovered": 0,
+                "scheduler_epoch": epoch,
+            }
+        active = await self._task_state_call("list_active_tasks", limit=limit)
+        if not isinstance(active, list):
+            raise TypeError(f"TaskStateStore.list_active_tasks returned non-list: {type(active)}")
+        pending_items: list[ModelWorkItem] = []
+        scanned = 0
+        for task_record in active:
+            if not isinstance(task_record, TaskRecord):
+                raise TypeError(f"TaskStateStore.list_active_tasks item returned non-TaskRecord: {type(task_record)}")
+            record = self._task_record_data(task_record)
+            scanned += 1
+            if str(record.get("status") or "") != "pending":
+                continue
+            item = self._work_item_from_task_record(record)
+            async with self._cv:
+                if item.request_id in self._all_request_ids():
+                    continue
+            pending_items.append(item)
+        recovered = 0
+        async with self._cv:
+            for item in pending_items:
+                if item.request_id in self._all_request_ids():
+                    continue
+                self._backlog(item.domain_key).append(item)
+                self._request_locations[item.request_id] = "backlog"
+                self._track_sampling_inflight_locked(item)
+                recovered += 1
+            self._reaper_scanned += scanned
+            self._reaper_recovered += recovered
+            if recovered:
+                self._requeued += recovered
+                self._cv.notify_all()
+        if recovered:
+            logger.warning(
+                "[model_work_scheduler] recovered lost pending tasks scanned=%s recovered=%s reason=%s",
+                scanned,
+                recovered,
+                reason,
+            )
+        return {
+            "ok": True,
+            "scanned": scanned,
+            "recovered": recovered,
+            "scheduler_epoch": epoch,
+            "reason": str(reason),
+        }
 
     def _task_record_matches_work_item(self, record: dict[str, Any], item: ModelWorkItem) -> bool:
         if str(record.get("request_id") or "") != item.request_id:
@@ -2886,6 +2979,8 @@ class _ModelWorkSchedulerActor:
             "assignment_loop_running": self._assignment_loop_task is not None and not self._assignment_loop_task.done(),
             "owner_heartbeat_interval_s": self._owner_heartbeat_interval_s,
             "owner_heartbeat_running": self._owner_heartbeat_task is not None and not self._owner_heartbeat_task.done(),
+            "reaper_loop_interval_s": self._reaper_loop_interval_s,
+            "reaper_loop_running": self._reaper_loop_task is not None and not self._reaper_loop_task.done(),
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -2937,6 +3032,8 @@ class _ModelWorkSchedulerActor:
                 "failed": self._failed,
                 "requeued": self._requeued,
                 "stale_dropped": self._stale_dropped,
+                "reaper_scanned": self._reaper_scanned,
+                "reaper_recovered": self._reaper_recovered,
             },
         }
 
@@ -3041,6 +3138,17 @@ def _create_ray_actor_handle():
                 hydrate_task_state=hydrate_task_state,
             )
             return out.to_wire()
+
+        async def reap_lost_pending_tasks(
+            self,
+            *,
+            limit: int | None = None,
+            reason: str = "scheduler_reaper_requeue",
+        ) -> dict[str, Any]:
+            return await super().reap_lost_pending_tasks(
+                limit=limit,
+                reason=reason,
+            )
 
         async def validate_lease(
             self,
@@ -3430,6 +3538,22 @@ class ModelWorkSchedulerClient:
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.assign_pending returned non-dict: {type(out)}")
         return AssignPendingResult.from_wire(out)
+
+    async def reap_lost_pending_tasks(
+        self,
+        *,
+        limit: int | None = None,
+        reason: str = "scheduler_reaper_requeue",
+        timeout_s: float = 10.0,
+    ) -> dict[str, Any]:
+        actor = await self._get_ray_actor_async(create_if_missing=False)
+        out = await self._await_ray_ref(
+            actor.reap_lost_pending_tasks.remote(limit=limit, reason=str(reason)),
+            timeout_s=timeout_s,
+        )
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelWorkScheduler.reap_lost_pending_tasks returned non-dict: {type(out)}")
+        return out
 
     async def cancel_request(
         self,

@@ -11,6 +11,7 @@ from mint_server.backend.task_state_store import TaskStateStore
 
 from .harness import SchedulerComponentWorld
 from .invariants import assert_terminal_not_scheduled
+from .scenarios import sampling_meta
 
 
 pytestmark = pytest.mark.component
@@ -1069,6 +1070,50 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         assert new_lease["item"]["request_id"] == "component-owner-fencing"
         assert new_lease["scheduler_epoch"] == 2
         assert new_lease["lease_id"] != old_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_reaper_recovers_lost_pending_after_hydration(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-reaper-lost-pending"
+        created = await world.task_state.async_create_task(
+            request_id=request_id,
+            op="sampling.asample",
+            domain_key=world.domain_key,
+            request_json=b'{"prompt":"lost"}',
+            metadata={
+                **sampling_meta(world.domain_key),
+                "user_id": "user-a",
+                "apikey_id": "key-a",
+                "throttle_principal": "apikey:key-a",
+                "affinity_group": "lora:session-a:generation:1",
+                "token_cost": 1,
+            },
+        )
+
+        before = await world.observe_scheduler(request_id)
+        reaped = await world.scheduler.reap_lost_pending_tasks(reason="component-test-reaper")
+        stats = await world.scheduler.stats()
+        after = await world.observe_scheduler(request_id)
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        await world.runtime_once()
+
+        assert created["created"] is True
+        assert before.present is False
+        assert reaped["ok"] is True
+        assert reaped["recovered"] == 1
+        assert stats["counters"]["reaper_recovered"] == 1
+        assert after.present is True
+        assert after.location in {"backlog", "assigned"}
+        assert assigned.assigned == 1
+        assert await world.observe_future_status(request_id) == FutureStatus.DONE
+        assert (await world.observe_task(request_id))["status"] == "done"
     finally:
         world.close()
 
