@@ -26,79 +26,121 @@ update the skill instead of reviving old deployment paths.
 |------|-------|
 | Ray head task | `mint-dev-head` |
 | Ray head IP | Read from `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` |
-| Ray Client address | `ray://$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt):10001` |
 | Shell access | No SSH access to the dev head; attach only through Ray Client |
-| API port | `8000` |
-| Code checkout | `/vePFS-Mindverse/share/mint/dev/mint-server` |
-| Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
+| API port | `8000` (code default) |
+| Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` (launcher default) |
 | Ray namespace | `mint_${USER}` with a non-root user name |
-| Public config | `/vePFS-Mindverse/share/mint/dev/config/common.env` |
 | Private config | `/vePFS-Mindverse/share/mint/dev/config/secrets.env` |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
 
-Dev config is split deliberately:
-- `common.env`: non-secret deployment config such as port, Ray address, runtime
-  root, code root, namespace, log path, model lists, and feature flags.
-- `secrets.env`: private values such as API keys or credentials. Source it only
-  when needed; never print it, commit it, or paste its contents into logs.
-
-Use `/vePFS-Mindverse/share/mint/dev/config/common.env` as the dev server startup contract.
 The dev Ray head is reachable only as a Ray Client endpoint. Do not use
 historical `ssh mint-dev` commands.
 
-Dev namespaces are user-scoped. Derive them from the effective non-root user:
+### Launch contract: minimal inputs
 
-```bash
-MINT_DEV_USER="${MINT_DEV_USER:-${USER:-$(id -un)}}"
-if [ -z "${MINT_DEV_USER}" ] || [ "${MINT_DEV_USER}" = "root" ]; then
-  echo "error: dev Ray namespace requires a non-root user name" >&2
-  exit 1
-fi
-export MINT_RAY_NAMESPACE="mint_${MINT_DEV_USER}"
-```
+`scripts/start_dev_server.sh` is the dev launcher. It takes the smallest
+possible input set and lets everything else fall back to code defaults
+(host/port, `LD_LIBRARY_PATH`, vLLM child python, HF modules, supported-model
+list). It does NOT source a shared `common.env`; that historical file hardcodes
+a fixed code checkout and a shared Ray namespace, which the per-launch contract
+forbids.
 
-Do not hard-code shared namespaces such as `tinker_leixiang` in dev commands.
+| Variable | Role | Source |
+|----------|------|--------|
+| `MINT_CODE_ROOT` | mint-server checkout to run | **required, no default** |
+| `MINT_RAY_NAMESPACE` | actor namespace | derived `mint_<user>`, refuses root/empty |
+| `PFS_RUNTIME_ENV_ROOT` | prebuilt host-venv (interpreter + torch/vllm), not business code | defaults to dev runtime |
+| `MINT_RAY_HEAD_ADDRESS_PATH` | head-address file; server reads live head IP | defaults to canonical dev path |
+| `MINT_TMP_ROOT` | scratch root | defaults to dev tmp |
+| `MINT_DEV_DEPLOYMENT_ENV` | optional deployment policy (models, placement, prewarm, OTEL) | optional; must not set code root or namespace |
+
+`MINT_CODE_ROOT` has no default on purpose: the launcher never silently runs the
+shared `/vePFS-Mindverse/share/mint/dev/mint-server` checkout. If it is unset,
+the launcher refuses. **Ask the user which checkout to run** before launching;
+do not guess.
+
+`MINT_RAY_NAMESPACE` is user-scoped. The launcher derives `mint_<user>` from the
+effective non-root user and refuses `mint`, `root`, `mint_root`, or empty. **If
+the namespace cannot be derived (for example you run as root), ask the user**
+for `MINT_RAY_NAMESPACE` or `MINT_DEV_USER` instead of inventing one. Do not
+hard-code shared namespaces such as `tinker_leixiang`.
+
+`secrets.env` holds private values (API keys, credentials). Source it only when
+needed; never print it, commit it, or paste its contents into logs.
 
 ## Code Versioning
 
-The dev server code is managed as a PFS git checkout. Do not use file sync tools.
-Because the current dev head has no SSH shell access, update the checkout from a
-machine that has the PFS mounted, then record the branch and commit SHA before
-testing.
+The dev server code is whatever checkout you pass as `MINT_CODE_ROOT`. Manage it
+as a git checkout; do not use file sync tools. Record the branch and commit SHA
+before testing.
 
 ```bash
-cd /vePFS-Mindverse/share/mint/dev/mint-server
+cd "${MINT_CODE_ROOT}"
 git fetch origin
 git status --short --branch
 git rev-parse HEAD
 ```
 
-For issue branches, checkout the requested remote branch in
-`/vePFS-Mindverse/share/mint/dev/mint-server` and record the commit SHA before testing.
+For issue branches, check out the requested branch in your `MINT_CODE_ROOT` and
+record the commit SHA before testing. There is no canonical shared checkout the
+launcher defaults to; the checkout is always an explicit input.
 
 ## Start Or Restart
 
-Use the runtime interpreter from `/vePFS-Mindverse/share/mint/dev/runtime`; do not use system
-Python for server startup or Ray inspection.
+The launcher re-execs into the runtime interpreter under
+`PFS_RUNTIME_ENV_ROOT/host-venv`; do not use system Python for server startup or
+Ray inspection.
 
 The current dev head cannot be entered with SSH, so the old `pkill`/`nohup`
 restart path is invalid. Do not restart the shared dev API process until the
 API process owner/launcher for the Ray-Client-only topology is identified.
 
-For local or issue-scoped dev servers running on a machine with the PFS mounted,
-use the project launcher and point it at the dev Ray head:
+For a local or issue-scoped dev server on a machine with the PFS mounted, the
+one-shot minimal launch is:
 
 ```bash
-cd /vePFS-Mindverse/share/mint/dev/mint-server
-HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-RAY_ADDRESS="ray://${HEAD_IP}:10001" \
-MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
+MINT_CODE_ROOT=/path/to/your/mint-server-checkout \
+MINT_DEV_USER=<you> \
 scripts/start_dev_server.sh
 ```
+
+That is the whole required input: the checkout to run, plus a non-root user for
+the namespace. Runtime root, head address, port, model list, and library paths
+all use defaults. The launcher prints the resolved contract to stderr before
+starting; review it. Override a default only when needed, for example:
+
+```bash
+MINT_CODE_ROOT=/path/to/checkout MINT_DEV_USER=<you> \
+PFS_RUNTIME_ENV_ROOT=/path/to/other/runtime \
+MINT_DEV_DEPLOYMENT_ENV=/path/to/deployment.env \
+scripts/start_dev_server.sh
+```
+
+If `MINT_CODE_ROOT` is missing the launcher refuses; ask the user which checkout
+to run. If the namespace resolves to root the launcher refuses; ask the user for
+`MINT_RAY_NAMESPACE` or `MINT_DEV_USER`.
 
 After any code change, restart the server before validating behavior. Python
 servers do not hot-reload. In the Ray-Client-only dev topology, treat shared
 server restart as blocked unless the current API launcher is known.
+
+### Issue-scoped servers
+
+There is no separate issue launcher. Isolation between concurrent dev servers
+comes entirely from the Ray namespace: every control-plane actor is looked up
+with `namespace=`, so a per-launch `mint_<user>` (or issue-scoped) namespace
+already gives the server its own scheduler, task-store, and cron actors. Run an
+isolated issue server with `start_dev_server.sh` plus a scoped namespace, port,
+and log, and any issue-specific tuning as plain env vars:
+
+```bash
+MINT_CODE_ROOT=/path/to/issue/checkout \
+MINT_RAY_NAMESPACE=mint_<you>_issue_<n> \
+MINT_PORT=10416 \
+MINT_LOG_FILE=/tmp/mint_server_issue_<n>.log \
+MINT_DISABLE_MINT_ROUTE=1 MINT_UVICORN_WORKERS=1 \
+scripts/start_dev_server.sh
+```
 
 ## Issue-Scoped Cleanup
 
@@ -264,5 +306,9 @@ credential files, signed requests, or process environments.
 - Do not source or print private config unless the task requires it.
 - Do not switch ports to hide a failed restart; fix the listener or process that
   owns port `8000`.
-- Do not install packages until the runtime root and `PYTHONPATH` from
-  `/vePFS-Mindverse/share/mint/dev/config/common.env` have been verified.
+- Do not default `MINT_CODE_ROOT` to the shared dev checkout. It is a required,
+  explicit input; ask the user which checkout to run.
+- Do not invent a Ray namespace. Derive `mint_<user>`; if that resolves to root
+  or is otherwise unavailable, ask the user.
+- Do not install packages until the runtime root (`PFS_RUNTIME_ENV_ROOT`) and the
+  resolved `PYTHONPATH` have been verified.

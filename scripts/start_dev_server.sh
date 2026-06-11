@@ -1,60 +1,134 @@
 #!/bin/sh
 set -eu
 
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$repo_root"
+# Minimal one-shot dev launcher for mint-server.
+#
+# Contract: supply the smallest possible set of inputs; everything else uses
+# code defaults (host/port, LD_LIBRARY_PATH, vLLM child python, HF modules,
+# supported-model list). This script deliberately does NOT source the legacy
+# shared common.env, because that file hardcodes a fixed code checkout and a
+# shared Ray namespace, both of which must be chosen per launch.
+#
+# Required (script refuses to start if absent):
+#   MINT_CODE_ROOT   mint-server checkout to run. No default: never silently
+#                    runs the shared /vePFS-Mindverse/share/mint/dev checkout.
+#
+# Derived (override only if needed):
+#   MINT_RAY_NAMESPACE        mint_<user>; refuses root/empty.
+#   PFS_RUNTIME_ENV_ROOT      prebuilt host-venv (interpreter + torch/vllm/...),
+#                             not business code; defaults to the dev runtime.
+#   MINT_RAY_HEAD_ADDRESS_PATH  canonical head-address file; server reads the
+#                             live head IP from it at init.
+#   MINT_TMP_ROOT             scratch root for TMPDIR/cache.
+#
+# Optional:
+#   MINT_DEV_DEPLOYMENT_ENV   extra deployment policy (model list, placement,
+#                             prewarm, OTEL). Must NOT set MINT_CODE_ROOT or
+#                             MINT_RAY_NAMESPACE; those are rejected below.
 
-set -a
-dev_config_env="${MINT_DEV_CONFIG_ENV:-/vePFS-Mindverse/share/mint/dev/config/common.env}"
-if [ ! -r "${dev_config_env}" ]; then
-  echo "missing dev config: ${dev_config_env}" >&2
-  exit 1
-fi
-. "${dev_config_env}"
-dev_secrets_env="${MINT_DEV_SECRETS_ENV:-/vePFS-Mindverse/share/mint/dev/config/secrets.env}"
-if [ -r "${dev_secrets_env}" ]; then
-  . "${dev_secrets_env}"
-fi
-set +a
-
-if [ -z "${MINT_RUNTIME_CHECKPOINT_DIR:-}" ]; then
-  export MINT_RUNTIME_CHECKPOINT_DIR="/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints"
-fi
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
-  export MINT_CODE_ROOT="$repo_root"
-fi
-
-api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"
-api_tmp_link="/tmp/mda"
-mkdir -p "$api_tmp_root"
-if [ -L "$api_tmp_link" ] || [ -f "$api_tmp_link" ]; then
-  rm -f "$api_tmp_link"
-elif [ -e "$api_tmp_link" ]; then
-  echo "refusing to replace non-link temp path: $api_tmp_link" >&2
+  echo "error: MINT_CODE_ROOT is required (mint-server checkout to run)." >&2
+  echo "       Ask which checkout to use; do not default to the shared dev tree." >&2
   exit 1
 fi
-ln -s "$api_tmp_root" "$api_tmp_link"
+if [ ! -d "${MINT_CODE_ROOT}" ]; then
+  echo "error: MINT_CODE_ROOT does not exist: ${MINT_CODE_ROOT}" >&2
+  exit 1
+fi
+cd "${MINT_CODE_ROOT}"
 
+mint_user="${MINT_DEV_USER:-${USER:-$(id -un)}}"
+if [ -z "${mint_user}" ] || [ "${mint_user}" = "root" ]; then
+  echo "error: cannot derive a non-root dev Ray namespace (user=${mint_user:-unset})." >&2
+  echo "       Set MINT_RAY_NAMESPACE=mint_<you> or MINT_DEV_USER=<you>." >&2
+  exit 1
+fi
+export MINT_RAY_NAMESPACE="${MINT_RAY_NAMESPACE:-mint_${mint_user}}"
+case "${MINT_RAY_NAMESPACE}" in
+  ""|mint|root|mint_root)
+    echo "error: refusing shared/root namespace: ${MINT_RAY_NAMESPACE}" >&2
+    exit 1
+    ;;
+esac
+
+export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
+export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
+export MINT_RAY_JOB_WORKING_DIR="${MINT_RAY_JOB_WORKING_DIR:-${MINT_CODE_ROOT}}"
+# Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH. The driver must attach as
+# a Ray client (ray://...:10001); the file holds a bare IP that the server would
+# normalize to the GCS port (...:6379) and try to direct-attach, which hangs on a
+# driver-only API host. We read the IP here and set the client/direct addresses.
+ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt}"
+unset MINT_RAY_HEAD_ADDRESS_PATH || true
+export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint/dev/tmp}"
+
+deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
+if [ -n "${deployment_env}" ]; then
+  if [ ! -r "${deployment_env}" ]; then
+    echo "error: MINT_DEV_DEPLOYMENT_ENV not readable: ${deployment_env}" >&2
+    exit 1
+  fi
+  if grep -Eq '^[[:space:]]*export[[:space:]]+(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH)=' "${deployment_env}"; then
+    echo "error: ${deployment_env} must not set MINT_CODE_ROOT, the Ray namespace," >&2
+    echo "       or MINT_RAY_HEAD_ADDRESS_PATH (those are per-launch inputs)." >&2
+    exit 1
+  fi
+  set -a
+  . "${deployment_env}"
+  set +a
+  export MINT_CODE_ROOT MINT_RAY_NAMESPACE PFS_RUNTIME_ENV_ROOT
+fi
+
+api_tmp_root="${MINT_TMP_ROOT}/api/${mint_user}"
+api_tmp_link="/tmp/mda"
+mkdir -p "${api_tmp_root}"
+if [ -L "${api_tmp_link}" ] || [ -f "${api_tmp_link}" ]; then
+  rm -f "${api_tmp_link}"
+elif [ -e "${api_tmp_link}" ]; then
+  echo "error: refusing to replace non-link temp path: ${api_tmp_link}" >&2
+  exit 1
+fi
+ln -s "${api_tmp_root}" "${api_tmp_link}"
 export TMPDIR="${api_tmp_link}/t"
 export XDG_CACHE_HOME="${api_tmp_link}/c"
-mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}" "${MINT_RUNTIME_CHECKPOINT_DIR}"
+mkdir -p "${TMPDIR}" "${XDG_CACHE_HOME}"
 
-ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/mint/dev/mint-server/ray_head_ip.txt}"
 ray_head_ip=""
-if [ -r "$ray_head_ip_path" ]; then
-  ray_head_ip=$(tr -d '[:space:]' < "$ray_head_ip_path")
+if [ -r "${ray_head_ip_path}" ]; then
+  ray_head_ip=$(tr -d '[:space:]' < "${ray_head_ip_path}")
 fi
-if [ -n "$ray_head_ip" ]; then
-  case "${RAY_ADDRESS:-}" in
-    ray://*) ;;
-    *:6379|"") export RAY_ADDRESS="ray://${ray_head_ip}:10001" ;;
-  esac
+# Driver attaches as a Ray client; actors get the direct GCS address as a hint.
+if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
+  export MINT_RAY_CLIENT_ADDRESS="ray://${ray_head_ip}:10001"
+fi
+if [ -z "${RAY_CLIENT_ADDRESS:-}" ] && [ -n "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
+  export RAY_CLIENT_ADDRESS="${MINT_RAY_CLIENT_ADDRESS}"
+fi
+if [ -z "${RAY_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
+  export RAY_ADDRESS="${ray_head_ip}:6379"
 fi
 if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
-  case "${RAY_ADDRESS:-}" in
-    ray://*) export MINT_RAY_CLIENT_ADDRESS="${RAY_ADDRESS}" ;;
-  esac
+  echo "error: no Ray head address. Expected an IP in ${ray_head_ip_path}" >&2
+  echo "       or set MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 explicitly." >&2
+  exit 1
 fi
 
-"${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/bootstrap_control_plane.py
-exec "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python" scripts/run_server.py
+py="${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python"
+if [ ! -x "${py}" ]; then
+  echo "error: runtime python not found: ${py}" >&2
+  exit 1
+fi
+
+echo "=== mint-dev launch contract ===" >&2
+echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
+echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
+echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
+echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS}" >&2
+echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2
+echo "ray head ip source        ${ray_head_ip_path}" >&2
+echo "MINT_TMP_ROOT             ${MINT_TMP_ROOT}" >&2
+echo "MINT_DEV_DEPLOYMENT_ENV   ${deployment_env:-<none, code defaults>}" >&2
+echo "================================" >&2
+
+"${py}" scripts/bootstrap_control_plane.py
+exec "${py}" scripts/run_server.py
