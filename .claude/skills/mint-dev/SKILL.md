@@ -53,6 +53,13 @@ forbids.
 | `MINT_RAY_HEAD_ADDRESS_PATH` | head-address file; server reads live head IP | defaults to canonical dev path |
 | `MINT_TMP_ROOT` | scratch root | defaults to dev tmp |
 | `MINT_DEV_DEPLOYMENT_ENV` | optional deployment policy (models, placement, prewarm, OTEL) | optional; must not set code root or namespace |
+| `MINT_RAY_JOB_WORKING_DIR` | (not recommended) Ray working_dir override | leave unset |
+
+Do **not** set `MINT_RAY_JOB_WORKING_DIR`. Workers access code via `PYTHONPATH`
+which already points at PFS paths — no upload needed. Setting this variable
+causes Ray to package and upload the entire directory over the Ray Client
+connection (~100 MB per job). Leave it unset; a missing module will fail loudly
+at import time rather than silently using uploaded stale code.
 
 `MINT_CODE_ROOT` has no default on purpose: the launcher never silently runs the
 shared `/vePFS-Mindverse/share/mint/dev/mint-server` checkout. If it is unset,

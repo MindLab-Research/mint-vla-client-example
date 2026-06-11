@@ -53,7 +53,9 @@ esac
 
 export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
 export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
-export MINT_RAY_JOB_WORKING_DIR="${MINT_RAY_JOB_WORKING_DIR:-${MINT_CODE_ROOT}}"
+# Do NOT set MINT_RAY_JOB_WORKING_DIR. Workers access code via PYTHONPATH which
+# already points at PFS paths. Setting this variable causes Ray to package and
+# upload the entire directory over the Ray Client connection (~100 MB per job).
 # Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH. The driver must attach as
 # a Ray client (ray://...:10001); the file holds a bare IP that the server would
 # normalize to the GCS port (...:6379) and try to direct-attach, which hangs on a
@@ -77,6 +79,13 @@ if [ -n "${deployment_env}" ]; then
   . "${deployment_env}"
   set +a
   export MINT_CODE_ROOT MINT_RAY_NAMESPACE PFS_RUNTIME_ENV_ROOT
+fi
+
+secrets_env="${MINT_DEV_SECRETS_ENV:-/vePFS-Mindverse/share/mint/dev/config/secrets.env}"
+if [ -r "${secrets_env}" ]; then
+  set -a
+  . "${secrets_env}"
+  set +a
 fi
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${mint_user}"
