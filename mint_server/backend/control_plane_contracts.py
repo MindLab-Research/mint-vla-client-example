@@ -462,9 +462,11 @@ class AssignPendingResult(WireCompatibleResult):
     assigned: int
     skipped_domains: list[str] = field(default_factory=list)
     reason: ConflictReason | str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "assigned": self.assigned,
             "skipped_domains": list(self.skipped_domains),
@@ -478,6 +480,7 @@ class AssignPendingResult(WireCompatibleResult):
             assigned=int(data.get("assigned") or 0),
             skipped_domains=[str(value) for value in data.get("skipped_domains") or []],
             reason=_reason_from_wire(data.get("reason")),
+            extra=_extra_wire_fields(data, {"ok", "assigned", "skipped_domains", "reason"}),
         )
 
 

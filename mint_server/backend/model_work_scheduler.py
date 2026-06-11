@@ -1230,11 +1230,11 @@ class _ModelWorkSchedulerActor:
             self._drop_empty_backlog(domain_key)
         return pending, skipped_domains
 
-    async def _assign_pending_unlocked(self, *, max_items: int | None = None) -> dict[str, Any]:
+    async def _assign_pending_unlocked(self, *, max_items: int | None = None) -> AssignPendingResult:
         async with self._cv:
             pending, skipped_domains = self._prepare_assignments_locked(max_items=max_items)
             if not pending:
-                return {"ok": True, "assigned": 0, "skipped_domains": skipped_domains}
+                return AssignPendingResult(ok=True, assigned=0, skipped_domains=skipped_domains)
         assigned_count = 0
         for index, assigned in enumerate(pending):
             try:
@@ -1267,22 +1267,22 @@ class _ModelWorkSchedulerActor:
                     self._commit_assigned_locked(assigned)
                     assigned_count += 1
                     self._cv.notify_all()
-        return {"ok": True, "assigned": assigned_count, "skipped_domains": skipped_domains}
+        return AssignPendingResult(ok=True, assigned=assigned_count, skipped_domains=skipped_domains)
 
     async def _assign_pending_if_no_inflight_unlocked(
         self,
         *,
         hydrate_task_state: bool = True,
-    ) -> dict[str, Any]:
+    ) -> AssignPendingResult:
         async with self._cv:
             if self._has_inflight_scheduler_transition_locked():
-                return {
-                    "ok": True,
-                    "assigned": 0,
-                    "skipped_domains": [],
-                    "deferred": "inflight_scheduler_transition",
-                }
-        return await self.assign_pending(hydrate_task_state=hydrate_task_state)
+                return AssignPendingResult(
+                    ok=True,
+                    assigned=0,
+                    skipped_domains=[],
+                    extra={"deferred": "inflight_scheduler_transition"},
+                )
+        return AssignPendingResult.from_wire(await self.assign_pending(hydrate_task_state=hydrate_task_state))
 
     def _remove_request_from_memory_locked(self, request_id: str) -> bool:
         request_id = str(request_id)
@@ -1897,18 +1897,19 @@ class _ModelWorkSchedulerActor:
         requeued = 0
         async with self._cv:
             if self._has_inflight_scheduler_transition_locked():
+                assigned = AssignPendingResult(
+                    ok=True,
+                    assigned=0,
+                    skipped_domains=[],
+                    extra={"deferred": "inflight_scheduler_transition"},
+                )
                 return {
                     "ok": True,
                     "replicas": len(self._replicas),
                     "removed": 0,
                     "requeued": 0,
                     "expired": 0,
-                    "assigned": {
-                        "ok": True,
-                        "assigned": 0,
-                        "skipped_domains": [],
-                        "deferred": "inflight_scheduler_transition",
-                    },
+                    "assigned": assigned.to_wire(),
                     "deferred": "inflight_scheduler_transition",
                 }
             previous_replicas = dict(self._replicas)
@@ -2017,7 +2018,7 @@ class _ModelWorkSchedulerActor:
             "removed": removed_count,
             "requeued": requeued + expired,
             "expired": expired,
-            "assigned": assigned_pending,
+            "assigned": assigned_pending.to_wire(),
         }
 
     async def assign_pending(
@@ -2034,8 +2035,13 @@ class _ModelWorkSchedulerActor:
                 await self._ensure_task_state_owner()
         expired = await self._expire_leases_unlocked(now=time.time())
         out = await self._assign_pending_unlocked(max_items=max_items)
-        out["expired"] = expired
-        return out
+        return AssignPendingResult(
+            ok=out.ok,
+            assigned=out.assigned,
+            skipped_domains=list(out.skipped_domains),
+            reason=out.reason,
+            extra={**dict(out.extra), "expired": expired},
+        ).to_wire()
 
     def _validate_claimer(
         self,
