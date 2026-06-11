@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.control_plane_contracts import ExecutorOutcome, LeaseToken
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_runtime_actor import (
     ModelRuntimeActor,
@@ -14,10 +14,8 @@ from mint_server.backend.model_runtime_actor import (
     get_or_create_model_runtime_actor,
 )
 from mint_server.backend.model_work_execution_context import (
-    ModelWorkFinalize,
     get_current_model_work_consumer_generation,
     get_current_model_work_consumer_id,
-    get_current_model_work_finalize_buffer,
     get_current_model_work_lease_id,
 )
 from mint_server.backend.task_payload_store import TaskPayloadStore
@@ -105,6 +103,18 @@ class _FakeScheduler:
         self.assigned: list[dict] = []
         self.request_id_by_lease_id: dict[str, str] = {}
 
+    def _kwargs_with_lease_fields(self, kwargs: dict, *, include_full: bool = False) -> dict:
+        lease = kwargs.pop("lease", None)
+        if lease is None:
+            return kwargs
+        token = lease if isinstance(lease, LeaseToken) else LeaseToken.from_wire(dict(lease))
+        token_kwargs = token.to_wire()
+        if not include_full:
+            token_kwargs.pop("request_id", None)
+            token_kwargs.pop("attempt_id", None)
+            token_kwargs.pop("scheduler_epoch", None)
+        return {**token_kwargs, **kwargs}
+
     async def claim(self, **kwargs):
         self.claim_calls.append(kwargs)
         if not self.claims:
@@ -115,22 +125,26 @@ class _FakeScheduler:
         return {"ok": True, "leases": leases}
 
     async def renew(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs)
         self.renewed.append(kwargs)
         return {"ok": True, **kwargs}
 
     async def begin_finalize(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs)
         self.begin_finalized.append(kwargs)
         if not self.begin_finalize_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {"ok": True, **kwargs}
 
     async def complete(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs)
         self.completed.append(kwargs)
         if not self.complete_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {"ok": True, **kwargs}
 
     async def finish_success(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs, include_full=True)
         self.finished_success.append(kwargs)
         if self.finish_success_error is not None:
             raise self.finish_success_error
@@ -143,6 +157,7 @@ class _FakeScheduler:
         }
 
     async def finish_failure(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs, include_full=True)
         self.finished_failure.append(kwargs)
         if self.finish_failure_error is not None:
             raise self.finish_failure_error
@@ -153,6 +168,7 @@ class _FakeScheduler:
         }
 
     async def fail(self, **kwargs):
+        kwargs = self._kwargs_with_lease_fields(kwargs)
         self.failed.append(kwargs)
         return {"ok": True, **kwargs}
 
@@ -183,28 +199,12 @@ class _FakeTaskFutureService:
         return {"model_work_attempt_id": "current-attempt"}
 
     async def async_resolve(self, request_id: str, result, *, billing_observations=None):
-        buffer = get_current_model_work_finalize_buffer()
-        if buffer is not None:
-            buffer.finalization = ModelWorkFinalize(
-                kind="resolve",
-                request_id=str(request_id),
-                payload=result,
-                billing_observations=billing_observations,
-            )
-            return
+        _ = billing_observations
         if self.fail_terminal_write:
             raise RuntimeError("task state terminal write failed")
         self.resolved.append((request_id, result))
 
     async def async_fail(self, request_id: str, error: str):
-        buffer = get_current_model_work_finalize_buffer()
-        if buffer is not None:
-            buffer.finalization = ModelWorkFinalize(
-                kind="fail",
-                request_id=str(request_id),
-                payload=str(error),
-            )
-            return
         if self.fail_terminal_write:
             raise RuntimeError("task state terminal write failed")
         self.failed.append((request_id, str(error)))
@@ -298,7 +298,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     task_state_store = _FakeTaskStateStore()
     seen_context: list[tuple[str | None, str | None, int | None]] = []
 
-    async def _executor(_lease: dict) -> None:
+    async def _executor(_lease: dict) -> ExecutorOutcome:
         seen_context.append(
             (
                 get_current_model_work_lease_id(),
@@ -307,7 +307,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
             )
         )
         await asyncio.sleep(0.16)
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -394,10 +394,10 @@ async def test_issue_616_model_runtime_finishes_success_via_scheduler(tmp_path) 
         }
     ]
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(
-            _lease["item"]["request_id"],
-            {"ok": True},
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(
+            kind="success",
+            payload={"ok": True},
             billing_observations=billing_observations,
         )
 
@@ -521,8 +521,8 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
     )
     task_state_store = _FakeTaskStateStore()
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -720,6 +720,7 @@ async def test_issue_593_model_runtime_dead_actor_exception_requeues_gpu_actor_d
 async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease() -> None:
     lease = _lease("runtime-req-timeout")
     lease["item"]["op"] = "training.save_weights_for_sampler"
+    lease["consumer_id"] = "training:Qwen/Qwen3-0.6B::replica-0::generation::3"
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
@@ -869,8 +870,8 @@ async def test_issue_648_vllm_runtime_uses_dynamic_token_budget_for_claim() -> N
         budget_calls += 1
         return 604124
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -981,12 +982,12 @@ async def test_issue_648_model_runtime_executes_claimed_vllm_leases_concurrently
     started: list[str] = []
     release = asyncio.Event()
 
-    async def _executor(lease: dict) -> None:
+    async def _executor(lease: dict) -> ExecutorOutcome:
         started.append(lease["item"]["request_id"])
         if len(started) == 2:
             release.set()
         await asyncio.wait_for(release.wait(), timeout=1)
-        await task_futures.async_resolve(lease["item"]["request_id"], {"ok": True})
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1023,10 +1024,10 @@ async def test_model_runtime_renews_pending_sequential_leases() -> None:
     task_state_store = _FakeTaskStateStore()
     started: list[str] = []
 
-    async def _executor(lease: dict) -> None:
+    async def _executor(lease: dict) -> ExecutorOutcome:
         started.append(lease["item"]["request_id"])
         await asyncio.sleep(0.16)
-        await task_futures.async_resolve(lease["item"]["request_id"], {"ok": True})
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="bumblebee:model-a",
@@ -1057,8 +1058,8 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_fail(_lease["item"]["request_id"], "engine startup failed")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="user_error", error="engine startup failed")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1100,8 +1101,8 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
     )
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1137,8 +1138,8 @@ async def test_issue_593_model_runtime_completes_without_task_state_finalize_met
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1172,8 +1173,8 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1204,8 +1205,8 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
         fail_terminal_write=True,
     )
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1229,8 +1230,8 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     task_futures = _FakeTaskFutureService(statuses={})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1254,8 +1255,8 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1396,8 +1397,8 @@ async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1490,8 +1491,8 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
 
-    async def _executor(_lease: dict) -> None:
-        await task_futures.async_fail(_lease["item"]["request_id"], "engine startup failed")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="user_error", error="engine startup failed")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -1547,12 +1548,11 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
         }
     )
 
-    async def _executor(lease: dict) -> None:
+    async def _executor(lease: dict) -> ExecutorOutcome:
         request_id = lease["item"]["request_id"]
         if request_id == failed_lease["item"]["request_id"]:
-            await task_futures.async_fail(request_id, "engine startup failed")
-            return
-        await task_futures.async_resolve(request_id, {"ok": True})
+            return ExecutorOutcome(kind="user_error", error="engine startup failed")
+        return ExecutorOutcome(kind="success", payload={"ok": True})
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",

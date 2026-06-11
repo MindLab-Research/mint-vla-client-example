@@ -130,6 +130,19 @@ class LeaseToken(WireCompatibleResult):
         )
 
 
+def _lease_kwargs(kwargs: dict[str, Any], *, include_full: bool = False) -> dict[str, Any]:
+    lease = kwargs.pop("lease", None)
+    if lease is None:
+        return kwargs
+    token = lease if isinstance(lease, LeaseToken) else LeaseToken.from_wire(dict(lease))
+    token_kwargs = token.to_wire()
+    if not include_full:
+        token_kwargs.pop("request_id", None)
+        token_kwargs.pop("attempt_id", None)
+        token_kwargs.pop("scheduler_epoch", None)
+    return {**token_kwargs, **kwargs}
+
+
 @dataclass(frozen=True, eq=False)
 class SubmitTaskResult(WireCompatibleResult):
     ok: bool
@@ -999,9 +1012,7 @@ class AsyncSchedulerQueue(Protocol):
     async def renew(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         lease_ttl_s: float = 30.0,
         timeout_s: float | None = None,
     ) -> RenewResult: ...
@@ -1009,9 +1020,7 @@ class AsyncSchedulerQueue(Protocol):
     async def begin_finalize(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         finalize_ttl_s: float = 30.0,
         staged_payload_path: str | None = None,
         timeout_s: float | None = None,
@@ -1020,21 +1029,14 @@ class AsyncSchedulerQueue(Protocol):
     async def complete(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         timeout_s: float | None = None,
     ) -> FinishResult: ...
 
     async def finish_success(
         self,
         *,
-        request_id: str,
-        lease_id: str,
-        attempt_id: str,
-        scheduler_epoch: int,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         result_path: str,
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
@@ -1045,12 +1047,7 @@ class AsyncSchedulerQueue(Protocol):
     async def finish_failure(
         self,
         *,
-        request_id: str,
-        lease_id: str,
-        attempt_id: str,
-        scheduler_epoch: int,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         error: str,
         result_path: str | None = None,
         result_checksum: str | None = None,
@@ -1061,9 +1058,7 @@ class AsyncSchedulerQueue(Protocol):
     async def fail(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         requeue: bool = True,
         reason: str = "failed",
         abort_finalize: bool = False,
@@ -1073,9 +1068,7 @@ class AsyncSchedulerQueue(Protocol):
     async def validate(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         timeout_s: float | None = None,
     ) -> ValidateLeaseResult: ...
 
@@ -1280,6 +1273,7 @@ class InProcessSchedulerQueueAdapter:
         return ClaimResult.from_wire(out)
 
     async def renew(self, **kwargs: Any) -> RenewResult:
+        kwargs = _lease_kwargs(kwargs)
         kwargs.pop("timeout_s", None)
         out = await self.actor.renew_lease(**kwargs)
         if isinstance(out, LeaseResult):
@@ -1287,6 +1281,7 @@ class InProcessSchedulerQueueAdapter:
         return RenewResult.from_wire(out)
 
     async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
+        kwargs = _lease_kwargs(kwargs)
         kwargs.pop("timeout_s", None)
         out = await self.actor.begin_finalize_lease(**kwargs)
         if isinstance(out, LeaseResult):
@@ -1294,6 +1289,7 @@ class InProcessSchedulerQueueAdapter:
         return LeaseResult.from_wire(out)
 
     async def complete(self, **kwargs: Any) -> FinishResult:
+        kwargs = _lease_kwargs(kwargs)
         kwargs.pop("timeout_s", None)
         out = await self.actor.complete_lease(**kwargs)
         if isinstance(out, FinishResult):
@@ -1301,6 +1297,7 @@ class InProcessSchedulerQueueAdapter:
         return FinishResult.from_wire(out)
 
     async def finish_success(self, **kwargs: Any) -> FinishResult:
+        kwargs = _lease_kwargs(kwargs, include_full=True)
         kwargs.pop("timeout_s", None)
         out = await self.actor.finish_lease_success(**kwargs)
         if isinstance(out, FinishResult):
@@ -1308,6 +1305,7 @@ class InProcessSchedulerQueueAdapter:
         return FinishResult.from_wire(out)
 
     async def finish_failure(self, **kwargs: Any) -> FinishResult:
+        kwargs = _lease_kwargs(kwargs, include_full=True)
         kwargs.pop("timeout_s", None)
         out = await self.actor.finish_lease_failure(**kwargs)
         if isinstance(out, FinishResult):
@@ -1315,6 +1313,7 @@ class InProcessSchedulerQueueAdapter:
         return FinishResult.from_wire(out)
 
     async def fail(self, **kwargs: Any) -> FailLeaseResult:
+        kwargs = _lease_kwargs(kwargs)
         kwargs.pop("timeout_s", None)
         out = await self.actor.fail_lease(**kwargs)
         if isinstance(out, FailLeaseResult):
@@ -1322,6 +1321,7 @@ class InProcessSchedulerQueueAdapter:
         return FailLeaseResult.from_wire(out)
 
     async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
+        kwargs = _lease_kwargs(kwargs)
         kwargs.pop("timeout_s", None)
         out = await self.actor.validate_lease(**kwargs)
         if isinstance(out, ValidateLeaseResult):

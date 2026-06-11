@@ -32,6 +32,7 @@ from .control_plane_contracts import (
     FailLeaseResult,
     FinishResult,
     LeaseResult,
+    LeaseToken,
     OwnerLeaseResult,
     RenewResult,
     SyncReplicasResult,
@@ -80,6 +81,31 @@ def _ray_model_work_scheduler_actor_name() -> str:
     if env_value:
         return str(env_value)
     return str(getattr(server_config, "model_work_scheduler_actor_name", "mint_model_work_scheduler"))
+
+
+def _lease_token_from_kwargs(kwargs: dict[str, Any], *, require_full: bool = False) -> LeaseToken:
+    lease = kwargs.pop("lease", None)
+    if lease is not None:
+        return lease if isinstance(lease, LeaseToken) else LeaseToken.from_wire(dict(lease))
+    if require_full:
+        return LeaseToken.from_wire(
+            {
+                "request_id": kwargs.pop("request_id"),
+                "lease_id": kwargs.pop("lease_id"),
+                "attempt_id": kwargs.pop("attempt_id"),
+                "scheduler_epoch": kwargs.pop("scheduler_epoch"),
+                "consumer_id": kwargs.pop("consumer_id"),
+                "consumer_generation": kwargs.pop("consumer_generation"),
+            }
+        )
+    return LeaseToken(
+        request_id=str(kwargs.pop("request_id", "")),
+        lease_id=str(kwargs.pop("lease_id")),
+        attempt_id=str(kwargs.pop("attempt_id", "")),
+        scheduler_epoch=int(kwargs.pop("scheduler_epoch", 0)),
+        consumer_id=str(kwargs.pop("consumer_id")),
+        consumer_generation=int(kwargs.pop("consumer_generation")),
+    )
 
 
 def _otel_metric_attrs() -> dict[str, str]:
@@ -3646,18 +3672,16 @@ class ModelWorkSchedulerClient:
     async def renew_lease(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         lease_ttl_s: float = 30.0,
         timeout_s: float = 10.0,
     ) -> RenewResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.renew_lease.remote(
-                lease_id=str(lease_id),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                lease_id=str(lease.lease_id),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
                 lease_ttl_s=float(lease_ttl_s),
             ),
             timeout_s=timeout_s,
@@ -3667,22 +3691,21 @@ class ModelWorkSchedulerClient:
         return RenewResult.from_wire(out)
 
     async def renew(self, **kwargs: Any) -> RenewResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
         return await self.renew_lease(**kwargs)
 
     async def complete_lease(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         timeout_s: float = 10.0,
     ) -> FinishResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.complete_lease.remote(
-                lease_id=str(lease_id),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                lease_id=str(lease.lease_id),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
             ),
             timeout_s=timeout_s,
         )
@@ -3691,17 +3714,13 @@ class ModelWorkSchedulerClient:
         return FinishResult.from_wire(out)
 
     async def complete(self, **kwargs: Any) -> FinishResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
         return await self.complete_lease(**kwargs)
 
     async def finish_lease_success(
         self,
         *,
-        request_id: str,
-        lease_id: str,
-        attempt_id: str,
-        scheduler_epoch: int,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         result_path: str,
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
@@ -3711,12 +3730,12 @@ class ModelWorkSchedulerClient:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.finish_lease_success.remote(
-                request_id=str(request_id),
-                lease_id=str(lease_id),
-                attempt_id=str(attempt_id),
-                scheduler_epoch=int(scheduler_epoch),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                request_id=str(lease.request_id),
+                lease_id=str(lease.lease_id),
+                attempt_id=str(lease.attempt_id),
+                scheduler_epoch=int(lease.scheduler_epoch),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
                 result_path=str(result_path),
                 result_checksum=result_checksum,
                 result_size_bytes=result_size_bytes,
@@ -3731,12 +3750,7 @@ class ModelWorkSchedulerClient:
     async def finish_lease_failure(
         self,
         *,
-        request_id: str,
-        lease_id: str,
-        attempt_id: str,
-        scheduler_epoch: int,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         error: str,
         result_path: str | None = None,
         result_checksum: str | None = None,
@@ -3746,12 +3760,12 @@ class ModelWorkSchedulerClient:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.finish_lease_failure.remote(
-                request_id=str(request_id),
-                lease_id=str(lease_id),
-                attempt_id=str(attempt_id),
-                scheduler_epoch=int(scheduler_epoch),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                request_id=str(lease.request_id),
+                lease_id=str(lease.lease_id),
+                attempt_id=str(lease.attempt_id),
+                scheduler_epoch=int(lease.scheduler_epoch),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
                 error=str(error),
                 result_path=result_path,
                 result_checksum=result_checksum,
@@ -3764,17 +3778,17 @@ class ModelWorkSchedulerClient:
         return FinishResult.from_wire(out)
 
     async def finish_success(self, **kwargs: Any) -> FinishResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs, require_full=True)
         return await self.finish_lease_success(**kwargs)
 
     async def finish_failure(self, **kwargs: Any) -> FinishResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs, require_full=True)
         return await self.finish_lease_failure(**kwargs)
 
     async def begin_finalize_lease(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         finalize_ttl_s: float = 30.0,
         staged_payload_path: str | None = None,
         timeout_s: float = 10.0,
@@ -3782,9 +3796,9 @@ class ModelWorkSchedulerClient:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.begin_finalize_lease.remote(
-                lease_id=str(lease_id),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                lease_id=str(lease.lease_id),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
                 finalize_ttl_s=float(finalize_ttl_s),
                 staged_payload_path=staged_payload_path,
             ),
@@ -3795,22 +3809,21 @@ class ModelWorkSchedulerClient:
         return LeaseResult.from_wire(out)
 
     async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
         return await self.begin_finalize_lease(**kwargs)
 
     async def validate_lease(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         timeout_s: float = 10.0,
     ) -> ValidateLeaseResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.validate_lease.remote(
-                lease_id=str(lease_id),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                lease_id=str(lease.lease_id),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
             ),
             timeout_s=timeout_s,
         )
@@ -3819,14 +3832,13 @@ class ModelWorkSchedulerClient:
         return ValidateLeaseResult.from_wire(out)
 
     async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
         return await self.validate_lease(**kwargs)
 
     async def fail_lease(
         self,
         *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
+        lease: LeaseToken,
         requeue: bool = True,
         reason: str = "failed",
         abort_finalize: bool = False,
@@ -3835,9 +3847,9 @@ class ModelWorkSchedulerClient:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.fail_lease.remote(
-                lease_id=str(lease_id),
-                consumer_id=str(consumer_id),
-                consumer_generation=int(consumer_generation),
+                lease_id=str(lease.lease_id),
+                consumer_id=str(lease.consumer_id),
+                consumer_generation=int(lease.consumer_generation),
                 requeue=bool(requeue),
                 reason=str(reason),
                 abort_finalize=bool(abort_finalize),
@@ -3849,6 +3861,7 @@ class ModelWorkSchedulerClient:
         return FailLeaseResult.from_wire(out)
 
     async def fail(self, **kwargs: Any) -> FailLeaseResult:
+        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
         return await self.fail_lease(**kwargs)
 
     async def expire_leases(
