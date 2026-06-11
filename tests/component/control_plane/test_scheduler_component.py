@@ -2143,6 +2143,36 @@ async def test_scheduler_component_retrieve_pending_survives_scheduler_restart(t
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path, monkeypatch) -> None:
+    class AbsentScheduler:
+        async def contains_request(self, *, request_id: str, timeout_s: float | None = None) -> dict[str, object]:
+            _ = request_id, timeout_s
+            return {"ok": True, "present": False}
+
+        async def contains(self, **kwargs) -> dict[str, object]:
+            return await self.contains_request(**kwargs)
+
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-retrieve-orphan-pending"
+        await world.enqueue_sampling(request_id, assign=False)
+
+        status_code, payload = await world.retrieve(
+            request_id,
+            monkeypatch,
+            scheduler_override=AbsentScheduler(),
+        )
+
+        assert status_code == 200
+        assert payload["category"] == "system"
+        assert "request must be retried" in payload["error"]
+        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_retrieve_wait_returns_terminal_result(tmp_path, monkeypatch) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:

@@ -221,6 +221,10 @@ class _FakeTaskStateStore:
         self.failures.append(dict(kwargs))
         return {"ok": True, "record": dict(kwargs)}
 
+    async def async_complete_task_failure(self, **kwargs):
+        self.failures.append(dict(kwargs))
+        return {"ok": True, "record": dict(kwargs)}
+
     async def async_requeue_task(self, **kwargs):
         return {"ok": True, "record": dict(kwargs)}
 

@@ -379,11 +379,12 @@ class SchedulerComponentWorld:
         *,
         admin: bool = True,
         wait_timeout_s: float = 0.0,
+        scheduler_override: Any | None = None,
     ) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)
         import mint_server.backend.model_work_scheduler as scheduler_module
 
-        monkeypatch.setattr(scheduler_module, "model_work_scheduler", self.scheduler)
+        monkeypatch.setattr(scheduler_module, "model_work_scheduler", scheduler_override or self.scheduler)
         monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: float(wait_timeout_s))
         monkeypatch.setattr(futures_route, "_is_privileged", lambda _request: bool(admin))
         response = SimpleNamespace(status_code=200, headers={})
