@@ -58,13 +58,10 @@ esac
 
 export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
 export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
-# MINT_RAY_JOB_WORKING_DIR: must point to a PFS path visible to all Ray nodes
-# (head + workers). Never set to a local path like /root/code/mint — Ray will
-# package and upload the entire directory (~100 MB) over the Ray Client
-# connection. MINT_CODE_ROOT must already be a PFS path; it is used as default.
-if [ -z "${MINT_RAY_JOB_WORKING_DIR:-}" ] && echo "${MINT_CODE_ROOT}" | grep -q "^/vePFS"; then
-  export MINT_RAY_JOB_WORKING_DIR="${MINT_CODE_ROOT}"
-fi
+# Do NOT set MINT_RAY_JOB_WORKING_DIR. Even PFS paths cause Ray to package and
+# upload the directory (~100-240 MB) over the Ray Client connection.
+# Workers find mint_server via PFS_PYTHONPATH (built from MINT_CODE_ROOT) which
+# is passed as env_vars to every actor's runtime_env.
 # Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH. The driver must attach as
 # a Ray client (ray://...:10001); the file holds a bare IP that the server would
 # normalize to the GCS port (...:6379) and try to direct-attach, which hangs on a

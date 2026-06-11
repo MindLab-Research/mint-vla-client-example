@@ -175,6 +175,16 @@ def _driver_runtime_env() -> dict[str, Any]:
     if working_dir:
         runtime_env["working_dir"] = working_dir
 
+    # When no working_dir is uploaded, Ray Client serializes actor class
+    # definitions on the head node before per-actor runtime_env takes effect.
+    # The head node's PYTHONPATH does not include MINT_CODE_ROOT, so unpickling
+    # fails with ModuleNotFoundError. Pass PFS_PYTHONPATH as env_vars so the
+    # head node can resolve mint_server without an upload.
+    if not working_dir:
+        from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
+        if PFS_PYTHONPATH:
+            runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = PFS_PYTHONPATH
+
     py_modules_csv = os.environ.get("MINT_RAY_PY_MODULES_CSV", "").strip()
     py_modules: list[str] = []
     if py_modules_csv:
