@@ -2530,7 +2530,7 @@ class VerlTrainingEngine:
         if _is_qwen3_30b_model(model_key):
             train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 4, 1, 1
         elif _is_qwen35_model(model_key):
-            train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 1, 1, 1
+            train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 2, 1, 1
         else:
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_key)
         return DistributedConfig(

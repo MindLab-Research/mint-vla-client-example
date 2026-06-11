@@ -118,7 +118,7 @@ def test_bumblebee_235b_keeps_existing_mint_topology_with_bumblebee_etp(monkeypa
     assert _bumblebee_runtime_etp("Qwen/Qwen3-235B-A22B-Instruct-2507", cfg) == 1
 
 
-def test_bumblebee_qwen35_uses_four_gpu_dense_topology(monkeypatch):
+def test_bumblebee_qwen35_uses_eight_gpu_topology(monkeypatch):
     monkeypatch.delenv("MINT_QWEN35_TRAINING_BACKEND", raising=False)
     engine = VerlTrainingEngine()
 
@@ -128,9 +128,9 @@ def test_bumblebee_qwen35_uses_four_gpu_dense_topology(monkeypatch):
     )
 
     assert cfg.tensor_parallel_size == 4
-    assert cfg.expert_parallel_size == 1
+    assert cfg.expert_parallel_size == 2
     assert cfg.expert_tensor_parallel_size == 1
-    assert cfg.world_size == 4
+    assert cfg.world_size == 8
 
 
 def test_bumblebee_placement_group_name_is_namespace_scoped():
