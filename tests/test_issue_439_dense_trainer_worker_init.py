@@ -538,3 +538,76 @@ def test_issue_561_retire_metadata_failure_does_not_block_recreate(monkeypatch) 
         "auxiliary_failures": ["metadata_update_failed"],
     }
     assert snap["recent_training_incidents"][1]["failure_class"] == "metadata_update_failed"
+
+
+def test_dense_trainer_registers_creating_before_ready_wait(monkeypatch) -> None:
+    """The undesired-GPU-actor reaper kills any mint_dense_* actor not present in
+    the supervisor inventory. The dense trainer must therefore register the actor
+    (creating=True) BEFORE the up-to-600s __ray_ready__ wait, otherwise the actor
+    is unprotected during init and gets reaped mid forward_backward.
+    """
+    from mint_server.backend import dense_trainer as dt
+    from mint_server import config as cfg
+
+    monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
+    monkeypatch.setattr(cfg, "MINT_CODE_ROOT", "/tmp/mint-root")
+    monkeypatch.setattr(cfg, "PFS_HF_MODULES_PATH", "/tmp/hf-modules")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+
+    events: list[tuple[str, object]] = []
+
+    class _ReadyRemote:
+        def remote(self):
+            events.append(("ready_wait", None))
+            return "ready-ref"
+
+    class _FakeActor:
+        def __init__(self) -> None:
+            self.__ray_ready__ = _ReadyRemote()
+
+    class _FakeRemoteBuilder:
+        def remote(self, **_kwargs):
+            return _FakeActor()
+
+    class _FakeTrainingWorker:
+        @staticmethod
+        def options(**_kwargs):
+            return _FakeRemoteBuilder()
+
+    class _FakePool:
+        def get(self, _actor_name: str):
+            return None
+
+        def register(self, **kwargs):
+            return SimpleNamespace(current_session=kwargs.get("session_id"))
+
+        def mark_ready(self, _actor_name: str) -> None:
+            return None
+
+    def _fake_publish(launch, *, ready=True, **_kwargs):
+        events.append(("publish", bool(ready)))
+        return SimpleNamespace(current_session=launch.session_id)
+
+    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    monkeypatch.setattr(dt, "publish_backend_model_actor", _fake_publish)
+    monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        dt.ray, "get_actor", lambda *a, **k: (_ for _ in ()).throw(ValueError("missing"))
+    )
+    monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
+    monkeypatch.setattr(dt, "PlacementGroupSchedulingStrategy", lambda **kwargs: kwargs)
+
+    dt.get_or_create_dense_trainer(
+        training_worker_cls=_FakeTrainingWorker,
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+        lora_rank=8,
+        learning_rate=1e-4,
+        session_id="model-protect",
+    )
+
+    # First inventory publish (creating=True) must happen before the ready wait.
+    assert events[0] == ("publish", False), events
+    assert ("ready_wait", None) in events
+    assert events.index(("publish", False)) < events.index(("ready_wait", None))
+    # And a ready=True publish must follow once init completes.
+    assert ("publish", True) in events
