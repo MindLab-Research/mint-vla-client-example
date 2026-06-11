@@ -12,10 +12,11 @@ set -eu
 # Required (script refuses to start if absent):
 #   MINT_CODE_ROOT   Your personal mint-server checkout under /vePFS-Mindverse/share/.
 #                    Must be visible to all Ray nodes (head + workers).
-#                    Do NOT use: /root/code/mint (local, Ray head can't see it),
+#                    Do NOT use: local paths (Ray head can't see them),
 #                    /vePFS-Mindverse/user/... (not mounted on Ray nodes), or
 #                    /vePFS-Mindverse/share/mint/dev/mint-server (shared, affects everyone).
-#                    Sync first: rsync -a --delete /root/code/mint/ /vePFS-Mindverse/share/<your-path>/
+#                    Sync your checkout first, e.g.:
+#                    rsync -a --delete <your-checkout>/ /vePFS-Mindverse/share/<your-path>/
 #
 # Derived (override only if needed):
 #   MINT_RAY_NAMESPACE        mint_<user>; refuses root/empty.
