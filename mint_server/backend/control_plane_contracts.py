@@ -1230,11 +1230,17 @@ class InProcessSchedulerQueueAdapter:
 
     async def renew(self, **kwargs: Any) -> RenewResult:
         kwargs.pop("timeout_s", None)
-        return RenewResult.from_wire(await self.actor.renew_lease(**kwargs))
+        out = await self.actor.renew_lease(**kwargs)
+        if isinstance(out, LeaseResult):
+            return out
+        return RenewResult.from_wire(out)
 
     async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
         kwargs.pop("timeout_s", None)
-        return LeaseResult.from_wire(await self.actor.begin_finalize_lease(**kwargs))
+        out = await self.actor.begin_finalize_lease(**kwargs)
+        if isinstance(out, LeaseResult):
+            return out
+        return LeaseResult.from_wire(out)
 
     async def complete(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)

@@ -2227,17 +2227,17 @@ class _ModelWorkSchedulerActor:
         consumer_generation: int,
         finalize_ttl_s: float = 30.0,
         staged_payload_path: str | None = None,
-    ) -> dict[str, Any]:
+    ) -> LeaseResult:
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return LeaseResult(ok=False, reason="unknown_lease")
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return LeaseResult(ok=False, reason="stale_consumer")
             now = time.time()
             request_id = lease.item.request_id
             attempt_id = lease.attempt_id
@@ -2303,19 +2303,19 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return LeaseResult(ok=False, reason="unknown_lease")
             if (
                 lease.item.request_id != request_id
                 or lease.attempt_id != attempt_id
                 or lease.consumer_id != consumer_id
                 or int(lease.consumer_generation) != int(consumer_generation)
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return LeaseResult(ok=False, reason="stale_consumer")
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
             self._request_locations[request_id] = "leased"
             self._cv.notify_all()
-            return {"ok": True, "lease": lease.to_dict()}
+            return LeaseResult(ok=True, lease=lease.to_dict())
 
     async def renew_lease(
         self,
@@ -2324,17 +2324,17 @@ class _ModelWorkSchedulerActor:
         consumer_id: str,
         consumer_generation: int,
         lease_ttl_s: float = 30.0,
-    ) -> dict[str, Any]:
+    ) -> LeaseResult:
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return LeaseResult(ok=False, reason="unknown_lease")
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return LeaseResult(ok=False, reason="stale_consumer")
             request_id = lease.item.request_id
             attempt_id = lease.attempt_id
             scheduler_epoch = int(self._scheduler_epoch or 0)
@@ -2358,7 +2358,7 @@ class _ModelWorkSchedulerActor:
                         if current is not None and current.item.request_id == request_id:
                             self._remove_request_from_memory_locked(request_id)
                             self._cv.notify_all()
-                    return {"ok": False, "reason": "unknown_lease"}
+                    return LeaseResult(ok=False, reason="unknown_lease")
                 raise
             if isinstance(renewed, TaskMutationResult):
                 if not renewed.ok:
@@ -2369,21 +2369,21 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return LeaseResult(ok=False, reason="unknown_lease")
             if (
                 lease.item.request_id != request_id
                 or lease.attempt_id != attempt_id
                 or lease.consumer_id != consumer_id
                 or int(lease.consumer_generation) != int(consumer_generation)
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return LeaseResult(ok=False, reason="stale_consumer")
             if renew_rejected is not None:
                 if renew_rejected == "terminal":
                     self._remove_request_from_memory_locked(request_id)
                     self._cv.notify_all()
-                return {"ok": False, "reason": renew_rejected}
+                return LeaseResult(ok=False, reason=renew_rejected)
             lease.lease_expires_at = new_expires_at
-            return {"ok": True, "lease": lease.to_dict()}
+            return LeaseResult(ok=True, lease=lease.to_dict())
 
     async def _terminal_task_state_for_lease(self, lease: ModelWorkLease) -> _TerminalTaskState:
         if not self._use_task_state_store:
@@ -3002,6 +3002,40 @@ def _create_ray_actor_handle():
                 lease_id=lease_id,
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
+            )
+            return out.to_wire()
+
+        async def renew_lease(
+            self,
+            *,
+            lease_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+            lease_ttl_s: float = 30.0,
+        ) -> dict[str, Any]:
+            out = await super().renew_lease(
+                lease_id=lease_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                lease_ttl_s=lease_ttl_s,
+            )
+            return out.to_wire()
+
+        async def begin_finalize_lease(
+            self,
+            *,
+            lease_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+            finalize_ttl_s: float = 30.0,
+            staged_payload_path: str | None = None,
+        ) -> dict[str, Any]:
+            out = await super().begin_finalize_lease(
+                lease_id=lease_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                finalize_ttl_s=finalize_ttl_s,
+                staged_payload_path=staged_payload_path,
             )
             return out.to_wire()
 
