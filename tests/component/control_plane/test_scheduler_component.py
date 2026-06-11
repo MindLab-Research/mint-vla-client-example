@@ -289,6 +289,90 @@ async def test_scheduler_component_fail_requeue_rejects_durable_finalizing_lease
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_fail_requeue_rejects_finalizing_after_local_ttl_drift(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-fail-requeue-finalizing-ttl-drift"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        block = world.faults.block("task_state.begin_finalize")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=1.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        await asyncio.sleep(1.05)
+        block.release.set()
+        begin = await finalize_task
+
+        failed = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="ordinary-fail-after-local-ttl-drift",
+        )
+
+        assert begin["ok"] is True
+        assert failed == {"ok": False, "reason": "finalize_in_progress"}
+        assert (await world.observe_task(request_id))["status"] == "finalizing"
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_fail_requeue_recovers_after_durable_finalize_ttl_expires(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-fail-requeue-finalizing-expired"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=1.0,
+        )
+
+        await asyncio.sleep(1.05)
+        failed = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="recover-expired-finalize",
+        )
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        reclaimed = await world.claim_one()
+
+        assert begin["ok"] is True
+        assert failed == {"ok": True, "request_id": request_id, "requeued": True}
+        assert assigned["assigned"] == 1
+        assert reclaimed["item"]["request_id"] == request_id
+        assert str(reclaimed["lease_id"]) != str(lease["lease_id"])
+        assert (await world.observe_task(request_id))["status"] == "leased"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
