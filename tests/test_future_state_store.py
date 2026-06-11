@@ -240,7 +240,7 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
     assert future_store.get_task("req-2")["status"] == "retrieved"
 
 
-def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -> None:
+def test_model_work_admission_delegates_durable_create_to_scheduler_gateway(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -255,12 +255,14 @@ def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -
     class _Scheduler:
         def __init__(self) -> None:
             self.seen_status: FutureStatus | None = None
+            self.seen_metadata: dict | None = None
 
         async def append_work(self, **kwargs):
             try:
                 self.seen_status = await service.async_get_status(kwargs["request_id"])
             except KeyError:
                 self.seen_status = None
+            self.seen_metadata = dict(kwargs.get("extra") or {})
             return {"ok": True, "request_id": kwargs["request_id"]}
 
     scheduler = _Scheduler()
@@ -272,17 +274,22 @@ def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -
             request_json=b'{"base_model":"Qwen/Test"}',
             domain_key="megatron:Qwen/Test",
             queued_meta={"op": "training.create_model"},
-            task_futures_client=service,
             scheduler_client=scheduler,
         )
     )
 
-    assert scheduler.seen_status == FutureStatus.PENDING
-    assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
-    assert future_store.get_task("req-admission")["op"] == "training.create_model"
+    assert scheduler.seen_status is None
+    assert scheduler.seen_metadata is not None
+    assert scheduler.seen_metadata["op"] == "training.create_model"
+    try:
+        asyncio.run(service.async_get_status("req-admission"))
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("enqueue_model_work should not create future rows before scheduler append")
 
 
-def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path) -> None:
+def test_model_work_admission_does_not_cleanup_future_when_scheduler_append_fails(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -306,7 +313,6 @@ def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path
                 request_json=b'{"base_model":"Qwen/Test"}',
                 domain_key="megatron:Qwen/Test",
                 queued_meta={"op": "training.create_model"},
-                task_futures_client=service,
                 scheduler_client=_Scheduler(),
             )
         except RuntimeError as e:

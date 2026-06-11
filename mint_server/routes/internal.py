@@ -431,7 +431,6 @@ async def metrics() -> Response:
 
 @router.post("/model_work_scheduler/noop")
 async def model_work_scheduler_noop(http_request: Request) -> dict:
-    from ..backend.task_state_store import task_futures
     from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
     from ..backend.model_work_admission import enqueue_model_work
 
@@ -460,7 +459,6 @@ async def model_work_scheduler_noop(http_request: Request) -> dict:
                     "stage": "queued",
                     "queued_at": time.time(),
                 },
-                task_futures_client=task_futures,
             ),
         )
     except Exception as e:

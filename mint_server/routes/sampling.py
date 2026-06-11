@@ -1329,9 +1329,7 @@ async def _asample_impl(
                 "suppress_billing": bool(suppress_billing),
             },
             queued_meta=queued_meta,
-            create_future=True,
             payload_hash=payload_hash,
-            task_futures_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -2339,7 +2337,6 @@ async def compute_logprobs(
                 "domain_key": domain_key,
                 "affinity_group": affinity_group,
             },
-            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={

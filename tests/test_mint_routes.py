@@ -107,7 +107,7 @@ class _StubModelWorkScheduler:
         return {"ok": True}
 
 
-def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> None:
+def test_mint_action_route_does_not_cleanup_gateway_owned_future_when_enqueue_fails(monkeypatch) -> None:
     from mint_server.routes import mint as mint_routes
 
     task_futures = _StubTaskFutureService()
@@ -149,8 +149,7 @@ def test_mint_action_route_cleans_up_future_when_enqueue_fails(monkeypatch) -> N
 
     assert resp.status_code == 503, resp.text
     assert len(task_futures.created) == 1
-    assert len(task_futures.cleaned) == 1
-    assert task_futures.cleaned == task_futures.created
+    assert task_futures.cleaned == []
     assert len(scheduler.calls) == 1
 
 
@@ -1665,7 +1664,7 @@ def test_mint_reverse_kl_route_releases_durable_inflight_on_enqueue_failure(
 
     assert resp.status_code == 503, resp.text
     assert inflight_calls == [("model-123", +1), ("model-123", -1)]
-    assert task_futures.cleaned
+    assert task_futures.cleaned == []
 
 
 def test_mint_reverse_kl_route_propagates_detached_store_503(monkeypatch) -> None:

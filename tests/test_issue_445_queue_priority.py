@@ -77,6 +77,20 @@ class _StubSamplingSessionManager:
         return "Qwen/Qwen3-4B-Instruct-2507"
 
 
+async def _sampling_snapshot(session_id: str):
+    return sampling_route.SamplingSessionSnapshot(
+        session_id=session_id,
+        uses_multi_lora=True,
+        uses_base_model=False,
+        base_model="Qwen/Qwen3-4B-Instruct-2507",
+        lora_rank=32,
+        adapter_path="/tmp/adapter",
+        lora_loaded=False,
+        lora_int_id=None,
+        metadata_version=1,
+    )
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -105,6 +119,7 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
     async def _no_snapshot(_sid):
         return None
 
+    monkeypatch.setattr(sampling_route, "_async_get_http_sampling_snapshot", _sampling_snapshot)
     monkeypatch.setattr(sampling_route, "_async_get_detached_sampling_snapshot", _no_snapshot)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -163,7 +178,10 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
     monkeypatch.setattr(training_route, "_get_max_model_len", lambda _base_model: 4096)
     monkeypatch.setattr(training_route, "task_futures", _StubTaskFutureService())
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
-    monkeypatch.setattr(training_route, "_mark_training_inflight", lambda *_args, **_kwargs: None)
+    async def _mark_training_inflight(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(training_route, "_mark_training_inflight", _mark_training_inflight)
 
     req = ForwardBackwardRequest(
         model_id="run-445",
@@ -193,6 +211,7 @@ async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", _StubTaskFutureService())
     monkeypatch.setattr(sampling_route, "record_sampling_admission_metric", lambda **_kwargs: None)
+    monkeypatch.setattr(sampling_route, "_async_get_http_sampling_snapshot", _sampling_snapshot)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
 

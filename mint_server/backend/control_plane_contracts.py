@@ -138,9 +138,11 @@ class SubmitTaskResult(WireCompatibleResult):
     assigned: bool = False
     reason: ConflictReason | str | None = None
     record: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
             "created": self.created,
@@ -154,13 +156,17 @@ class SubmitTaskResult(WireCompatibleResult):
         assigned = data.get("assigned", False)
         if isinstance(assigned, dict):
             assigned = bool(assigned.get("assigned"))
+        created = data.get("created")
+        if created is None:
+            created = bool(data["ok"]) and not bool(data.get("idempotent", False))
         return cls(
             ok=bool(data["ok"]),
             request_id=str(data["request_id"]),
-            created=bool(data.get("created", not bool(data.get("idempotent", False)))),
+            created=bool(created),
             assigned=bool(assigned),
             reason=_reason_from_wire(data.get("reason")),
             record=data.get("record") if isinstance(data.get("record"), dict) else None,
+            extra=_extra_wire_fields(data, {"ok", "request_id", "created", "assigned", "reason", "record"}),
         )
 
 
@@ -722,6 +728,47 @@ class ExecutorOutcome(WireCompatibleResult):
                 else None
             ),
         )
+
+
+@runtime_checkable
+class ModelWorkTaskGateway(Protocol):
+    async def submit_task(
+        self,
+        *,
+        request_id: str,
+        op: str,
+        domain_key: str,
+        request_json: bytes,
+        metadata: dict[str, Any],
+        user_id: str | None = None,
+        apikey_id: str | None = None,
+        throttle_principal: str | None = None,
+        webhook_url: str | None = None,
+        affinity_group: str | None = None,
+        ordering_key: str | None = None,
+        token_cost: int = 1,
+        assign: bool = True,
+        assign_max_items: int | None = 1,
+        payload_hash: str | None = None,
+        timeout_s: float | None = None,
+    ) -> SubmitTaskResult: ...
+
+    async def cancel_task(
+        self,
+        *,
+        request_id: str,
+        reason: str,
+        timeout_s: float | None = None,
+    ) -> CancelTaskResult: ...
+
+    async def retrieve_task(
+        self,
+        *,
+        request_id: str,
+        wait_timeout_s: float = 0.0,
+        privileged: bool = False,
+        timeout_s: float | None = None,
+    ) -> RetrieveTaskResult: ...
 
 
 @runtime_checkable

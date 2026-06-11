@@ -3358,6 +3358,7 @@ class ModelWorkSchedulerClient:
         extra: dict[str, Any] | None = None,
         assign: bool = False,
         assign_max_items: int | None = None,
+        timeout_s: float | None = None,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         item = ModelWorkItem(
@@ -3381,7 +3382,7 @@ class ModelWorkSchedulerClient:
                 assign=bool(assign),
                 assign_max_items=assign_max_items,
             ),
-            timeout_s=10.0,
+            timeout_s=10.0 if timeout_s is None else float(timeout_s),
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.append returned non-dict: {type(out)}")
