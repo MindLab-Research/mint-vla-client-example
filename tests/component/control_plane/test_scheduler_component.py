@@ -2121,20 +2121,23 @@ async def test_scheduler_component_megatron_training_session_is_serialized_by_or
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path, monkeypatch) -> None:
+async def test_scheduler_component_retrieve_pending_survives_scheduler_restart(tmp_path, monkeypatch) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
         request_id = "component-retrieve-orphan"
         await world.enqueue_sampling(request_id, assign=False)
-        await world.scheduler.cancel_request(request_id=request_id, reason="synthetic orphan")
+        await world.acquire_owner(owner_id="component-scheduler-orphan-probe", now=time.time() + 31.0)
+        world.replace_scheduler(owner_id="component-scheduler-orphan-probe")
 
         status_code, payload = await world.retrieve(request_id, monkeypatch)
 
-        assert status_code == 200
-        assert payload["category"] == "system"
-        assert "request must be retried" in payload["error"]
-        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+        assert status_code == 408
+        assert payload["request_id"] == request_id
+        assert payload["type"] == "try_again"
+        assert payload["status"] == "queued"
+        assert payload["queue_kind"] == "model_work_scheduler"
+        assert await world.observe_future_status(request_id) == FutureStatus.PENDING
     finally:
         world.close()
 
@@ -2415,13 +2418,45 @@ async def test_scheduler_component_cancel_assigned_work_removes_scheduler_projec
         await world.enqueue_sampling(request_id)
 
         cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        failed_status = await world.observe_future_status(request_id)
         status_code, payload = await world.retrieve(request_id, monkeypatch)
 
         assert cancelled["cancelled"] is True
         assert (await world.observe_scheduler(request_id))["present"] is False
+        assert failed_status == FutureStatus.FAILED
         assert status_code == 200
-        assert "request must be retried" in payload["error"]
-        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+        assert "cancelled" in payload["error"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_cancel_assigned_work_survives_scheduler_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-cancel-assigned-restart"
+        await world.enqueue_sampling(request_id)
+
+        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        await world.acquire_owner(owner_id="component-scheduler-restart", now=time.time() + 31.0)
+        world.replace_scheduler(owner_id="component-scheduler-restart")
+        await world.start()
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        claimed = await world.claim_none()
+        failed_status = await world.observe_future_status(request_id)
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert cancelled["cancelled"] is True
+        assert assigned["assigned"] == 0
+        assert claimed["leases"] == []
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert failed_status == FutureStatus.FAILED
+        assert status_code == 200
+        assert "cancelled" in payload["error"]
     finally:
         world.close()
 
@@ -2444,14 +2479,54 @@ async def test_scheduler_component_cancel_leased_work_removes_scheduler_projecti
             consumer_id=world.consumer_id,
             consumer_generation=world.generation,
         )
+        failed_status = await world.observe_future_status(request_id)
         status_code, payload = await world.retrieve(request_id, monkeypatch)
 
         assert cancelled["cancelled"] is True
         assert validate == {"ok": False, "reason": "unknown_lease"}
         assert (await world.observe_scheduler(request_id))["present"] is False
+        assert failed_status == FutureStatus.FAILED
         assert status_code == 200
-        assert "request must be retried" in payload["error"]
-        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+        assert "cancelled" in payload["error"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_cancel_leased_work_survives_scheduler_restart(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-cancel-leased-restart"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        await world.acquire_owner(owner_id="component-scheduler-restart", now=time.time() + 31.0)
+        world.replace_scheduler(owner_id="component-scheduler-restart")
+        await world.start()
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        claimed = await world.claim_none()
+        failed_status = await world.observe_future_status(request_id)
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert cancelled["cancelled"] is True
+        assert assigned["assigned"] == 0
+        assert claimed["leases"] == []
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        ) == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert failed_status == FutureStatus.FAILED
+        assert status_code == 200
+        assert "cancelled" in payload["error"]
     finally:
         world.close()
 

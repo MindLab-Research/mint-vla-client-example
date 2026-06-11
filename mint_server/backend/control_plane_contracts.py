@@ -158,6 +158,18 @@ class AsyncTaskLedger(Protocol):
         now: float | None = None,
     ) -> dict[str, Any]: ...
 
+    async def complete_task_failure(
+        self,
+        *,
+        request_id: str,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any]: ...
+
     async def requeue_task(
         self,
         *,
@@ -366,6 +378,9 @@ class TaskStateStoreLedgerAdapter:
     async def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call_dict("commit_finalize_failure", **kwargs)
 
+    async def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._call_dict("complete_task_failure", **kwargs)
+
     async def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call_dict("requeue_task", **kwargs)
 
@@ -397,6 +412,7 @@ _ASYNC_TASK_LEDGER_METHODS = (
     "begin_finalize",
     "commit_finalize_success",
     "commit_finalize_failure",
+    "complete_task_failure",
     "requeue_task",
     "forget_task",
     "get_task",

@@ -151,6 +151,10 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
             self.calls.append(("commit_finalize_failure", kwargs))
             return {"ok": True}
 
+        async def async_complete_task_failure(self, **kwargs):
+            self.calls.append(("complete_task_failure", kwargs))
+            return {"ok": True}
+
         async def async_requeue_task(self, **kwargs):
             self.calls.append(("requeue_task", kwargs))
             return {"ok": True}
@@ -288,10 +292,26 @@ def test_async_ray_actor_create_paths_do_not_block_event_loop(
         ping = _Remote({"ok": True, "actor_name": "created", "code_identity": code_identity})
         stats = _Remote({"ok": True, "scheduler_instance_id": "created", "code_identity": code_identity})
 
-    def _blocking_create_handle():
-        handle_entered.set()
-        assert release_handle.wait(timeout=2.0)
-        return _Actor()
+    class _RemoteActorClass:
+        def options(self, **_kwargs):
+            return self
+
+        def remote(self, *_args, **_kwargs):
+            handle_entered.set()
+            assert release_handle.wait(timeout=2.0)
+            return _Actor()
+
+    def _fake_remote(*_args, **_kwargs):
+        def _decorate(_cls):
+            return _RemoteActorClass()
+
+        return _decorate
+
+    def _fake_method(**_kwargs):
+        def _decorate(fn):
+            return fn
+
+        return _decorate
 
     async def _async_get_ray_ref(ref, *, timeout_s=None):
         return ref
@@ -311,7 +331,10 @@ def test_async_ray_actor_create_paths_do_not_block_event_loop(
 
     monkeypatch.setattr(ray, "is_initialized", lambda: True)
     monkeypatch.setattr(ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("missing")))
-    monkeypatch.setattr(module, "_create_ray_actor_handle", _blocking_create_handle)
+    monkeypatch.setattr(ray, "remote", _fake_remote)
+    monkeypatch.setattr(ray, "method", _fake_method, raising=False)
+    monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {})
+    monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
     if hasattr(module, "async_get_ray_ref"):
         monkeypatch.setattr(module, "async_get_ray_ref", _async_get_ray_ref)
 
