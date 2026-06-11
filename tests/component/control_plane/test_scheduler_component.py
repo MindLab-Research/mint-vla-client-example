@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from mint_server.backend.control_plane_contracts import ExecutorOutcome
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
 from mint_server.backend.task_state_store import TaskStateStore
@@ -177,6 +178,54 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         ).ok is True
         record = await world.observe_task("component-stale-consumer")
         assert record["status"] == "leased"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_gpu_actor_died_fences_consumer_until_generation_bump(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-gpu-died-fence-a")
+        lease = await world.claim_one()
+
+        failed = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="gpu_actor_died",
+        )
+        await world.enqueue_sampling("component-gpu-died-fence-b")
+        fenced_claim = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        next_generation = world.generation + 1
+        next_consumer_id = world.replica(generation=next_generation)["consumer_id"]
+        await world.scheduler.sync_replicas([world.replica(generation=next_generation, status="healthy")])
+        recovered_claim = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=next_consumer_id,
+            consumer_generation=next_generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        stats = await world.scheduler.stats()
+
+        assert failed.ok is True and failed.requeued is True
+        assert fenced_claim.ok is False
+        assert fenced_claim.reason == "stale_consumer"
+        assert len(recovered_claim.leases) == 1
+        assert recovered_claim.leases[0]["consumer_id"] == next_consumer_id
+        assert stats["self_failed_consumers"] == []
     finally:
         world.close()
 
@@ -894,8 +943,8 @@ async def test_scheduler_component_executor_failure_commits_failed_terminal(tmp_
         await world.start()
         await world.enqueue_sampling("component-exec-failed")
 
-        async def _failing_executor(_lease: dict) -> None:
-            raise RuntimeError("synthetic executor failure")
+        async def _failing_executor(_lease: dict) -> ExecutorOutcome:
+            return ExecutorOutcome(kind="user_error", error="synthetic executor failure")
 
         actor = await world.runtime_once(executor=_failing_executor)
 
@@ -2449,8 +2498,8 @@ async def test_scheduler_component_retrieve_masks_internal_error_for_non_admin(t
         request_id = "component-retrieve-mask-error"
         await world.enqueue_sampling(request_id)
 
-        async def _failing_executor(_lease: dict) -> None:
-            raise RuntimeError("internal gpu traceback secret")
+        async def _failing_executor(_lease: dict) -> ExecutorOutcome:
+            return ExecutorOutcome(kind="user_error", error="internal gpu traceback secret")
 
         await world.runtime_once(executor=_failing_executor)
 

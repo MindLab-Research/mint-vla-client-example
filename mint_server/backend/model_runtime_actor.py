@@ -118,6 +118,17 @@ def _finalization_from_outcome(
     raise RuntimeError(f"cannot convert executor outcome to terminal finalization: {outcome.kind!r}")
 
 
+def _looks_like_dead_actor_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    text = str(exc)
+    return (
+        name in {"ActorDiedError", "ActorUnavailableError", "RayActorError"}
+        or "actor died" in text.lower()
+        or "actor is dead" in text.lower()
+        or "actor is temporarily unavailable" in text.lower()
+    )
+
+
 @dataclass(frozen=True)
 class ModelRuntimeActorConfig:
     domain_key: str
@@ -413,6 +424,9 @@ class ModelRuntimeActor:
         self._last_claimed_at: float | None = None
         self._last_completed_at: float | None = None
         self._last_renewed_at: float | None = None
+        self._max_renew_rpc_latency_s = 0.0
+        self._consecutive_renew_failures = 0
+        self._last_renew_deadline_slack_s: float | None = None
         self._last_error: str | None = None
         self._last_error_traceback: str | None = None
         self._dynamic_token_budget: int | None = None
@@ -471,6 +485,9 @@ class ModelRuntimeActor:
             "last_claimed_at": self._last_claimed_at,
             "last_completed_at": self._last_completed_at,
             "last_renewed_at": self._last_renewed_at,
+            "max_renew_rpc_latency_s": self._max_renew_rpc_latency_s,
+            "consecutive_renew_failures": self._consecutive_renew_failures,
+            "last_renew_deadline_slack_s": self._last_renew_deadline_slack_s,
             "last_error": self._last_error,
             "last_error_traceback": self._last_error_traceback,
             "processed_total": int(self._processed_total),
@@ -954,15 +971,27 @@ class ModelRuntimeActor:
                     raise TimeoutError(
                         f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
                     )
-                result = await self._scheduler.renew(
-                    lease_id=_lease_token(lease).lease_id,
-                    consumer_id=self._config.consumer_id,
-                    consumer_generation=self._config.actor_generation,
+                renew_started = time.monotonic()
+                try:
+                    result = await self._scheduler.renew(
+                        lease_id=_lease_token(lease).lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                        lease_ttl_s=self._config.lease_ttl_s,
+                    )
+                except Exception:
+                    self._record_renew_result(
+                        ok=False,
+                        latency_s=time.monotonic() - renew_started,
+                        lease_ttl_s=self._config.lease_ttl_s,
+                    )
+                    raise
+                self._record_renew_result(
+                    ok=_scheduler_result_ok(result),
+                    latency_s=time.monotonic() - renew_started,
                     lease_ttl_s=self._config.lease_ttl_s,
                 )
                 if _scheduler_result_ok(result):
-                    self._last_renewed_at = time.time()
-                    self._renewed_total += 1
                     continue
                 raise RuntimeError(f"model work lease renew failed: {result!r}")
 
@@ -971,6 +1000,7 @@ class ModelRuntimeActor:
         while pending_lease_ids:
             await asyncio.sleep(interval_s)
             for lease_id in list(pending_lease_ids):
+                renew_started = time.monotonic()
                 try:
                     result = await self._scheduler.renew(
                         lease_id=lease_id,
@@ -979,6 +1009,11 @@ class ModelRuntimeActor:
                         lease_ttl_s=self._config.lease_ttl_s,
                     )
                 except Exception as e:
+                    self._record_renew_result(
+                        ok=False,
+                        latency_s=time.monotonic() - renew_started,
+                        lease_ttl_s=self._config.lease_ttl_s,
+                    )
                     self._record_error(e)
                     logger.warning(
                         "[model_runtime] pending lease renew failed actor=%s lease_id=%s error_type=%s error=%s",
@@ -988,9 +1023,24 @@ class ModelRuntimeActor:
                         e,
                     )
                     continue
+                self._record_renew_result(
+                    ok=_scheduler_result_ok(result),
+                    latency_s=time.monotonic() - renew_started,
+                    lease_ttl_s=self._config.lease_ttl_s,
+                )
                 if _scheduler_result_ok(result):
-                    self._last_renewed_at = time.time()
-                    self._renewed_total += 1
+                    continue
+
+    def _record_renew_result(self, *, ok: bool, latency_s: float, lease_ttl_s: float) -> None:
+        latency = max(0.0, float(latency_s))
+        self._max_renew_rpc_latency_s = max(self._max_renew_rpc_latency_s, latency)
+        if ok:
+            self._last_renewed_at = time.time()
+            self._renewed_total += 1
+            self._consecutive_renew_failures = 0
+            self._last_renew_deadline_slack_s = max(0.0, float(lease_ttl_s) - latency)
+            return
+        self._consecutive_renew_failures += 1
 
     async def _call_executor(self, lease: dict[str, Any]) -> ExecutorOutcome | None:
         result = await asyncio.to_thread(self._executor, lease)
@@ -1006,13 +1056,25 @@ class ModelRuntimeActor:
         item = lease.get("item") if isinstance(lease, dict) else {}
         tracer = get_otel_tracer()
         if tracer is None:
-            out = await self._call_executor(lease)
+            try:
+                out = await self._call_executor(lease)
+            except Exception as e:
+                return ExecutorOutcome(
+                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
+                    error=str(e),
+                )
             return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
         try:
             from opentelemetry.propagate import extract
             from opentelemetry.trace import SpanKind, Status, StatusCode
         except Exception:
-            out = await self._call_executor(lease)
+            try:
+                out = await self._call_executor(lease)
+            except Exception as e:
+                return ExecutorOutcome(
+                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
+                    error=str(e),
+                )
             return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
 
         span_context = None
@@ -1039,7 +1101,10 @@ class ModelRuntimeActor:
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
-                raise
+                return ExecutorOutcome(
+                    kind="fatal_backend_death" if _looks_like_dead_actor_error(e) else "retryable_failure",
+                    error=str(e),
+                )
             return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
 
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
@@ -1155,7 +1220,25 @@ class ModelRuntimeActor:
             except Exception:
                 pass
             if outcome.kind in {"retryable_failure", "fatal_backend_death"}:
-                raise RuntimeError(outcome.error or f"executor returned {outcome.kind}")
+                error = outcome.error or f"executor returned {outcome.kind}"
+                self._record_error(RuntimeError(error))
+                failed = await self._scheduler.fail(
+                    lease_id=lease_id,
+                    consumer_id=self._config.consumer_id,
+                    consumer_generation=self._config.actor_generation,
+                    reason="gpu_actor_died" if outcome.kind == "fatal_backend_death" else "executor_retryable_failure",
+                    requeue=True,
+                    abort_finalize=True,
+                )
+                if not _scheduler_result_ok(failed):
+                    logger.warning(
+                        "[model_runtime] retryable executor failure requeue rejected actor=%s request_id=%s result=%s",
+                        self._config.actor_name,
+                        request_id,
+                        failed,
+                    )
+                self._requeued_total += 1
+                return
             finalization = _finalization_from_outcome(request_id=request_id, outcome=outcome)
             if finalization.request_id != request_id:
                 raise RuntimeError(

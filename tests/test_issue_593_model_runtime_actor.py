@@ -491,6 +491,11 @@ async def test_issue_593_model_runtime_offloads_sync_executor_and_renews(tmp_pat
 
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert scheduler.renewed and scheduler.renewed[0]["lease_id"] == lease["lease_id"]
+    snapshot = actor.health_snapshot()
+    assert snapshot["renewed_total"] >= 1
+    assert snapshot["max_renew_rpc_latency_s"] >= 0.0
+    assert snapshot["consecutive_renew_failures"] == 0
+    assert snapshot["last_renew_deadline_slack_s"] is not None
     success = scheduler.finished_success[0]
     assert payload_store.read_json_payload(
         path=success["result_path"],
@@ -541,7 +546,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
 
 
 @pytest.mark.anyio
-async def test_issue_616_model_runtime_finishes_executor_failure_via_scheduler(tmp_path) -> None:
+async def test_issue_616_model_runtime_finishes_executor_user_error_via_scheduler(tmp_path) -> None:
     lease = _lease("runtime-req-task-state-failure", finalize=False)
     lease["attempt_id"] = "attempt-failure"
     lease["scheduler_epoch"] = 8
@@ -553,8 +558,8 @@ async def test_issue_616_model_runtime_finishes_executor_failure_via_scheduler(t
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
     task_state_store = _FakeTaskStateStore()
 
-    async def _executor(_lease: dict) -> None:
-        raise RuntimeError("boom")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="user_error", error="boom")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -575,13 +580,13 @@ async def test_issue_616_model_runtime_finishes_executor_failure_via_scheduler(t
         _finish_failure_kwargs(
             lease,
             consumer_id="vllm:model-a::replica-0::generation::3",
-            error="executor failed: boom",
+            error="boom",
         )
     ]
 
 
 @pytest.mark.anyio
-async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure_commit(
+async def test_issue_616_model_runtime_does_not_requeue_after_task_state_user_error_commit(
     tmp_path,
 ) -> None:
     lease = _lease("runtime-req-task-state-failure-future-fails", finalize=False)
@@ -598,8 +603,8 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
     )
     task_state_store = _FakeTaskStateStore()
 
-    async def _executor(_lease: dict) -> None:
-        raise RuntimeError("boom")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="user_error", error="boom")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",
@@ -623,7 +628,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease() -> None:
+async def test_issue_593_model_runtime_executor_exception_requeues_lease() -> None:
     lease = _lease("runtime-req-fail")
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
@@ -648,27 +653,67 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
     assert task_state_store.failures == []
-    assert scheduler.finished_failure == [
-        _finish_failure_kwargs(
-            lease,
-            consumer_id="vllm:model-a::replica-0::generation::3",
-            error="executor failed: boom",
-        )
-    ]
-    assert scheduler.begin_finalized == [
+    assert scheduler.finished_failure == []
+    assert scheduler.begin_finalized == []
+    assert scheduler.failed == [
         {
             "lease_id": lease["lease_id"],
             "consumer_id": "vllm:model-a::replica-0::generation::3",
             "consumer_generation": 3,
-            "finalize_ttl_s": 30.0,
+            "reason": "executor_retryable_failure",
+            "requeue": True,
+            "abort_finalize": True,
         }
     ]
     assert scheduler.completed == []
-    assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
-    assert snapshot["failed_total"] == 1
+    assert snapshot["failed_total"] == 0
+    assert snapshot["requeued_total"] == 1
     assert "RuntimeError: boom" in snapshot["last_error"]
+
+
+@pytest.mark.anyio
+async def test_issue_593_model_runtime_dead_actor_exception_requeues_gpu_actor_died() -> None:
+    lease = _lease("runtime-req-gpu-actor-died")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+
+    class ActorDiedError(RuntimeError):
+        pass
+
+    async def _executor(_lease: dict) -> None:
+        raise ActorDiedError("backend actor died")
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        executor=_executor,
+    )
+
+    result = await actor.run_once()
+
+    assert result == {"claimed": 1, "executed": 1}
+    assert task_futures.failed == []
+    assert scheduler.finished_failure == []
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "gpu_actor_died",
+            "requeue": True,
+            "abort_finalize": True,
+        }
+    ]
+    snapshot = actor.health_snapshot()
+    assert snapshot["failed_total"] == 0
+    assert snapshot["requeued_total"] == 1
+    assert "backend actor died" in snapshot["last_error"]
 
 
 @pytest.mark.anyio
@@ -1229,7 +1274,7 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_executor_failure() -> None:
+async def test_issue_593_model_runtime_requeues_if_executor_failure_skips_finalize() -> None:
     lease = _lease("runtime-req-missing-failure-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
@@ -1250,14 +1295,23 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_after_execu
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert scheduler.failed == []
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "executor_retryable_failure",
+            "requeue": True,
+            "abort_finalize": True,
+        }
+    ]
     snapshot = actor.health_snapshot()
     assert snapshot["failed_total"] == 0
     assert snapshot["requeued_total"] == 1
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_fail_write_fails() -> None:
+async def test_issue_593_model_runtime_requeues_if_executor_failure_and_future_fail_write_fails() -> None:
     lease = _lease("runtime-req-lost-failure-lease-fail-write")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
     task_futures = _FakeTaskFutureService(
@@ -1281,11 +1335,23 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert actor.health_snapshot()["failed_total"] == 0
+    assert scheduler.failed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+            "reason": "executor_retryable_failure",
+            "requeue": True,
+            "abort_finalize": True,
+        }
+    ]
+    snapshot = actor.health_snapshot()
+    assert snapshot["failed_total"] == 0
+    assert snapshot["requeued_total"] == 1
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_requeues_if_task_futures_fail_write_fails() -> None:
+async def test_issue_593_model_runtime_requeues_if_task_state_user_error_finish_fails() -> None:
     lease = _lease("runtime-req-fail-write-fail")
     scheduler = _FakeScheduler(
         claims=[[lease]],
@@ -1293,8 +1359,8 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_fail_write_fails
     )
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
-    async def _executor(_lease: dict) -> None:
-        raise RuntimeError("boom")
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="user_error", error="boom")
 
     actor = ModelRuntimeActor(
         domain_key="vllm:model-a",

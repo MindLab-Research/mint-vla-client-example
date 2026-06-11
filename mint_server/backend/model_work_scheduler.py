@@ -405,6 +405,7 @@ class _ModelWorkSchedulerActor:
         self._sampling_token_cost_by_request_id: dict[str, int] = {}
         self._sampling_admission_would_reject: dict[tuple[str, str], int] = {}
         self._sampling_admission_reject: dict[tuple[str, str], int] = {}
+        self._self_failed_consumers: set[str] = set()
         self._assignment_loop_task: asyncio.Task | None = None
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
@@ -2068,6 +2069,8 @@ class _ModelWorkSchedulerActor:
                 self._replica_queues.pop(key, None)
 
             expired_items = self._prepare_expired_leases_locked(now=now)
+            current_consumer_ids = {str(replica.consumer_id) for replica in self._replicas.values()}
+            self._self_failed_consumers.intersection_update(current_consumer_ids)
             self._cv.notify_all()
             replica_count = len(self._replicas)
             removed_count = len(removed)
@@ -2194,6 +2197,8 @@ class _ModelWorkSchedulerActor:
         claim_affinity_group: str | None = None
         while len(claimed) < max(1, int(max_items)):
             async with self._cv:
+                if str(consumer_id) in self._self_failed_consumers:
+                    return ClaimResult(ok=False, reason="stale_consumer")
                 self._validate_claimer(
                     domain_key=domain_key,
                     replica_id=replica_id,
@@ -2896,6 +2901,8 @@ class _ModelWorkSchedulerActor:
                 return FailLeaseResult(ok=False, reason="stale_consumer")
             if self._request_locations.get(request_id) == "finalizing":
                 return FailLeaseResult(ok=False, reason="finalize_inflight")
+            if str(reason) == "gpu_actor_died":
+                self._self_failed_consumers.add(str(consumer_id))
             self._leases_by_id.pop(lease.lease_id, None)
             self._lease_id_by_request_id.pop(lease.item.request_id, None)
             requeued_out = False
@@ -2990,6 +2997,8 @@ class _ModelWorkSchedulerActor:
             "replicas": [replica.to_dict() for _, replica in sorted(self._replicas.items())],
             "replica_queues": replica_queues,
             "leases": [lease.to_dict() for lease in self._leases_by_id.values()],
+            "self_failed_consumers": sorted(self._self_failed_consumers),
+            "self_failed_consumer_count": len(self._self_failed_consumers),
             "sampling_inflight": {
                 "mode": _sampling_inflight_admission_mode(),
                 "per_principal_domain_limit": _sampling_inflight_limit(
