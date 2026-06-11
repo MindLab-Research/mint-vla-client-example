@@ -229,7 +229,7 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
     assert future_store.get_task("req-2")["status"] == "retrieved"
 
 
-def test_model_work_admission_delegates_future_creation_to_scheduler_append(tmp_path) -> None:
+def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -250,13 +250,6 @@ def test_model_work_admission_delegates_future_creation_to_scheduler_append(tmp_
                 self.seen_status = await service.async_get_status(kwargs["request_id"])
             except KeyError:
                 self.seen_status = None
-            await service.async_create_model_work_with_id(
-                kwargs["request_id"],
-                op=kwargs["op"],
-                domain_key=kwargs["domain_key"],
-                request_json=kwargs["request_json"],
-                meta=kwargs["extra"],
-            )
             return {"ok": True, "request_id": kwargs["request_id"]}
 
     scheduler = _Scheduler()
@@ -273,9 +266,50 @@ def test_model_work_admission_delegates_future_creation_to_scheduler_append(tmp_
         )
     )
 
-    assert scheduler.seen_status is None
+    assert scheduler.seen_status == FutureStatus.PENDING
     assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
     assert future_store.get_task("req-admission")["op"] == "training.create_model"
+
+
+def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    service = TaskFutureService(
+        future_state_client=_LocalFutureStateClient(future_store),
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+    service._payload_store = __import__(
+        "mint_server.backend.task_payload_store",
+        fromlist=["TaskPayloadStore"],
+    ).TaskPayloadStore(root_dir=tmp_path)
+
+    class _Scheduler:
+        async def append(self, **kwargs):
+            raise RuntimeError("scheduler append failed")
+
+    async def _run() -> None:
+        try:
+            await enqueue_model_work(
+                request_id="req-admission-fail",
+                op="training.create_model",
+                request_json=b'{"base_model":"Qwen/Test"}',
+                domain_key="megatron:Qwen/Test",
+                queued_meta={"op": "training.create_model"},
+                task_futures_client=service,
+                scheduler_client=_Scheduler(),
+            )
+        except RuntimeError as e:
+            assert str(e) == "scheduler append failed"
+        else:
+            raise AssertionError("enqueue_model_work should have raised")
+
+    asyncio.run(_run())
+    try:
+        future_store.get_task("req-admission-fail")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("failed scheduler append should clean up local future")
 
 
 def test_task_future_service_reads_legacy_sqlite_terminal_rows(tmp_path) -> None:
