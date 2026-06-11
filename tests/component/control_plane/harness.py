@@ -303,8 +303,7 @@ class SchedulerComponentWorld:
             token_budget=token_budget,
             lease_ttl_s=lease_ttl_s,
         )
-        get_claimed = getattr(claimed, "get", None)
-        leases = get_claimed("leases") if callable(get_claimed) else None
+        leases = claimed.leases
         assert isinstance(leases, list)
         assert len(leases) == 1
         return leases[0]
@@ -318,7 +317,7 @@ class SchedulerComponentWorld:
             max_items=1,
             lease_ttl_s=lease_ttl_s,
         )
-        assert claimed.get("leases") == []
+        assert claimed.leases == []
         return claimed
 
     async def acquire_owner(

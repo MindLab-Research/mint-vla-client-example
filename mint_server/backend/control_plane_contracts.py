@@ -89,34 +89,10 @@ def _reason_to_wire(value: Any) -> str | None:
 
 
 class WireCompatibleResult:
-    """Mapping compatibility while consumers migrate from wire dicts to fields."""
+    """Typed result base with explicit wire conversion."""
 
     def to_wire(self) -> dict[str, Any]:
         raise NotImplementedError
-
-    def __getitem__(self, key: str) -> Any:
-        return self.to_wire()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_wire().get(key, default)
-
-    def __contains__(self, key: object) -> bool:
-        return key in self.to_wire()
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, dict):
-            wire = self.to_wire()
-            return all(wire.get(key) == value for key, value in other.items())
-        return NotImplemented
-
-    def keys(self):
-        return self.to_wire().keys()
-
-    def items(self):
-        return self.to_wire().items()
-
-    def values(self):
-        return self.to_wire().values()
 
 
 def _extra_wire_fields(data: dict[str, Any], known: set[str]) -> dict[str, Any]:

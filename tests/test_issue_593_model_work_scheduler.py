@@ -177,7 +177,7 @@ class _SchedulerMockHarness:
 
     async def claim_one(self, request_id: str = "req-mock") -> dict:
         await self.actor.sync_replicas([_replica("replica-0")])
-        assert (await self.actor.append(_work(request_id), assign=True))["ok"] is True
+        assert (await self.actor.append(_work(request_id), assign=True)).ok is True
         claimed = await self.actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -186,7 +186,7 @@ class _SchedulerMockHarness:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        return claimed["leases"][0]
+        return claimed.leases[0]
 
     def close(self) -> None:
         self.task_state.close()
@@ -220,8 +220,8 @@ def test_scheduler_assigns_to_registered_replica_queue() -> None:
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-1")))["ok"] is True
-        assert (await actor.sync_replicas([_replica("replica-0")]))["replicas"] == 1
+        assert (await actor.append(_work("req-1"))).ok is True
+        assert (await actor.sync_replicas([_replica("replica-0")])).replicas == 1
 
         stats = actor.stats()
         queue = stats["replica_queues"]["vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"]
@@ -236,7 +236,7 @@ def test_scheduler_assigns_to_registered_replica_queue() -> None:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-1"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-1"]
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         ]["depth"] == 0
@@ -263,8 +263,8 @@ def test_scheduler_claims_first_item_when_it_exceeds_token_budget() -> None:
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-expensive"]
-        assert claimed["remaining_queue_depth"] == 1
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-expensive"]
+        assert claimed.remaining_queue_depth == 1
 
     asyncio.run(_run())
 
@@ -295,8 +295,8 @@ def test_scheduler_same_ordering_key_is_claimed_serially() -> None:
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in first["leases"]] == ["req-serial-1"]
-        assert blocked["leases"] == []
+        assert [lease["item"]["request_id"] for lease in first.leases] == ["req-serial-1"]
+        assert blocked.leases == []
 
     asyncio.run(_run())
 
@@ -342,8 +342,8 @@ def test_scheduler_multi_claim_for_training_domains_stays_on_same_affinity() -> 
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-a2"]
-        assert claimed["remaining_queue_depth"] == 1
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-a1", "req-a2"]
+        assert claimed.remaining_queue_depth == 1
 
     asyncio.run(_run())
 
@@ -381,7 +381,7 @@ def test_scheduler_same_affinity_domains_can_be_disabled_by_constructor() -> Non
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-b1"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-a1", "req-b1"]
 
     asyncio.run(_run())
 
@@ -415,8 +415,8 @@ def test_scheduler_same_affinity_domains_can_be_overridden_from_env(
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-a1", "req-a2"]
-        assert claimed["remaining_queue_depth"] == 1
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-a1", "req-a2"]
+        assert claimed.remaining_queue_depth == 1
 
     asyncio.run(_run())
 
@@ -492,7 +492,7 @@ def test_scheduler_client_forwards_sync_replicas_hydration_flag(monkeypatch: pyt
             timeout_s=3.0,
         )
 
-        assert out == {"ok": True}
+        assert out.ok is True
 
     asyncio.run(_run())
 
@@ -577,7 +577,7 @@ def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert len(claimed["leases"]) == 1
+        assert len(claimed.leases) == 1
 
     asyncio.run(_setup())
 
@@ -725,14 +725,14 @@ def test_scheduler_append_can_assign_immediately() -> None:
         await actor.sync_replicas([_replica("replica-0")])
         out = await actor.append(_work("req-1"), assign=True, assign_max_items=1)
 
-        assert out["ok"] is True
+        assert out.ok is True
         assert await actor.is_empty() is False
-        assert out["scheduler_instance_id"]
+        assert out.scheduler_instance_id
         contains = await actor.contains_request(request_id="req-1")
-        assert contains["present"] is True
-        assert contains["location"] == "assigned"
-        assert contains["scheduler_instance_id"] == out["scheduler_instance_id"]
-        assert out["assigned"]["assigned"] == 1
+        assert contains.present is True
+        assert contains.location == "assigned"
+        assert contains.scheduler_instance_id == out.scheduler_instance_id
+        assert out.assigned["assigned"] == 1
         assert actor.stats()["backlog_depth"] == 0
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
@@ -750,13 +750,13 @@ def test_sampling_token_budget_admission_enforce_rejects_principal_domain(
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-token-1", token_cost=7)))["ok"] is True
+        assert (await actor.append(_work("req-token-1", token_cost=7))).ok is True
         rejected = await actor.append(_work("req-token-2", token_cost=4))
 
-        assert rejected["ok"] is False
-        assert rejected["reason"] == "principal_domain_token_budget_exceeded"
-        assert rejected["current"] == 11
-        assert rejected["limit"] == 10
+        assert rejected.ok is False
+        assert rejected.reason == "principal_domain_token_budget_exceeded"
+        assert rejected.extra["current"] == 11
+        assert rejected.extra["limit"] == 10
         domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
         assert actor.stats()["sampling_inflight"]["tokens_by_domain"][domain] == 7
 
@@ -777,9 +777,9 @@ def test_contains_request_does_not_hydrate_task_state_store() -> None:
             hydrate_task_state=False,
         )
 
-        assert contains["ok"] is True
-        assert contains["present"] is False
-        assert contains["location"] is None
+        assert contains.ok is True
+        assert contains.present is False
+        assert contains.location is None
 
     asyncio.run(_run())
 
@@ -800,8 +800,8 @@ def test_append_does_not_hydrate_task_state_store_before_enqueue() -> None:
     async def _run() -> None:
         out = await actor.append(_work("req-append-no-hydrate"))
 
-        assert out["ok"] is True
-        assert out["request_id"] == "req-append-no-hydrate"
+        assert out.ok is True
+        assert out.request_id == "req-append-no-hydrate"
         assert store.get_task("req-append-no-hydrate")["request_id"] == "req-append-no-hydrate"
 
     try:
@@ -828,8 +828,8 @@ def test_sync_replicas_can_skip_task_state_store_hydration() -> None:
             hydrate_task_state=False,
         )
 
-        assert out["ok"] is True
-        assert out["replicas"] == 1
+        assert out.ok is True
+        assert out.replicas == 1
 
     asyncio.run(_run())
 
@@ -842,12 +842,12 @@ def test_sampling_inflight_admission_observe_records_would_reject(
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-1")))["ok"] is True
+        assert (await actor.append(_work("req-1"))).ok is True
         second = await actor.append(_work("req-2"))
 
-        assert second["ok"] is True
-        assert second["sampling_inflight_admission"]["would_reject"] is True
-        assert second["sampling_inflight_admission"]["reason"] == "principal_domain_inflight_limit_exceeded"
+        assert second.ok is True
+        assert second.extra["sampling_inflight_admission"]["would_reject"] is True
+        assert second.extra["sampling_inflight_admission"]["reason"] == "principal_domain_inflight_limit_exceeded"
         stats = actor.stats()
         domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
         assert stats["sampling_inflight"]["by_domain"][domain] == 2
@@ -871,13 +871,13 @@ def test_sampling_inflight_admission_enforce_rejects_principal_domain(
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-1")))["ok"] is True
+        assert (await actor.append(_work("req-1"))).ok is True
         rejected = await actor.append(_work("req-2"))
 
-        assert rejected["ok"] is False
-        assert rejected["reason"] == "principal_domain_inflight_limit_exceeded"
-        assert rejected["current"] == 1
-        assert rejected["limit"] == 1
+        assert rejected.ok is False
+        assert rejected.reason == "principal_domain_inflight_limit_exceeded"
+        assert rejected.extra["current"] == 1
+        assert rejected.extra["limit"] == 1
         assert actor.stats()["backlog_depth"] == 1
 
     asyncio.run(_run())
@@ -892,13 +892,13 @@ def test_sampling_inflight_admission_enforce_rejects_domain_total(
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-1", throttle_principal="apikey:key-a")))["ok"] is True
+        assert (await actor.append(_work("req-1", throttle_principal="apikey:key-a"))).ok is True
         rejected = await actor.append(_work("req-2", throttle_principal="apikey:key-b"))
 
-        assert rejected["ok"] is False
-        assert rejected["reason"] == "domain_inflight_limit_exceeded"
-        assert rejected["current"] == 1
-        assert rejected["limit"] == 1
+        assert rejected.ok is False
+        assert rejected.reason == "domain_inflight_limit_exceeded"
+        assert rejected.extra["current"] == 1
+        assert rejected.extra["limit"] == 1
         domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
         assert actor.stats()["sampling_inflight"]["by_domain"][domain] == 1
 
@@ -914,7 +914,7 @@ def test_sampling_inflight_admission_releases_count_after_completion(
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-1"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-1"), assign=True)).ok is True
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -923,13 +923,14 @@ def test_sampling_inflight_admission_releases_count_after_completion(
             max_items=1,
             lease_ttl_s=30.0,
         )
-        lease_id = str(claimed["leases"][0]["lease_id"])
-        assert (await actor.complete_lease(
+        lease_id = str(claimed.leases[0]["lease_id"])
+        completed = await actor.complete_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
-        ))["ok"] is True
-        assert (await actor.append(_work("req-2"), assign=True))["ok"] is True
+        )
+        assert completed.ok is True
+        assert (await actor.append(_work("req-2"), assign=True)).ok is True
 
     asyncio.run(_run())
 
@@ -939,7 +940,7 @@ def test_scheduler_assignment_loop_moves_backlog_to_replica_queue(monkeypatch: p
     actor = _ModelWorkSchedulerActor()
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-loop")))["ok"] is True
+        assert (await actor.append(_work("req-loop"))).ok is True
         await actor.sync_replicas([_replica("replica-0")])
         for _ in range(20):
             stats = actor.stats()
@@ -962,8 +963,8 @@ def test_scheduler_cancel_request_removes_assigned_work() -> None:
 
         out = await actor.cancel_request(request_id="req-1", reason="test_cancel")
 
-        assert out["cancelled"] is True
-        assert (await actor.contains_request(request_id="req-1"))["present"] is False
+        assert out.cancelled is True
+        assert (await actor.contains_request(request_id="req-1")).present is False
         assert await actor.is_empty() is True
 
     asyncio.run(_run())
@@ -1002,7 +1003,7 @@ def test_scheduler_sync_reassigns_requeued_work_to_new_consumer_generation() -> 
         await actor.sync_replicas(
             [_replica("replica-0", consumer_id="consumer-old", generation=1)]
         )
-        assert (await actor.append(_work("req-recycle"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-recycle"), assign=True)).ok is True
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -1011,7 +1012,7 @@ def test_scheduler_sync_reassigns_requeued_work_to_new_consumer_generation() -> 
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-recycle"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-recycle"]
 
         await actor.sync_replicas(
             [_replica("replica-0", consumer_id="consumer-new", generation=2)]
@@ -1038,11 +1039,11 @@ def test_scheduler_sync_reassigns_requeued_work_to_new_consumer_generation() -> 
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert [lease["item"]["request_id"] for lease in claimed_after_recycle["leases"]] == [
+        assert [lease["item"]["request_id"] for lease in claimed_after_recycle.leases] == [
             "req-recycle"
         ]
-        assert claimed_after_recycle["leases"][0]["consumer_id"] == "consumer-new"
-        assert claimed_after_recycle["leases"][0]["consumer_generation"] == 2
+        assert claimed_after_recycle.leases[0]["consumer_id"] == "consumer-new"
+        assert claimed_after_recycle.leases[0]["consumer_generation"] == 2
 
     asyncio.run(_run())
 
@@ -1082,7 +1083,7 @@ def test_assignment_accounts_for_active_leases() -> None:
             consumer_generation=10,
             max_items=1,
         )
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-active"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-active"]
 
         await actor.append(_work("req-next", affinity_group="lora:b"))
         await actor.assign_pending()
@@ -1110,10 +1111,10 @@ def test_unhealthy_replica_requeues_assigned_and_leased_work() -> None:
             consumer_generation=10,
             max_items=1,
         )
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-assigned"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-assigned"]
 
         sync = await actor.sync_replicas([_replica("replica-0", status="unhealthy")])
-        assert sync["requeued"] == 2
+        assert sync.requeued == 2
         stats = actor.stats()
         assert stats["backlog_depth"] == 2
         assert stats["leases"] == []
@@ -1138,17 +1139,18 @@ def test_lease_complete_fail_and_expiry() -> None:
             max_items=1,
             lease_ttl_s=1.0,
         )
-        return str(claimed["leases"][0]["lease_id"])
+        return str(claimed.leases[0]["lease_id"])
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
 
         complete_lease = await _claim_one("req-complete")
-        assert (await actor.complete_lease(
+        complete = await actor.complete_lease(
             lease_id=complete_lease,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
-        ))["ok"] is True
+        )
+        assert complete.ok is True
         assert actor.stats()["counters"]["completed"] == 1
 
         fail_lease = await _claim_one("req-fail")
@@ -1159,11 +1161,11 @@ def test_lease_complete_fail_and_expiry() -> None:
             requeue=False,
             reason="runtime_error",
         )
-        assert failed == {"ok": True, "request_id": "req-fail", "requeued": False}
+        assert failed.ok is True and failed.request_id == "req-fail" and failed.requeued is False
         assert actor.stats()["counters"]["failed"] == 1
 
         expire_lease = await _claim_one("req-expire")
-        assert (await actor.expire_leases(now=time.time() + 999.0))["expired"] == 1
+        assert (await actor.expire_leases(now=time.time() + 999.0)).expired == 1
         assert actor.stats()["backlog_depth"] == 1
         assert expire_lease not in {lease["lease_id"] for lease in actor.stats()["leases"]}
 
@@ -1183,25 +1185,28 @@ def test_validate_lease_rejects_requeued_or_stale_leases() -> None:
             consumer_id="consumer-replica-0",
             consumer_generation=10,
         )
-        lease_id = str(claimed["leases"][0]["lease_id"])
+        lease_id = str(claimed.leases[0]["lease_id"])
 
-        assert (await actor.validate_lease(
+        validated = await actor.validate_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
-        ))["ok"] is True
-        assert (await actor.fail_lease(
+        )
+        assert validated.ok is True
+        failed = await actor.fail_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
             requeue=True,
             reason="test_requeue",
-        ))["requeued"] is True
-        assert (await actor.validate_lease(
+        )
+        assert failed.requeued is True
+        rejected = await actor.validate_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
-        )) == {"ok": False, "reason": "unknown_lease"}
+        )
+        assert rejected.ok is False and rejected.reason == "unknown_lease"
 
     asyncio.run(_run())
 
@@ -1220,17 +1225,18 @@ def test_finalizing_lease_survives_replica_sync_until_finalize_ttl() -> None:
             consumer_generation=10,
             lease_ttl_s=1.0,
         )
-        lease_id = str(claimed["leases"][0]["lease_id"])
+        lease_id = str(claimed.leases[0]["lease_id"])
 
-        assert (await actor.begin_finalize_lease(
+        finalizing = await actor.begin_finalize_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
             finalize_ttl_s=60.0,
-        ))["ok"] is True
+        )
+        assert finalizing.ok is True
         sync = await actor.sync_replicas([_replica("replica-0", status="unhealthy")])
 
-        assert sync["requeued"] == 0
+        assert sync.requeued == 0
         assert actor.stats()["leases"][0]["lease_id"] == lease_id
 
     asyncio.run(_run())
@@ -1253,13 +1259,13 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
             ),
             assign=True,
         )
-        assert out["ok"] is True
+        assert out.ok is True
 
         record = store.get_task("req-persisted")
         assert record["status"] == "assigned"
         assert record["subqueue_id"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         assert record["scheduler_epoch"] == 1
-        assert record["metadata"]["model_work_scheduler_instance_id"] == out["scheduler_instance_id"]
+        assert record["metadata"]["model_work_scheduler_instance_id"] == out.scheduler_instance_id
 
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
@@ -1269,7 +1275,7 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
             max_items=1,
             lease_ttl_s=30.0,
         )
-        lease = claimed["leases"][0]
+        lease = claimed.leases[0]
         record = store.get_task("req-persisted")
         assert record["status"] == "leased"
         assert record["lease_id"] == lease["lease_id"]
@@ -1283,11 +1289,11 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
             consumer_generation=10,
             lease_ttl_s=120.0,
         )
-        assert renewed["ok"] is True
+        assert renewed.ok is True
         record = store.get_task("req-persisted")
         assert record["status"] == "leased"
         assert float(record["lease_expires_at"]) > claimed_expires_at
-        assert renewed["lease"]["lease_expires_at"] == record["lease_expires_at"]
+        assert renewed.lease["lease_expires_at"] == record["lease_expires_at"]
 
         finalizing = await actor.begin_finalize_lease(
             lease_id=lease["lease_id"],
@@ -1296,7 +1302,7 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
             finalize_ttl_s=30.0,
             staged_payload_path="/tmp/req-persisted.json",
         )
-        assert finalizing["ok"] is True
+        assert finalizing.ok is True
         record = store.get_task("req-persisted")
         assert record["status"] == "finalizing"
         assert record["staged_payload_path"] == "/tmp/req-persisted.json"
@@ -1319,7 +1325,7 @@ def test_scheduler_renew_lease_rejects_durable_terminal_task_state() -> None:
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-terminal-renew"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-terminal-renew"), assign=True)).ok is True
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -1328,7 +1334,7 @@ def test_scheduler_renew_lease_rejects_durable_terminal_task_state() -> None:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        lease = claimed["leases"][0]
+        lease = claimed.leases[0]
         store.complete_task_failure(
             request_id="req-terminal-renew",
             error="external terminalization",
@@ -1341,7 +1347,7 @@ def test_scheduler_renew_lease_rejects_durable_terminal_task_state() -> None:
             lease_ttl_s=30.0,
         )
 
-        assert renewed == {"ok": False, "reason": "terminal"}
+        assert renewed.ok is False and renewed.reason == "terminal"
         assert actor.stats()["leases"] == []
 
     try:
@@ -1374,11 +1380,11 @@ def test_scheduler_renew_lease_task_state_rpc_does_not_hold_scheduler_lock() -> 
             ),
             timeout=0.2,
         )
-        assert validated["ok"] is True
+        assert validated.ok is True
 
         release.set()
         renewed = await asyncio.wait_for(renew_task, timeout=1.0)
-        assert renewed["ok"] is True
+        assert renewed.ok is True
 
     try:
         asyncio.run(_run())
@@ -1409,8 +1415,8 @@ def test_scheduler_accepts_pre_registered_pending_task_state_store_future() -> N
         await actor.sync_replicas([_replica("replica-0")])
         out = await actor.append(work, assign=True)
 
-        assert out["ok"] is True
-        assert out["idempotent"] is True
+        assert out.ok is True
+        assert out.idempotent is True
         assert store.get_task("req-pre-registered")["status"] == "assigned"
 
     try:
@@ -1436,7 +1442,7 @@ def test_scheduler_rolls_back_new_task_when_assign_fails_after_create() -> None:
 
         with pytest.raises(KeyError):
             store.get_task("req-assign-fails")
-        assert (await actor.contains_request(request_id="req-assign-fails"))["present"] is False
+        assert (await actor.contains_request(request_id="req-assign-fails")).present is False
         assert actor.stats()["backlog_depth"] == 0
 
     try:
@@ -1460,13 +1466,13 @@ def test_scheduler_hydrates_active_task_state_after_restart() -> None:
 
     async def _run() -> None:
         await actor_a.sync_replicas([_replica("replica-0")])
-        assert (await actor_a.append(_work("req-restart"), assign=True))["ok"] is True
+        assert (await actor_a.append(_work("req-restart"), assign=True)).ok is True
         assert store.get_task("req-restart")["status"] == "assigned"
 
         await actor_b.sync_replicas([_replica("replica-0")])
         contains = await actor_b.contains_request(request_id="req-restart")
-        assert contains["present"] is True
-        assert contains["location"] == "assigned"
+        assert contains.present is True
+        assert contains.location == "assigned"
         claimed = await actor_b.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -1475,7 +1481,7 @@ def test_scheduler_hydrates_active_task_state_after_restart() -> None:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-restart"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-restart"]
         assert store.get_task("req-restart")["status"] == "leased"
 
     try:
@@ -1516,7 +1522,7 @@ def test_scheduler_hydrates_sampling_inflight_counts_from_task_state_store() -> 
             request_id="req-hydrate-a",
             hydrate_task_state=False,
         )
-        assert contains["present"] is True
+        assert contains.present is True
         stats = actor.stats()
         assert stats["sampling_inflight"]["by_domain"][domain] == 3
         assert stats["sampling_inflight"]["principal_domain_max_by_domain"][domain] == 2
@@ -1538,7 +1544,7 @@ def test_scheduler_persists_requeue_before_reclaim() -> None:
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-requeue"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-requeue"), assign=True)).ok is True
         claimed = await actor.claim_from_replica_queue(
             domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",
@@ -1547,7 +1553,7 @@ def test_scheduler_persists_requeue_before_reclaim() -> None:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        lease = claimed["leases"][0]
+        lease = claimed.leases[0]
         failed = await actor.fail_lease(
             lease_id=lease["lease_id"],
             consumer_id="consumer-replica-0",
@@ -1555,7 +1561,7 @@ def test_scheduler_persists_requeue_before_reclaim() -> None:
             reason="executor_failed",
             requeue=True,
         )
-        assert failed["requeued"] is True
+        assert failed.requeued is True
         assert store.get_task("req-requeue")["status"] == "pending"
 
         await actor.assign_pending(max_items=1)
@@ -1567,7 +1573,7 @@ def test_scheduler_persists_requeue_before_reclaim() -> None:
             max_items=1,
             lease_ttl_s=30.0,
         )
-        assert [item["item"]["request_id"] for item in reclaimed["leases"]] == ["req-requeue"]
+        assert [item["item"]["request_id"] for item in reclaimed.leases] == ["req-requeue"]
         assert store.get_task("req-requeue")["status"] == "leased"
 
     try:
@@ -1586,8 +1592,8 @@ def test_issue_645_scheduler_drops_terminal_stale_head_and_claims_next() -> None
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-stale"), assign=True))["ok"] is True
-        assert (await actor.append(_work("req-valid"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-stale"), assign=True)).ok is True
+        assert (await actor.append(_work("req-valid"), assign=True)).ok is True
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         ]["depth"] == 2
@@ -1608,10 +1614,10 @@ def test_issue_645_scheduler_drops_terminal_stale_head_and_claims_next() -> None
             lease_ttl_s=30.0,
         )
 
-        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == ["req-valid"]
+        assert [lease["item"]["request_id"] for lease in claimed.leases] == ["req-valid"]
         assert store.get_task("req-stale")["status"] == "retrieved"
         assert store.get_task("req-valid")["status"] == "leased"
-        assert (await actor.contains_request(request_id="req-stale"))["present"] is False
+        assert (await actor.contains_request(request_id="req-stale")).present is False
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
         ]["depth"] == 0
@@ -1633,7 +1639,7 @@ def test_issue_645_scheduler_requeues_pending_stale_head() -> None:
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-pending-stale"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-pending-stale"), assign=True)).ok is True
         store.requeue_task(
             request_id="req-pending-stale",
             scheduler_epoch=1,
@@ -1649,9 +1655,9 @@ def test_issue_645_scheduler_requeues_pending_stale_head() -> None:
             lease_ttl_s=30.0,
         )
 
-        assert claimed["leases"] == []
+        assert claimed.leases == []
         assert store.get_task("req-pending-stale")["status"] == "pending"
-        assert (await actor.contains_request(request_id="req-pending-stale"))["location"] == "backlog"
+        assert (await actor.contains_request(request_id="req-pending-stale")).location == "backlog"
         assert actor.stats()["counters"]["requeued"] == 1
         assert actor.stats()["counters"]["stale_dropped"] == 0
 
@@ -1670,8 +1676,8 @@ def test_issue_645_scheduler_drops_terminal_stale_backlog_head_and_assigns_next(
     )
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-stale"), assign=False))["ok"] is True
-        assert (await actor.append(_work("req-valid"), assign=False))["ok"] is True
+        assert (await actor.append(_work("req-stale"), assign=False)).ok is True
+        assert (await actor.append(_work("req-valid"), assign=False)).ok is True
         assert actor.stats()["backlog_depth"] == 2
 
         store.complete_task_failure(
@@ -1683,10 +1689,10 @@ def test_issue_645_scheduler_drops_terminal_stale_backlog_head_and_assigns_next(
 
         synced = await actor.sync_replicas([_replica("replica-0")])
 
-        assert synced["assigned"]["assigned"] == 1
+        assert synced.assigned["assigned"] == 1
         assert store.get_task("req-stale")["status"] == "retrieved"
         assert store.get_task("req-valid")["status"] == "assigned"
-        assert (await actor.contains_request(request_id="req-stale"))["present"] is False
+        assert (await actor.contains_request(request_id="req-stale")).present is False
         assert actor.stats()["backlog_depth"] == 0
         assert actor.stats()["replica_queues"][
             "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
@@ -1726,7 +1732,7 @@ def test_issue_645_scheduler_reconciles_wrapped_task_state_conflict() -> None:
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-wrapped-conflict"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-wrapped-conflict"), assign=True)).ok is True
         store.complete_task_failure(
             request_id="req-wrapped-conflict",
             error="client_abandoned",
@@ -1744,9 +1750,9 @@ def test_issue_645_scheduler_reconciles_wrapped_task_state_conflict() -> None:
             lease_ttl_s=30.0,
         )
 
-        assert claimed["leases"] == []
+        assert claimed.leases == []
         assert store.get_task("req-wrapped-conflict")["status"] == "retrieved"
-        assert (await actor.contains_request(request_id="req-wrapped-conflict"))["present"] is False
+        assert (await actor.contains_request(request_id="req-wrapped-conflict")).present is False
         assert actor.stats()["counters"]["stale_dropped"] == 1
 
     try:
@@ -1765,7 +1771,7 @@ def test_issue_645_scheduler_does_not_reconcile_unrelated_assign_conflict() -> N
     )
 
     async def _run() -> None:
-        assert (await actor.append(_work("req-conflict"), assign=False))["ok"] is True
+        assert (await actor.append(_work("req-conflict"), assign=False)).ok is True
 
         task_state.overrides["assign_task"] = TaskStateConflictError(
             "terminal task commit payload mismatch"
@@ -1791,7 +1797,7 @@ def test_issue_645_scheduler_does_not_reconcile_unrelated_task_state_conflict() 
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
-        assert (await actor.append(_work("req-conflict"), assign=True))["ok"] is True
+        assert (await actor.append(_work("req-conflict"), assign=True)).ok is True
         store.complete_task_failure(
             request_id="req-conflict",
             error="client_abandoned",

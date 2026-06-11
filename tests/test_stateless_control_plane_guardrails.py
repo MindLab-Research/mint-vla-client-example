@@ -319,8 +319,10 @@ def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> Non
 
     success, failure = asyncio.run(_run())
 
-    assert success == {"ok": True, "method": "finish_lease_success"}
-    assert failure == {"ok": True, "method": "finish_lease_failure"}
+    assert success.ok is True
+    assert success.extra["method"] == "finish_lease_success"
+    assert failure.ok is True
+    assert failure.extra["method"] == "finish_lease_failure"
     assert calls == [
         (
             "finish_lease_success",
