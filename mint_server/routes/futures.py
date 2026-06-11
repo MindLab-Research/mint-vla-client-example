@@ -641,7 +641,7 @@ async def retrieve_future(
 
                 contains = await model_work_scheduler.contains_request(
                     request_id=body.request_id,
-                    hydrate_task_state=False,
+                    hydrate_task_state=True,
                 )
                 if not bool(contains.get("present")):
                     await task_futures.async_fail(

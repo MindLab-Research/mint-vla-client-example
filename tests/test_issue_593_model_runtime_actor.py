@@ -58,6 +58,18 @@ def _lease(request_id: str = "runtime-req-1", *, finalize: bool = True) -> dict:
     return lease
 
 
+def _finish_failure_kwargs(lease: dict, *, consumer_id: str, error: str) -> dict:
+    return {
+        "request_id": lease["item"]["request_id"],
+        "lease_id": lease["lease_id"],
+        "attempt_id": lease["attempt_id"],
+        "scheduler_epoch": lease["scheduler_epoch"],
+        "consumer_id": consumer_id,
+        "consumer_generation": 3,
+        "error": error,
+    }
+
+
 def _lease_with_attempt(request_id: str, attempt_id: str) -> dict:
     lease = _lease(request_id)
     lease["item"]["extra"] = {
@@ -73,22 +85,32 @@ class _FakeScheduler:
         claims: list[list[dict]] | None = None,
         complete_ok: bool = True,
         begin_finalize_ok: bool = True,
+        finish_success_error: Exception | None = None,
+        finish_failure_error: Exception | None = None,
     ) -> None:
         self.claims = claims or []
         self.complete_ok = bool(complete_ok)
         self.begin_finalize_ok = bool(begin_finalize_ok)
+        self.finish_success_error = finish_success_error
+        self.finish_failure_error = finish_failure_error
         self.claim_calls: list[dict] = []
         self.renewed: list[dict] = []
         self.begin_finalized: list[dict] = []
         self.completed: list[dict] = []
+        self.finished_success: list[dict] = []
+        self.finished_failure: list[dict] = []
         self.failed: list[dict] = []
         self.assigned: list[dict] = []
+        self.request_id_by_lease_id: dict[str, str] = {}
 
     async def claim(self, **kwargs):
         self.claim_calls.append(kwargs)
         if not self.claims:
             return {"ok": True, "leases": []}
-        return {"ok": True, "leases": self.claims.pop(0)}
+        leases = self.claims.pop(0)
+        for lease in leases:
+            self.request_id_by_lease_id[str(lease["lease_id"])] = str(lease["item"]["request_id"])
+        return {"ok": True, "leases": leases}
 
     async def renew(self, **kwargs):
         self.renewed.append(kwargs)
@@ -105,6 +127,28 @@ class _FakeScheduler:
         if not self.complete_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {"ok": True, **kwargs}
+
+    async def finish_success(self, **kwargs):
+        self.finished_success.append(kwargs)
+        if self.finish_success_error is not None:
+            raise self.finish_success_error
+        if not self.complete_ok:
+            return {"ok": False, "reason": "unknown_lease", **kwargs}
+        return {
+            "ok": True,
+            "request_id": self.request_id_by_lease_id.get(str(kwargs["lease_id"])),
+            "status": "done",
+        }
+
+    async def finish_failure(self, **kwargs):
+        self.finished_failure.append(kwargs)
+        if self.finish_failure_error is not None:
+            raise self.finish_failure_error
+        return {
+            "ok": True,
+            "request_id": self.request_id_by_lease_id.get(str(kwargs["lease_id"])),
+            "status": "failed",
+        }
 
     async def fail(self, **kwargs):
         self.failed.append(kwargs)
@@ -297,8 +341,9 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     assert task_futures.running[0][1]["lease_id"] == lease["lease_id"]
     assert scheduler.renewed and scheduler.renewed[0]["lease_id"] == lease["lease_id"]
     assert task_futures.resolved == []
-    assert len(task_state_store.successes) == 1
-    assert task_state_store.successes[0]["request_id"] == lease["item"]["request_id"]
+    assert task_state_store.successes == []
+    assert len(scheduler.finished_success) == 1
+    assert scheduler.finished_success[0]["result_path"] == scheduler.begin_finalized[0]["staged_payload_path"]
     assert scheduler.begin_finalized == [
         {
             "lease_id": lease["lease_id"],
@@ -311,13 +356,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     assert scheduler.begin_finalized[0]["staged_payload_path"].endswith(
         "/ru/runtime-req-1/attempt-runtime-req-1__lease-runtime-req-1.json"
     )
-    assert scheduler.completed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-        }
-    ]
+    assert scheduler.completed == []
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 1
@@ -326,7 +365,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
 
 
 @pytest.mark.anyio
-async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_path) -> None:
+async def test_issue_616_model_runtime_finishes_success_via_scheduler(tmp_path) -> None:
     lease = _lease("runtime-req-task-state-success", finalize=False)
     lease["attempt_id"] = "attempt-success"
     lease["scheduler_epoch"] = 7
@@ -375,13 +414,13 @@ async def test_issue_616_model_runtime_commits_success_to_task_state_store(tmp_p
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == []
     assert task_state_store.failures == []
-    assert len(task_state_store.successes) == 1
-    success = task_state_store.successes[0]
-    assert success["request_id"] == lease["item"]["request_id"]
+    assert task_state_store.successes == []
+    assert len(scheduler.finished_success) == 1
+    success = scheduler.finished_success[0]
+    assert scheduler.begin_finalized[0]["staged_payload_path"] == success["result_path"]
     assert success["lease_id"] == lease["lease_id"]
-    assert success["attempt_id"] == "attempt-success"
-    assert success["scheduler_epoch"] == 7
-    assert success["runtime_generation"] == 3
+    assert success["consumer_id"] == "vllm:model-a::replica-0::generation::3"
+    assert success["consumer_generation"] == 3
     assert success["result_checksum"].startswith("sha256:")
     assert success["result_size_bytes"] > 0
     assert success["billing_observations"] == billing_observations
@@ -426,20 +465,15 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
 
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == []
-    assert len(task_state_store.successes) == 1
-    assert scheduler.completed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-        }
-    ]
+    assert task_state_store.successes == []
+    assert len(scheduler.finished_success) == 1
+    assert scheduler.completed == []
     assert scheduler.failed == []
     assert actor.health_snapshot()["completed_total"] == 1
 
 
 @pytest.mark.anyio
-async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_store(tmp_path) -> None:
+async def test_issue_616_model_runtime_finishes_executor_failure_via_scheduler(tmp_path) -> None:
     lease = _lease("runtime-req-task-state-failure", finalize=False)
     lease["attempt_id"] = "attempt-failure"
     lease["scheduler_epoch"] = 8
@@ -469,15 +503,12 @@ async def test_issue_616_model_runtime_commits_executor_failure_to_task_state_st
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
     assert task_state_store.successes == []
-    assert task_state_store.failures == [
-        {
-            "request_id": lease["item"]["request_id"],
-            "lease_id": lease["lease_id"],
-            "attempt_id": "attempt-failure",
-            "scheduler_epoch": 8,
-            "runtime_generation": 3,
-            "error": "executor failed: boom",
-        }
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="vllm:model-a::replica-0::generation::3",
+            error="executor failed: boom",
+        )
     ]
 
 
@@ -516,17 +547,10 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_failure
 
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert len(task_state_store.failures) == 1
+    assert task_state_store.failures == []
+    assert len(scheduler.finished_failure) == 1
     assert scheduler.completed == []
-    assert scheduler.failed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-            "reason": "executor_failed",
-            "requeue": False,
-        }
-    ]
+    assert scheduler.failed == []
     assert actor.health_snapshot()["failed_total"] == 1
 
 
@@ -555,15 +579,13 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert task_state_store.failures == [
-        {
-            "request_id": lease["item"]["request_id"],
-            "lease_id": lease["lease_id"],
-            "attempt_id": lease["attempt_id"],
-            "scheduler_epoch": lease["scheduler_epoch"],
-            "runtime_generation": 3,
-            "error": "executor failed: boom",
-        }
+    assert task_state_store.failures == []
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="vllm:model-a::replica-0::generation::3",
+            error="executor failed: boom",
+        )
     ]
     assert scheduler.begin_finalized == [
         {
@@ -574,15 +596,7 @@ async def test_issue_593_model_runtime_executor_failure_fails_future_and_lease()
         }
     ]
     assert scheduler.completed == []
-    assert scheduler.failed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-            "reason": "executor_failed",
-            "requeue": False,
-        }
-    ]
+    assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
     assert snapshot["failed_total"] == 1
@@ -623,29 +637,19 @@ async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease()
     assert result == {"claimed": 1, "executed": 1}
     assert cancelled is True
     assert task_futures.failed == []
-    assert task_state_store.failures == [
-        {
-            "request_id": lease["item"]["request_id"],
-            "lease_id": lease["lease_id"],
-            "attempt_id": lease["attempt_id"],
-            "scheduler_epoch": lease["scheduler_epoch"],
-            "runtime_generation": 3,
-            "error": (
+    assert task_state_store.failures == []
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="training:Qwen/Qwen3-0.6B::replica-0::generation::3",
+            error=(
                 "executor failed: model work executor timed out after 0.1s "
                 "op=training.save_weights_for_sampler"
             ),
-        }
+        )
     ]
     assert scheduler.completed == []
-    assert scheduler.failed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "training:Qwen/Qwen3-0.6B::replica-0::generation::3",
-            "consumer_generation": 3,
-            "reason": "executor_failed",
-            "requeue": False,
-        }
-    ]
+    assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
     assert snapshot["failed_total"] == 1
@@ -721,28 +725,18 @@ async def test_issue_656_stale_recovered_generation_fails_without_executor() -> 
 
     assert result == {"claimed": 1, "executed": 1}
     assert called is False
-    assert task_state_store.failures == [
-        {
-            "request_id": lease["item"]["request_id"],
-            "lease_id": lease["lease_id"],
-            "attempt_id": lease["attempt_id"],
-            "scheduler_epoch": lease["scheduler_epoch"],
-            "runtime_generation": 3,
-            "error": (
+    assert task_state_store.failures == []
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="vllm:model-a::replica-0::generation::3",
+            error=(
                 "executor failed: model work request recovered from stale runtime generation "
                 "actor_generation=2 current_actor_generation=3; request must be retried"
             ),
-        }
+        )
     ]
-    assert scheduler.failed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-            "reason": "stale_runtime_generation",
-            "requeue": False,
-        }
-    ]
+    assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["failed_total"] == 1
     assert snapshot["active_request_id"] is None
@@ -898,7 +892,7 @@ async def test_issue_648_model_runtime_executes_claimed_vllm_leases_concurrently
         lease_a["item"]["request_id"],
         lease_b["item"]["request_id"],
     ]
-    assert len(scheduler.completed) == 2
+    assert len(scheduler.finished_success) == 2
     assert actor.health_snapshot()["active_lease_count"] == 0
 
 
@@ -940,7 +934,7 @@ async def test_model_runtime_renews_pending_sequential_leases() -> None:
     ]
     renewed_lease_ids = [call["lease_id"] for call in scheduler.renewed]
     assert lease_b["lease_id"] in renewed_lease_ids
-    assert len(scheduler.completed) == 2
+    assert len(scheduler.finished_success) == 2
 
 
 @pytest.mark.anyio
@@ -968,26 +962,16 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert task_state_store.failures == [
-        {
-            "request_id": lease["item"]["request_id"],
-            "lease_id": lease["lease_id"],
-            "attempt_id": lease["attempt_id"],
-            "scheduler_epoch": lease["scheduler_epoch"],
-            "runtime_generation": 3,
-            "error": "engine startup failed",
-        }
+    assert task_state_store.failures == []
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="vllm:model-a::replica-0::generation::3",
+            error="engine startup failed",
+        )
     ]
     assert scheduler.completed == []
-    assert scheduler.failed == [
-        {
-            "lease_id": lease["lease_id"],
-            "consumer_id": "vllm:model-a::replica-0::generation::3",
-            "consumer_generation": 3,
-            "reason": "future_failed",
-            "requeue": False,
-        }
-    ]
+    assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
     assert snapshot["failed_total"] == 1
@@ -997,11 +981,11 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails() -> None:
     lease = _lease("runtime-req-finalize-fail")
-    scheduler = _FakeScheduler(claims=[[lease]])
-    task_futures = _FakeTaskFutureService(
-        statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
-        fail_terminal_write=True,
+    scheduler = _FakeScheduler(
+        claims=[[lease]],
+        finish_success_error=RuntimeError("task state terminal write failed"),
     )
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
@@ -1020,6 +1004,7 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == []
     assert scheduler.completed == []
+    assert len(scheduler.finished_success) == 1
     assert scheduler.failed == [
         {
             "lease_id": lease["lease_id"],
@@ -1234,11 +1219,11 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_failure_lease_f
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_requeues_if_task_futures_fail_write_fails() -> None:
     lease = _lease("runtime-req-fail-write-fail")
-    scheduler = _FakeScheduler(claims=[[lease]])
-    task_futures = _FakeTaskFutureService(
-        statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
-        fail_terminal_write=True,
+    scheduler = _FakeScheduler(
+        claims=[[lease]],
+        finish_failure_error=RuntimeError("task state terminal write failed"),
     )
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
 
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
@@ -1257,6 +1242,7 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_fail_write_fails
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
     assert scheduler.completed == []
+    assert len(scheduler.finished_failure) == 1
     assert scheduler.failed == [
         {
             "lease_id": lease["lease_id"],
@@ -1600,6 +1586,7 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
         "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
+    monkeypatch.setenv("RAY_ADDRESS", "local")
 
     out = get_or_create_model_runtime_actor(
         domain_key="vllm:model-a",
@@ -1673,6 +1660,7 @@ def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> No
         "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
+    monkeypatch.setenv("RAY_ADDRESS", "local")
 
     out = get_or_create_model_runtime_actor(
         domain_key="vllm:model-a",
@@ -1748,6 +1736,7 @@ def test_issue_679_get_or_create_recreates_stale_runtime_env(monkeypatch) -> Non
         "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
+    monkeypatch.setenv("RAY_ADDRESS", "local")
 
     out = get_or_create_model_runtime_actor(
         domain_key="bumblebee:model-a",

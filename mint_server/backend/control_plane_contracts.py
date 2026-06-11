@@ -279,6 +279,38 @@ class AsyncSchedulerQueue(Protocol):
         timeout_s: float | None = None,
     ) -> dict[str, Any]: ...
 
+    async def finish_success(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def finish_failure(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        consumer_id: str,
+        consumer_generation: int,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
+
     async def fail(
         self,
         *,
@@ -493,6 +525,14 @@ class InProcessSchedulerQueueAdapter:
     async def complete(self, **kwargs: Any) -> dict[str, Any]:
         kwargs.pop("timeout_s", None)
         return await self.actor.complete_lease(**kwargs)
+
+    async def finish_success(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("timeout_s", None)
+        return await self.actor.finish_lease_success(**kwargs)
+
+    async def finish_failure(self, **kwargs: Any) -> dict[str, Any]:
+        kwargs.pop("timeout_s", None)
+        return await self.actor.finish_lease_failure(**kwargs)
 
     async def fail(self, **kwargs: Any) -> dict[str, Any]:
         kwargs.pop("timeout_s", None)

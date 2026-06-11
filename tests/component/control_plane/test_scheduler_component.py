@@ -373,6 +373,199 @@ async def test_scheduler_component_fail_requeue_recovers_after_durable_finalize_
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_finish_success_requires_begin_finalize(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finish-success-before-finalize"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        finished = await world.scheduler.finish_success(
+            request_id=request_id,
+            lease_id=lease["lease_id"],
+            attempt_id=lease["attempt_id"],
+            scheduler_epoch=lease["scheduler_epoch"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            result_path=str(world.tmp_path / "result.json"),
+        )
+
+        assert finished == {"ok": False, "reason": "not_finalizing"}
+        assert (await world.observe_task(request_id))["status"] == "leased"
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_finish_success_commits_terminal_and_releases_projection(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finish-success"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+            staged_payload_path=str(world.tmp_path / "component-finish-success.json"),
+        )
+
+        finished = await world.scheduler.finish_success(
+            request_id=request_id,
+            lease_id=lease["lease_id"],
+            attempt_id=lease["attempt_id"],
+            scheduler_epoch=lease["scheduler_epoch"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            result_path=str(world.tmp_path / "component-finish-success.json"),
+            result_checksum="sha256:abc",
+            result_size_bytes=123,
+            billing_observations=[{"tokens": 7}],
+        )
+
+        record = await world.observe_task(request_id)
+        assert begin["ok"] is True
+        assert finished == {"ok": True, "request_id": request_id, "status": "done"}
+        assert record["status"] == "done"
+        assert record["result_path"].endswith("component-finish-success.json")
+        assert record["result_checksum"] == "sha256:abc"
+        assert record["result_size_bytes"] == 123
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_finish_success_preserves_absent_result_metadata(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finish-success-no-meta"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+            staged_payload_path=str(world.tmp_path / "component-finish-success-no-meta.json"),
+        )
+
+        finished = await world.scheduler.finish_success(
+            request_id=request_id,
+            lease_id=lease["lease_id"],
+            attempt_id=lease["attempt_id"],
+            scheduler_epoch=lease["scheduler_epoch"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            result_path=str(world.tmp_path / "component-finish-success-no-meta.json"),
+        )
+
+        record = await world.observe_task(request_id)
+        assert begin["ok"] is True
+        assert finished == {"ok": True, "request_id": request_id, "status": "done"}
+        assert record["status"] == "done"
+        assert record["result_checksum"] is None
+        assert record["result_size_bytes"] is None
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_finish_failure_commits_terminal_and_releases_projection(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finish-failure"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+        )
+
+        finished = await world.scheduler.finish_failure(
+            request_id=request_id,
+            lease_id=lease["lease_id"],
+            attempt_id=lease["attempt_id"],
+            scheduler_epoch=lease["scheduler_epoch"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            error="runtime failed",
+        )
+
+        record = await world.observe_task(request_id)
+        assert begin["ok"] is True
+        assert finished == {"ok": True, "request_id": request_id, "status": "failed"}
+        assert record["status"] == "failed"
+        assert record["error"] == "runtime failed"
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_finish_cancel_after_durable_commit_releases_projection(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finish-cancel"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+        )
+
+        def _cancel_after_commit(**_kwargs):
+            return asyncio.CancelledError()
+
+        world.faults.fail_next("task_state.commit_finalize_success.after", _cancel_after_commit)
+
+        with pytest.raises(asyncio.CancelledError):
+            await world.scheduler.finish_success(
+                request_id=request_id,
+                lease_id=lease["lease_id"],
+                attempt_id=lease["attempt_id"],
+                scheduler_epoch=lease["scheduler_epoch"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                result_path=str(world.tmp_path / "component-finish-cancel.json"),
+                result_checksum="sha256:abc",
+                result_size_bytes=123,
+            )
+
+        assert begin["ok"] is True
+        assert (await world.observe_task(request_id))["status"] == "done"
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_duplicate_append_cancel_does_not_forget_existing_pending(
     tmp_path,
 ) -> None:
@@ -2145,8 +2338,14 @@ async def test_scheduler_component_retrieve_pending_survives_scheduler_restart(t
 @pytest.mark.anyio
 async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path, monkeypatch) -> None:
     class AbsentScheduler:
-        async def contains_request(self, *, request_id: str, timeout_s: float | None = None) -> dict[str, object]:
-            _ = request_id, timeout_s
+        async def contains_request(
+            self,
+            *,
+            request_id: str,
+            hydrate_task_state: bool = True,
+            timeout_s: float | None = None,
+        ) -> dict[str, object]:
+            _ = request_id, hydrate_task_state, timeout_s
             return {"ok": True, "present": False}
 
         async def contains(self, **kwargs) -> dict[str, object]:

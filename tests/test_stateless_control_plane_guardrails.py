@@ -84,6 +84,19 @@ def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
     assert "from ..routes" not in context_source
 
 
+def test_model_runtime_terminal_commit_goes_through_scheduler_finish_surface() -> None:
+    runtime_source = (
+        REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+    ).read_text()
+
+    assert "_commit_task_state_success" not in runtime_source
+    assert "_commit_task_state_failure" not in runtime_source
+    assert "commit_finalize_success(" not in runtime_source
+    assert "commit_finalize_failure(" not in runtime_source
+    assert "finish_success(" in runtime_source
+    assert "finish_failure(" in runtime_source
+
+
 def test_task_ledger_contract_rejects_sync_task_state_store_surface() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -236,6 +249,109 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
                 "result_size_bytes": 456,
             },
         )
+    ]
+
+
+def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> None:
+    import mint_server.backend.model_work_scheduler as scheduler_module
+
+    calls: list[tuple[str, dict]] = []
+
+    class _RemoteMethod:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def remote(self, **kwargs):
+            calls.append((self.name, kwargs))
+            return {"ok": True, "method": self.name}
+
+    class _Actor:
+        finish_lease_success = _RemoteMethod("finish_lease_success")
+        finish_lease_failure = _RemoteMethod("finish_lease_failure")
+
+    async def _get_actor(self, **_kwargs):
+        return _Actor()
+
+    async def _await_ref(self, ref, *, timeout_s=None):
+        assert timeout_s == 3.0
+        return ref
+
+    async def _run() -> tuple[dict, dict]:
+        client = ModelWorkSchedulerClient()
+        success = await client.finish_success(
+            request_id="request-a",
+            lease_id="lease-a",
+            attempt_id="attempt-a",
+            scheduler_epoch=11,
+            consumer_id="consumer-a",
+            consumer_generation=7,
+            result_path="/tmp/result.json",
+            result_checksum=None,
+            result_size_bytes=None,
+            billing_observations=[{"tokens": 5}],
+            timeout_s=3.0,
+        )
+        failure = await client.finish_failure(
+            request_id="request-b",
+            lease_id="lease-b",
+            attempt_id="attempt-b",
+            scheduler_epoch=12,
+            consumer_id="consumer-b",
+            consumer_generation=8,
+            error="boom",
+            result_path=None,
+            result_checksum=None,
+            result_size_bytes=None,
+            timeout_s=3.0,
+        )
+        return success, failure
+
+    monkeypatch.setattr(
+        scheduler_module.ModelWorkSchedulerClient,
+        "_get_ray_actor_async",
+        _get_actor,
+    )
+    monkeypatch.setattr(
+        scheduler_module.ModelWorkSchedulerClient,
+        "_await_ray_ref",
+        _await_ref,
+    )
+
+    success, failure = asyncio.run(_run())
+
+    assert success == {"ok": True, "method": "finish_lease_success"}
+    assert failure == {"ok": True, "method": "finish_lease_failure"}
+    assert calls == [
+        (
+            "finish_lease_success",
+            {
+                "request_id": "request-a",
+                "lease_id": "lease-a",
+                "attempt_id": "attempt-a",
+                "scheduler_epoch": 11,
+                "consumer_id": "consumer-a",
+                "consumer_generation": 7,
+                "result_path": "/tmp/result.json",
+                "result_checksum": None,
+                "result_size_bytes": None,
+                "billing_observations": [{"tokens": 5}],
+            },
+        ),
+        (
+            "finish_lease_failure",
+            {
+                "request_id": "request-b",
+                "lease_id": "lease-b",
+                "attempt_id": "attempt-b",
+                "scheduler_epoch": 12,
+                "consumer_id": "consumer-b",
+                "consumer_generation": 8,
+                "error": "boom",
+                "result_path": None,
+                "result_checksum": None,
+                "result_size_bytes": None,
+            },
+        ),
     ]
 
 
