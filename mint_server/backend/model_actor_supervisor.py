@@ -965,6 +965,7 @@ class ModelActorSupervisorCore:
         self._restarted_total = 0
         self._blocked_total = 0
         self._busy_recycle_skipped_total = 0
+        self._health_timeout_preserved_total = 0
         self._scheduler_sync_failures_total = 0
         self._placement_reconcile_failures_total = 0
         self._topology_reconcile_failures_total = 0
@@ -2430,6 +2431,39 @@ class ModelActorSupervisorCore:
                     self._actor_generations.pop(key, None)
                     results[label] = self._states.get(key, {})
                     continue
+                if _is_ray_get_timeout_error(e):
+                    # A health-probe timeout means the actor is still alive but
+                    # busy (e.g. executing a long save_weights_for_sampler that
+                    # starves the snapshot call). Killing/recreating it here would
+                    # abort an in-flight lease, flip the scheduler registration to
+                    # unclaimable, and re-queue the same request onto a fresh actor
+                    # that promptly times out again. Preserve the prior healthy
+                    # registration and wait for the next reconcile instead.
+                    self._health_timeout_preserved_total += 1
+                    previous = self._states.get(key, {})
+                    self._states[key] = {
+                        **previous,
+                        "domain_key": spec.domain_key,
+                        "replica_id": spec.replica_id,
+                        "actor_name": spec.normalized_actor_name(),
+                        "last_action": "health_timeout_preserved",
+                        "last_action_at": time.time(),
+                        "node_pins": resolved_node_pins,
+                        "worker_aliases": original_spec.normalized_worker_aliases(),
+                        "gpu_count": spec.gpu_count,
+                    }
+                    logger.warning(
+                        "[model_actor_supervisor] health probe timed out; runtime "
+                        "assumed busy, not recreating domain=%s replica=%s actor=%s "
+                        "error_type=%s error=%s",
+                        spec.domain_key,
+                        spec.replica_id,
+                        spec.normalized_actor_name(),
+                        type(e).__name__,
+                        e,
+                    )
+                    results[label] = self._states[key]
+                    continue
                 previous = self._states.get(key, {})
                 crash_count = int(previous.get("crash_count", 0)) + 1
                 self._states[key] = {
@@ -2597,6 +2631,7 @@ class ModelActorSupervisorCore:
             "restarted_total": int(self._restarted_total),
             "blocked_total": int(self._blocked_total),
             "busy_recycle_skipped_total": int(self._busy_recycle_skipped_total),
+            "health_timeout_preserved_total": int(self._health_timeout_preserved_total),
             "scheduler_sync_failures_total": int(self._scheduler_sync_failures_total),
             "placement_reconcile_failures_total": int(self._placement_reconcile_failures_total),
             "topology_reconcile_failures_total": int(self._topology_reconcile_failures_total),

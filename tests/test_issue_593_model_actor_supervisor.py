@@ -1555,6 +1555,50 @@ async def test_issue_593_supervisor_restarts_dead_runtime_with_monotonic_generat
 
 
 @pytest.mark.anyio
+async def test_issue_593_supervisor_preserves_busy_runtime_on_health_timeout() -> None:
+    from ray.exceptions import GetTimeoutError
+
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    first_generation = created[0].generation
+    # A health-probe timeout means alive-but-busy, not dead: the runtime must be
+    # neither killed nor recreated, and its scheduler registration must stay
+    # claimable so the in-flight lease is not requeued as replica_unclaimable.
+    created[0].health_errors.append(GetTimeoutError("timed out after 5.000s"))
+
+    out = await supervisor.reconcile_once()
+
+    assert len(created) == 1
+    assert supervisor._actors[("vllm:model-a", "replica-0")] is created[0]
+    replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
+    assert replica["last_action"] == "health_timeout_preserved"
+    assert out["snapshot"]["restarted_total"] == 0
+    assert out["snapshot"]["health_timeout_preserved_total"] == 1
+    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["generation"] == first_generation
+
+
+@pytest.mark.anyio
 async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() -> None:
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []

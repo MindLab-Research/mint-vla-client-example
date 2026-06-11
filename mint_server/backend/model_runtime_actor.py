@@ -24,7 +24,11 @@ from ..logging_context import (
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .execution_context import ExecutionContext, bind_execution_context
-from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
+from .model_actor_supervisor import (
+    _is_ray_get_timeout_error,
+    consumer_id_for_replica,
+    queue_id_for_replica,
+)
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
@@ -141,17 +145,34 @@ def get_or_create_model_runtime_actor(
     except ValueError:
         pass
     except Exception as e:
-        logger.warning(
-            "[model_runtime] existing actor health check failed name=%s error_type=%s error=%s; recreating",
-            name,
-            type(e).__name__,
-            e,
-        )
-        try:
-            existing = ray.get_actor(name, namespace=_ray_namespace())
-            ray.kill(existing, no_restart=True)
-        except Exception:
-            pass
+        if _is_ray_get_timeout_error(e):
+            # The actor exists but its health_snapshot did not return within the
+            # probe window: it is alive and busy (e.g. mid save_weights_for_sampler),
+            # not dead. Killing it here would abort an in-flight lease and trigger a
+            # kill/recreate loop. Reuse the existing handle and let the caller retry.
+            logger.warning(
+                "[model_runtime] existing actor health probe timed out name=%s "
+                "error_type=%s error=%s; assuming busy, reusing existing actor",
+                name,
+                type(e).__name__,
+                e,
+            )
+            try:
+                return ray.get_actor(name, namespace=_ray_namespace())
+            except Exception:
+                pass
+        else:
+            logger.warning(
+                "[model_runtime] existing actor health check failed name=%s error_type=%s error=%s; recreating",
+                name,
+                type(e).__name__,
+                e,
+            )
+            try:
+                existing = ray.get_actor(name, namespace=_ray_namespace())
+                ray.kill(existing, no_restart=True)
+            except Exception:
+                pass
 
     ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
     if ray_address is None:
