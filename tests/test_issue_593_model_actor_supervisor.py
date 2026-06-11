@@ -2051,7 +2051,7 @@ def test_issue_593_topology_specs_accept_qwen35_bumblebee_training_alias(
                 base_model: {
                     "bumblebee": {
                         "placement": [
-                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 4},
+                            {"replica": 0, "worker_alias": "mint-worker-0", "gpu_count": 8},
                         ]
                     }
                 }
@@ -2068,8 +2068,8 @@ def test_issue_593_topology_specs_accept_qwen35_bumblebee_training_alias(
             base_model=base_model,
             launcher_key="training",
             worker_aliases=("mint-worker-0",),
-            placement_alias_slices=(("replica-0", "mint-worker-0", 4),),
-            gpu_count=4,
+            placement_alias_slices=(("replica-0", "mint-worker-0", 8),),
+            gpu_count=8,
         )
     ]
     assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
