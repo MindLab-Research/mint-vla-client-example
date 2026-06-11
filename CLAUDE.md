@@ -26,6 +26,19 @@ background file sync.
 - Keep each checkout on the intended branch and use `git pull --ff-only`.
 - Runtime/config/logs come from the matching `/share/mint/{dev,prod}` tree.
 
+## Worktree Discipline
+
+All feature, bugfix, review, and experiment work must happen in a dedicated git
+worktree. Keep the main checkout (`/root/code/mint`) clean and pinned to
+`origin/develop`; do not develop directly in the main checkout.
+
+- Before starting work, create or reuse a task-specific worktree and branch.
+- Treat the main checkout as the read-only baseline for `origin/develop`.
+- If the local `develop` branch is already attached to another worktree, it is
+  acceptable for the main checkout to be detached at `origin/develop`.
+- Do not commit feature work from the main checkout unless the user explicitly
+  asks for a direct `origin/develop` documentation or policy update.
+
 ## Remote Commands
 
 **NEVER** run `ray` or `volc` commands locally. Invoke the appropriate skill instead.
