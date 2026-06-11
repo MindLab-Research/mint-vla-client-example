@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Literal, Protocol, runtime_checkable
 
 
 class TaskLedgerOp(StrEnum):
@@ -38,6 +39,614 @@ class SchedulerQueueOp(StrEnum):
     STATS = "stats"
 
 
+class ConflictReason(StrEnum):
+    ADMISSION_REJECTED = "admission_rejected"
+    ALREADY_TERMINAL = "already_terminal"
+    CANCELLED_AFTER_REQUEUE_COMMIT = "cancelled_after_requeue_commit"
+    DOMAIN_INFLIGHT_LIMIT_EXCEEDED = "domain_inflight_limit_exceeded"
+    DOMAIN_TOKEN_BUDGET_EXCEEDED = "domain_token_budget_exceeded"
+    DUPLICATE_MISMATCH = "duplicate_mismatch"
+    DUPLICATE_REQUEST_ID = "duplicate_request_id"
+    FINALIZE_IN_PROGRESS = "finalize_in_progress"
+    FINALIZE_INFLIGHT = "finalize_inflight"
+    LEASE_EXPIRED = "lease_expired"
+    NOT_FINALIZING = "not_finalizing"
+    NOT_FOUND = "not_found"
+    NOT_PENDING = "not_pending"
+    NOT_TERMINAL = "not_terminal"
+    OWNER_ACTIVE = "owner_active"
+    PAYLOAD_CHANGED = "payload_changed"
+    PRINCIPAL_DOMAIN_INFLIGHT_LIMIT_EXCEEDED = "principal_domain_inflight_limit_exceeded"
+    PRINCIPAL_DOMAIN_TOKEN_BUDGET_EXCEEDED = "principal_domain_token_budget_exceeded"
+    RETRY_REQUIRED = "retry_required"
+    STALE_CONSUMER = "stale_consumer"
+    STALE_EPOCH = "stale_epoch"
+    STALE_GENERATION = "stale_generation"
+    STALE_OWNER = "stale_owner"
+    TASK_STATE_INVALID = "task_state_invalid"
+    TERMINAL = "terminal"
+    UNKNOWN = "unknown"
+    UNKNOWN_LEASE = "unknown_lease"
+
+
+def _reason_from_wire(value: Any) -> ConflictReason | None:
+    if value is None:
+        return None
+    if isinstance(value, ConflictReason):
+        return value
+    try:
+        return ConflictReason(str(value))
+    except ValueError:
+        return ConflictReason.UNKNOWN
+
+
+@dataclass(frozen=True)
+class LeaseToken:
+    request_id: str
+    lease_id: str
+    attempt_id: str
+    scheduler_epoch: int
+    consumer_id: str
+    consumer_generation: int
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "request_id": self.request_id,
+            "lease_id": self.lease_id,
+            "attempt_id": self.attempt_id,
+            "scheduler_epoch": self.scheduler_epoch,
+            "consumer_id": self.consumer_id,
+            "consumer_generation": self.consumer_generation,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "LeaseToken":
+        return cls(
+            request_id=str(data["request_id"]),
+            lease_id=str(data["lease_id"]),
+            attempt_id=str(data["attempt_id"]),
+            scheduler_epoch=int(data["scheduler_epoch"]),
+            consumer_id=str(data["consumer_id"]),
+            consumer_generation=int(data["consumer_generation"]),
+        )
+
+
+@dataclass(frozen=True)
+class SubmitTaskResult:
+    ok: bool
+    request_id: str
+    created: bool = False
+    assigned: bool = False
+    reason: ConflictReason | None = None
+    record: dict[str, Any] | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "created": self.created,
+            "assigned": self.assigned,
+            "reason": self.reason.value if self.reason is not None else None,
+            "record": self.record,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "SubmitTaskResult":
+        assigned = data.get("assigned", False)
+        if isinstance(assigned, dict):
+            assigned = bool(assigned.get("assigned"))
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]),
+            created=bool(data.get("created", not bool(data.get("idempotent", False)))),
+            assigned=bool(assigned),
+            reason=_reason_from_wire(data.get("reason")),
+            record=data.get("record") if isinstance(data.get("record"), dict) else None,
+        )
+
+
+@dataclass(frozen=True)
+class CancelTaskResult:
+    ok: bool
+    request_id: str
+    was_terminal: bool = False
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "was_terminal": self.was_terminal,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "CancelTaskResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]),
+            was_terminal=bool(data.get("was_terminal", False)),
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class RetrieveTaskResult:
+    status: Literal["ready", "failed", "pending", "unknown", "unavailable"]
+    request_id: str
+    result_path: str | None = None
+    result_checksum: str | None = None
+    result_size_bytes: int | None = None
+    error: dict[str, Any] | None = None
+    retry_after_s: float | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "request_id": self.request_id,
+            "result_path": self.result_path,
+            "result_checksum": self.result_checksum,
+            "result_size_bytes": self.result_size_bytes,
+            "error": self.error,
+            "retry_after_s": self.retry_after_s,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "RetrieveTaskResult":
+        return cls(
+            status=data["status"],
+            request_id=str(data["request_id"]),
+            result_path=data.get("result_path"),
+            result_checksum=data.get("result_checksum"),
+            result_size_bytes=(
+                int(data["result_size_bytes"]) if data.get("result_size_bytes") is not None else None
+            ),
+            error=data.get("error") if isinstance(data.get("error"), dict) else None,
+            retry_after_s=float(data["retry_after_s"]) if data.get("retry_after_s") is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class TaskRecord:
+    request_id: str
+    status: str
+    data: dict[str, Any] = field(default_factory=dict)
+
+    def to_wire(self) -> dict[str, Any]:
+        return dict(self.data)
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "TaskRecord":
+        return cls(
+            request_id=str(data["request_id"]),
+            status=str(data["status"]),
+            data=dict(data),
+        )
+
+
+@dataclass(frozen=True)
+class OwnerLeaseResult:
+    ok: bool
+    owner_id: str | None = None
+    epoch: int | None = None
+    expires_at: float | None = None
+    fencing_token: str | None = None
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "owner_id": self.owner_id,
+            "epoch": self.epoch,
+            "expires_at": self.expires_at,
+            "fencing_token": self.fencing_token,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "OwnerLeaseResult":
+        return cls(
+            ok=bool(data["ok"]),
+            owner_id=str(data["owner_id"]) if data.get("owner_id") is not None else None,
+            epoch=int(data["epoch"]) if data.get("epoch") is not None else None,
+            expires_at=float(data["expires_at"]) if data.get("expires_at") is not None else None,
+            fencing_token=str(data["fencing_token"]) if data.get("fencing_token") is not None else None,
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class CreateTaskResult:
+    ok: bool
+    created: bool
+    record: dict[str, Any]
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "created": self.created,
+            "record": self.record,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "CreateTaskResult":
+        return cls(
+            ok=bool(data["ok"]),
+            created=bool(data["created"]),
+            record=dict(data["record"]),
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class TaskMutationResult:
+    ok: bool
+    record: dict[str, Any] | None = None
+    reason: ConflictReason | None = None
+    idempotent: bool = False
+    retry_required: bool = False
+    deleted: bool | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "record": self.record,
+            "reason": self.reason.value if self.reason is not None else None,
+            "idempotent": self.idempotent,
+            "retry_required": self.retry_required,
+            "deleted": self.deleted,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "TaskMutationResult":
+        return cls(
+            ok=bool(data["ok"]),
+            record=data.get("record") if isinstance(data.get("record"), dict) else None,
+            reason=_reason_from_wire(data.get("reason")),
+            idempotent=bool(data.get("idempotent", False)),
+            retry_required=bool(data.get("retry_required", False)),
+            deleted=bool(data["deleted"]) if data.get("deleted") is not None else None,
+        )
+
+
+AssignTaskResult = TaskMutationResult
+ClaimTaskResult = TaskMutationResult
+RenewLeaseResult = TaskMutationResult
+BeginFinalizeResult = TaskMutationResult
+CommitFinalizeResult = TaskMutationResult
+RequeueTaskResult = TaskMutationResult
+
+
+@dataclass(frozen=True)
+class TaskStatusChange:
+    changed: bool
+    request_id: str
+    record: dict[str, Any] | None = None
+    missing: bool = False
+    timeout: bool = False
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "changed": self.changed,
+            "request_id": self.request_id,
+            "record": self.record,
+            "missing": self.missing,
+            "timeout": self.timeout,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "TaskStatusChange":
+        record = data.get("record") if isinstance(data.get("record"), dict) else None
+        request_id = str(data.get("request_id") or (record or {}).get("request_id"))
+        return cls(
+            changed=bool(data["changed"]),
+            request_id=request_id,
+            record=record,
+            missing=bool(data.get("missing", False)),
+            timeout=bool(data.get("timeout", False)),
+        )
+
+
+@dataclass(frozen=True)
+class AppendWorkResult:
+    ok: bool
+    request_id: str | None = None
+    domain_key: str | None = None
+    scheduler_instance_id: str | None = None
+    backlog_depth: int | None = None
+    assigned: dict[str, Any] | None = None
+    idempotent: bool = False
+    reason: ConflictReason | None = None
+    retry_after_s: float | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "domain_key": self.domain_key,
+            "scheduler_instance_id": self.scheduler_instance_id,
+            "backlog_depth": self.backlog_depth,
+            "assigned": self.assigned,
+            "idempotent": self.idempotent,
+            "reason": self.reason.value if self.reason is not None else None,
+            "retry_after_s": self.retry_after_s,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "AppendWorkResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
+            domain_key=str(data["domain_key"]) if data.get("domain_key") is not None else None,
+            scheduler_instance_id=(
+                str(data["scheduler_instance_id"]) if data.get("scheduler_instance_id") is not None else None
+            ),
+            backlog_depth=int(data["backlog_depth"]) if data.get("backlog_depth") is not None else None,
+            assigned=data.get("assigned") if isinstance(data.get("assigned"), dict) else None,
+            idempotent=bool(data.get("idempotent", False)),
+            reason=_reason_from_wire(data.get("reason")),
+            retry_after_s=float(data["retry_after_s"]) if data.get("retry_after_s") is not None else None,
+        )
+
+
+@dataclass(frozen=True)
+class AssignPendingResult:
+    ok: bool
+    assigned: int
+    skipped_domains: list[str] = field(default_factory=list)
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "assigned": self.assigned,
+            "skipped_domains": list(self.skipped_domains),
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "AssignPendingResult":
+        return cls(
+            ok=bool(data["ok"]),
+            assigned=int(data.get("assigned") or 0),
+            skipped_domains=[str(value) for value in data.get("skipped_domains") or []],
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    ok: bool
+    leases: list[dict[str, Any]] = field(default_factory=list)
+    remaining_queue_depth: int = 0
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "leases": list(self.leases),
+            "remaining_queue_depth": self.remaining_queue_depth,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ClaimResult":
+        return cls(
+            ok=bool(data["ok"]),
+            leases=list(data.get("leases") or []),
+            remaining_queue_depth=int(data.get("remaining_queue_depth") or 0),
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class LeaseResult:
+    ok: bool
+    lease: dict[str, Any] | None = None
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "lease": self.lease,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "LeaseResult":
+        return cls(
+            ok=bool(data["ok"]),
+            lease=data.get("lease") if isinstance(data.get("lease"), dict) else None,
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+RenewResult = LeaseResult
+
+
+@dataclass(frozen=True)
+class FinishResult:
+    ok: bool
+    request_id: str | None = None
+    status: str | None = None
+    reason: ConflictReason | None = None
+    idempotent: bool = False
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "status": self.status,
+            "reason": self.reason.value if self.reason is not None else None,
+            "idempotent": self.idempotent,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "FinishResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
+            status=str(data["status"]) if data.get("status") is not None else None,
+            reason=_reason_from_wire(data.get("reason")),
+            idempotent=bool(data.get("idempotent", False)),
+        )
+
+
+@dataclass(frozen=True)
+class FailLeaseResult:
+    ok: bool
+    request_id: str | None = None
+    requeued: bool = False
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "requeued": self.requeued,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "FailLeaseResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
+            requeued=bool(data.get("requeued", False)),
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class ValidateLeaseResult:
+    ok: bool
+    request_id: str | None = None
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ValidateLeaseResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class ExpireResult:
+    ok: bool
+    expired: int
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"ok": self.ok, "expired": self.expired}
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ExpireResult":
+        return cls(ok=bool(data["ok"]), expired=int(data.get("expired") or 0))
+
+
+@dataclass(frozen=True)
+class ContainsResult:
+    ok: bool
+    request_id: str
+    present: bool
+    location: str | None = None
+    lease_id: str | None = None
+    scheduler_instance_id: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "request_id": self.request_id,
+            "present": self.present,
+            "location": self.location,
+            "lease_id": self.lease_id,
+            "scheduler_instance_id": self.scheduler_instance_id,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ContainsResult":
+        return cls(
+            ok=bool(data["ok"]),
+            request_id=str(data["request_id"]),
+            present=bool(data["present"]),
+            location=str(data["location"]) if data.get("location") is not None else None,
+            lease_id=str(data["lease_id"]) if data.get("lease_id") is not None else None,
+            scheduler_instance_id=(
+                str(data["scheduler_instance_id"]) if data.get("scheduler_instance_id") is not None else None
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class SyncReplicasResult:
+    ok: bool
+    registered: int = 0
+    removed: int = 0
+    expired: int = 0
+    assigned: dict[str, Any] | None = None
+    reason: ConflictReason | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "registered": self.registered,
+            "removed": self.removed,
+            "expired": self.expired,
+            "assigned": self.assigned,
+            "reason": self.reason.value if self.reason is not None else None,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "SyncReplicasResult":
+        return cls(
+            ok=bool(data["ok"]),
+            registered=int(data.get("registered") or 0),
+            removed=int(data.get("removed") or 0),
+            expired=int(data.get("expired") or 0),
+            assigned=data.get("assigned") if isinstance(data.get("assigned"), dict) else None,
+            reason=_reason_from_wire(data.get("reason")),
+        )
+
+
+@dataclass(frozen=True)
+class ExecutorOutcome:
+    kind: Literal["success", "retryable_failure", "fatal_backend_death", "user_error"]
+    payload: Any | None = None
+    error: str | None = None
+    billing_observations: list[dict[str, Any]] | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "payload": self.payload,
+            "error": self.error,
+            "billing_observations": self.billing_observations,
+        }
+
+    @classmethod
+    def from_wire(cls, data: dict[str, Any]) -> "ExecutorOutcome":
+        return cls(
+            kind=data["kind"],
+            payload=data.get("payload"),
+            error=data.get("error"),
+            billing_observations=(
+                list(data["billing_observations"])
+                if data.get("billing_observations") is not None
+                else None
+            ),
+        )
+
+
 @runtime_checkable
 class AsyncTaskLedger(Protocol):
     async def ensure_ready(
@@ -55,7 +664,7 @@ class AsyncTaskLedger(Protocol):
         owner_id: str,
         ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> OwnerLeaseResult: ...
 
     async def renew_owner(
         self,
@@ -64,7 +673,7 @@ class AsyncTaskLedger(Protocol):
         epoch: int,
         ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> OwnerLeaseResult: ...
 
     async def create_task(
         self,
@@ -76,7 +685,7 @@ class AsyncTaskLedger(Protocol):
         payload_hash: str | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> CreateTaskResult: ...
 
     async def assign_task(
         self,
@@ -85,7 +694,7 @@ class AsyncTaskLedger(Protocol):
         subqueue_id: str,
         scheduler_epoch: int,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> AssignTaskResult: ...
 
     async def claim_task(
         self,
@@ -99,7 +708,7 @@ class AsyncTaskLedger(Protocol):
         runtime_generation: int,
         lease_ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ClaimTaskResult: ...
 
     async def renew_lease(
         self,
@@ -111,7 +720,7 @@ class AsyncTaskLedger(Protocol):
         runtime_generation: int,
         lease_ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> RenewLeaseResult: ...
 
     async def begin_finalize(
         self,
@@ -124,7 +733,7 @@ class AsyncTaskLedger(Protocol):
         finalize_ttl_s: float,
         staged_payload_path: str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> BeginFinalizeResult: ...
 
     async def commit_finalize_success(
         self,
@@ -140,7 +749,7 @@ class AsyncTaskLedger(Protocol):
         billing_observations: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> CommitFinalizeResult: ...
 
     async def commit_finalize_failure(
         self,
@@ -156,7 +765,7 @@ class AsyncTaskLedger(Protocol):
         result_size_bytes: int | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> CommitFinalizeResult: ...
 
     async def complete_task_failure(
         self,
@@ -168,7 +777,7 @@ class AsyncTaskLedger(Protocol):
         result_size_bytes: int | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> CommitFinalizeResult: ...
 
     async def requeue_task(
         self,
@@ -177,13 +786,13 @@ class AsyncTaskLedger(Protocol):
         scheduler_epoch: int,
         reason: str,
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> RequeueTaskResult: ...
 
-    async def forget_task(self, *, request_id: str) -> dict[str, Any]: ...
+    async def forget_task(self, *, request_id: str) -> TaskMutationResult: ...
 
-    async def get_task(self, *, request_id: str) -> dict[str, Any]: ...
+    async def get_task(self, *, request_id: str) -> TaskRecord: ...
 
-    async def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]: ...
+    async def list_active_tasks(self, *, limit: int | None = None) -> list[TaskRecord]: ...
 
     async def wait_task_status_change(
         self,
@@ -193,7 +802,7 @@ class AsyncTaskLedger(Protocol):
         observed_status: str | None = None,
         observed_updated_at: float | None = None,
         terminal_only: bool = False,
-    ) -> dict[str, Any]: ...
+    ) -> TaskStatusChange: ...
 
     async def update_task_metadata(
         self,
@@ -201,7 +810,7 @@ class AsyncTaskLedger(Protocol):
         request_id: str,
         metadata: dict[str, Any],
         now: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> TaskMutationResult: ...
 
 
 @runtime_checkable
@@ -225,16 +834,16 @@ class AsyncSchedulerQueue(Protocol):
         assign: bool = False,
         assign_max_items: int | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> AppendWorkResult: ...
 
-    async def sync_replicas(self, replicas: list[dict[str, Any]], **kwargs: Any) -> dict[str, Any]: ...
+    async def sync_replicas(self, replicas: list[dict[str, Any]], **kwargs: Any) -> SyncReplicasResult: ...
 
     async def assign_pending(
         self,
         *,
         max_items: int | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> AssignPendingResult: ...
 
     async def claim(
         self,
@@ -247,7 +856,7 @@ class AsyncSchedulerQueue(Protocol):
         token_budget: int | None = None,
         lease_ttl_s: float = 30.0,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ClaimResult: ...
 
     async def renew(
         self,
@@ -257,7 +866,7 @@ class AsyncSchedulerQueue(Protocol):
         consumer_generation: int,
         lease_ttl_s: float = 30.0,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> RenewResult: ...
 
     async def begin_finalize(
         self,
@@ -268,7 +877,7 @@ class AsyncSchedulerQueue(Protocol):
         finalize_ttl_s: float = 30.0,
         staged_payload_path: str | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> LeaseResult: ...
 
     async def complete(
         self,
@@ -277,7 +886,7 @@ class AsyncSchedulerQueue(Protocol):
         consumer_id: str,
         consumer_generation: int,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> FinishResult: ...
 
     async def finish_success(
         self,
@@ -293,7 +902,7 @@ class AsyncSchedulerQueue(Protocol):
         result_size_bytes: int | None = None,
         billing_observations: list[dict[str, Any]] | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> FinishResult: ...
 
     async def finish_failure(
         self,
@@ -309,7 +918,7 @@ class AsyncSchedulerQueue(Protocol):
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> FinishResult: ...
 
     async def fail(
         self,
@@ -321,7 +930,7 @@ class AsyncSchedulerQueue(Protocol):
         reason: str = "failed",
         abort_finalize: bool = False,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> FailLeaseResult: ...
 
     async def validate(
         self,
@@ -330,16 +939,16 @@ class AsyncSchedulerQueue(Protocol):
         consumer_id: str,
         consumer_generation: int,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ValidateLeaseResult: ...
 
     async def expire(
         self,
         *,
         now: float | None = None,
         timeout_s: float | None = None,
-    ) -> dict[str, Any]: ...
+    ) -> ExpireResult: ...
 
-    async def contains(self, *, request_id: str, timeout_s: float | None = None) -> dict[str, Any]: ...
+    async def contains(self, *, request_id: str, timeout_s: float | None = None) -> ContainsResult: ...
 
     async def stats(self, **kwargs: Any) -> dict[str, Any]: ...
 
