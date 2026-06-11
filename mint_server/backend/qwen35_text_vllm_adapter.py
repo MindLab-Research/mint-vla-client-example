@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,10 @@ def normalize_hf_dtype_str(value: Any) -> str | None:
 
 
 def read_hf_config_json(model_path: str) -> dict[str, Any] | None:
-    config_path = os.path.join(model_path, "config.json")
+    config_dir = resolve_hf_config_dir(model_path)
+    if config_dir is None:
+        return None
+    config_path = os.path.join(config_dir, "config.json")
     try:
         with open(config_path, encoding="utf-8") as f:
             raw_config = json.load(f)
@@ -82,6 +86,31 @@ def read_hf_config_json(model_path: str) -> dict[str, Any] | None:
         logger.warning("Unable to parse HF config.json: %s", config_path)
         return None
     return raw_config if isinstance(raw_config, dict) else None
+
+
+def resolve_hf_config_dir(model_path: str) -> str | None:
+    """Resolve a local HF config directory for a path or cached repo id."""
+
+    path = Path(model_path).expanduser()
+    if (path / "config.json").is_file():
+        return str(path)
+
+    repo_id = str(model_path).strip()
+    if not _looks_like_hf_repo_id(repo_id):
+        return None
+
+    revision = "main"
+    if "@" in repo_id:
+        repo_id, revision = repo_id.rsplit("@", 1)
+    cache_name = "models--" + repo_id.replace("/", "--")
+    for cache_root in _hf_cache_roots():
+        repo_cache = cache_root / cache_name
+        if not repo_cache.is_dir():
+            continue
+        snapshot = _resolve_hf_snapshot_dir(repo_cache, revision)
+        if snapshot is not None and (snapshot / "config.json").is_file():
+            return str(snapshot)
+    return None
 
 
 def infer_hf_torch_dtype_str(model_path: str) -> str | None:
@@ -141,6 +170,62 @@ def _qwen35_text_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | N
     if text_config.get("model_type") != QWEN35_TEXT_MODEL_TYPE:
         return None
     return text_config
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    if not value or value.startswith(("/", ".", "file:", "mint:", "s3:", "gs:")):
+        return False
+    if os.path.sep in value and value.count("/") != 1:
+        return False
+    namespace, sep, name = value.partition("/")
+    return bool(sep and namespace and name)
+
+
+def _hf_cache_roots() -> list[Path]:
+    roots: list[Path] = []
+    for key in ("HUGGINGFACE_HUB_CACHE", "TRANSFORMERS_CACHE"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            roots.append(Path(value).expanduser())
+
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        roots.append(Path(hf_home).expanduser() / "hub")
+
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    roots.append(Path("/vePFS-Mindverse/share/huggingface/hub"))
+
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        root_str = str(root)
+        if root_str not in seen:
+            deduped.append(root)
+            seen.add(root_str)
+    return deduped
+
+
+def _resolve_hf_snapshot_dir(repo_cache: Path, revision: str) -> Path | None:
+    revision = revision.strip() or "main"
+    ref_path = repo_cache / "refs" / revision
+    if ref_path.is_file():
+        commit = ref_path.read_text(encoding="utf-8").strip()
+        if commit:
+            return repo_cache / "snapshots" / commit
+
+    direct_snapshot = repo_cache / "snapshots" / revision
+    if direct_snapshot.is_dir():
+        return direct_snapshot
+
+    snapshots_dir = repo_cache / "snapshots"
+    if not snapshots_dir.is_dir():
+        return None
+    snapshots = sorted(
+        (path for path in snapshots_dir.iterdir() if path.is_dir()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return snapshots[0] if snapshots else None
 
 
 def _validate_qwen35_text_config(text_config: dict[str, Any]) -> None:
@@ -240,7 +325,10 @@ def materialize_qwen35_text_vllm_config(
     *,
     root_dir: str | None = None,
 ) -> str | None:
-    raw_config = read_hf_config_json(model_path)
+    config_source_dir = resolve_hf_config_dir(model_path)
+    if config_source_dir is None:
+        return None
+    raw_config = read_hf_config_json(config_source_dir)
     if not isinstance(raw_config, dict):
         return None
     if raw_config.get("model_type") != QWEN35_MODEL_TYPE:

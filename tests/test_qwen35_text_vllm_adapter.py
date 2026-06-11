@@ -80,6 +80,27 @@ def test_qwen35_text_adapter_materializes_marked_text_only_config(tmp_path):
     assert "mrope_interleaved" not in config["rope_parameters"]
 
 
+def test_qwen35_text_adapter_resolves_cached_repo_id(monkeypatch, tmp_path):
+    cache_root = tmp_path / "hf-cache"
+    repo_cache = cache_root / "models--Qwen--Qwen3.5-27B"
+    snapshot = repo_cache / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text("abc123\n", encoding="utf-8")
+    (snapshot / "config.json").write_text(json.dumps(_raw_qwen35_config()), encoding="utf-8")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(cache_root))
+
+    config_dir = adapter.materialize_qwen35_text_vllm_config(
+        "Qwen/Qwen3.5-27B",
+        root_dir=str(tmp_path / "runtime"),
+    )
+
+    assert config_dir is not None
+    config = json.loads((tmp_path / "runtime").glob("qwen35-text-vllm-config/*/config.json").__next__().read_text())
+    assert config["model_type"] == "qwen3_next"
+    assert adapter.resolve_hf_config_dir("Qwen/Qwen3.5-27B") == str(snapshot)
+
+
 def test_qwen35_text_adapter_ignores_non_qwen35_model(tmp_path):
     model_dir = tmp_path / "qwen3"
     model_dir.mkdir()
