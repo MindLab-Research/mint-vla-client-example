@@ -6,6 +6,11 @@ import time
 import pytest
 
 from mint_server.backend.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.control_plane_contracts import (
+    AsyncSchedulerQueue,
+    AsyncTaskLedger,
+    ModelWorkTaskGateway,
+)
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
 from mint_server.backend.task_state_store import TaskStateStore
@@ -16,6 +21,17 @@ from .scenarios import sampling_meta
 
 
 pytestmark = pytest.mark.component
+
+
+def test_scheduler_component_world_exposes_typed_contracts(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        assert isinstance(world.task_gateway, ModelWorkTaskGateway)
+        assert isinstance(world.task_ledger, AsyncTaskLedger)
+        assert isinstance(world.runtime_queue, AsyncSchedulerQueue)
+        assert world.scheduler is world.runtime_queue
+    finally:
+        world.close()
 
 
 async def _assert_stats_progress_while_blocked(world: SchedulerComponentWorld, call, block_name: str):

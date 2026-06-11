@@ -8,8 +8,11 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from mint_server.backend.control_plane_contracts import (
+    AsyncSchedulerQueue,
+    AsyncTaskLedger,
     ExecutorOutcome,
     InProcessSchedulerQueueAdapter,
+    ModelWorkTaskGateway,
 )
 from mint_server.backend.model_actor_supervisor import (
     ModelActorSpec,
@@ -211,7 +214,13 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id="component-scheduler",
         )
-        self.scheduler = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.runtime_queue: AsyncSchedulerQueue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.scheduler = self.runtime_queue
+        self.task_ledger: AsyncTaskLedger = self.scheduler_actor._task_state_store
+        self.task_gateway: ModelWorkTaskGateway = SchedulerModelWorkTaskGateway(
+            scheduler_client=self.runtime_queue,
+            task_ledger_client=self.task_ledger,
+        )
         self.event_log: list[tuple[str, dict[str, Any]]] = []
 
     def replace_scheduler(self, *, owner_id: str) -> None:
@@ -220,7 +229,13 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id=owner_id,
         )
-        self.scheduler = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.runtime_queue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.scheduler = self.runtime_queue
+        self.task_ledger = self.scheduler_actor._task_state_store
+        self.task_gateway = SchedulerModelWorkTaskGateway(
+            scheduler_client=self.runtime_queue,
+            task_ledger_client=self.task_ledger,
+        )
 
     @property
     def consumer_id(self) -> str:
@@ -277,7 +292,7 @@ class SchedulerComponentWorld:
             token_cost=token_cost,
             assign=assign,
             assign_max_items=1,
-            scheduler_client=self.scheduler,
+            gateway_client=self.task_gateway,
         )
 
     async def claim_one(
@@ -394,7 +409,7 @@ class SchedulerComponentWorld:
             "model_work_task_gateway",
             SchedulerModelWorkTaskGateway(
                 scheduler_client=scheduler_override or self.scheduler,
-                task_ledger_client=self.task_state,
+                task_ledger_client=self.task_ledger if scheduler_override is None else self.task_state,
             ),
         )
         monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: float(wait_timeout_s))

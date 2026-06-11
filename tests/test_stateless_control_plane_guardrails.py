@@ -357,6 +357,64 @@ def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> Non
     ]
 
 
+def _calls_name(node: ast.AST, name: str) -> bool:
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Name) and child.func.id == name:
+            return True
+    return False
+
+
+def _called_attribute_names(node: ast.AST) -> set[str]:
+    attrs: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+            attrs.add(child.func.attr)
+    return attrs
+
+
+def test_model_work_submit_routes_do_not_touch_task_lifecycle_storage() -> None:
+    forbidden_attrs = {
+        "async_create_model_work_with_id",
+        "async_create_task",
+        "async_cleanup",
+        "async_fail",
+    }
+    checked: list[str] = []
+    for path in sorted((REPO_ROOT / "mint_server" / "routes").rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if not _calls_name(node, "enqueue_model_work"):
+                continue
+            checked.append(f"{path.relative_to(REPO_ROOT)}::{node.name}")
+            called = _called_attribute_names(node)
+            assert not (called & forbidden_attrs), (
+                f"{path.relative_to(REPO_ROOT)}::{node.name} calls model-work submit and "
+                f"direct lifecycle storage methods: {sorted(called & forbidden_attrs)}"
+            )
+
+    assert checked == [
+        "mint_server/routes/internal.py::model_work_scheduler_noop",
+        "mint_server/routes/mint.py::_enqueue_mint_model_work",
+        "mint_server/routes/sampling.py::_asample_impl",
+        "mint_server/routes/sampling.py::compute_logprobs",
+        "mint_server/routes/training.py::_enqueue_training_model_work_route",
+        "mint_server/routes/training.py::_enqueue_internal_serialized_model_op",
+        "mint_server/routes/training.py::create_model",
+        "mint_server/routes/training.py::create_model_from_state",
+        "mint_server/routes/weights.py::_enqueue_weights_model_work",
+    ]
+
+
+def test_model_work_retrieve_route_uses_gateway_not_scheduler_orphan_probe() -> None:
+    source = (REPO_ROOT / "mint_server" / "routes" / "futures.py").read_text()
+    assert "model_work_scheduler.contains_request" not in source
+    assert "model_work_orphan_failed" not in source
+    assert "recovered without this request" not in source
+    assert ".retrieve_task(" in source
+
+
 def _function_source(path: Path, function_name: str) -> str:
     source = path.read_text()
     tree = ast.parse(source, filename=str(path))
