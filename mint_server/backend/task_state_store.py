@@ -3789,9 +3789,16 @@ def _create_ray_actor(*, require_ready: bool = True):
     db_path = _task_state_store_db_path()
     max_concurrency = int(os.environ.get("MINT_TASK_STATE_STORE_ACTOR_MAX_CONCURRENCY", "256"))
 
-    @ray.remote(num_cpus=0, max_concurrency=max_concurrency, max_restarts=0)
+    @ray.remote(
+        num_cpus=0,
+        max_concurrency=max_concurrency,
+        max_restarts=0,
+        concurrency_groups={"health": 8},
+    )
     class _RayTaskStateStoreActor(_TaskStateStoreActor):
-        pass
+        @ray.method(concurrency_group="health")
+        def ping(self) -> dict[str, Any]:
+            return super().ping()
 
     options: dict[str, Any] = {
         "name": actor_name,

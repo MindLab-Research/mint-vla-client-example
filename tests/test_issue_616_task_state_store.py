@@ -67,6 +67,68 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
     assert calls == {"require_ready": False, "timeout_s": 7.0}
 
 
+def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypatch) -> None:
+    import mint_server.backend.task_state_store as module
+    import ray
+
+    captured: dict[str, object] = {}
+
+    class _OptionsProxy:
+        def __init__(self, cls):
+            self._cls = cls
+
+        def remote(self, db_path: str):
+            captured["db_path"] = db_path
+            actor = self._cls(db_path)
+            ping = actor.ping
+
+            class _RemoteMethod:
+                def remote(self):
+                    return ping()
+
+            actor.ping = _RemoteMethod()
+            return actor
+
+    class _RemoteClass:
+        def __init__(self, cls):
+            self._cls = cls
+
+        def options(self, **options):
+            captured["options"] = options
+            return _OptionsProxy(self._cls)
+
+    def _fake_remote(**remote_kwargs):
+        captured["remote_kwargs"] = remote_kwargs
+
+        def _decorator(cls):
+            captured["actor_cls"] = cls
+            return _RemoteClass(cls)
+
+        return _decorator
+
+    def _fake_method(**method_kwargs):
+        captured["method_kwargs"] = method_kwargs
+
+        def _decorator(fn):
+            captured["method_name"] = fn.__name__
+            return fn
+
+        return _decorator
+
+    monkeypatch.setattr(ray, "remote", _fake_remote)
+    monkeypatch.setattr(ray, "method", _fake_method)
+    monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {})
+    monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "sync_get_ray_ref", lambda ref, *, timeout_s=None: ref)
+    monkeypatch.setattr(module, "_task_state_store_db_path", lambda: ":memory:")
+
+    module._create_ray_actor(require_ready=True)
+
+    assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8}
+    assert captured["method_kwargs"] == {"concurrency_group": "health"}
+    assert captured["method_name"] == "ping"
+
+
 def test_training_session_inflight_is_durable_metadata(tmp_path: Path) -> None:
     store = TaskStateStore(str(tmp_path / "task-state-training-inflight.sqlite3"))
     try:
