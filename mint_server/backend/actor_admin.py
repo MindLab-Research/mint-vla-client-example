@@ -18,6 +18,7 @@ from .async_ray_control import (
     async_placement_group_table,
     is_actor_lookup_not_found,
 )
+from .model_actor_pg_names import actor_placement_group_names
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +69,20 @@ async def _augment_with_placement_groups(actors: list[dict]) -> None:
             name = actor.get("actor_name")
             if not isinstance(name, str) or not name:
                 continue
-            pg_name = f"{name}_pg"
+            namespace = actor.get("namespace")
+            pg_name = next(
+                (
+                    candidate
+                    for candidate in actor_placement_group_names(
+                        name,
+                        str(namespace) if namespace is not None else None,
+                    )
+                    if candidate in by_name
+                ),
+                None,
+            )
+            if pg_name is None:
+                continue
             try:
                 info = by_name.get(pg_name)
                 if not isinstance(info, dict):
@@ -242,16 +256,24 @@ def _raise_if_busy_kill_targets(
 
 
 def _remove_actor_pg(actor_name: str, *, namespace: str | None = None) -> None:
-    from .ray_placement_groups import get_named_placement_group
+    from .ray_placement_groups import PlacementGroupNotFoundError, get_named_placement_group
     import ray
 
-    try:
-        pg = get_named_placement_group(f"{actor_name}_pg", namespace=namespace)
-    except Exception as exc:
-        if isinstance(exc, ValueError) and "not found" in str(exc).lower():
-            return
-        raise
-    ray.util.remove_placement_group(pg)
+    first_error: Exception | None = None
+    removed_any = False
+    for pg_name in actor_placement_group_names(actor_name, namespace):
+        try:
+            pg = get_named_placement_group(pg_name, namespace=namespace)
+        except PlacementGroupNotFoundError:
+            continue
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+        ray.util.remove_placement_group(pg)
+        removed_any = True
+    if first_error is not None and not removed_any:
+        raise first_error
 
 
 async def _kill_exact_vllm_actor(*, actor_name: str) -> int:

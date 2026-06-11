@@ -422,3 +422,43 @@ def test_kill_dense_actors_returns_503_when_pg_lookup_mismatches_namespace(monke
     assert resp.status_code == 503, resp.text
     assert "target_namespace='ns-a'" in resp.text
     assert pool.unregister_calls == []
+
+
+def test_kill_exact_vllm_actor_ignores_missing_placement_group(monkeypatch) -> None:
+    import mint_server.backend.actor_admin as actor_admin
+    import mint_server.backend.ray_placement_groups as ray_placement_groups
+    from mint_server.backend.model_actor_supervisor import ActorType
+
+    _install_ray_stub(monkeypatch)
+
+    async def _lookup(*_args, **_kwargs):
+        return object()
+
+    async def _kill_ok(*_args, **_kwargs):
+        return None
+
+    def _raise_missing_pg(*_args, **_kwargs):
+        raise ray_placement_groups.PlacementGroupNotFoundError("placement group 'vllm-a_pg' not found")
+
+    pool = _FakePool(
+        actors=[],
+        entries=[
+            SimpleNamespace(
+                actor_type=ActorType.VLLM,
+                actor_name="vllm-a",
+                namespace="mint",
+                base_model="Qwen/Qwen3.5-27B",
+                actor_handle=None,
+            )
+        ],
+    )
+    monkeypatch.setattr(actor_admin, "async_lookup_actor_handle", _lookup)
+    monkeypatch.setattr(actor_admin, "async_kill_named_actor", _kill_ok)
+    monkeypatch.setattr(ray_placement_groups, "get_named_placement_group", _raise_missing_pg)
+    client = _build_client(monkeypatch, pool)
+
+    resp = client.post("/internal/actors/kill", json={"actor_type": "vllm", "actor_name": "vllm-a"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["killed_by_type"]["vllm"] == 1
+    assert pool.unregister_calls == ["vllm-a"]

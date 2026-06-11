@@ -8,6 +8,7 @@ from typing import Any
 
 import ray
 
+from .model_actor_pg_names import actor_placement_group_names
 from .ray_placement_groups import remove_named_placement_group
 
 logger = logging.getLogger(__name__)
@@ -50,14 +51,14 @@ def _remove_placement_group_for_actor_name(actor_name: str | None, namespace: st
     if not actor_name:
         return
 
-    pg_name = f"{actor_name}_pg"
-    try:
-        removed = remove_named_placement_group(pg_name, namespace=namespace)
-    except Exception as e:
-        logger.warning(f"[ray.kill] failed remove placement_group={pg_name}: {type(e).__name__}: {e}")
-        return
-    if removed:
-        logger.warning(f"[ray.kill] removed placement_group={pg_name}")
+    for pg_name in actor_placement_group_names(actor_name, namespace):
+        try:
+            removed = remove_named_placement_group(pg_name, namespace=namespace)
+        except Exception as e:
+            logger.warning(f"[ray.kill] failed remove placement_group={pg_name}: {type(e).__name__}: {e}")
+            continue
+        if removed:
+            logger.warning(f"[ray.kill] removed placement_group={pg_name}")
 
 
 def kill(

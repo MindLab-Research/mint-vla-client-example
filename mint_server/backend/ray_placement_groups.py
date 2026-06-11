@@ -14,6 +14,10 @@ class PlacementGroupMismatchError(RuntimeError):
         self.pg = pg
 
 
+class PlacementGroupNotFoundError(ValueError):
+    pass
+
+
 def _ray_namespace() -> str:
     env_ns = env_nonempty(os.environ, "MINT_RAY_NAMESPACE")
     if env_ns:
@@ -120,13 +124,14 @@ def get_named_placement_group(
     target_namespace = namespace or _ray_namespace()
     pg = None
     try:
-        pg = ray.util.get_placement_group(name, namespace=target_namespace)
-    except TypeError:
-        pg = ray.util.get_placement_group(name)
+        try:
+            pg = ray.util.get_placement_group(name, namespace=target_namespace)
+        except TypeError:
+            pg = ray.util.get_placement_group(name)
     except Exception:
         info = _lookup_named_pg_info(name, target_namespace)
         if info is None:
-            raise
+            raise PlacementGroupNotFoundError(f"placement group {name!r} not found") from None
         pg = _placement_group_from_info(info)
         if pg is None:
             raise
@@ -162,10 +167,12 @@ def remove_named_placement_group(name: str, *, namespace: str | None = None) -> 
     target_namespace = namespace or _ray_namespace()
     try:
         pg = get_named_placement_group(name, namespace=target_namespace)
+    except PlacementGroupNotFoundError:
+        return False
     except Exception:
         info = _lookup_named_pg_info(name, target_namespace)
         if info is None:
-            return False
+            raise
         pg = _placement_group_from_info(info)
         if pg is None:
             return False

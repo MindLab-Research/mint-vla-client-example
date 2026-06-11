@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import ray
 
+from .model_actor_pg_names import actor_placement_group_names
+
 logger = logging.getLogger(__name__)
 
 
@@ -887,26 +889,27 @@ def _check_cross_namespace_conflicts(requested_node_ips: dict[str, int]) -> str:
             try:
                 # Verify actor exists (we don't need the handle, just check it's alive)
                 _ = ray.get_actor(actor_name, namespace=actor_ns)
-                # Get placement group to find node
-                pg_name = f"{actor_name}_pg"
-                try:
-                    pg = ray.util.get_placement_group(pg_name)
-                    pg_info = ray.util.placement_group_table(pg)
-                    bundles_to_node = pg_info.get("bundles_to_node_id", {})
+                # Get placement group to find node.
+                for pg_name in actor_placement_group_names(actor_name, actor_ns):
+                    try:
+                        pg = ray.util.get_placement_group(pg_name)
+                        pg_info = ray.util.placement_group_table(pg)
+                        bundles_to_node = pg_info.get("bundles_to_node_id", {})
 
-                    # Check if any bundle is on requested nodes
-                    for node_id in bundles_to_node.values():
-                        for n in ray.nodes():
-                            if n.get("NodeID") == node_id:
-                                node_ip = n.get("NodeManagerAddress")
-                                if node_ip in requested_node_ips:
-                                    key = f"{actor_ns} (node: {node_ip})"
-                                    if key not in conflicts_by_namespace:
-                                        conflicts_by_namespace[key] = []
-                                    conflicts_by_namespace[key].append(actor_name)
-                                break
-                except Exception:
-                    pass
+                        # Check if any bundle is on requested nodes
+                        for node_id in bundles_to_node.values():
+                            for n in ray.nodes():
+                                if n.get("NodeID") == node_id:
+                                    node_ip = n.get("NodeManagerAddress")
+                                    if node_ip in requested_node_ips:
+                                        key = f"{actor_ns} (node: {node_ip})"
+                                        if key not in conflicts_by_namespace:
+                                            conflicts_by_namespace[key] = []
+                                        conflicts_by_namespace[key].append(actor_name)
+                                    break
+                        break
+                    except Exception:
+                        pass
             except Exception:
                 continue
 

@@ -189,3 +189,64 @@ def test_remove_named_placement_group_ignores_removed_table_entries(
 
     assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is False
     assert removed == []
+
+
+def test_remove_named_placement_group_handles_old_ray_namespace_miss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ray_module = types.ModuleType("ray")
+    ray_util_module = types.ModuleType("ray.util")
+    removed: list[object] = []
+    calls: list[tuple[object, ...]] = []
+
+    def _get_placement_group(*args, **kwargs):
+        calls.append((args, kwargs))
+        if "namespace" in kwargs:
+            raise TypeError("get_placement_group() got an unexpected keyword argument 'namespace'")
+        raise ValueError("pg not found in namespace")
+
+    def _placement_group_table(arg=None):
+        if arg is not None:
+            raise AssertionError("unexpected placement_group_table arg")
+        return {}
+
+    ray_util_module.get_placement_group = _get_placement_group
+    ray_util_module.remove_placement_group = lambda pg: removed.append(pg)
+    ray_util_module.placement_group_table = _placement_group_table
+    ray_module.util = ray_util_module
+
+    monkeypatch.setitem(sys.modules, "ray", ray_module)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
+    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+
+    assert module.remove_named_placement_group("missing_pg", namespace="ns-a") is False
+    assert calls == [
+        (("missing_pg",), {"namespace": "ns-a"}),
+        (("missing_pg",), {}),
+    ]
+    assert removed == []
+
+
+def test_get_named_placement_group_classifies_missing_old_ray_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ray_module = types.ModuleType("ray")
+    ray_util_module = types.ModuleType("ray.util")
+
+    def _get_placement_group(*args, **kwargs):
+        if "namespace" in kwargs:
+            raise TypeError("get_placement_group() got an unexpected keyword argument 'namespace'")
+        raise ValueError("Failed to look up placement group with name: missing_pg")
+
+    ray_util_module.get_placement_group = _get_placement_group
+    ray_util_module.placement_group_table = lambda: {}
+    ray_module.util = ray_util_module
+
+    monkeypatch.setitem(sys.modules, "ray", ray_module)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
+    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+
+    with pytest.raises(module.PlacementGroupNotFoundError):
+        module.get_named_placement_group("missing_pg", namespace="ns-a")

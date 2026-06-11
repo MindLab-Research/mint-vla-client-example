@@ -7,6 +7,7 @@ from functools import lru_cache
 from typing import Any
 
 from ..runtime_env import env_nonempty
+from .model_actor_pg_names import actor_placement_group_names
 
 logger = logging.getLogger(__name__)
 
@@ -597,7 +598,8 @@ class ModelActorPlacementReconciler:
                 continue
             if self._actor_killer(name, self._namespace, "model_actor_supervisor_undesired_wrapper"):
                 cleaned.append(name)
-            self._placement_group_remover(f"{name}_pg", self._namespace)
+            for pg_name in actor_placement_group_names(name, self._namespace):
+                self._placement_group_remover(pg_name, self._namespace)
         return cleaned
 
     def _cleanup_undesired_mint_gpu_actors(self, keep_actor_names: set[str]) -> list[str]:
@@ -621,7 +623,8 @@ class ModelActorPlacementReconciler:
             seen.add(key)
             if self._gpu_actor_killer(actor_info, reason):
                 cleaned.append(name)
-            self._placement_group_remover(f"{name}_pg", namespace)
+            for pg_name in actor_placement_group_names(name, namespace):
+                self._placement_group_remover(pg_name, namespace)
         return cleaned
 
     def _cleanup_orphan_owned_pgs(self, owned_actor_names: set[str]) -> list[str]:
@@ -629,9 +632,9 @@ class ModelActorPlacementReconciler:
         for actor_name in sorted(owned_actor_names):
             if self._actor_exists(actor_name, self._namespace):
                 continue
-            pg_name = f"{actor_name}_pg"
-            if self._placement_group_remover(pg_name, self._namespace):
-                removed.append(pg_name)
+            for pg_name in actor_placement_group_names(actor_name, self._namespace):
+                if self._placement_group_remover(pg_name, self._namespace):
+                    removed.append(pg_name)
         return removed
 
     def _target_actor_started(self, owned_actor_names: set[str]) -> bool:
@@ -809,7 +812,11 @@ class ModelActorPlacementReconciler:
                 if required:
                     if self._target_actor_started(owned_actor_names):
                         continue
-                    ignore_pg_names = {f"{name}_pg" for name in owned_actor_names}
+                    ignore_pg_names = {
+                        pg_name
+                        for name in owned_actor_names
+                        for pg_name in actor_placement_group_names(name, self._namespace)
+                    }
                     try:
                         self._capacity_checker(
                             required,
