@@ -1315,9 +1315,14 @@ class _ModelWorkSchedulerActor:
                 self._cv.notify_all()
             return {"ok": True, "request_id": request_id, "cancelled": removed, "reason": str(reason)}
 
-    async def contains_request(self, *, request_id: str) -> dict[str, Any]:
+    async def contains_request(
+        self,
+        *,
+        request_id: str,
+        hydrate_task_state: bool = True,
+    ) -> dict[str, Any]:
         request_id = str(request_id)
-        if self._use_task_state_store:
+        if self._use_task_state_store and hydrate_task_state:
             await self._ensure_task_state_ready()
         async with self._cv:
             location = self._request_locations.get(request_id)
@@ -1839,8 +1844,16 @@ def _create_ray_actor(*, require_ready: bool = True):
             return super().ping()
 
         @ray.method(concurrency_group="lookup")
-        async def contains_request(self, *, request_id: str) -> dict[str, Any]:
-            return await super().contains_request(request_id=request_id)
+        async def contains_request(
+            self,
+            *,
+            request_id: str,
+            hydrate_task_state: bool = True,
+        ) -> dict[str, Any]:
+            return await super().contains_request(
+                request_id=request_id,
+                hydrate_task_state=hydrate_task_state,
+            )
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
         use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),
@@ -2062,11 +2075,15 @@ class ModelWorkSchedulerClient:
         self,
         *,
         request_id: str,
+        hydrate_task_state: bool = True,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
-            actor.contains_request.remote(request_id=str(request_id)),
+            actor.contains_request.remote(
+                request_id=str(request_id),
+                hydrate_task_state=bool(hydrate_task_state),
+            ),
             timeout_s=timeout_s,
         )
         if not isinstance(out, dict):

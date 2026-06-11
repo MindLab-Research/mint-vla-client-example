@@ -457,6 +457,27 @@ def test_scheduler_append_can_assign_immediately() -> None:
     asyncio.run(_run())
 
 
+def test_contains_request_does_not_hydrate_task_state_store() -> None:
+    actor = _ModelWorkSchedulerActor(use_task_state_store=True)
+
+    async def _unexpected_hydrate():
+        raise AssertionError("contains_request must remain a lightweight memory lookup")
+
+    actor._ensure_task_state_ready = _unexpected_hydrate  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        contains = await actor.contains_request(
+            request_id="req-missing",
+            hydrate_task_state=False,
+        )
+
+        assert contains["ok"] is True
+        assert contains["present"] is False
+        assert contains["location"] is None
+
+    asyncio.run(_run())
+
+
 def test_sampling_inflight_admission_observe_records_would_reject(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1050,7 +1071,11 @@ def test_scheduler_hydrates_sampling_inflight_counts_from_task_state_store() -> 
                 },
             )
 
-        contains = await actor.contains_request(request_id="req-hydrate-a")
+        await actor._ensure_task_state_ready()
+        contains = await actor.contains_request(
+            request_id="req-hydrate-a",
+            hydrate_task_state=False,
+        )
         assert contains["present"] is True
         stats = actor.stats()
         assert stats["sampling_inflight"]["by_domain"][domain] == 3

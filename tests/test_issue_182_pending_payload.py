@@ -61,10 +61,20 @@ class _StubTaskFutureService:
 class _StubModelWorkScheduler:
     def __init__(self, *, present: bool = True) -> None:
         self.present = bool(present)
-        self.contains_calls: list[str] = []
+        self.contains_calls: list[dict] = []
 
-    async def contains_request(self, *, request_id: str) -> dict:
-        self.contains_calls.append(request_id)
+    async def contains_request(
+        self,
+        *,
+        request_id: str,
+        hydrate_task_state: bool = True,
+    ) -> dict:
+        self.contains_calls.append(
+            {
+                "request_id": request_id,
+                "hydrate_task_state": hydrate_task_state,
+            }
+        )
         return {"ok": True, "request_id": request_id, "present": self.present}
 
 
@@ -112,7 +122,9 @@ def test_issue_182_pending_payload_model_work_scheduler_queued(monkeypatch):
     assert payload.get("ordering_key") == "session:session-a"
     assert payload.get("estimated_wait_s") is None
     assert response.headers.get("X-Queue-ETA-S") is None
-    assert scheduler.contains_calls == ["rid_model_work_scheduler_queued"]
+    assert scheduler.contains_calls == [
+        {"request_id": "rid_model_work_scheduler_queued", "hydrate_task_state": False}
+    ]
 
 
 def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monkeypatch):
@@ -131,7 +143,9 @@ def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monke
     assert payload.get("queue_position") is None
     assert payload.get("queue_depth") is None
     assert response.headers.get("Retry-After") == "1"
-    assert scheduler.contains_calls == ["rid_queue_default"]
+    assert scheduler.contains_calls == [
+        {"request_id": "rid_queue_default", "hydrate_task_state": False}
+    ]
 
 
 def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
@@ -363,7 +377,9 @@ def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
 
     assert response.status_code == 200
     assert payload.get("error") == "model work scheduler recovered without this request; request must be retried"
-    assert scheduler.contains_calls == ["rid_orphaned_model_work"]
+    assert scheduler.contains_calls == [
+        {"request_id": "rid_orphaned_model_work", "hydrate_task_state": False}
+    ]
 
 
 def test_issue_182_non_sampling_status_is_generic(monkeypatch):
