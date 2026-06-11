@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from mint_server.backend.control_plane_contracts import ExecutorOutcome
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_runtime_actor import (
     ModelRuntimeActor,
@@ -428,6 +429,41 @@ async def test_issue_616_model_runtime_finishes_success_via_scheduler(tmp_path) 
         path=success["result_path"],
         expected_checksum=success["result_checksum"],
     ) == {"ok": True}
+
+
+@pytest.mark.anyio
+async def test_issue_593_model_runtime_accepts_executor_outcome_success(tmp_path) -> None:
+    lease = _lease("runtime-req-outcome-success")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    payload_store = TaskPayloadStore(tmp_path)
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(
+            kind="success",
+            payload={"ok": True, "source": "executor_outcome"},
+            billing_observations=[{"tokens": 11}],
+        )
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        payload_store=payload_store,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert task_futures.resolved == []
+    assert len(scheduler.finished_success) == 1
+    success = scheduler.finished_success[0]
+    assert success["billing_observations"] == [{"tokens": 11}]
+    assert payload_store.read_json_payload(
+        path=success["result_path"],
+        expected_checksum=success["result_checksum"],
+    ) == {"ok": True, "source": "executor_outcome"}
 
 
 @pytest.mark.anyio

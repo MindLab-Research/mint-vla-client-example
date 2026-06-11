@@ -23,7 +23,7 @@ from ..logging_context import (
     set_trace_id,
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
-from .control_plane_contracts import LeaseToken, as_task_ledger
+from .control_plane_contracts import ExecutorOutcome, LeaseToken, as_task_ledger
 from .execution_context import ExecutionContext, bind_execution_context
 from .model_actor_supervisor import (
     _is_ray_get_timeout_error,
@@ -37,7 +37,7 @@ from .task_state_store import FutureStatus, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
 
-ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[None]]
+ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None]]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
 _EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
@@ -78,6 +78,43 @@ def _lease_token(lease: dict[str, Any]) -> LeaseToken:
 
 def _lease_id(lease: dict[str, Any]) -> str:
     return str(lease["lease_id"])
+
+
+def _outcome_from_finalize_buffer(finalize_buffer: ModelWorkFinalizeBuffer) -> ExecutorOutcome | None:
+    finalization = finalize_buffer.finalization
+    if finalization is None:
+        return None
+    if finalization.kind == "resolve":
+        return ExecutorOutcome(
+            kind="success",
+            payload=finalization.payload,
+            billing_observations=finalization.billing_observations,
+        )
+    if finalization.kind == "fail":
+        return ExecutorOutcome(kind="user_error", error=str(finalization.payload))
+    raise RuntimeError(f"unknown model work finalization kind: {finalization.kind!r}")
+
+
+def _finalization_from_outcome(
+    *,
+    request_id: str,
+    outcome: ExecutorOutcome,
+) -> SimpleNamespace:
+    if outcome.kind == "success":
+        return SimpleNamespace(
+            kind="resolve",
+            request_id=str(request_id),
+            payload=outcome.payload,
+            billing_observations=outcome.billing_observations,
+        )
+    if outcome.kind == "user_error":
+        return SimpleNamespace(
+            kind="fail",
+            request_id=str(request_id),
+            payload=str(outcome.error or "Task failed"),
+            billing_observations=None,
+        )
+    raise RuntimeError(f"cannot convert executor outcome to terminal finalization: {outcome.kind!r}")
 
 
 @dataclass(frozen=True)
@@ -249,7 +286,7 @@ def get_or_create_model_runtime_actor(
     )
 
 
-async def _default_executor(lease: dict[str, Any]) -> None:
+async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
     context = await _ensure_execution_bindings()
     item = lease.get("item")
     if not isinstance(item, dict):
@@ -276,6 +313,7 @@ async def _default_executor(lease: dict[str, Any]) -> None:
             ),
             component="model_runtime_actor",
         )
+    return ExecutorOutcome(kind="success")
 
 
 async def _ensure_execution_bindings() -> ExecutionContext:
@@ -953,18 +991,22 @@ class ModelRuntimeActor:
                     self._last_renewed_at = time.time()
                     self._renewed_total += 1
 
-    async def _run_executor(self, lease: dict[str, Any]) -> None:
+    async def _run_executor(
+        self,
+        lease: dict[str, Any],
+        finalize_buffer: ModelWorkFinalizeBuffer,
+    ) -> ExecutorOutcome:
         item = lease.get("item") if isinstance(lease, dict) else {}
         tracer = get_otel_tracer()
         if tracer is None:
-            await self._executor(lease)
-            return
+            out = await self._executor(lease)
+            return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
         try:
             from opentelemetry.propagate import extract
             from opentelemetry.trace import SpanKind, Status, StatusCode
         except Exception:
-            await self._executor(lease)
-            return
+            out = await self._executor(lease)
+            return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
 
         span_context = None
         extra = item.get("extra") if isinstance(item, dict) else {}
@@ -986,11 +1028,12 @@ class ModelRuntimeActor:
             span.set_attribute("replica_id", self._config.replica_id)
             span.set_attribute("actor_name", self._config.actor_name)
             try:
-                await self._executor(lease)
+                out = await self._executor(lease)
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
                 raise
+            return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
 
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
@@ -1086,13 +1129,13 @@ class ModelRuntimeActor:
                 consumer_generation=self._config.actor_generation,
                 finalize_buffer=finalize_buffer,
             ):
-                task = asyncio.create_task(self._run_executor(lease))
+                task = asyncio.create_task(self._run_executor(lease, finalize_buffer))
                 await self._renew_until_done(
                     lease,
                     task,
                     execution_timeout_s=self._execution_timeout_s_for_lease(lease),
                 )
-                await task
+                outcome = await task
             executor_done_at = time.time()
             try:
                 await self._task_futures.async_update_meta(
@@ -1104,9 +1147,9 @@ class ModelRuntimeActor:
                 )
             except Exception:
                 pass
-            finalization = finalize_buffer.finalization
-            if finalization is None:
-                raise RuntimeError("model work executor finished without resolving or failing future")
+            if outcome.kind in {"retryable_failure", "fatal_backend_death"}:
+                raise RuntimeError(outcome.error or f"executor returned {outcome.kind}")
+            finalization = _finalization_from_outcome(request_id=request_id, outcome=outcome)
             if finalization.request_id != request_id:
                 raise RuntimeError(
                     f"model work executor finalized wrong request_id: {finalization.request_id!r}"

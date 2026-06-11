@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from mint_server.backend.control_plane_contracts import (
+    ExecutorOutcome,
     InProcessSchedulerQueueAdapter,
 )
 from mint_server.backend.model_actor_supervisor import (
@@ -337,12 +338,13 @@ class SchedulerComponentWorld:
     async def runtime_once(
         self,
         *,
-        executor: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        executor: Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None]] | None = None,
         lease_ttl_s: float = 1.0,
     ) -> ModelRuntimeActor:
-        async def _default_executor(lease: dict[str, Any]) -> None:
+        async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
             request_id = str(lease["item"]["request_id"])
             await self.future_service.async_resolve(request_id, {"ok": True, "request_id": request_id})
+            return ExecutorOutcome(kind="success")
 
         actor = ModelRuntimeActor(
             domain_key=self.domain_key,
