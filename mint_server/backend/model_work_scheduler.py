@@ -2438,27 +2438,27 @@ class _ModelWorkSchedulerActor:
         lease_id: str,
         consumer_id: str,
         consumer_generation: int,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return FinishResult(ok=False, reason="unknown_lease")
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return FinishResult(ok=False, reason="stale_consumer")
             if self._request_locations.get(lease.item.request_id) == "finalizing":
-                return {"ok": False, "reason": "finalize_inflight"}
+                return FinishResult(ok=False, reason="finalize_inflight")
             request_id = lease.item.request_id
         terminal = await self._terminal_task_state_for_lease(lease)
         if not terminal.ok:
-            return {"ok": False, "reason": str(terminal.reason or "not_terminal")}
+            return FinishResult(ok=False, reason=str(terminal.reason or "not_terminal"))
         async with self._cv:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return {"ok": False, "reason": "stale_consumer"}
-                return {"ok": False, "reason": "unknown_lease"}
+                    return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason="unknown_lease")
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2466,13 +2466,13 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return FinishResult(ok=False, reason="stale_consumer")
             if self._request_locations.get(request_id) == "finalizing":
-                return {"ok": False, "reason": "finalize_inflight"}
+                return FinishResult(ok=False, reason="finalize_inflight")
             self._leases_by_id.pop(lease.lease_id, None)
             self._remove_request_location(request_id)
             self._completed += 1
-            return {"ok": True, "request_id": request_id}
+            return FinishResult(ok=True, request_id=request_id)
 
     async def _finish_lease_terminal(
         self,
@@ -2489,7 +2489,7 @@ class _ModelWorkSchedulerActor:
         result_size_bytes: int | None = None,
         error: str | None = None,
         billing_observations: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         request_id = str(request_id)
         lease_id = str(lease_id)
         attempt_id = str(attempt_id)
@@ -2501,37 +2501,37 @@ class _ModelWorkSchedulerActor:
             lease = self._leases_by_id.get(lease_id)
             if lease is not None:
                 if lease.consumer_id != consumer_id or int(lease.consumer_generation) != consumer_generation:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 if (
                     lease.item.request_id != request_id
                     or str(lease.attempt_id) != attempt_id
                     or int(lease.scheduler_epoch or 0) != scheduler_epoch
                 ):
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
             elif self._request_locations.get(request_id) is not None:
-                return {"ok": False, "reason": "stale_consumer"}
+                return FinishResult(ok=False, reason="stale_consumer")
         if self._use_task_state_store:
             try:
                 task_record = await self._task_state_call("get_task", request_id=request_id)
                 if not isinstance(task_record, TaskRecord):
-                    return {"ok": False, "reason": "task_state_invalid"}
+                    return FinishResult(ok=False, reason="task_state_invalid")
                 record = self._task_record_data(task_record)
                 status = str(record.get("status") or "")
                 expected_status = "done" if success else "failed"
                 if status in TERMINAL_TASK_STATUSES and status != expected_status:
-                    return {"ok": False, "reason": "task_state_invalid"}
+                    return FinishResult(ok=False, reason="task_state_invalid")
                 if status != "finalizing" and status not in TERMINAL_TASK_STATUSES:
-                    return {"ok": False, "reason": "not_finalizing"}
+                    return FinishResult(ok=False, reason="not_finalizing")
                 elif str(record.get("lease_id") or "") != lease_id:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 elif str(record.get("attempt_id") or "") != attempt_id:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 elif int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 elif int(record.get("runtime_generation") or 0) != consumer_generation:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 elif str(record.get("consumer_id") or "") != str(consumer_id):
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 elif success:
                     committed = await self._task_state_call(
                         "commit_finalize_success",
@@ -2572,38 +2572,38 @@ class _ModelWorkSchedulerActor:
                 raise
             except Exception as exc:
                 if self._task_not_found_cause(exc) is not None:
-                    return {"ok": False, "reason": "unknown_lease"}
+                    return FinishResult(ok=False, reason="unknown_lease")
                 raise
             if isinstance(committed, TaskMutationResult):
                 record = committed.record
                 if not isinstance(record, dict):
-                    return {"ok": False, "reason": "task_state_invalid"}
+                    return FinishResult(ok=False, reason="task_state_invalid")
                 status = str(record.get("status") or "")
                 expected_status = "done" if success else "failed"
                 if status != expected_status:
-                    return {"ok": False, "reason": "task_state_invalid"}
+                    return FinishResult(ok=False, reason="task_state_invalid")
                 if str(record.get("lease_id") or "") != lease_id:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 if str(record.get("attempt_id") or "") != attempt_id:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 if int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 if int(record.get("runtime_generation") or 0) != consumer_generation:
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 if str(record.get("consumer_id") or "") != str(consumer_id):
-                    return {"ok": False, "reason": "stale_consumer"}
+                    return FinishResult(ok=False, reason="stale_consumer")
                 idempotent = bool(committed.idempotent)
             else:
                 idempotent = False
         else:
             idempotent = False
         if lease is None:
-            return {
-                "ok": True,
-                "request_id": request_id,
-                "status": "done" if success else "failed",
-                "idempotent": True,
-            }
+            return FinishResult(
+                ok=True,
+                request_id=request_id,
+                status="done" if success else "failed",
+                idempotent=True,
+            )
         released = await self._release_finished_lease_projection(
             lease,
             lease_id=lease_id,
@@ -2611,8 +2611,15 @@ class _ModelWorkSchedulerActor:
             consumer_generation=consumer_generation,
             success=success,
         )
-        if bool(released.get("ok")) and idempotent:
-            released["idempotent"] = True
+        if released.ok and idempotent:
+            released = FinishResult(
+                ok=released.ok,
+                request_id=released.request_id,
+                status=released.status,
+                reason=released.reason,
+                idempotent=True,
+                extra=dict(released.extra),
+            )
         return released
 
     async def _release_finished_lease_projection(
@@ -2623,14 +2630,14 @@ class _ModelWorkSchedulerActor:
         consumer_id: str,
         consumer_generation: int,
         success: bool,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         request_id = lease.item.request_id
         async with self._cv:
             current = self._leases_by_id.get(str(lease_id))
             if current is None:
                 if self._request_locations.get(request_id) is not None:
-                    return {"ok": False, "reason": "stale_consumer"}
-                return {"ok": False, "reason": "unknown_lease"}
+                    return FinishResult(ok=False, reason="stale_consumer")
+                return FinishResult(ok=False, reason="unknown_lease")
             if not self._current_lease_matches_locked(
                 current,
                 expected=lease,
@@ -2638,7 +2645,7 @@ class _ModelWorkSchedulerActor:
                 consumer_id=consumer_id,
                 consumer_generation=consumer_generation,
             ):
-                return {"ok": False, "reason": "stale_consumer"}
+                return FinishResult(ok=False, reason="stale_consumer")
             self._leases_by_id.pop(current.lease_id, None)
             self._lease_id_by_request_id.pop(request_id, None)
             self._remove_request_location(request_id)
@@ -2646,7 +2653,11 @@ class _ModelWorkSchedulerActor:
                 self._completed += 1
             else:
                 self._failed += 1
-            return {"ok": True, "request_id": request_id, "status": "done" if success else "failed"}
+            return FinishResult(
+                ok=True,
+                request_id=request_id,
+                status="done" if success else "failed",
+            )
 
     async def finish_lease_success(
         self,
@@ -2661,7 +2672,7 @@ class _ModelWorkSchedulerActor:
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
         billing_observations: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         return await self._finish_lease_terminal(
             request_id=request_id,
             lease_id=lease_id,
@@ -2689,7 +2700,7 @@ class _ModelWorkSchedulerActor:
         result_path: str | None = None,
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         return await self._finish_lease_terminal(
             request_id=request_id,
             lease_id=lease_id,
@@ -3086,6 +3097,76 @@ def _create_ray_actor_handle():
                 max_items=max_items,
                 token_budget=token_budget,
                 lease_ttl_s=lease_ttl_s,
+            )
+            return out.to_wire()
+
+        async def complete_lease(
+            self,
+            *,
+            lease_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+        ) -> dict[str, Any]:
+            out = await super().complete_lease(
+                lease_id=lease_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+            )
+            return out.to_wire()
+
+        async def finish_lease_success(
+            self,
+            *,
+            request_id: str,
+            lease_id: str,
+            attempt_id: str,
+            scheduler_epoch: int,
+            consumer_id: str,
+            consumer_generation: int,
+            result_path: str,
+            result_checksum: str | None = None,
+            result_size_bytes: int | None = None,
+            billing_observations: list[dict[str, Any]] | None = None,
+        ) -> dict[str, Any]:
+            out = await super().finish_lease_success(
+                request_id=request_id,
+                lease_id=lease_id,
+                attempt_id=attempt_id,
+                scheduler_epoch=scheduler_epoch,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                result_path=result_path,
+                result_checksum=result_checksum,
+                result_size_bytes=result_size_bytes,
+                billing_observations=billing_observations,
+            )
+            return out.to_wire()
+
+        async def finish_lease_failure(
+            self,
+            *,
+            request_id: str,
+            lease_id: str,
+            attempt_id: str,
+            scheduler_epoch: int,
+            consumer_id: str,
+            consumer_generation: int,
+            error: str,
+            result_path: str | None = None,
+            result_checksum: str | None = None,
+            result_size_bytes: int | None = None,
+        ) -> dict[str, Any]:
+            out = await super().finish_lease_failure(
+                request_id=request_id,
+                lease_id=lease_id,
+                attempt_id=attempt_id,
+                scheduler_epoch=scheduler_epoch,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                error=error,
+                result_path=result_path,
+                result_checksum=result_checksum,
+                result_size_bytes=result_size_bytes,
             )
             return out.to_wire()
 

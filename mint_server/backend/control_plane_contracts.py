@@ -1251,15 +1251,24 @@ class InProcessSchedulerQueueAdapter:
 
     async def complete(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return FinishResult.from_wire(await self.actor.complete_lease(**kwargs))
+        out = await self.actor.complete_lease(**kwargs)
+        if isinstance(out, FinishResult):
+            return out
+        return FinishResult.from_wire(out)
 
     async def finish_success(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return FinishResult.from_wire(await self.actor.finish_lease_success(**kwargs))
+        out = await self.actor.finish_lease_success(**kwargs)
+        if isinstance(out, FinishResult):
+            return out
+        return FinishResult.from_wire(out)
 
     async def finish_failure(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return FinishResult.from_wire(await self.actor.finish_lease_failure(**kwargs))
+        out = await self.actor.finish_lease_failure(**kwargs)
+        if isinstance(out, FinishResult):
+            return out
+        return FinishResult.from_wire(out)
 
     async def fail(self, **kwargs: Any) -> FailLeaseResult:
         kwargs.pop("timeout_s", None)
