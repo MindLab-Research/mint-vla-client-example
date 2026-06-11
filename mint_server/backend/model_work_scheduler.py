@@ -1282,7 +1282,7 @@ class _ModelWorkSchedulerActor:
                     skipped_domains=[],
                     extra={"deferred": "inflight_scheduler_transition"},
                 )
-        return AssignPendingResult.from_wire(await self.assign_pending(hydrate_task_state=hydrate_task_state))
+        return await self.assign_pending(hydrate_task_state=hydrate_task_state)
 
     def _remove_request_from_memory_locked(self, request_id: str) -> bool:
         request_id = str(request_id)
@@ -1694,7 +1694,7 @@ class _ModelWorkSchedulerActor:
                     request_id=work.request_id,
                 )
             assigned = (
-                await self.assign_pending(max_items=assign_max_items)
+                (await self.assign_pending(max_items=assign_max_items)).to_wire()
                 if bool(assign)
                 else {"ok": True, "assigned": 0, "skipped_domains": []}
             )
@@ -1778,7 +1778,7 @@ class _ModelWorkSchedulerActor:
                 self._cv.notify_all()
                 backlog_depth = len(self._backlog(work.domain_key))
             assigned = (
-                await self.assign_pending(max_items=assign_max_items)
+                (await self.assign_pending(max_items=assign_max_items)).to_wire()
                 if bool(assign)
                 else {"ok": True, "assigned": 0, "skipped_domains": []}
             )
@@ -2034,7 +2034,7 @@ class _ModelWorkSchedulerActor:
         *,
         max_items: int | None = None,
         hydrate_task_state: bool = True,
-    ) -> dict[str, Any]:
+    ) -> AssignPendingResult:
         self._ensure_assignment_loop_started()
         if self._use_task_state_store:
             if hydrate_task_state:
@@ -2049,7 +2049,7 @@ class _ModelWorkSchedulerActor:
             skipped_domains=list(out.skipped_domains),
             reason=out.reason,
             extra={**dict(out.extra), "expired": expired},
-        ).to_wire()
+        )
 
     def _validate_claimer(
         self,
@@ -3026,6 +3026,18 @@ def _create_ray_actor_handle():
         ) -> dict[str, Any]:
             out = await super().sync_replicas(
                 replicas,
+                hydrate_task_state=hydrate_task_state,
+            )
+            return out.to_wire()
+
+        async def assign_pending(
+            self,
+            *,
+            max_items: int | None = None,
+            hydrate_task_state: bool = True,
+        ) -> dict[str, Any]:
+            out = await super().assign_pending(
+                max_items=max_items,
                 hydrate_task_state=hydrate_task_state,
             )
             return out.to_wire()

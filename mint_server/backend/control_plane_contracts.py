@@ -1226,7 +1226,10 @@ class InProcessSchedulerQueueAdapter:
 
     async def assign_pending(self, **kwargs: Any) -> AssignPendingResult:
         kwargs.pop("timeout_s", None)
-        return AssignPendingResult.from_wire(await self.actor.assign_pending(**kwargs))
+        out = await self.actor.assign_pending(**kwargs)
+        if isinstance(out, AssignPendingResult):
+            return out
+        return AssignPendingResult.from_wire(out)
 
     async def claim(self, **kwargs: Any) -> ClaimResult:
         kwargs.pop("timeout_s", None)
