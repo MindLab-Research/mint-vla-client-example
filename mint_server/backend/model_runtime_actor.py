@@ -474,7 +474,8 @@ class ModelRuntimeActor:
             token_budget=token_budget,
             lease_ttl_s=self._config.lease_ttl_s,
         )
-        leases = claimed.get("leases") if isinstance(claimed, dict) else None
+        get_claimed = getattr(claimed, "get", None)
+        leases = get_claimed("leases") if callable(get_claimed) else None
         if not leases:
             self._empty_polls_total += 1
             self._clear_transient_scheduler_error()
@@ -883,7 +884,7 @@ class ModelRuntimeActor:
                     consumer_generation=self._config.actor_generation,
                     lease_ttl_s=self._config.lease_ttl_s,
                 )
-                if isinstance(result, dict) and bool(result.get("ok")):
+                if bool(getattr(result, "get", lambda _key, _default=None: _default)("ok")):
                     self._last_renewed_at = time.time()
                     self._renewed_total += 1
                     continue
@@ -911,7 +912,7 @@ class ModelRuntimeActor:
                         e,
                     )
                     continue
-                if isinstance(result, dict) and bool(result.get("ok")):
+                if bool(getattr(result, "get", lambda _key, _default=None: _default)("ok")):
                     self._last_renewed_at = time.time()
                     self._renewed_total += 1
 
@@ -995,7 +996,7 @@ class ModelRuntimeActor:
                     consumer_generation=self._config.actor_generation,
                     finalize_ttl_s=self._config.lease_ttl_s,
                 )
-                if isinstance(begin_finalize, dict) and bool(begin_finalize.get("ok")):
+                if bool(getattr(begin_finalize, "get", lambda _key, _default=None: _default)("ok")):
                     await self._scheduler.finish_failure(
                         request_id=request_id,
                         lease_id=lease_id,
@@ -1086,7 +1087,7 @@ class ModelRuntimeActor:
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
                     )
-                    if not isinstance(completed, dict) or not bool(completed.get("ok")):
+                    if not bool(getattr(completed, "get", lambda _key, _default=None: _default)("ok")):
                         logger.warning(
                             "[model_runtime] legacy lease complete rejected after future resolve actor=%s request_id=%s result=%s",
                             self._config.actor_name,
@@ -1107,7 +1108,7 @@ class ModelRuntimeActor:
                     reason="future_failed",
                     requeue=False,
                 )
-                if not isinstance(failed, dict) or not bool(failed.get("ok")):
+                if not bool(getattr(failed, "get", lambda _key, _default=None: _default)("ok")):
                     logger.warning(
                         "[model_runtime] legacy lease fail rejected after future failure actor=%s request_id=%s result=%s",
                         self._config.actor_name,
@@ -1142,7 +1143,7 @@ class ModelRuntimeActor:
                     else None
                 ),
             )
-            if not isinstance(begin_finalize, dict) or not bool(begin_finalize.get("ok")):
+            if not bool(getattr(begin_finalize, "get", lambda _key, _default=None: _default)("ok")):
                 logger.warning(
                     "[model_runtime] lease finalize rejected actor=%s request_id=%s result=%s",
                     self._config.actor_name,
@@ -1206,7 +1207,7 @@ class ModelRuntimeActor:
                         consumer_generation=self._config.actor_generation,
                         error=str(finalization.payload),
                     )
-                if not isinstance(finished, dict) or not bool(finished.get("ok")):
+                if not bool(getattr(finished, "get", lambda _key, _default=None: _default)("ok")):
                     logger.warning(
                         "[model_runtime] lease finish rejected actor=%s request_id=%s result=%s",
                         self._config.actor_name,
@@ -1273,7 +1274,7 @@ class ModelRuntimeActor:
                 consumer_generation=self._config.actor_generation,
                 finalize_ttl_s=self._config.lease_ttl_s,
             )
-            if not isinstance(begin_finalize, dict) or not bool(begin_finalize.get("ok")):
+            if not bool(getattr(begin_finalize, "get", lambda _key, _default=None: _default)("ok")):
                 logger.warning(
                     "[model_runtime] failure lease finalize rejected actor=%s request_id=%s result=%s",
                     self._config.actor_name,
@@ -1308,7 +1309,7 @@ class ModelRuntimeActor:
                     consumer_generation=self._config.actor_generation,
                     error=f"executor failed: {e}",
                 )
-                if not isinstance(finished, dict) or not bool(finished.get("ok")):
+                if not bool(getattr(finished, "get", lambda _key, _default=None: _default)("ok")):
                     logger.warning(
                         "[model_runtime] failure lease finish rejected actor=%s request_id=%s result=%s",
                         self._config.actor_name,

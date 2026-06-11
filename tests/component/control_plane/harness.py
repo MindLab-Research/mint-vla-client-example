@@ -20,7 +20,7 @@ from mint_server.backend.model_runtime_actor import ModelRuntimeActor
 from mint_server.backend.model_work_admission import enqueue_model_work
 from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
 from mint_server.backend.task_payload_store import TaskPayloadStore
-from mint_server.backend.task_state_store import TaskFutureService, TaskStateStore
+from mint_server.backend.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
@@ -303,7 +303,8 @@ class SchedulerComponentWorld:
             token_budget=token_budget,
             lease_ttl_s=lease_ttl_s,
         )
-        leases = claimed.get("leases") if isinstance(claimed, dict) else None
+        get_claimed = getattr(claimed, "get", None)
+        leases = get_claimed("leases") if callable(get_claimed) else None
         assert isinstance(leases, list)
         assert len(leases) == 1
         return leases[0]

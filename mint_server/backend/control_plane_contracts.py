@@ -69,7 +69,7 @@ class ConflictReason(StrEnum):
     UNKNOWN_LEASE = "unknown_lease"
 
 
-def _reason_from_wire(value: Any) -> ConflictReason | None:
+def _reason_from_wire(value: Any) -> ConflictReason | str | None:
     if value is None:
         return None
     if isinstance(value, ConflictReason):
@@ -77,11 +77,54 @@ def _reason_from_wire(value: Any) -> ConflictReason | None:
     try:
         return ConflictReason(str(value))
     except ValueError:
-        return ConflictReason.UNKNOWN
+        return str(value)
 
 
-@dataclass(frozen=True)
-class LeaseToken:
+def _reason_to_wire(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, ConflictReason):
+        return value.value
+    return str(value)
+
+
+class WireCompatibleResult:
+    """Mapping compatibility while consumers migrate from wire dicts to fields."""
+
+    def to_wire(self) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def __getitem__(self, key: str) -> Any:
+        return self.to_wire()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_wire().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.to_wire()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            wire = self.to_wire()
+            return all(wire.get(key) == value for key, value in other.items())
+        return NotImplemented
+
+    def keys(self):
+        return self.to_wire().keys()
+
+    def items(self):
+        return self.to_wire().items()
+
+    def values(self):
+        return self.to_wire().values()
+
+
+def _extra_wire_fields(data: dict[str, Any], known: set[str]) -> dict[str, Any]:
+    return {key: value for key, value in data.items() if key not in known}
+
+
+@dataclass(frozen=True, eq=False)
+class LeaseToken(WireCompatibleResult):
     request_id: str
     lease_id: str
     attempt_id: str
@@ -111,13 +154,13 @@ class LeaseToken:
         )
 
 
-@dataclass(frozen=True)
-class SubmitTaskResult:
+@dataclass(frozen=True, eq=False)
+class SubmitTaskResult(WireCompatibleResult):
     ok: bool
     request_id: str
     created: bool = False
     assigned: bool = False
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
     record: dict[str, Any] | None = None
 
     def to_wire(self) -> dict[str, Any]:
@@ -126,7 +169,7 @@ class SubmitTaskResult:
             "request_id": self.request_id,
             "created": self.created,
             "assigned": self.assigned,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
             "record": self.record,
         }
 
@@ -145,19 +188,23 @@ class SubmitTaskResult:
         )
 
 
-@dataclass(frozen=True)
-class CancelTaskResult:
+@dataclass(frozen=True, eq=False)
+class CancelTaskResult(WireCompatibleResult):
     ok: bool
     request_id: str
     was_terminal: bool = False
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
+    cancelled: bool | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
             "was_terminal": self.was_terminal,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
+            **({} if self.cancelled is None else {"cancelled": self.cancelled}),
         }
 
     @classmethod
@@ -167,11 +214,13 @@ class CancelTaskResult:
             request_id=str(data["request_id"]),
             was_terminal=bool(data.get("was_terminal", False)),
             reason=_reason_from_wire(data.get("reason")),
+            cancelled=bool(data["cancelled"]) if data.get("cancelled") is not None else None,
+            extra=_extra_wire_fields(data, {"ok", "request_id", "was_terminal", "reason", "cancelled"}),
         )
 
 
-@dataclass(frozen=True)
-class RetrieveTaskResult:
+@dataclass(frozen=True, eq=False)
+class RetrieveTaskResult(WireCompatibleResult):
     status: Literal["ready", "failed", "pending", "unknown", "unavailable"]
     request_id: str
     result_path: str | None = None
@@ -206,8 +255,8 @@ class RetrieveTaskResult:
         )
 
 
-@dataclass(frozen=True)
-class TaskRecord:
+@dataclass(frozen=True, eq=False)
+class TaskRecord(WireCompatibleResult):
     request_id: str
     status: str
     data: dict[str, Any] = field(default_factory=dict)
@@ -224,14 +273,14 @@ class TaskRecord:
         )
 
 
-@dataclass(frozen=True)
-class OwnerLeaseResult:
+@dataclass(frozen=True, eq=False)
+class OwnerLeaseResult(WireCompatibleResult):
     ok: bool
     owner_id: str | None = None
     epoch: int | None = None
     expires_at: float | None = None
     fencing_token: str | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -240,7 +289,7 @@ class OwnerLeaseResult:
             "epoch": self.epoch,
             "expires_at": self.expires_at,
             "fencing_token": self.fencing_token,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -255,19 +304,19 @@ class OwnerLeaseResult:
         )
 
 
-@dataclass(frozen=True)
-class CreateTaskResult:
+@dataclass(frozen=True, eq=False)
+class CreateTaskResult(WireCompatibleResult):
     ok: bool
     created: bool
     record: dict[str, Any]
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "created": self.created,
             "record": self.record,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -280,11 +329,11 @@ class CreateTaskResult:
         )
 
 
-@dataclass(frozen=True)
-class TaskMutationResult:
+@dataclass(frozen=True, eq=False)
+class TaskMutationResult(WireCompatibleResult):
     ok: bool
     record: dict[str, Any] | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
     idempotent: bool = False
     retry_required: bool = False
     deleted: bool | None = None
@@ -293,7 +342,7 @@ class TaskMutationResult:
         return {
             "ok": self.ok,
             "record": self.record,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
             "idempotent": self.idempotent,
             "retry_required": self.retry_required,
             "deleted": self.deleted,
@@ -319,8 +368,8 @@ CommitFinalizeResult = TaskMutationResult
 RequeueTaskResult = TaskMutationResult
 
 
-@dataclass(frozen=True)
-class TaskStatusChange:
+@dataclass(frozen=True, eq=False)
+class TaskStatusChange(WireCompatibleResult):
     changed: bool
     request_id: str
     record: dict[str, Any] | None = None
@@ -349,8 +398,8 @@ class TaskStatusChange:
         )
 
 
-@dataclass(frozen=True)
-class AppendWorkResult:
+@dataclass(frozen=True, eq=False)
+class AppendWorkResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
     domain_key: str | None = None
@@ -358,11 +407,13 @@ class AppendWorkResult:
     backlog_depth: int | None = None
     assigned: dict[str, Any] | None = None
     idempotent: bool = False
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
     retry_after_s: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
             "domain_key": self.domain_key,
@@ -370,7 +421,7 @@ class AppendWorkResult:
             "backlog_depth": self.backlog_depth,
             "assigned": self.assigned,
             "idempotent": self.idempotent,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
             "retry_after_s": self.retry_after_s,
         }
 
@@ -388,22 +439,36 @@ class AppendWorkResult:
             idempotent=bool(data.get("idempotent", False)),
             reason=_reason_from_wire(data.get("reason")),
             retry_after_s=float(data["retry_after_s"]) if data.get("retry_after_s") is not None else None,
+            extra=_extra_wire_fields(
+                data,
+                {
+                    "ok",
+                    "request_id",
+                    "domain_key",
+                    "scheduler_instance_id",
+                    "backlog_depth",
+                    "assigned",
+                    "idempotent",
+                    "reason",
+                    "retry_after_s",
+                },
+            ),
         )
 
 
-@dataclass(frozen=True)
-class AssignPendingResult:
+@dataclass(frozen=True, eq=False)
+class AssignPendingResult(WireCompatibleResult):
     ok: bool
     assigned: int
     skipped_domains: list[str] = field(default_factory=list)
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "assigned": self.assigned,
             "skipped_domains": list(self.skipped_domains),
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -416,19 +481,19 @@ class AssignPendingResult:
         )
 
 
-@dataclass(frozen=True)
-class ClaimResult:
+@dataclass(frozen=True, eq=False)
+class ClaimResult(WireCompatibleResult):
     ok: bool
     leases: list[dict[str, Any]] = field(default_factory=list)
     remaining_queue_depth: int = 0
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
 
     def to_wire(self) -> dict[str, Any]:
         return {
             "ok": self.ok,
             "leases": list(self.leases),
             "remaining_queue_depth": self.remaining_queue_depth,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -441,17 +506,19 @@ class ClaimResult:
         )
 
 
-@dataclass(frozen=True)
-class LeaseResult:
+@dataclass(frozen=True, eq=False)
+class LeaseResult(WireCompatibleResult):
     ok: bool
     lease: dict[str, Any] | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "lease": self.lease,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -460,26 +527,29 @@ class LeaseResult:
             ok=bool(data["ok"]),
             lease=data.get("lease") if isinstance(data.get("lease"), dict) else None,
             reason=_reason_from_wire(data.get("reason")),
+            extra=_extra_wire_fields(data, {"ok", "lease", "reason"}),
         )
 
 
 RenewResult = LeaseResult
 
 
-@dataclass(frozen=True)
-class FinishResult:
+@dataclass(frozen=True, eq=False)
+class FinishResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
     status: str | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
     idempotent: bool = False
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
             "status": self.status,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
             "idempotent": self.idempotent,
         }
 
@@ -491,22 +561,25 @@ class FinishResult:
             status=str(data["status"]) if data.get("status") is not None else None,
             reason=_reason_from_wire(data.get("reason")),
             idempotent=bool(data.get("idempotent", False)),
+            extra=_extra_wire_fields(data, {"ok", "request_id", "status", "reason", "idempotent"}),
         )
 
 
-@dataclass(frozen=True)
-class FailLeaseResult:
+@dataclass(frozen=True, eq=False)
+class FailLeaseResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
     requeued: bool = False
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
             "requeued": self.requeued,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -516,20 +589,23 @@ class FailLeaseResult:
             request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
             requeued=bool(data.get("requeued", False)),
             reason=_reason_from_wire(data.get("reason")),
+            extra=_extra_wire_fields(data, {"ok", "request_id", "requeued", "reason"}),
         )
 
 
-@dataclass(frozen=True)
-class ValidateLeaseResult:
+@dataclass(frozen=True, eq=False)
+class ValidateLeaseResult(WireCompatibleResult):
     ok: bool
     request_id: str | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
             "request_id": self.request_id,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
@@ -538,11 +614,12 @@ class ValidateLeaseResult:
             ok=bool(data["ok"]),
             request_id=str(data["request_id"]) if data.get("request_id") is not None else None,
             reason=_reason_from_wire(data.get("reason")),
+            extra=_extra_wire_fields(data, {"ok", "request_id", "reason"}),
         )
 
 
-@dataclass(frozen=True)
-class ExpireResult:
+@dataclass(frozen=True, eq=False)
+class ExpireResult(WireCompatibleResult):
     ok: bool
     expired: int
 
@@ -554,8 +631,8 @@ class ExpireResult:
         return cls(ok=bool(data["ok"]), expired=int(data.get("expired") or 0))
 
 
-@dataclass(frozen=True)
-class ContainsResult:
+@dataclass(frozen=True, eq=False)
+class ContainsResult(WireCompatibleResult):
     ok: bool
     request_id: str
     present: bool
@@ -587,39 +664,60 @@ class ContainsResult:
         )
 
 
-@dataclass(frozen=True)
-class SyncReplicasResult:
+@dataclass(frozen=True, eq=False)
+class SyncReplicasResult(WireCompatibleResult):
     ok: bool
+    replicas: int = 0
     registered: int = 0
     removed: int = 0
+    requeued: int = 0
     expired: int = 0
     assigned: dict[str, Any] | None = None
-    reason: ConflictReason | None = None
+    reason: ConflictReason | str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Any]:
         return {
+            **dict(self.extra),
             "ok": self.ok,
+            "replicas": self.replicas,
             "registered": self.registered,
             "removed": self.removed,
+            "requeued": self.requeued,
             "expired": self.expired,
             "assigned": self.assigned,
-            "reason": self.reason.value if self.reason is not None else None,
+            "reason": _reason_to_wire(self.reason),
         }
 
     @classmethod
     def from_wire(cls, data: dict[str, Any]) -> "SyncReplicasResult":
         return cls(
             ok=bool(data["ok"]),
+            replicas=int(data.get("replicas") or 0),
             registered=int(data.get("registered") or 0),
             removed=int(data.get("removed") or 0),
+            requeued=int(data.get("requeued") or 0),
             expired=int(data.get("expired") or 0),
             assigned=data.get("assigned") if isinstance(data.get("assigned"), dict) else None,
             reason=_reason_from_wire(data.get("reason")),
+            extra=_extra_wire_fields(
+                data,
+                {
+                    "ok",
+                    "replicas",
+                    "registered",
+                    "removed",
+                    "requeued",
+                    "expired",
+                    "assigned",
+                    "reason",
+                },
+            ),
         )
 
 
-@dataclass(frozen=True)
-class ExecutorOutcome:
+@dataclass(frozen=True, eq=False)
+class ExecutorOutcome(WireCompatibleResult):
     kind: Literal["success", "retryable_failure", "fatal_backend_death", "user_error"]
     payload: Any | None = None
     error: str | None = None
@@ -1092,7 +1190,7 @@ class InProcessSchedulerQueueAdapter:
     def __init__(self, actor: Any) -> None:
         self.actor = actor
 
-    async def append_work(self, **kwargs: Any) -> dict[str, Any]:
+    async def append_work(self, **kwargs: Any) -> AppendWorkResult:
         item = {
             "request_id": kwargs["request_id"],
             "op": kwargs["op"],
@@ -1108,64 +1206,69 @@ class InProcessSchedulerQueueAdapter:
             "ordering_key": kwargs.get("ordering_key"),
             "token_cost": kwargs.get("token_cost", 1),
         }
-        return await self.actor.append(
-            item,
-            assign=bool(kwargs.get("assign", False)),
-            assign_max_items=kwargs.get("assign_max_items"),
+        return AppendWorkResult.from_wire(
+            await self.actor.append(
+                item,
+                assign=bool(kwargs.get("assign", False)),
+                assign_max_items=kwargs.get("assign_max_items"),
+            )
         )
 
-    async def sync_replicas(self, replicas: list[dict[str, Any]], **_kwargs: Any) -> dict[str, Any]:
-        return await self.actor.sync_replicas(replicas)
+    async def sync_replicas(self, replicas: list[dict[str, Any]], **_kwargs: Any) -> SyncReplicasResult:
+        return SyncReplicasResult.from_wire(await self.actor.sync_replicas(replicas))
 
-    async def assign_pending(self, **kwargs: Any) -> dict[str, Any]:
+    async def assign_pending(self, **kwargs: Any) -> AssignPendingResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.assign_pending(**kwargs)
+        return AssignPendingResult.from_wire(await self.actor.assign_pending(**kwargs))
 
-    async def claim(self, **kwargs: Any) -> dict[str, Any]:
+    async def claim(self, **kwargs: Any) -> ClaimResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.claim_from_replica_queue(**kwargs)
+        return ClaimResult.from_wire(await self.actor.claim_from_replica_queue(**kwargs))
 
-    async def renew(self, **kwargs: Any) -> dict[str, Any]:
+    async def renew(self, **kwargs: Any) -> RenewResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.renew_lease(**kwargs)
+        return RenewResult.from_wire(await self.actor.renew_lease(**kwargs))
 
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+    async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.begin_finalize_lease(**kwargs)
+        return LeaseResult.from_wire(await self.actor.begin_finalize_lease(**kwargs))
 
-    async def complete(self, **kwargs: Any) -> dict[str, Any]:
+    async def complete(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.complete_lease(**kwargs)
+        return FinishResult.from_wire(await self.actor.complete_lease(**kwargs))
 
-    async def finish_success(self, **kwargs: Any) -> dict[str, Any]:
+    async def finish_success(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.finish_lease_success(**kwargs)
+        return FinishResult.from_wire(await self.actor.finish_lease_success(**kwargs))
 
-    async def finish_failure(self, **kwargs: Any) -> dict[str, Any]:
+    async def finish_failure(self, **kwargs: Any) -> FinishResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.finish_lease_failure(**kwargs)
+        return FinishResult.from_wire(await self.actor.finish_lease_failure(**kwargs))
 
-    async def fail(self, **kwargs: Any) -> dict[str, Any]:
+    async def fail(self, **kwargs: Any) -> FailLeaseResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.fail_lease(**kwargs)
+        return FailLeaseResult.from_wire(await self.actor.fail_lease(**kwargs))
 
-    async def validate(self, **kwargs: Any) -> dict[str, Any]:
+    async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.validate_lease(**kwargs)
+        return ValidateLeaseResult.from_wire(await self.actor.validate_lease(**kwargs))
 
-    async def expire(self, **kwargs: Any) -> dict[str, Any]:
+    async def expire(self, **kwargs: Any) -> ExpireResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.expire_leases(**kwargs)
+        return ExpireResult.from_wire(await self.actor.expire_leases(**kwargs))
 
-    async def contains(self, **kwargs: Any) -> dict[str, Any]:
+    async def contains(self, **kwargs: Any) -> ContainsResult:
         kwargs.pop("timeout_s", None)
-        return await self.actor.contains_request(**kwargs)
+        return ContainsResult.from_wire(await self.actor.contains_request(**kwargs))
 
-    async def contains_request(self, **kwargs: Any) -> dict[str, Any]:
+    async def contains_request(self, **kwargs: Any) -> ContainsResult:
         return await self.contains(**kwargs)
 
-    async def cancel_request(self, **kwargs: Any) -> dict[str, Any]:
-        return await self.actor.cancel_request(**kwargs)
+    async def cancel_request(self, **kwargs: Any) -> CancelTaskResult:
+        out = await self.actor.cancel_request(**kwargs)
+        if "was_terminal" not in out:
+            out = {**out, "was_terminal": not bool(out.get("cancelled"))}
+        return CancelTaskResult.from_wire(out)
 
     async def stats(self, **_kwargs: Any) -> dict[str, Any]:
         return self.actor.stats()

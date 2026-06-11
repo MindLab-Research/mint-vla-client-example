@@ -9,7 +9,7 @@ TraceEnqueue = Callable[..., Awaitable[Any]]
 @dataclass(frozen=True)
 class ModelWorkAdmissionResult:
     request_id: str
-    scheduler_result: dict[str, Any]
+    scheduler_result: Any
 
 
 class ModelWorkAdmissionRejectedError(RuntimeError):
@@ -118,8 +118,9 @@ async def enqueue_model_work(
                 op=op,
                 enqueue_coro=append_coro,
             )
-        scheduler_confirmed = isinstance(out, dict) and bool(out.get("ok"))
-        if isinstance(out, dict) and not scheduler_confirmed:
+        get_result = getattr(out, "get", None)
+        scheduler_confirmed = callable(get_result) and bool(get_result("ok"))
+        if callable(get_result) and not scheduler_confirmed:
             reason = str(out.get("reason") or "")
             if reason in {
                 "principal_domain_inflight_limit_exceeded",
@@ -130,7 +131,7 @@ async def enqueue_model_work(
                 raise ModelWorkAdmissionRejectedError(out)
         return ModelWorkAdmissionResult(
             request_id=request_id,
-            scheduler_result=out if isinstance(out, dict) else {},
+            scheduler_result=out if callable(get_result) else {},
         )
     except Exception:
         if scheduler_confirmed:

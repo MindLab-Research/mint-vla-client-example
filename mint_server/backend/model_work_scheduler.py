@@ -21,7 +21,21 @@ from ..config import (
 from ..runtime_env import env_nonempty
 from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
-from .control_plane_contracts import as_task_ledger
+from .control_plane_contracts import (
+    AppendWorkResult,
+    AssignPendingResult,
+    CancelTaskResult,
+    ClaimResult,
+    ContainsResult,
+    ExpireResult,
+    FailLeaseResult,
+    FinishResult,
+    LeaseResult,
+    RenewResult,
+    SyncReplicasResult,
+    ValidateLeaseResult,
+    as_task_ledger,
+)
 from .task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
 
 logger = logging.getLogger(__name__)
@@ -3125,9 +3139,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.append returned non-dict: {type(out)}")
         if not bool(out.get("ok")) and out.get("reason") == "duplicate_request_id":
             raise ModelWorkSchedulerConflictError(f"duplicate request_id: {request_id}")
-        return out
+        return AppendWorkResult.from_wire(out)
 
-    async def append_work(self, **kwargs: Any) -> dict[str, Any]:
+    async def append_work(self, **kwargs: Any) -> AppendWorkResult:
         return await self.append(**kwargs)
 
     async def sync_replicas(
@@ -3136,7 +3150,7 @@ class ModelWorkSchedulerClient:
         *,
         hydrate_task_state: bool = True,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> SyncReplicasResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         payload = [
             replica.to_dict() if isinstance(replica, ModelReplicaRegistration) else dict(replica)
@@ -3151,14 +3165,14 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.sync_replicas returned non-dict: {type(out)}")
-        return out
+        return SyncReplicasResult.from_wire(out)
 
     async def assign_pending(
         self,
         *,
         max_items: int | None = None,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> AssignPendingResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.assign_pending.remote(max_items=max_items),
@@ -3166,7 +3180,7 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.assign_pending returned non-dict: {type(out)}")
-        return out
+        return AssignPendingResult.from_wire(out)
 
     async def cancel_request(
         self,
@@ -3174,7 +3188,7 @@ class ModelWorkSchedulerClient:
         request_id: str,
         reason: str = "cancelled",
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> CancelTaskResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.cancel_request.remote(request_id=str(request_id), reason=str(reason)),
@@ -3182,7 +3196,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.cancel_request returned non-dict: {type(out)}")
-        return out
+        if "was_terminal" not in out:
+            out = {**out, "was_terminal": not bool(out.get("cancelled"))}
+        return CancelTaskResult.from_wire(out)
 
     async def contains_request(
         self,
@@ -3190,7 +3206,7 @@ class ModelWorkSchedulerClient:
         request_id: str,
         hydrate_task_state: bool = True,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> ContainsResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.contains_request.remote(
@@ -3201,9 +3217,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.contains_request returned non-dict: {type(out)}")
-        return out
+        return ContainsResult.from_wire(out)
 
-    async def contains(self, **kwargs: Any) -> dict[str, Any]:
+    async def contains(self, **kwargs: Any) -> ContainsResult:
         return await self.contains_request(**kwargs)
 
     async def is_empty(self, *, timeout_s: float = 10.0) -> bool:
@@ -3222,7 +3238,7 @@ class ModelWorkSchedulerClient:
         token_budget: int | None = None,
         lease_ttl_s: float = 30.0,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> ClaimResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.claim_from_replica_queue.remote(
@@ -3240,9 +3256,9 @@ class ModelWorkSchedulerClient:
             raise TypeError(
                 f"ModelWorkScheduler.claim_from_replica_queue returned non-dict: {type(out)}"
             )
-        return out
+        return ClaimResult.from_wire(out)
 
-    async def claim(self, **kwargs: Any) -> dict[str, Any]:
+    async def claim(self, **kwargs: Any) -> ClaimResult:
         return await self.claim_from_replica_queue(**kwargs)
 
     async def renew_lease(
@@ -3253,7 +3269,7 @@ class ModelWorkSchedulerClient:
         consumer_generation: int,
         lease_ttl_s: float = 30.0,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> RenewResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.renew_lease.remote(
@@ -3266,9 +3282,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.renew_lease returned non-dict: {type(out)}")
-        return out
+        return RenewResult.from_wire(out)
 
-    async def renew(self, **kwargs: Any) -> dict[str, Any]:
+    async def renew(self, **kwargs: Any) -> RenewResult:
         return await self.renew_lease(**kwargs)
 
     async def complete_lease(
@@ -3278,7 +3294,7 @@ class ModelWorkSchedulerClient:
         consumer_id: str,
         consumer_generation: int,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.complete_lease.remote(
@@ -3290,9 +3306,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.complete_lease returned non-dict: {type(out)}")
-        return out
+        return FinishResult.from_wire(out)
 
-    async def complete(self, **kwargs: Any) -> dict[str, Any]:
+    async def complete(self, **kwargs: Any) -> FinishResult:
         return await self.complete_lease(**kwargs)
 
     async def finish_lease_success(
@@ -3309,7 +3325,7 @@ class ModelWorkSchedulerClient:
         result_size_bytes: int | None = None,
         billing_observations: list[dict[str, Any]] | None = None,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.finish_lease_success.remote(
@@ -3328,7 +3344,7 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.finish_lease_success returned non-dict: {type(out)}")
-        return out
+        return FinishResult.from_wire(out)
 
     async def finish_lease_failure(
         self,
@@ -3344,7 +3360,7 @@ class ModelWorkSchedulerClient:
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> FinishResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.finish_lease_failure.remote(
@@ -3363,12 +3379,12 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.finish_lease_failure returned non-dict: {type(out)}")
-        return out
+        return FinishResult.from_wire(out)
 
-    async def finish_success(self, **kwargs: Any) -> dict[str, Any]:
+    async def finish_success(self, **kwargs: Any) -> FinishResult:
         return await self.finish_lease_success(**kwargs)
 
-    async def finish_failure(self, **kwargs: Any) -> dict[str, Any]:
+    async def finish_failure(self, **kwargs: Any) -> FinishResult:
         return await self.finish_lease_failure(**kwargs)
 
     async def begin_finalize_lease(
@@ -3380,7 +3396,7 @@ class ModelWorkSchedulerClient:
         finalize_ttl_s: float = 30.0,
         staged_payload_path: str | None = None,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> LeaseResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.begin_finalize_lease.remote(
@@ -3394,9 +3410,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.begin_finalize_lease returned non-dict: {type(out)}")
-        return out
+        return LeaseResult.from_wire(out)
 
-    async def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
+    async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
         return await self.begin_finalize_lease(**kwargs)
 
     async def validate_lease(
@@ -3406,7 +3422,7 @@ class ModelWorkSchedulerClient:
         consumer_id: str,
         consumer_generation: int,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> ValidateLeaseResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.validate_lease.remote(
@@ -3418,9 +3434,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.validate_lease returned non-dict: {type(out)}")
-        return out
+        return ValidateLeaseResult.from_wire(out)
 
-    async def validate(self, **kwargs: Any) -> dict[str, Any]:
+    async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
         return await self.validate_lease(**kwargs)
 
     async def fail_lease(
@@ -3433,7 +3449,7 @@ class ModelWorkSchedulerClient:
         reason: str = "failed",
         abort_finalize: bool = False,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> FailLeaseResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(
             actor.fail_lease.remote(
@@ -3448,9 +3464,9 @@ class ModelWorkSchedulerClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.fail_lease returned non-dict: {type(out)}")
-        return out
+        return FailLeaseResult.from_wire(out)
 
-    async def fail(self, **kwargs: Any) -> dict[str, Any]:
+    async def fail(self, **kwargs: Any) -> FailLeaseResult:
         return await self.fail_lease(**kwargs)
 
     async def expire_leases(
@@ -3458,14 +3474,14 @@ class ModelWorkSchedulerClient:
         *,
         now: float | None = None,
         timeout_s: float = 10.0,
-    ) -> dict[str, Any]:
+    ) -> ExpireResult:
         actor = await self._get_ray_actor_async(create_if_missing=False)
         out = await self._await_ray_ref(actor.expire_leases.remote(now=now), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.expire_leases returned non-dict: {type(out)}")
-        return out
+        return ExpireResult.from_wire(out)
 
-    async def expire(self, **kwargs: Any) -> dict[str, Any]:
+    async def expire(self, **kwargs: Any) -> ExpireResult:
         return await self.expire_leases(**kwargs)
 
     async def stats(
