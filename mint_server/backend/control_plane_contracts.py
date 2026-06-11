@@ -1226,7 +1226,10 @@ class InProcessSchedulerQueueAdapter:
 
     async def claim(self, **kwargs: Any) -> ClaimResult:
         kwargs.pop("timeout_s", None)
-        return ClaimResult.from_wire(await self.actor.claim_from_replica_queue(**kwargs))
+        out = await self.actor.claim_from_replica_queue(**kwargs)
+        if isinstance(out, ClaimResult):
+            return out
+        return ClaimResult.from_wire(out)
 
     async def renew(self, **kwargs: Any) -> RenewResult:
         kwargs.pop("timeout_s", None)

@@ -2089,7 +2089,7 @@ class _ModelWorkSchedulerActor:
         max_items: int = 1,
         token_budget: int | None = None,
         lease_ttl_s: float = 30.0,
-    ) -> dict[str, Any]:
+    ) -> ClaimResult:
         self._ensure_assignment_loop_started()
         now = time.time()
         if self._use_task_state_store:
@@ -2217,7 +2217,7 @@ class _ModelWorkSchedulerActor:
         async with self._cv:
             self._claimed += 1
             remaining_queue_depth = len(self._queue(domain_key, replica_id))
-        return {"ok": True, "leases": claimed, "remaining_queue_depth": remaining_queue_depth}
+        return ClaimResult(ok=True, leases=claimed, remaining_queue_depth=remaining_queue_depth)
 
     async def begin_finalize_lease(
         self,
@@ -3036,6 +3036,28 @@ def _create_ray_actor_handle():
                 consumer_generation=consumer_generation,
                 finalize_ttl_s=finalize_ttl_s,
                 staged_payload_path=staged_payload_path,
+            )
+            return out.to_wire()
+
+        async def claim_from_replica_queue(
+            self,
+            *,
+            domain_key: str,
+            replica_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+            max_items: int = 1,
+            token_budget: int | None = None,
+            lease_ttl_s: float = 30.0,
+        ) -> dict[str, Any]:
+            out = await super().claim_from_replica_queue(
+                domain_key=domain_key,
+                replica_id=replica_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+                max_items=max_items,
+                token_budget=token_budget,
+                lease_ttl_s=lease_ttl_s,
             )
             return out.to_wire()
 
