@@ -2708,16 +2708,16 @@ class _ModelWorkSchedulerActor:
         lease_id: str,
         consumer_id: str,
         consumer_generation: int,
-    ) -> dict[str, Any]:
+    ) -> ValidateLeaseResult:
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
             if lease is None:
-                return {"ok": False, "reason": "unknown_lease"}
+                return ValidateLeaseResult(ok=False, reason="unknown_lease")
             if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
                 consumer_generation
             ):
-                return {"ok": False, "reason": "stale_consumer"}
-            return {"ok": True, "request_id": lease.item.request_id}
+                return ValidateLeaseResult(ok=False, reason="stale_consumer")
+            return ValidateLeaseResult(ok=True, request_id=lease.item.request_id)
 
     async def fail_lease(
         self,
@@ -2816,12 +2816,12 @@ class _ModelWorkSchedulerActor:
             )
         return {"ok": True, "request_id": request_id, "requeued": requeued_out}
 
-    async def expire_leases(self, *, now: float | None = None) -> dict[str, Any]:
+    async def expire_leases(self, *, now: float | None = None) -> ExpireResult:
         ts = time.time() if now is None else float(now)
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
         expired = await self._expire_leases_unlocked(now=ts)
-        return {"ok": True, "expired": expired}
+        return ExpireResult(ok=True, expired=expired)
 
     def _stats_snapshot(self) -> dict[str, Any]:
         now = time.time()
@@ -2989,6 +2989,24 @@ def _create_ray_actor_handle():
                 request_id=request_id,
                 hydrate_task_state=hydrate_task_state,
             )
+            return out.to_wire()
+
+        async def validate_lease(
+            self,
+            *,
+            lease_id: str,
+            consumer_id: str,
+            consumer_generation: int,
+        ) -> dict[str, Any]:
+            out = await super().validate_lease(
+                lease_id=lease_id,
+                consumer_id=consumer_id,
+                consumer_generation=consumer_generation,
+            )
+            return out.to_wire()
+
+        async def expire_leases(self, *, now: float | None = None) -> dict[str, Any]:
+            out = await super().expire_leases(now=now)
             return out.to_wire()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(

@@ -1254,11 +1254,17 @@ class InProcessSchedulerQueueAdapter:
 
     async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
         kwargs.pop("timeout_s", None)
-        return ValidateLeaseResult.from_wire(await self.actor.validate_lease(**kwargs))
+        out = await self.actor.validate_lease(**kwargs)
+        if isinstance(out, ValidateLeaseResult):
+            return out
+        return ValidateLeaseResult.from_wire(out)
 
     async def expire(self, **kwargs: Any) -> ExpireResult:
         kwargs.pop("timeout_s", None)
-        return ExpireResult.from_wire(await self.actor.expire_leases(**kwargs))
+        out = await self.actor.expire_leases(**kwargs)
+        if isinstance(out, ExpireResult):
+            return out
+        return ExpireResult.from_wire(out)
 
     async def contains(self, **kwargs: Any) -> ContainsResult:
         kwargs.pop("timeout_s", None)
