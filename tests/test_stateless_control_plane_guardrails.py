@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import as_task_ledger
+from mint_server.backend.control_plane_contracts import LeaseToken, as_task_ledger
 from mint_server.backend.model_work_scheduler import ModelWorkSchedulerClient
 from mint_server.backend.task_state_store import TaskStateStore, TaskStateStoreClient
 
@@ -279,12 +279,14 @@ def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> Non
     async def _run() -> tuple[dict, dict]:
         client = ModelWorkSchedulerClient()
         success = await client.finish_success(
-            request_id="request-a",
-            lease_id="lease-a",
-            attempt_id="attempt-a",
-            scheduler_epoch=11,
-            consumer_id="consumer-a",
-            consumer_generation=7,
+            lease=LeaseToken(
+                request_id="request-a",
+                lease_id="lease-a",
+                attempt_id="attempt-a",
+                scheduler_epoch=11,
+                consumer_id="consumer-a",
+                consumer_generation=7,
+            ),
             result_path="/tmp/result.json",
             result_checksum=None,
             result_size_bytes=None,
@@ -292,12 +294,14 @@ def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> Non
             timeout_s=3.0,
         )
         failure = await client.finish_failure(
-            request_id="request-b",
-            lease_id="lease-b",
-            attempt_id="attempt-b",
-            scheduler_epoch=12,
-            consumer_id="consumer-b",
-            consumer_generation=8,
+            lease=LeaseToken(
+                request_id="request-b",
+                lease_id="lease-b",
+                attempt_id="attempt-b",
+                scheduler_epoch=12,
+                consumer_id="consumer-b",
+                consumer_generation=8,
+            ),
             error="boom",
             result_path=None,
             result_checksum=None,

@@ -130,17 +130,14 @@ class LeaseToken(WireCompatibleResult):
         )
 
 
-def _lease_kwargs(kwargs: dict[str, Any], *, include_full: bool = False) -> dict[str, Any]:
-    lease = kwargs.pop("lease", None)
-    if lease is None:
-        return kwargs
+def _lease_to_actor_kwargs(lease: LeaseToken, *, include_full: bool = False) -> dict[str, Any]:
     token = lease if isinstance(lease, LeaseToken) else LeaseToken.from_wire(dict(lease))
     token_kwargs = token.to_wire()
     if not include_full:
         token_kwargs.pop("request_id", None)
         token_kwargs.pop("attempt_id", None)
         token_kwargs.pop("scheduler_epoch", None)
-    return {**token_kwargs, **kwargs}
+    return token_kwargs
 
 
 @dataclass(frozen=True, eq=False)
@@ -1272,57 +1269,113 @@ class InProcessSchedulerQueueAdapter:
             return out
         return ClaimResult.from_wire(out)
 
-    async def renew(self, **kwargs: Any) -> RenewResult:
-        kwargs = _lease_kwargs(kwargs)
-        kwargs.pop("timeout_s", None)
+    async def renew(
+        self,
+        *,
+        lease: LeaseToken,
+        lease_ttl_s: float = 30.0,
+        timeout_s: float | None = None,
+    ) -> RenewResult:
+        kwargs = _lease_to_actor_kwargs(lease)
+        kwargs["lease_ttl_s"] = lease_ttl_s
         out = await self.actor.renew_lease(**kwargs)
         if isinstance(out, LeaseResult):
             return out
         return RenewResult.from_wire(out)
 
-    async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
-        kwargs = _lease_kwargs(kwargs)
-        kwargs.pop("timeout_s", None)
+    async def begin_finalize(
+        self,
+        *,
+        lease: LeaseToken,
+        finalize_ttl_s: float = 30.0,
+        staged_payload_path: str | None = None,
+        timeout_s: float | None = None,
+    ) -> LeaseResult:
+        kwargs = _lease_to_actor_kwargs(lease)
+        kwargs["finalize_ttl_s"] = finalize_ttl_s
+        kwargs["staged_payload_path"] = staged_payload_path
         out = await self.actor.begin_finalize_lease(**kwargs)
         if isinstance(out, LeaseResult):
             return out
         return LeaseResult.from_wire(out)
 
-    async def complete(self, **kwargs: Any) -> FinishResult:
-        kwargs = _lease_kwargs(kwargs)
-        kwargs.pop("timeout_s", None)
+    async def complete(
+        self,
+        *,
+        lease: LeaseToken,
+        timeout_s: float | None = None,
+    ) -> FinishResult:
+        kwargs = _lease_to_actor_kwargs(lease)
         out = await self.actor.complete_lease(**kwargs)
         if isinstance(out, FinishResult):
             return out
         return FinishResult.from_wire(out)
 
-    async def finish_success(self, **kwargs: Any) -> FinishResult:
-        kwargs = _lease_kwargs(kwargs, include_full=True)
-        kwargs.pop("timeout_s", None)
+    async def finish_success(
+        self,
+        *,
+        lease: LeaseToken,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+        timeout_s: float | None = None,
+    ) -> FinishResult:
+        kwargs = _lease_to_actor_kwargs(lease, include_full=True)
+        kwargs["result_path"] = result_path
+        kwargs["result_checksum"] = result_checksum
+        kwargs["result_size_bytes"] = result_size_bytes
+        kwargs["billing_observations"] = billing_observations
         out = await self.actor.finish_lease_success(**kwargs)
         if isinstance(out, FinishResult):
             return out
         return FinishResult.from_wire(out)
 
-    async def finish_failure(self, **kwargs: Any) -> FinishResult:
-        kwargs = _lease_kwargs(kwargs, include_full=True)
-        kwargs.pop("timeout_s", None)
+    async def finish_failure(
+        self,
+        *,
+        lease: LeaseToken,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        timeout_s: float | None = None,
+    ) -> FinishResult:
+        kwargs = _lease_to_actor_kwargs(lease, include_full=True)
+        kwargs["error"] = error
+        kwargs["result_path"] = result_path
+        kwargs["result_checksum"] = result_checksum
+        kwargs["result_size_bytes"] = result_size_bytes
         out = await self.actor.finish_lease_failure(**kwargs)
         if isinstance(out, FinishResult):
             return out
         return FinishResult.from_wire(out)
 
-    async def fail(self, **kwargs: Any) -> FailLeaseResult:
-        kwargs = _lease_kwargs(kwargs)
-        kwargs.pop("timeout_s", None)
+    async def fail(
+        self,
+        *,
+        lease: LeaseToken,
+        requeue: bool = True,
+        reason: str = "failed",
+        abort_finalize: bool = False,
+        timeout_s: float | None = None,
+    ) -> FailLeaseResult:
+        kwargs = _lease_to_actor_kwargs(lease)
+        kwargs["requeue"] = requeue
+        kwargs["reason"] = reason
+        kwargs["abort_finalize"] = abort_finalize
         out = await self.actor.fail_lease(**kwargs)
         if isinstance(out, FailLeaseResult):
             return out
         return FailLeaseResult.from_wire(out)
 
-    async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
-        kwargs = _lease_kwargs(kwargs)
-        kwargs.pop("timeout_s", None)
+    async def validate(
+        self,
+        *,
+        lease: LeaseToken,
+        timeout_s: float | None = None,
+    ) -> ValidateLeaseResult:
+        kwargs = _lease_to_actor_kwargs(lease)
         out = await self.actor.validate_lease(**kwargs)
         if isinstance(out, ValidateLeaseResult):
             return out

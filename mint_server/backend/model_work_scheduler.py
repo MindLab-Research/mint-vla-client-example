@@ -83,31 +83,6 @@ def _ray_model_work_scheduler_actor_name() -> str:
     return str(getattr(server_config, "model_work_scheduler_actor_name", "mint_model_work_scheduler"))
 
 
-def _lease_token_from_kwargs(kwargs: dict[str, Any], *, require_full: bool = False) -> LeaseToken:
-    lease = kwargs.pop("lease", None)
-    if lease is not None:
-        return lease if isinstance(lease, LeaseToken) else LeaseToken.from_wire(dict(lease))
-    if require_full:
-        return LeaseToken.from_wire(
-            {
-                "request_id": kwargs.pop("request_id"),
-                "lease_id": kwargs.pop("lease_id"),
-                "attempt_id": kwargs.pop("attempt_id"),
-                "scheduler_epoch": kwargs.pop("scheduler_epoch"),
-                "consumer_id": kwargs.pop("consumer_id"),
-                "consumer_generation": kwargs.pop("consumer_generation"),
-            }
-        )
-    return LeaseToken(
-        request_id=str(kwargs.pop("request_id", "")),
-        lease_id=str(kwargs.pop("lease_id")),
-        attempt_id=str(kwargs.pop("attempt_id", "")),
-        scheduler_epoch=int(kwargs.pop("scheduler_epoch", 0)),
-        consumer_id=str(kwargs.pop("consumer_id")),
-        consumer_generation=int(kwargs.pop("consumer_generation")),
-    )
-
-
 def _otel_metric_attrs() -> dict[str, str]:
     attrs = {
         "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
@@ -3690,9 +3665,18 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.renew_lease returned non-dict: {type(out)}")
         return RenewResult.from_wire(out)
 
-    async def renew(self, **kwargs: Any) -> RenewResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
-        return await self.renew_lease(**kwargs)
+    async def renew(
+        self,
+        *,
+        lease: LeaseToken,
+        lease_ttl_s: float = 30.0,
+        timeout_s: float = 10.0,
+    ) -> RenewResult:
+        return await self.renew_lease(
+            lease=lease,
+            lease_ttl_s=lease_ttl_s,
+            timeout_s=timeout_s,
+        )
 
     async def complete_lease(
         self,
@@ -3713,9 +3697,13 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.complete_lease returned non-dict: {type(out)}")
         return FinishResult.from_wire(out)
 
-    async def complete(self, **kwargs: Any) -> FinishResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
-        return await self.complete_lease(**kwargs)
+    async def complete(
+        self,
+        *,
+        lease: LeaseToken,
+        timeout_s: float = 10.0,
+    ) -> FinishResult:
+        return await self.complete_lease(lease=lease, timeout_s=timeout_s)
 
     async def finish_lease_success(
         self,
@@ -3777,13 +3765,43 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.finish_lease_failure returned non-dict: {type(out)}")
         return FinishResult.from_wire(out)
 
-    async def finish_success(self, **kwargs: Any) -> FinishResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs, require_full=True)
-        return await self.finish_lease_success(**kwargs)
+    async def finish_success(
+        self,
+        *,
+        lease: LeaseToken,
+        result_path: str,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        billing_observations: list[dict[str, Any]] | None = None,
+        timeout_s: float = 10.0,
+    ) -> FinishResult:
+        return await self.finish_lease_success(
+            lease=lease,
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            billing_observations=billing_observations,
+            timeout_s=timeout_s,
+        )
 
-    async def finish_failure(self, **kwargs: Any) -> FinishResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs, require_full=True)
-        return await self.finish_lease_failure(**kwargs)
+    async def finish_failure(
+        self,
+        *,
+        lease: LeaseToken,
+        error: str,
+        result_path: str | None = None,
+        result_checksum: str | None = None,
+        result_size_bytes: int | None = None,
+        timeout_s: float = 10.0,
+    ) -> FinishResult:
+        return await self.finish_lease_failure(
+            lease=lease,
+            error=error,
+            result_path=result_path,
+            result_checksum=result_checksum,
+            result_size_bytes=result_size_bytes,
+            timeout_s=timeout_s,
+        )
 
     async def begin_finalize_lease(
         self,
@@ -3808,9 +3826,20 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.begin_finalize_lease returned non-dict: {type(out)}")
         return LeaseResult.from_wire(out)
 
-    async def begin_finalize(self, **kwargs: Any) -> LeaseResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
-        return await self.begin_finalize_lease(**kwargs)
+    async def begin_finalize(
+        self,
+        *,
+        lease: LeaseToken,
+        finalize_ttl_s: float = 30.0,
+        staged_payload_path: str | None = None,
+        timeout_s: float = 10.0,
+    ) -> LeaseResult:
+        return await self.begin_finalize_lease(
+            lease=lease,
+            finalize_ttl_s=finalize_ttl_s,
+            staged_payload_path=staged_payload_path,
+            timeout_s=timeout_s,
+        )
 
     async def validate_lease(
         self,
@@ -3831,9 +3860,13 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.validate_lease returned non-dict: {type(out)}")
         return ValidateLeaseResult.from_wire(out)
 
-    async def validate(self, **kwargs: Any) -> ValidateLeaseResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
-        return await self.validate_lease(**kwargs)
+    async def validate(
+        self,
+        *,
+        lease: LeaseToken,
+        timeout_s: float = 10.0,
+    ) -> ValidateLeaseResult:
+        return await self.validate_lease(lease=lease, timeout_s=timeout_s)
 
     async def fail_lease(
         self,
@@ -3860,9 +3893,22 @@ class ModelWorkSchedulerClient:
             raise TypeError(f"ModelWorkScheduler.fail_lease returned non-dict: {type(out)}")
         return FailLeaseResult.from_wire(out)
 
-    async def fail(self, **kwargs: Any) -> FailLeaseResult:
-        kwargs["lease"] = _lease_token_from_kwargs(kwargs)
-        return await self.fail_lease(**kwargs)
+    async def fail(
+        self,
+        *,
+        lease: LeaseToken,
+        requeue: bool = True,
+        reason: str = "failed",
+        abort_finalize: bool = False,
+        timeout_s: float = 10.0,
+    ) -> FailLeaseResult:
+        return await self.fail_lease(
+            lease=lease,
+            requeue=requeue,
+            reason=reason,
+            abort_finalize=abort_finalize,
+            timeout_s=timeout_s,
+        )
 
     async def expire_leases(
         self,
