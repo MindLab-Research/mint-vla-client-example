@@ -99,6 +99,17 @@ class _DictKV:
     def keys(self) -> list[str]:
         return list(self._data.keys())
 
+    def iter_keys(self, *, prefix: str | None = None, limit: int | None = None):
+        yielded = 0
+        max_items = None if limit is None else max(0, int(limit))
+        for key in sorted(self._data.keys()):
+            if prefix is not None and not str(key).startswith(prefix):
+                continue
+            yield str(key)
+            yielded += 1
+            if max_items is not None and yielded >= max_items:
+                break
+
     def close(self) -> None:
         self._data.clear()
 
@@ -133,6 +144,28 @@ class _RocksKV:
 
     def keys(self) -> list[str]:
         return [str(key.decode("utf-8") if isinstance(key, bytes) else key) for key in self._db.keys()]
+
+    def iter_keys(self, *, prefix: str | None = None, limit: int | None = None):
+        max_items = None if limit is None else max(0, int(limit))
+        if max_items == 0:
+            return
+        yielded = 0
+        prefix_text = None if prefix is None else str(prefix)
+        iterator = self._db.iter()
+        if prefix_text is None:
+            iterator.seek_to_first()
+        else:
+            iterator.seek(prefix_text)
+        while iterator.valid():
+            raw_key = iterator.key()
+            key = str(raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key)
+            if prefix_text is not None and not key.startswith(prefix_text):
+                break
+            yield key
+            yielded += 1
+            if max_items is not None and yielded >= max_items:
+                break
+            iterator.next()
 
     def close(self) -> None:
         close = getattr(self._db, "close", None)
@@ -396,14 +429,22 @@ class FutureStateStore:
         return records
 
     def _ids_from_index_prefix(self, prefix: str, *, limit: int | None = None) -> list[str]:
-        keys = sorted(key for key in self._kv.keys() if key.startswith(prefix))
         out: list[str] = []
+        max_items = None if limit is None else max(0, int(limit))
+        if max_items == 0:
+            return out
+        iter_keys = getattr(self._kv, "iter_keys", None)
+        keys = (
+            iter_keys(prefix=prefix, limit=max_items)
+            if callable(iter_keys)
+            else (key for key in self._kv.keys() if key.startswith(prefix))
+        )
         for key in keys:
             value = self._kv.get(key)
             if value is None:
                 continue
             out.append(str(value))
-            if limit is not None and len(out) >= max(0, int(limit)):
+            if max_items is not None and len(out) >= max_items:
                 break
         return out
 
@@ -742,8 +783,19 @@ class FutureStateStore:
         expired: list[str] = []
         expired_by_op: dict[str, int] = {}
         ids: list[str] = []
+        remaining_ids = max(0, int(limit))
+        if remaining_ids == 0:
+            return []
         for status in ("pending", "queued", "assigned"):
-            ids.extend(self._ids_from_index_prefix(f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:"))
+            ids.extend(
+                self._ids_from_index_prefix(
+                    f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:",
+                    limit=remaining_ids,
+                )
+            )
+            remaining_ids = max(0, int(limit) - len(ids))
+            if remaining_ids == 0:
+                break
         for request_id in ids:
             if len(expired) >= max(0, int(limit)):
                 break
@@ -784,7 +836,7 @@ class FutureStateStore:
             return []
         cutoff = _now(now) - ttl_s
         out: list[dict[str, Any]] = []
-        for request_id in self._ids_from_index_prefix(_INDEX_RESULT_PREFIX):
+        for request_id in self._ids_from_index_prefix(_INDEX_RESULT_PREFIX, limit=max(0, int(limit))):
             if len(out) >= max(0, int(limit)):
                 break
             try:
@@ -828,8 +880,13 @@ class FutureStateStore:
             return []
         cutoff = _now(now) - ttl_s
         out: list[dict[str, Any]] = []
-        candidate_ids = self._ids_from_index_prefix(_INDEX_STAGED_PREFIX)
-        candidate_ids.extend(self._ids_from_index_prefix(_INDEX_UPDATED_PREFIX))
+        remaining_ids = max(0, int(limit))
+        if remaining_ids == 0:
+            return []
+        candidate_ids = self._ids_from_index_prefix(_INDEX_STAGED_PREFIX, limit=remaining_ids)
+        remaining_ids = max(0, int(limit) - len(candidate_ids))
+        if remaining_ids > 0:
+            candidate_ids.extend(self._ids_from_index_prefix(_INDEX_UPDATED_PREFIX, limit=remaining_ids))
         for request_id in candidate_ids:
             if len(out) >= max(0, int(limit)):
                 break
@@ -889,7 +946,7 @@ class FutureStateStore:
             return []
         cutoff = _now(now) - ttl_s
         deleted: list[str] = []
-        for request_id in self._ids_from_index_prefix(_INDEX_UPDATED_PREFIX):
+        for request_id in self._ids_from_index_prefix(_INDEX_UPDATED_PREFIX, limit=max(0, int(limit))):
             if len(deleted) >= max(0, int(limit)):
                 break
             with self._lock_for_request(request_id):
@@ -1108,10 +1165,11 @@ class FutureStateStore:
         if remaining == 0:
             return []
         for status in ("pending", "queued", "assigned", "leased", "running", "finalizing"):
+            status_limit = remaining if remaining is not None else None
             ids.extend(
                 self._ids_from_index_prefix(
                     f"{_INDEX_STATUS_PREFIX}{_index_value(status)}:",
-                    limit=remaining,
+                    limit=status_limit,
                 )
             )
             if remaining is not None:
