@@ -87,6 +87,36 @@ def test_issue_432_vllm_stats_observer_drops_non_finite_actor_timings() -> None:
     assert snap["add_request_exec_s_count"] == 0
 
 
+def test_issue_432_vllm_stats_observer_tracks_generate_path_fallback_metrics() -> None:
+    obs = VllmStatsObserver()
+
+    obs.observe_request_started()
+    snap = obs.snapshot()
+    assert snap["scheduler_running_requests"] == 1
+
+    obs.observe_request_result(
+        prompt_tokens=32,
+        generated_tokens=12,
+        num_samples=3,
+        total_s=2.5,
+        first_token_s=0.4,
+    )
+    obs.observe_request_finished()
+    obs.observe_request_finished()
+
+    snap = obs.snapshot()
+    assert snap["scheduler_running_requests"] == 0
+    assert snap["prefill_requests_iter_total"] == pytest.approx(1)
+    assert snap["decode_requests_iter_total"] == pytest.approx(3)
+    assert snap["prompt_tokens_iter_total"] == pytest.approx(32)
+    assert snap["generation_tokens_iter_total"] == pytest.approx(12)
+    assert snap["time_to_first_token_s_total"] == pytest.approx(0.4)
+    assert snap["first_token_observed_s_total"] == pytest.approx(0.4)
+    assert snap["prefill_time_s_total"] == pytest.approx(0.4)
+    assert snap["decode_time_s_total"] == pytest.approx(2.1)
+    assert snap["time_per_output_token_s_total"] == pytest.approx(2.5 / 12.0)
+
+
 def test_issue_432_install_vllm_iteration_observability_patches_fails_open(monkeypatch) -> None:
     monkeypatch.setattr(vllm_obs_mod, "_VLLM_PATCHES_INSTALLED", False)
 

@@ -853,12 +853,14 @@ def _create_extended_server_class(
             async with self._gate_lock:
                 async with self._active_generates_cond:
                     self._active_generates += 1
+            self._vllm_stats_observer.observe_request_started()
 
         async def _register_generate_end(self) -> None:
             async with self._active_generates_cond:
                 self._active_generates -= 1
                 if self._active_generates == 0:
                     self._active_generates_cond.notify_all()
+            self._vllm_stats_observer.observe_request_finished()
 
         @asynccontextmanager
         async def _exclusive_engine_op(self):
@@ -1552,6 +1554,13 @@ def _create_extended_server_class(
                 elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
+                self._vllm_stats_observer.observe_request_result(
+                    prompt_tokens=len(prompt_ids),
+                    generated_tokens=len(token_ids),
+                    num_samples=1,
+                    total_s=total_s,
+                    first_token_s=first_tok_s,
+                )
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
@@ -1637,6 +1646,13 @@ def _create_extended_server_class(
                             }
                 )
             self._progress_last.pop(request_id, None)
+            self._vllm_stats_observer.observe_request_result(
+                prompt_tokens=len(prompt_ids),
+                generated_tokens=sum(len(item["token_ids"]) for item in outs),
+                num_samples=len(outs),
+                total_s=total_s,
+                first_token_s=first_tok_s,
+            )
             return outs
 
         @traced_async_from_traceparent(
@@ -1817,6 +1833,13 @@ def _create_extended_server_class(
                 elif any(tid in [151645, 151643, 163586, 163585] for tid in token_ids[-3:]):
                     stop_reason = "stop"
 
+                self._vllm_stats_observer.observe_request_result(
+                    prompt_tokens=len(prompt_ids),
+                    generated_tokens=len(token_ids),
+                    num_samples=1,
+                    total_s=total_s,
+                    first_token_s=first_tok_s,
+                )
                 return {
                     "token_ids": token_ids,
                     "logprobs": log_probs,
@@ -1902,6 +1925,13 @@ def _create_extended_server_class(
                             }
                 )
             self._progress_last.pop(request_id, None)
+            self._vllm_stats_observer.observe_request_result(
+                prompt_tokens=len(prompt_ids),
+                generated_tokens=sum(len(item["token_ids"]) for item in outs),
+                num_samples=len(outs),
+                total_s=total_s,
+                first_token_s=first_tok_s,
+            )
             return outs
 
         async def generate(
@@ -1975,10 +2005,15 @@ def _create_extended_server_class(
             )
 
             # Get final response
+            t0 = time.perf_counter()
+            first_tok_s: float | None = None
             final_res = None
             async for output in generator:
+                if first_tok_s is None:
+                    first_tok_s = time.perf_counter() - t0
                 final_res = output
             assert final_res is not None
+            total_s = time.perf_counter() - t0
 
             token_ids = final_res.outputs[0].token_ids
             log_probs = None
@@ -1997,6 +2032,13 @@ def _create_extended_server_class(
                     )
                 if raw is not None:
                     routed_experts = raw.tolist() if hasattr(raw, "tolist") else raw
+            self._vllm_stats_observer.observe_request_result(
+                prompt_tokens=len(prompt_ids),
+                generated_tokens=len(token_ids),
+                num_samples=1,
+                total_s=total_s,
+                first_token_s=first_tok_s,
+            )
             return TokenOutput(
                 token_ids=token_ids,
                 log_probs=log_probs,

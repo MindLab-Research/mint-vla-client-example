@@ -231,6 +231,7 @@ class VllmStatsObserver:
         self._add_request_wait_time = _LatencyAgg()
         self._add_request_exec_time = _LatencyAgg()
         self._first_token_observed_time = _LatencyAgg()
+        self._actor_running_requests = 0
 
     def record(self, scheduler_stats: Any, iteration_stats: Any) -> None:
         with self._lock:
@@ -290,6 +291,69 @@ class VllmStatsObserver:
             self._add_request_exec_time.observe(add_request_exec_s)
             self._first_token_observed_time.observe(first_token_observed_s)
 
+    def observe_request_started(self) -> None:
+        with self._lock:
+            self._actor_running_requests += 1
+
+    def observe_request_finished(self) -> None:
+        with self._lock:
+            self._actor_running_requests = max(0, self._actor_running_requests - 1)
+
+    def observe_request_result(
+        self,
+        *,
+        prompt_tokens: int | None = None,
+        generated_tokens: int | None = None,
+        num_samples: int | None = None,
+        total_s: float | None = None,
+        first_token_s: float | None = None,
+    ) -> None:
+        try:
+            prompt_count = max(0, int(prompt_tokens or 0))
+        except (TypeError, ValueError):
+            prompt_count = 0
+        try:
+            generated_count = max(0, int(generated_tokens or 0))
+        except (TypeError, ValueError):
+            generated_count = 0
+        try:
+            sample_count = max(1, int(num_samples or 1))
+        except (TypeError, ValueError):
+            sample_count = 1
+
+        decode_s: float | None = None
+        mean_output_token_s: float | None = None
+        try:
+            total_value = float(total_s) if total_s is not None else None
+        except (TypeError, ValueError):
+            total_value = None
+        if total_value is not None and not math.isfinite(total_value):
+            total_value = None
+        try:
+            first_token_value = float(first_token_s) if first_token_s is not None else None
+        except (TypeError, ValueError):
+            first_token_value = None
+        if first_token_value is not None and not math.isfinite(first_token_value):
+            first_token_value = None
+        if total_value is not None:
+            if first_token_value is not None:
+                decode_s = max(0.0, total_value - max(0.0, first_token_value))
+            else:
+                decode_s = max(0.0, total_value)
+            if generated_count > 0:
+                mean_output_token_s = max(0.0, total_value) / float(generated_count)
+
+        with self._lock:
+            self._prefill_requests_iter.observe(1)
+            self._decode_requests_iter.observe(sample_count)
+            self._prompt_tokens_iter.observe(prompt_count)
+            self._generation_tokens_iter.observe(generated_count)
+            self._ttft_time.observe(first_token_value)
+            self._first_token_observed_time.observe(first_token_value)
+            self._prefill_time.observe(first_token_value)
+            self._decode_time.observe(decode_s)
+            self._output_token_time.observe(mean_output_token_s)
+
     @staticmethod
     def _snapshot_with_stem(stem: str, agg: _LatencyAgg) -> dict[str, float | int]:
         snap = agg.snapshot()
@@ -308,7 +372,10 @@ class VllmStatsObserver:
             hit_ratio = 0.0 if queries <= 0 else float(hits) / float(queries)
             out: dict[str, float | int] = {
                 "scheduler_waiting_requests": int(self._waiting),
-                "scheduler_running_requests": int(self._running),
+                "scheduler_running_requests": max(
+                    int(self._running),
+                    int(self._actor_running_requests),
+                ),
                 "scheduler_kv_cache_usage_ratio": float(self._kv_cache_usage_ratio),
                 "prefix_cache_queries_total": queries,
                 "prefix_cache_hits_total": hits,

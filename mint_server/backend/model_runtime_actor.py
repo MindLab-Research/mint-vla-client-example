@@ -777,6 +777,13 @@ class ModelRuntimeActor:
         payload: Any,
         billing_observations: list[dict[str, Any]] | None = None,
     ) -> None:
+        if not self._task_state_finalize_enabled(lease):
+            await self._task_futures.async_resolve(
+                str(lease["item"]["request_id"]),
+                payload,
+                billing_observations=billing_observations,
+            )
+            return
         self._require_task_state_finalize(lease)
         item = lease["item"]
         request_id = str(item["request_id"])
@@ -806,6 +813,9 @@ class ModelRuntimeActor:
         *,
         error: str,
     ) -> None:
+        if not self._task_state_finalize_enabled(lease):
+            await self._task_futures.async_fail(str(lease["item"]["request_id"]), str(error))
+            return
         self._require_task_state_finalize(lease)
         item = lease["item"]
         await self._task_state_future_call(
@@ -1110,7 +1120,7 @@ class ModelRuntimeActor:
                 finalize_ttl_s=self._config.lease_ttl_s,
                 staged_payload_path=(
                     self._staged_payload_path_for_lease(lease)
-                    if finalization.kind == "resolve"
+                    if finalization.kind == "resolve" and self._task_state_finalize_enabled(lease)
                     else None
                 ),
             )

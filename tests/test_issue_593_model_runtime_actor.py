@@ -990,6 +990,41 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
 
 
 @pytest.mark.anyio
+async def test_issue_593_model_runtime_completes_without_task_state_finalize_metadata() -> None:
+    lease = _lease("runtime-req-no-task-state-finalize", finalize=False)
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+
+    async def _executor(_lease: dict) -> None:
+        await task_futures.async_resolve(_lease["item"]["request_id"], {"ok": True})
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        executor=_executor,
+    )
+
+    result = await actor.run_once()
+
+    assert result == {"claimed": 1, "executed": 1}
+    assert task_futures.resolved == [(lease["item"]["request_id"], {"ok": True})]
+    assert scheduler.failed == []
+    assert scheduler.completed == [
+        {
+            "lease_id": lease["lease_id"],
+            "consumer_id": "vllm:model-a::replica-0::generation::3",
+            "consumer_generation": 3,
+        }
+    ]
+    snapshot = actor.health_snapshot()
+    assert snapshot["completed_total"] == 1
+    assert snapshot["requeued_total"] == 0
+
+
+@pytest.mark.anyio
 async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_finalize() -> None:
     lease = _lease("runtime-req-missing-finalize-lease")
     scheduler = _FakeScheduler(claims=[[lease]], begin_finalize_ok=False)
