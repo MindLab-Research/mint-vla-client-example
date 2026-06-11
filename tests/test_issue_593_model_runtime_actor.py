@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -464,6 +465,37 @@ async def test_issue_593_model_runtime_accepts_executor_outcome_success(tmp_path
         path=success["result_path"],
         expected_checksum=success["result_checksum"],
     ) == {"ok": True, "source": "executor_outcome"}
+
+
+@pytest.mark.anyio
+async def test_issue_593_model_runtime_offloads_sync_executor_and_renews(tmp_path) -> None:
+    lease = _lease("runtime-req-sync-offload")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    payload_store = TaskPayloadStore(tmp_path)
+
+    def _executor(_lease: dict) -> ExecutorOutcome:
+        time.sleep(0.35)
+        return ExecutorOutcome(kind="success", payload={"ok": True, "source": "sync_executor"})
+
+    actor = ModelRuntimeActor(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        payload_store=payload_store,
+        executor=_executor,
+        lease_ttl_s=0.3,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert scheduler.renewed and scheduler.renewed[0]["lease_id"] == lease["lease_id"]
+    success = scheduler.finished_success[0]
+    assert payload_store.read_json_payload(
+        path=success["result_path"],
+        expected_checksum=success["result_checksum"],
+    ) == {"ok": True, "source": "sync_executor"}
 
 
 @pytest.mark.anyio

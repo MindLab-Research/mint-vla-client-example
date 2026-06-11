@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -37,7 +38,7 @@ from .task_state_store import FutureStatus, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
 
-ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None]]
+ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None] | ExecutorOutcome | None]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
 _EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
@@ -991,6 +992,12 @@ class ModelRuntimeActor:
                     self._last_renewed_at = time.time()
                     self._renewed_total += 1
 
+    async def _call_executor(self, lease: dict[str, Any]) -> ExecutorOutcome | None:
+        result = await asyncio.to_thread(self._executor, lease)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def _run_executor(
         self,
         lease: dict[str, Any],
@@ -999,13 +1006,13 @@ class ModelRuntimeActor:
         item = lease.get("item") if isinstance(lease, dict) else {}
         tracer = get_otel_tracer()
         if tracer is None:
-            out = await self._executor(lease)
+            out = await self._call_executor(lease)
             return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
         try:
             from opentelemetry.propagate import extract
             from opentelemetry.trace import SpanKind, Status, StatusCode
         except Exception:
-            out = await self._executor(lease)
+            out = await self._call_executor(lease)
             return _outcome_from_finalize_buffer(finalize_buffer) or out or ExecutorOutcome(kind="success")
 
         span_context = None
@@ -1028,7 +1035,7 @@ class ModelRuntimeActor:
             span.set_attribute("replica_id", self._config.replica_id)
             span.set_attribute("actor_name", self._config.actor_name)
             try:
-                out = await self._executor(lease)
+                out = await self._call_executor(lease)
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
