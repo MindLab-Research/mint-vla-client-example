@@ -1219,7 +1219,10 @@ class InProcessSchedulerQueueAdapter:
         return AppendWorkResult.from_wire(out)
 
     async def sync_replicas(self, replicas: list[dict[str, Any]], **_kwargs: Any) -> SyncReplicasResult:
-        return SyncReplicasResult.from_wire(await self.actor.sync_replicas(replicas))
+        out = await self.actor.sync_replicas(replicas)
+        if isinstance(out, SyncReplicasResult):
+            return out
+        return SyncReplicasResult.from_wire(out)
 
     async def assign_pending(self, **kwargs: Any) -> AssignPendingResult:
         kwargs.pop("timeout_s", None)

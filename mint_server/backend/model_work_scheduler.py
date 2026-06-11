@@ -1890,7 +1890,7 @@ class _ModelWorkSchedulerActor:
         replicas: list[dict[str, Any]],
         *,
         hydrate_task_state: bool = True,
-    ) -> dict[str, Any]:
+    ) -> SyncReplicasResult:
         self._ensure_assignment_loop_started()
         now = time.time()
         if self._use_task_state_store:
@@ -1911,15 +1911,15 @@ class _ModelWorkSchedulerActor:
                     skipped_domains=[],
                     extra={"deferred": "inflight_scheduler_transition"},
                 )
-                return {
-                    "ok": True,
-                    "replicas": len(self._replicas),
-                    "removed": 0,
-                    "requeued": 0,
-                    "expired": 0,
-                    "assigned": assigned.to_wire(),
-                    "deferred": "inflight_scheduler_transition",
-                }
+                return SyncReplicasResult(
+                    ok=True,
+                    replicas=len(self._replicas),
+                    removed=0,
+                    requeued=0,
+                    expired=0,
+                    assigned=assigned.to_wire(),
+                    extra={"deferred": "inflight_scheduler_transition"},
+                )
             previous_replicas = dict(self._replicas)
             previous_queues = {
                 key: deque(queue)
@@ -2020,14 +2020,14 @@ class _ModelWorkSchedulerActor:
         assigned_pending = await self._assign_pending_if_no_inflight_unlocked(
             hydrate_task_state=hydrate_task_state,
         )
-        return {
-            "ok": True,
-            "replicas": replica_count,
-            "removed": removed_count,
-            "requeued": requeued + expired,
-            "expired": expired,
-            "assigned": assigned_pending.to_wire(),
-        }
+        return SyncReplicasResult(
+            ok=True,
+            replicas=replica_count,
+            removed=removed_count,
+            requeued=requeued + expired,
+            expired=expired,
+            assigned=assigned_pending.to_wire(),
+        )
 
     async def assign_pending(
         self,
@@ -3004,6 +3004,18 @@ def _create_ray_actor_handle():
                 item,
                 assign=assign,
                 assign_max_items=assign_max_items,
+            )
+            return out.to_wire()
+
+        async def sync_replicas(
+            self,
+            replicas: list[dict[str, Any]],
+            *,
+            hydrate_task_state: bool = True,
+        ) -> dict[str, Any]:
+            out = await super().sync_replicas(
+                replicas,
+                hydrate_task_state=hydrate_task_state,
             )
             return out.to_wire()
 
