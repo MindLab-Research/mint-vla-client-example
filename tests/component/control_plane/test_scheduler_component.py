@@ -53,7 +53,7 @@ async def _assert_scheduler_surfaces_progress_while_blocked(
     result = await task
     assert contains["ok"] is True
     assert stats["scheduler_instance_id"]
-    assert appended.scheduler_result["ok"] is True
+    assert appended.scheduler_result.ok is True
     assert synced["ok"] is True
     return result
 
@@ -132,10 +132,10 @@ async def test_scheduler_component_duplicate_append_is_idempotent_while_pending(
         first = await world.enqueue_sampling("component-duplicate")
         second = await world.enqueue_sampling("component-duplicate")
 
-        assert first.scheduler_result["ok"] is True
-        assert not first.scheduler_result.get("idempotent", False)
-        assert second.scheduler_result["ok"] is True
-        assert second.scheduler_result["idempotent"] is True
+        assert first.scheduler_result.ok is True
+        assert not first.scheduler_result.idempotent
+        assert second.scheduler_result.ok is True
+        assert second.scheduler_result.idempotent is True
 
         lease = await world.claim_one()
         assert lease["item"]["request_id"] == "component-duplicate"
@@ -589,7 +589,7 @@ async def test_scheduler_component_duplicate_append_cancel_does_not_forget_exist
         assigned = await world.scheduler.assign_pending(max_items=1)
         lease = await world.claim_one()
 
-        assert created.scheduler_result["ok"] is True
+        assert created.scheduler_result.ok is True
         assert (await world.observe_task(request_id))["status"] == "leased"
         assert assigned["assigned"] == 1
         assert lease["item"]["request_id"] == request_id
@@ -627,7 +627,7 @@ async def test_scheduler_component_duplicate_append_cancel_does_not_rewrite_exis
 
         task = await world.observe_task(request_id)
 
-        assert created.scheduler_result["ok"] is True
+        assert created.scheduler_result.ok is True
         assert task["status"] == "pending"
         assert task["request_json"] == first_payload
     finally:
@@ -2268,15 +2268,15 @@ async def test_scheduler_component_sampling_token_budget_admission_enforce_rejec
         with pytest.raises(ModelWorkAdmissionRejectedError) as rejected_exc:
             await world.enqueue_sampling("component-token-budget-b", token_cost=4)
 
-        assert first.scheduler_result["ok"] is True
-        assert rejected_exc.value.scheduler_result["reason"] == "principal_domain_token_budget_exceeded"
-        assert rejected_exc.value.scheduler_result["current"] == 11
-        assert rejected_exc.value.scheduler_result["limit"] == 10
+        assert first.scheduler_result.ok is True
+        assert rejected_exc.value.scheduler_result.reason == "principal_domain_token_budget_exceeded"
+        assert rejected_exc.value.scheduler_result.extra["current"] == 11
+        assert rejected_exc.value.scheduler_result.extra["limit"] == 10
         assert (await world.observe_scheduler("component-token-budget-b"))["present"] is False
 
         await world.runtime_once()
         accepted_after_release = await world.enqueue_sampling("component-token-budget-c", token_cost=4)
-        assert accepted_after_release.scheduler_result["ok"] is True
+        assert accepted_after_release.scheduler_result.ok is True
     finally:
         world.close()
 
@@ -2591,9 +2591,9 @@ async def test_scheduler_component_sampling_admission_observe_allows_would_rejec
         first = await world.enqueue_sampling("component-admission-observe-a", assign=False)
         second = await world.enqueue_sampling("component-admission-observe-b", assign=False)
 
-        assert first.scheduler_result["ok"] is True
-        assert second.scheduler_result["ok"] is True
-        assert second.scheduler_result["sampling_inflight_admission"]["would_reject"] is True
+        assert first.scheduler_result.ok is True
+        assert second.scheduler_result.ok is True
+        assert second.scheduler_result.extra["sampling_inflight_admission"]["would_reject"] is True
         assert (
             await world.observe_scheduler("component-admission-observe-b")
         )["present"] is True
@@ -2620,16 +2620,16 @@ async def test_scheduler_component_sampling_admission_enforce_rejects_and_releas
         with pytest.raises(ModelWorkAdmissionRejectedError) as rejected_exc:
             await world.enqueue_sampling("component-admission-enforce-b")
 
-        assert first.scheduler_result["ok"] is True
-        assert rejected_exc.value.scheduler_result["ok"] is False
-        assert rejected_exc.value.scheduler_result["reason"] == "principal_domain_inflight_limit_exceeded"
+        assert first.scheduler_result.ok is True
+        assert rejected_exc.value.scheduler_result.ok is False
+        assert rejected_exc.value.scheduler_result.reason == "principal_domain_inflight_limit_exceeded"
         assert (await world.observe_scheduler("component-admission-enforce-b"))["present"] is False
 
         await world.runtime_once()
         await assert_terminal_not_scheduled(world, "component-admission-enforce-a")
 
         accepted_after_release = await world.enqueue_sampling("component-admission-enforce-c")
-        assert accepted_after_release.scheduler_result["ok"] is True
+        assert accepted_after_release.scheduler_result.ok is True
         assert (await world.observe_scheduler("component-admission-enforce-c"))["present"] is True
     finally:
         world.close()
@@ -2971,7 +2971,7 @@ async def test_scheduler_component_append_cancellation_after_durable_create_roll
         retry = await world.enqueue_sampling(request_id, assign=False)
         status_code, payload = await world.retrieve(request_id, monkeypatch)
 
-        assert retry.scheduler_result["ok"] is True
+        assert retry.scheduler_result.ok is True
         assert (await world.observe_scheduler(request_id))["present"] is True
         assert status_code == 408
         assert payload["request_id"] == request_id
