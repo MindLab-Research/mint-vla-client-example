@@ -1023,6 +1023,7 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
             "consumer_generation": 3,
             "reason": "task_state_finalize_failed",
             "requeue": True,
+            "abort_finalize": True,
         }
     ]
     assert actor.health_snapshot()["requeued_total"] == 1
@@ -1259,6 +1260,7 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_fail_write_fails
             "consumer_generation": 3,
             "reason": "task_state_finalize_failed",
             "requeue": True,
+            "abort_finalize": True,
         }
     ]
     assert actor.health_snapshot()["requeued_total"] == 1

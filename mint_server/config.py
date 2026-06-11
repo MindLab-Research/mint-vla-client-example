@@ -505,6 +505,8 @@ class ServerConfig:
     sampling_max_pending_asample_per_apikey: int = 64
     sampling_max_inflight_per_principal_domain: int = 1024
     sampling_max_inflight_per_domain: int = 10240
+    sampling_max_inflight_tokens_per_principal_domain: int = 0
+    sampling_max_inflight_tokens_per_domain: int = 0
     sampling_inflight_admission_mode: str = "observe"
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
@@ -776,6 +778,18 @@ class ServerConfig:
                 "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
                 getattr(file_sampling, "max_inflight_per_domain", None) if file_sampling is not None else None,
                 10240,
+            ),
+            sampling_max_inflight_tokens_per_principal_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
+                getattr(file_sampling, "max_inflight_tokens_per_principal_domain", None)
+                if file_sampling is not None
+                else None,
+                0,
+            ),
+            sampling_max_inflight_tokens_per_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
+                getattr(file_sampling, "max_inflight_tokens_per_domain", None) if file_sampling is not None else None,
+                0,
             ),
             sampling_inflight_admission_mode=_pick_str(
                 "MINT_SAMPLING_INFLIGHT_ADMISSION_MODE",

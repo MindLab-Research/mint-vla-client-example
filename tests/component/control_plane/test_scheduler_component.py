@@ -6,6 +6,8 @@ import time
 import pytest
 
 from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
+from mint_server.backend.task_state_store import TaskStateStore
 
 from .harness import SchedulerComponentWorld
 from .invariants import assert_terminal_not_scheduled
@@ -245,6 +247,43 @@ async def test_scheduler_component_fail_terminal_requires_durable_terminal_commi
             )
         )["ok"] is True
         assert (await world.observe_task("component-fail-before-commit"))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_fail_requeue_rejects_durable_finalizing_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-fail-requeue-finalizing"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        begin = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+        )
+
+        failed = await world.scheduler.fail(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            requeue=True,
+            reason="ordinary-fail-after-finalize",
+        )
+
+        assert begin["ok"] is True
+        assert failed == {"ok": False, "reason": "finalize_in_progress"}
+        assert (await world.observe_task(request_id))["status"] == "finalizing"
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
     finally:
         world.close()
 
@@ -1276,6 +1315,85 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_re
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_direct_fail_requeue_cancellation_after_commit_preserves_backlog(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-direct-fail-requeue-cancel-after"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one()
+
+        block = world.faults.block("task_state.requeue_task.after")
+        fail_task = asyncio.create_task(
+            world.scheduler.fail(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                requeue=True,
+                reason="direct-fail-requeue-cancel-after",
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        fail_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await fail_task
+
+        assert (
+            await world.scheduler.validate(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        ) == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["location"] == "backlog"
+        assert (await world.observe_task(request_id))["status"] == "pending"
+
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        new_lease = await world.claim_one()
+
+        assert assigned["assigned"] == 1
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_expire_cancellation_after_terminal_requeue_rejection_cleans_projection(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-expire-requeue-terminal-after"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one(lease_ttl_s=1.0)
+
+        block = world.faults.block("task_state.requeue_task.after")
+        expire_task = asyncio.create_task(world.scheduler.expire(now=time.time() + 2.0))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        await asyncio.to_thread(
+            world.task_store.complete_task_success,
+            request_id=request_id,
+            result_path=str(world.tmp_path / "result.json"),
+            result_checksum=None,
+            result_size_bytes=None,
+        )
+        expire_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await expire_task
+
+        assert (await world.observe_task(request_id))["status"] == "done"
+        assert (await world.observe_scheduler(request_id))["present"] is False
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_requeue_failure_restores_unprocessed_batch_to_backlog(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
@@ -1404,5 +1522,1037 @@ async def test_scheduler_component_sync_requeue_failure_preserves_replica_regist
             [world.replica(status="healthy", generation=old_generation + 1)]
         )
         assert synced["requeued"] == 1
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_assign_cancellation_restores_backlog(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-assign-cancel"
+        await world.enqueue_sampling(request_id, assign=False)
+
+        block = world.faults.block("task_state.assign_task")
+        assign_task = asyncio.create_task(world.scheduler.assign_pending(max_items=1))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        assign_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await assign_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "backlog"
+        reassigned = await world.scheduler.assign_pending(max_items=1)
+        lease = await world.claim_one()
+
+        assert reassigned["assigned"] == 1
+        assert lease["item"]["request_id"] == request_id
+        assert (await world.observe_task(request_id))["status"] == "leased"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_claim_cancellation_restores_assigned_work(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-claim-cancel"
+        await world.enqueue_sampling(request_id)
+
+        block = world.faults.block("task_state.claim_task")
+        claim_task = asyncio.create_task(
+            world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        claim_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await claim_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "assigned"
+        lease = await world.claim_one()
+
+        assert lease["item"]["request_id"] == request_id
+        assert (await world.observe_task(request_id))["status"] == "leased"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_begin_finalize_cancellation_restores_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finalize-cancel"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.begin_finalize")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        finalize_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "leased"
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+
+        retried = await world.scheduler.begin_finalize(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            finalize_ttl_s=30.0,
+        )
+        assert retried["ok"] is True
+        assert (await world.observe_task(request_id))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_sync_cancellation_preserves_replica_registry_and_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        old_consumer_id = world.consumer_id
+        old_generation = world.generation
+        request_id = "component-sync-cancel"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.requeue_task")
+        sync_task = asyncio.create_task(
+            world.scheduler.sync_replicas(
+                [world.replica(status="healthy", generation=old_generation + 1)]
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        sync_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sync_task
+
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=old_consumer_id,
+                consumer_generation=old_generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_scheduler(request_id))["location"] == "leased"
+        await world.enqueue_sampling("component-sync-cancel-after", assign=False)
+        with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.replica(generation=old_generation + 1)["consumer_id"],
+                consumer_generation=old_generation + 1,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_sync_cancellation_after_requeue_commit_preserves_backlog_and_registry(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        old_consumer_id = world.consumer_id
+        old_generation = world.generation
+        request_id = "component-sync-cancel-after-requeue"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one()
+
+        block = world.faults.block("task_state.requeue_task.after")
+        sync_task = asyncio.create_task(
+            world.scheduler.sync_replicas(
+                [world.replica(status="healthy", generation=old_generation + 1)]
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        sync_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await sync_task
+
+        assert (
+            await world.scheduler.validate(
+                lease_id=old_lease["lease_id"],
+                consumer_id=old_consumer_id,
+                consumer_generation=old_generation,
+            )
+        ) == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["location"] == "backlog"
+        assert (await world.observe_task(request_id))["status"] == "pending"
+        with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.replica(generation=old_generation + 1)["consumer_id"],
+                consumer_generation=old_generation + 1,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+
+        reassigned = await world.scheduler.assign_pending(max_items=1)
+        new_lease = await world.claim_one(
+            consumer_id=old_consumer_id,
+            consumer_generation=old_generation,
+        )
+
+        assert reassigned["assigned"] == 1
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_expire_cancellation_preserves_retryable_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-expire-cancel"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one(lease_ttl_s=1.0)
+
+        block = world.faults.block("task_state.requeue_task")
+        expire_task = asyncio.create_task(world.scheduler.expire(now=time.time() + 2.0))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        expire_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await expire_task
+
+        assert (
+            await world.scheduler.validate(
+                lease_id=old_lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (await world.observe_scheduler(request_id))["location"] == "leased"
+
+        expired = await world.scheduler.expire(now=time.time() + 3.0)
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        new_lease = await world.claim_one()
+
+        assert expired == {"ok": True, "expired": 1}
+        assert assigned["assigned"] == 1
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_affinity_sticks_to_same_replica_surface(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.scheduler.sync_replicas(
+            [
+                world.replica(replica_id="replica-a", status="healthy"),
+                world.replica(replica_id="replica-b", status="healthy"),
+            ]
+        )
+        await world.enqueue_sampling("component-affinity-a1", affinity_group="lora:a")
+        await world.enqueue_sampling("component-affinity-a2", affinity_group="lora:a")
+        await world.enqueue_sampling("component-affinity-b1", affinity_group="lora:b")
+
+        first_a = await world.claim_one(replica_id="replica-a")
+        second_a = await world.claim_one(replica_id="replica-a")
+        first_b = await world.claim_one(replica_id="replica-b")
+
+        assert [first_a["item"]["request_id"], second_a["item"]["request_id"]] == [
+            "component-affinity-a1",
+            "component-affinity-a2",
+        ]
+        assert first_b["item"]["request_id"] == "component-affinity-b1"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_assignment_counts_active_leases_surface(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.scheduler.sync_replicas(
+            [
+                world.replica(replica_id="replica-a", status="healthy"),
+                world.replica(replica_id="replica-b", status="healthy"),
+            ]
+        )
+        await world.enqueue_sampling("component-active-lease", affinity_group="lora:a")
+        active = await world.claim_one(replica_id="replica-a")
+
+        await world.enqueue_sampling("component-after-active", affinity_group="lora:b")
+
+        assert active["item"]["request_id"] == "component-active-lease"
+        claimed_b = await world.claim_one(replica_id="replica-b")
+        empty_a = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id="replica-a",
+            consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        assert claimed_b["item"]["request_id"] == "component-after-active"
+        assert empty_a["leases"] == []
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_claims_first_item_when_it_exceeds_token_budget_surface(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-expensive-first", assign=False, token_cost=100)
+        await world.enqueue_sampling("component-cheap-next", assign=False, token_cost=1)
+        assigned = await world.scheduler.assign_pending(max_items=2)
+
+        claimed = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=4,
+            token_budget=50,
+            lease_ttl_s=30.0,
+        )
+        next_lease = await world.claim_one()
+
+        assert assigned["assigned"] == 2
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == [
+            "component-expensive-first"
+        ]
+        assert next_lease["item"]["request_id"] == "component-cheap-next"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_same_session_sampling_is_serialized_by_ordering_key(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling(
+            "component-session-serial-a",
+            affinity_group="lora:session-a:generation:1",
+            ordering_key="session:session-a",
+        )
+        await world.enqueue_sampling(
+            "component-session-serial-b",
+            affinity_group="lora:session-a:generation:1",
+            ordering_key="session:session-a",
+        )
+
+        first = await world.claim_one()
+        blocked = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        assert first["item"]["request_id"] == "component-session-serial-a"
+        assert blocked["leases"] == []
+
+        await world.future_service.async_resolve(
+            "component-session-serial-a",
+            {"ok": True, "request_id": "component-session-serial-a"},
+        )
+        assert (
+            await world.scheduler.complete(
+                lease_id=first["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+
+        second = await world.claim_one()
+        assert second["item"]["request_id"] == "component-session-serial-b"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_sampling_token_budget_admission_enforce_rejects_and_releases(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "100")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN", "10")
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        first = await world.enqueue_sampling("component-token-budget-a", token_cost=7)
+        with pytest.raises(ModelWorkAdmissionRejectedError) as rejected_exc:
+            await world.enqueue_sampling("component-token-budget-b", token_cost=4)
+
+        assert first.scheduler_result["ok"] is True
+        assert rejected_exc.value.scheduler_result["reason"] == "principal_domain_token_budget_exceeded"
+        assert rejected_exc.value.scheduler_result["current"] == 11
+        assert rejected_exc.value.scheduler_result["limit"] == 10
+        assert (await world.observe_scheduler("component-token-budget-b"))["present"] is False
+
+        await world.runtime_once()
+        accepted_after_release = await world.enqueue_sampling("component-token-budget-c", token_cost=4)
+        assert accepted_after_release.scheduler_result["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_megatron_training_session_is_serialized_by_ordering_key(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path, domain_key="megatron:glm-5")
+    try:
+        await world.start()
+        await world.enqueue_sampling(
+            "component-megatron-session-a",
+            affinity_group="training_session:model-a",
+            ordering_key="training_session:model-a",
+        )
+        await world.enqueue_sampling(
+            "component-megatron-session-b",
+            affinity_group="training_session:model-a",
+            ordering_key="training_session:model-a",
+        )
+
+        first = await world.claim_one()
+        blocked = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=4,
+            lease_ttl_s=30.0,
+        )
+
+        assert first["item"]["request_id"] == "component-megatron-session-a"
+        assert blocked["leases"] == []
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_retrieve_orphan_pending_fails_future(tmp_path, monkeypatch) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-retrieve-orphan"
+        await world.enqueue_sampling(request_id, assign=False)
+        await world.scheduler.cancel_request(request_id=request_id, reason="synthetic orphan")
+
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert status_code == 200
+        assert payload["category"] == "system"
+        assert "request must be retried" in payload["error"]
+        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_retrieve_wait_returns_terminal_result(tmp_path, monkeypatch) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-retrieve-wait-terminal"
+        await world.enqueue_sampling(request_id)
+
+        async def _complete_later() -> None:
+            await asyncio.sleep(0.01)
+            await world.runtime_once()
+
+        completion = asyncio.create_task(_complete_later())
+        status_code, payload = await world.retrieve(
+            request_id,
+            monkeypatch,
+            wait_timeout_s=0.2,
+        )
+        await completion
+
+        assert status_code == 200
+        assert payload == {"ok": True, "request_id": request_id}
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_retrieve_masks_internal_error_for_non_admin(tmp_path, monkeypatch) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-retrieve-mask-error"
+        await world.enqueue_sampling(request_id)
+
+        async def _failing_executor(_lease: dict) -> None:
+            raise RuntimeError("internal gpu traceback secret")
+
+        await world.runtime_once(executor=_failing_executor)
+
+        admin_status, admin_payload = await world.retrieve(request_id, monkeypatch, admin=True)
+        user_status, user_payload = await world.retrieve(request_id, monkeypatch, admin=False)
+
+        assert admin_status == 200
+        assert "internal gpu traceback secret" in admin_payload["error"]
+        assert user_status == 200
+        assert user_payload["error"] == "Operation failed. Contact administrator if issue persists."
+        assert user_payload["category"] == "system"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_supervisor_start_failure_removes_claimable_replica(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        class _FailingRuntime:
+            def __init__(self, spec, generation: int) -> None:
+                self.actor_name = spec.normalized_actor_name()
+                self.generation = int(generation)
+                self.shutdown_calls = 0
+
+            def start(self) -> dict:
+                raise RuntimeError("synthetic runtime start failure")
+
+            def shutdown(self) -> dict:
+                self.shutdown_calls += 1
+                return {"ok": True}
+
+            def health_snapshot(self) -> dict:
+                return {
+                    "running": False,
+                    "actor_generation": self.generation,
+                    "last_error": "synthetic runtime start failure",
+                }
+
+        async def _factory(spec, generation: int):
+            return _FailingRuntime(spec, generation)
+
+        supervisor = world.supervisor_with_factory(_factory)
+        out = await supervisor.reconcile_once()
+        await world.enqueue_sampling("component-supervisor-start-failure", assign=False)
+
+        with pytest.raises(Exception, match="not claimable|unknown replica"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+
+        replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
+        assert out["ok"] is True
+        assert replica["state"] == "dead"
+        assert "synthetic runtime start failure" in replica["last_error"]
+        assert (await world.observe_scheduler("component-supervisor-start-failure"))["location"] == "backlog"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_supervisor_generation_restart_allows_only_new_consumer(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        class _Runtime:
+            def __init__(self, spec, generation: int) -> None:
+                self.actor_name = spec.normalized_actor_name()
+                self.generation = int(generation)
+                self.running = True
+                self.fail_health = False
+
+            def start(self) -> dict:
+                return {"running": True}
+
+            def shutdown(self) -> dict:
+                self.running = False
+                return {"ok": True}
+
+            def health_snapshot(self) -> dict:
+                if self.fail_health:
+                    raise RuntimeError("synthetic runtime health failure")
+                return {
+                    "running": self.running,
+                    "actor_generation": self.generation,
+                    "domain_key": world.domain_key,
+                    "replica_id": world.replica_id,
+                }
+
+        runtimes: list[_Runtime] = []
+
+        async def _factory(spec, generation: int):
+            runtime = _Runtime(spec, generation)
+            runtimes.append(runtime)
+            return runtime
+
+        supervisor = world.supervisor_with_factory(_factory)
+        first = await supervisor.reconcile_once()
+        old_replica = first["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
+        old_generation = int(old_replica["generation"])
+        old_consumer_id = str(old_replica["consumer_id"])
+        await world.enqueue_sampling("component-supervisor-generation", assign=False)
+
+        runtimes[-1].fail_health = True
+        second = await supervisor.reconcile_once()
+        new_replica = second["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
+        new_generation = int(new_replica["generation"])
+        new_consumer_id = str(new_replica["consumer_id"])
+
+        with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=old_consumer_id,
+                consumer_generation=old_generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+        claimed = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=new_consumer_id,
+            consumer_generation=new_generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+
+        assert first["ok"] is True
+        assert second["ok"] is True
+        assert new_generation > old_generation
+        assert len(runtimes) == 2
+        assert [lease["item"]["request_id"] for lease in claimed["leases"]] == [
+            "component-supervisor-generation"
+        ]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_durable_restart_hydrates_assigned_work(tmp_path) -> None:
+    db_path = tmp_path / "task_state.sqlite3"
+    first_store = TaskStateStore(db_path)
+    first = SchedulerComponentWorld(tmp_path / "first", task_store=first_store)
+    try:
+        await first.start()
+        request_id = "component-durable-restart-assigned"
+        await first.enqueue_sampling(request_id)
+        assert (await first.observe_task(request_id))["status"] == "assigned"
+    finally:
+        first.close()
+
+    second_store = TaskStateStore(db_path)
+    second = SchedulerComponentWorld(tmp_path / "second", task_store=second_store)
+    try:
+        await second.scheduler.sync_replicas([second.replica(status="healthy")])
+        contains = await second.observe_scheduler("component-durable-restart-assigned")
+        lease = await second.claim_one()
+
+        assert contains["present"] is True
+        assert contains["location"] == "assigned"
+        assert lease["item"]["request_id"] == "component-durable-restart-assigned"
+        assert (await second.observe_task("component-durable-restart-assigned"))["status"] == "leased"
+    finally:
+        second.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_sampling_admission_observe_allows_would_reject(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "observe")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "1")
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        first = await world.enqueue_sampling("component-admission-observe-a", assign=False)
+        second = await world.enqueue_sampling("component-admission-observe-b", assign=False)
+
+        assert first.scheduler_result["ok"] is True
+        assert second.scheduler_result["ok"] is True
+        assert second.scheduler_result["sampling_inflight_admission"]["would_reject"] is True
+        assert (
+            await world.observe_scheduler("component-admission-observe-b")
+        )["present"] is True
+
+        assigned = await world.scheduler.assign_pending(max_items=2)
+        assert assigned["assigned"] == 2
+        assert (await world.claim_one())["item"]["request_id"] == "component-admission-observe-a"
+        assert (await world.claim_one())["item"]["request_id"] == "component-admission-observe-b"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_sampling_admission_enforce_rejects_and_releases_after_terminal(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "enforce")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN", "1")
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        first = await world.enqueue_sampling("component-admission-enforce-a")
+        with pytest.raises(ModelWorkAdmissionRejectedError) as rejected_exc:
+            await world.enqueue_sampling("component-admission-enforce-b")
+
+        assert first.scheduler_result["ok"] is True
+        assert rejected_exc.value.scheduler_result["ok"] is False
+        assert rejected_exc.value.scheduler_result["reason"] == "principal_domain_inflight_limit_exceeded"
+        assert (await world.observe_scheduler("component-admission-enforce-b"))["present"] is False
+
+        await world.runtime_once()
+        await assert_terminal_not_scheduled(world, "component-admission-enforce-a")
+
+        accepted_after_release = await world.enqueue_sampling("component-admission-enforce-c")
+        assert accepted_after_release.scheduler_result["ok"] is True
+        assert (await world.observe_scheduler("component-admission-enforce-c"))["present"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_cancel_assigned_work_removes_scheduler_projection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-cancel-assigned"
+        await world.enqueue_sampling(request_id)
+
+        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert cancelled["cancelled"] is True
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert status_code == 200
+        assert "request must be retried" in payload["error"]
+        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_cancel_leased_work_removes_scheduler_projection(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-cancel-leased"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        validate = await world.scheduler.validate(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+        )
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert cancelled["cancelled"] is True
+        assert validate == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert status_code == 200
+        assert "request must be retried" in payload["error"]
+        assert await world.observe_future_status(request_id) == FutureStatus.FAILED
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_assign_cancellation_after_durable_commit_preserves_claimability(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-assign-cancel-after"
+        await world.enqueue_sampling(request_id, assign=False)
+
+        block = world.faults.block("task_state.assign_task.after")
+        assign_task = asyncio.create_task(world.scheduler.assign_pending(max_items=1))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        assign_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await assign_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "assigned"
+        assert (await world.observe_task(request_id))["status"] == "assigned"
+        lease = await world.claim_one()
+        assert lease["item"]["request_id"] == request_id
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_claim_cancellation_after_durable_commit_preserves_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-claim-cancel-after"
+        await world.enqueue_sampling(request_id)
+
+        block = world.faults.block("task_state.claim_task.after")
+        claim_task = asyncio.create_task(
+            world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        claim_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await claim_task
+
+        task = await world.observe_task(request_id)
+        assert task["status"] == "leased"
+        contains = await world.observe_scheduler(request_id)
+        assert contains["location"] == "leased"
+        assert contains["lease_id"] == task["lease_id"]
+        assert (
+            await world.scheduler.validate(
+                lease_id=str(task["lease_id"]),
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_begin_finalize_cancellation_after_durable_commit_preserves_finalizing(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-finalize-cancel-after"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.begin_finalize.after")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                finalize_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        finalize_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "leased"
+        assert (await world.observe_task(request_id))["status"] == "finalizing"
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        )["ok"] is True
+        assert (
+            await world.scheduler.complete(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        ) == {"ok": False, "reason": "not_terminal"}
+        assert (
+            await world.scheduler.expire(now=time.time() + 29.0)
+        ) == {"ok": True, "expired": 0}
+        committed = await world.task_state.async_commit_finalize_success(
+            request_id=request_id,
+            lease_id=lease["lease_id"],
+            attempt_id=lease["attempt_id"],
+            scheduler_epoch=lease["scheduler_epoch"],
+            runtime_generation=world.generation,
+            result_path=str(world.tmp_path / "result.json"),
+            result_checksum=None,
+            result_size_bytes=None,
+        )
+        completed = await world.scheduler.complete(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+        )
+
+        assert committed["ok"] is True
+        assert completed == {"ok": True, "request_id": request_id}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_expire_cancellation_after_requeue_commit_preserves_backlog(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-expire-cancel-after"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one(lease_ttl_s=1.0)
+
+        block = world.faults.block("task_state.requeue_task.after")
+        expire_task = asyncio.create_task(world.scheduler.expire(now=time.time() + 2.0))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        expire_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await expire_task
+
+        assert (await world.observe_scheduler(request_id))["location"] == "backlog"
+        assert (await world.observe_task(request_id))["status"] == "pending"
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        new_lease = await world.claim_one()
+        assert assigned["assigned"] == 1
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_append_cancellation_after_durable_create_rolls_back_task(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-append-cancel-after-create"
+
+        block = world.faults.block("task_state.create_task.after")
+        append_task = asyncio.create_task(world.enqueue_sampling(request_id, assign=False))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        append_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append_task
+
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        with pytest.raises(KeyError):
+            await world.observe_task(request_id)
+
+        retry = await world.enqueue_sampling(request_id, assign=False)
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+
+        assert retry.scheduler_result["ok"] is True
+        assert (await world.observe_scheduler(request_id))["present"] is True
+        assert status_code == 408
+        assert payload["request_id"] == request_id
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_append_cancellation_after_duplicate_create_keeps_terminal_result(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-append-cancel-duplicate-terminal"
+        await world.enqueue_sampling(request_id)
+        await world.runtime_once()
+        assert await world.observe_future_status(request_id) == FutureStatus.DONE
+        assert (await world.retrieve(request_id, monkeypatch))[0] == 200
+
+        block = world.faults.block("task_state.create_task.after")
+        append_task = asyncio.create_task(world.enqueue_sampling(request_id, assign=False))
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        append_task.cancel()
+        block.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await append_task
+
+        assert (await world.observe_task(request_id))["status"] in {"done", "retrieved"}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+        assert status_code == 200
+        assert payload == {"ok": True, "request_id": request_id}
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_renew_missing_task_cleans_orphan_lease(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-renew-missing-task"
+        await world.enqueue_sampling(request_id)
+        lease = await world.claim_one()
+        await world.task_state.async_forget_task(request_id=request_id)
+
+        renewed = await world.scheduler.renew(
+            lease_id=lease["lease_id"],
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            lease_ttl_s=30.0,
+        )
+
+        assert renewed == {"ok": False, "reason": "unknown_lease"}
+        assert (await world.observe_scheduler(request_id))["present"] is False
+        assert (
+            await world.scheduler.validate(
+                lease_id=lease["lease_id"],
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+            )
+        ) == {"ok": False, "reason": "unknown_lease"}
     finally:
         world.close()

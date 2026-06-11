@@ -1205,6 +1205,7 @@ class ModelRuntimeActor:
                             consumer_generation=self._config.actor_generation,
                             reason="task_state_finalize_failed",
                             requeue=True,
+                            abort_finalize=True,
                         )
                         self._requeued_total += 1
                     except Exception:
@@ -1272,6 +1273,7 @@ class ModelRuntimeActor:
                     consumer_generation=self._config.actor_generation,
                     reason="model_runtime_cancelled",
                     requeue=True,
+                    abort_finalize=True,
                 )
                 self._requeued_total += 1
             except Exception:
@@ -1339,6 +1341,7 @@ class ModelRuntimeActor:
                             consumer_generation=self._config.actor_generation,
                             reason="task_state_finalize_failed",
                             requeue=True,
+                            abort_finalize=True,
                         )
                         self._requeued_total += 1
                     except Exception:

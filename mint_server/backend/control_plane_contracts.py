@@ -275,6 +275,7 @@ class AsyncSchedulerQueue(Protocol):
         consumer_generation: int,
         requeue: bool = True,
         reason: str = "failed",
+        abort_finalize: bool = False,
         timeout_s: float | None = None,
     ) -> dict[str, Any]: ...
 
@@ -492,6 +493,12 @@ class InProcessSchedulerQueueAdapter:
     async def contains(self, **kwargs: Any) -> dict[str, Any]:
         kwargs.pop("timeout_s", None)
         return await self.actor.contains_request(**kwargs)
+
+    async def contains_request(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.contains(**kwargs)
+
+    async def cancel_request(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.actor.cancel_request(**kwargs)
 
     async def stats(self, **_kwargs: Any) -> dict[str, Any]:
         return self.actor.stats()

@@ -142,18 +142,32 @@ class LocalAsyncTaskStateClient:
         timeout_s: float,
         terminal_only: bool = False,
     ) -> dict[str, Any]:
-        _ = terminal_only
-        await asyncio.sleep(max(0.0, min(float(timeout_s), 0.01)))
-        try:
-            record = await asyncio.to_thread(self.store.get_task, str(request_id))
-            return {
-                "changed": False,
-                "timeout": True,
-                "missing": False,
-                "record": record,
-            }
-        except KeyError:
-            return {"changed": False, "timeout": False, "missing": True}
+        from mint_server.backend.task_state_store import TERMINAL_TASK_STATUSES
+
+        deadline = time.time() + max(0.0, float(timeout_s))
+        last_record: dict[str, Any] | None = None
+        while True:
+            try:
+                record = await asyncio.to_thread(self.store.get_task, str(request_id))
+            except KeyError:
+                return {"changed": False, "timeout": False, "missing": True}
+            last_record = record
+            status = str(record.get("status") or "")
+            if (terminal_only and status in TERMINAL_TASK_STATUSES) or not terminal_only:
+                return {
+                    "changed": True,
+                    "timeout": False,
+                    "missing": False,
+                    "record": record,
+                }
+            if time.time() >= deadline:
+                return {
+                    "changed": False,
+                    "timeout": True,
+                    "missing": False,
+                    "record": last_record,
+                }
+            await asyncio.sleep(0.005)
 
 
 class FaultingTaskPayloadStore(TaskPayloadStore):
@@ -174,10 +188,12 @@ class SchedulerComponentWorld:
     domain_key: str = DEFAULT_DOMAIN
     replica_id: str = DEFAULT_REPLICA
     generation: int = DEFAULT_GENERATION
+    task_store: TaskStateStore | None = None
 
     def __post_init__(self) -> None:
         self.faults = FaultController()
-        self.task_store = TaskStateStore.in_memory()
+        if self.task_store is None:
+            self.task_store = TaskStateStore.in_memory()
         self.task_state = LocalAsyncTaskStateClient(self.task_store, self.faults)
         self.payload_store = FaultingTaskPayloadStore(
             root_dir=self.tmp_path / "payloads",
@@ -208,17 +224,25 @@ class SchedulerComponentWorld:
     def consumer_id(self) -> str:
         return consumer_id_for_replica(self.domain_key, self.replica_id, self.generation)
 
-    def replica(self, *, status: str = "healthy", generation: int | None = None) -> dict[str, Any]:
+    def replica(
+        self,
+        *,
+        status: str = "healthy",
+        generation: int | None = None,
+        replica_id: str | None = None,
+        capacity: int = 4,
+    ) -> dict[str, Any]:
         generation = self.generation if generation is None else int(generation)
+        replica_id = self.replica_id if replica_id is None else str(replica_id)
         return {
             "domain_key": self.domain_key,
-            "replica_id": self.replica_id,
-            "consumer_id": consumer_id_for_replica(self.domain_key, self.replica_id, generation),
+            "replica_id": replica_id,
+            "consumer_id": consumer_id_for_replica(self.domain_key, replica_id, generation),
             "generation": generation,
             "status": status,
-            "queue_id": queue_id_for_replica(self.domain_key, self.replica_id),
-            "capacity": 4,
-            "actor_name": f"component-runtime-{self.replica_id}",
+            "queue_id": queue_id_for_replica(self.domain_key, replica_id),
+            "capacity": int(capacity),
+            "actor_name": f"component-runtime-{replica_id}",
             "node_pins": ["127.0.0.1"],
             "updated_at": time.time(),
         }
@@ -226,7 +250,15 @@ class SchedulerComponentWorld:
     async def start(self) -> None:
         await self.scheduler.sync_replicas([self.replica(status="healthy")])
 
-    async def enqueue_sampling(self, request_id: str, *, assign: bool = True) -> dict[str, Any]:
+    async def enqueue_sampling(
+        self,
+        request_id: str,
+        *,
+        assign: bool = True,
+        affinity_group: str = "lora:session-a:generation:1",
+        ordering_key: str | None = None,
+        token_cost: int = 1,
+    ) -> dict[str, Any]:
         return await enqueue_model_work(
             request_id=request_id,
             op="sampling.asample",
@@ -237,21 +269,37 @@ class SchedulerComponentWorld:
             apikey_id="key-a",
             throttle_principal="apikey:key-a",
             webhook_url=None,
-            affinity_group="lora:session-a:generation:1",
-            ordering_key="session:session-a",
-            token_cost=1,
+            affinity_group=affinity_group,
+            ordering_key=ordering_key,
+            token_cost=token_cost,
             assign=assign,
             assign_max_items=1,
             scheduler_client=self.scheduler,
         )
 
-    async def claim_one(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
+    async def claim_one(
+        self,
+        *,
+        lease_ttl_s: float = 30.0,
+        replica_id: str | None = None,
+        consumer_id: str | None = None,
+        consumer_generation: int | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        replica_id = self.replica_id if replica_id is None else str(replica_id)
+        consumer_generation = self.generation if consumer_generation is None else int(consumer_generation)
+        consumer_id = (
+            consumer_id
+            if consumer_id is not None
+            else consumer_id_for_replica(self.domain_key, replica_id, consumer_generation)
+        )
         claimed = await self.scheduler.claim(
             domain_key=self.domain_key,
-            replica_id=self.replica_id,
-            consumer_id=self.consumer_id,
-            consumer_generation=self.generation,
+            replica_id=replica_id,
+            consumer_id=consumer_id,
+            consumer_generation=consumer_generation,
             max_items=1,
+            token_budget=token_budget,
             lease_ttl_s=lease_ttl_s,
         )
         leases = claimed.get("leases") if isinstance(claimed, dict) else None
@@ -323,14 +371,23 @@ class SchedulerComponentWorld:
     def inject_payload_write_failure(self, enabled: bool) -> None:
         self.payload_store.fail_writes = bool(enabled)
 
-    async def retrieve(self, request_id: str, monkeypatch: Any) -> tuple[int, dict[str, Any]]:
+    async def retrieve(
+        self,
+        request_id: str,
+        monkeypatch: Any,
+        *,
+        admin: bool = True,
+        wait_timeout_s: float = 0.0,
+    ) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)
         import mint_server.backend.model_work_scheduler as scheduler_module
 
         monkeypatch.setattr(scheduler_module, "model_work_scheduler", self.scheduler)
-        monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: 0.0)
+        monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: float(wait_timeout_s))
+        monkeypatch.setattr(futures_route, "_is_privileged", lambda _request: bool(admin))
         response = SimpleNamespace(status_code=200, headers={})
-        request = SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
+        user_id = "admin" if admin else "user-a"
+        request = SimpleNamespace(state=SimpleNamespace(user_data={"user_id": user_id}), headers={})
         payload = await futures_route.retrieve_future(
             FutureRetrieveRequest(request_id=request_id),
             request,
@@ -365,6 +422,29 @@ class SchedulerComponentWorld:
                 )
             ],
             runtime_factory=_runtime_factory,
+            scheduler_sync=_sync,
+            control_plane_dependencies=[],
+            control_plane_enabled=False,
+            node_metrics_enabled=False,
+        )
+
+    def supervisor_with_factory(
+        self,
+        runtime_factory: Callable[[ModelActorSpec, int], Awaitable[Any]],
+    ) -> ModelActorSupervisorCore:
+        async def _sync(registrations: list[Any]) -> dict[str, Any]:
+            return await self.scheduler.sync_replicas([registration.to_dict() for registration in registrations])
+
+        return ModelActorSupervisorCore(
+            specs=[
+                ModelActorSpec(
+                    domain_key=self.domain_key,
+                    replica_id=self.replica_id,
+                    base_model="model-a",
+                    gpu_count=1,
+                )
+            ],
+            runtime_factory=runtime_factory,
             scheduler_sync=_sync,
             control_plane_dependencies=[],
             control_plane_enabled=False,

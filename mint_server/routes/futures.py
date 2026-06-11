@@ -76,6 +76,15 @@ def _apply_cached_response(cached: Any, response: Response) -> Any:
     return cached["__cached_body__"]
 
 
+def _apply_local_cached_response(cached: Any, request: Request, response: Response) -> Any:
+    body = _apply_cached_response(cached, response)
+    if isinstance(body, dict) and "error" in body and not _is_privileged(request):
+        masked = dict(body)
+        masked["error"] = _public_error(masked.get("error"))
+        return masked
+    return body
+
+
 def _local_hot_ttl_s() -> float:
     from ..config import config as server_config
 
@@ -417,7 +426,7 @@ async def retrieve_future(
     if cached is not None:
         logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
         _record_retrieve_wait(path="local", outcome="ready", waited=False)
-        return _apply_cached_response(cached, response)
+        return _apply_local_cached_response(cached, http_request, response)
 
     try:
         status = await task_futures.async_get_status(body.request_id)
@@ -791,7 +800,7 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-            return _apply_cached_response(cached, response)
+            return _apply_local_cached_response(cached, http_request, response)
         try:
             result = await task_futures.async_get_result(body.request_id)
         except Exception:

@@ -124,6 +124,8 @@ async def enqueue_model_work(
             if reason in {
                 "principal_domain_inflight_limit_exceeded",
                 "domain_inflight_limit_exceeded",
+                "principal_domain_token_budget_exceeded",
+                "domain_token_budget_exceeded",
             }:
                 raise ModelWorkAdmissionRejectedError(out)
         return ModelWorkAdmissionResult(
