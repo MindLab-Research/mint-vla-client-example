@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from typing import Any
@@ -10,6 +11,27 @@ from ..runtime_env import env_nonempty
 from .model_actor_pg_names import actor_placement_group_names
 
 logger = logging.getLogger(__name__)
+
+
+def _undesired_gpu_actor_grace_s() -> float:
+    """Grace period before the reaper kills an undesired mint GPU actor.
+
+    Configurable via MINT_UNDESIRED_GPU_ACTOR_GRACE_S (seconds, float).
+    Default 120 s: long enough to outlast a supervisor control-plane restart
+    and FIX-D adoption (which runs before the first reconcile), but short
+    enough to eventually reap genuinely-orphaned actors.
+    """
+    raw = str(os.environ.get("MINT_UNDESIRED_GPU_ACTOR_GRACE_S") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            logger.warning(
+                "[model_actor_placement] invalid MINT_UNDESIRED_GPU_ACTOR_GRACE_S=%r; using default",
+                raw,
+            )
+    return 120.0
+
 
 ActorExists = Callable[[str, str], bool]
 ActorKiller = Callable[[str, str, str], bool]
@@ -553,6 +575,9 @@ class ModelActorPlacementReconciler:
         self._gpu_actor_lister = gpu_actor_lister or _default_gpu_actor_lister
         self._placement_group_lister = placement_group_lister or _default_placement_group_lister
         self._placement_group_remover = placement_group_remover or _default_pg_remover
+        # Grace-period tracking for the undesired GPU actor reaper (Fix B / #727).
+        # Maps actor name -> first time it was seen as undesired (time.monotonic()).
+        self._undesired_first_seen: dict[str, float] = {}
 
     def _resolved_node_pins(self, spec: Any, *, context: str) -> list[str]:
         _ = context
@@ -603,9 +628,21 @@ class ModelActorPlacementReconciler:
         return cleaned
 
     def _cleanup_undesired_mint_gpu_actors(self, keep_actor_names: set[str]) -> list[str]:
+        """Kill mint GPU actors that are not in *keep_actor_names*.
+
+        Grace-period logic (Fix B / #727): an actor is not killed on first
+        sight. It must remain absent from *keep_actor_names* for at least
+        ``_undesired_gpu_actor_grace_s()`` seconds before the reaper acts.
+        This lets a newly-restarted supervisor re-adopt still-alive dense
+        workers (Fix D) before the first reconcile fires the reaper.
+        """
         cleaned: list[str] = []
         reason = "model_actor_supervisor_undesired_gpu_actor"
         seen: set[tuple[str, str]] = set()
+        now = time.monotonic()
+        grace = _undesired_gpu_actor_grace_s()
+        listed_names: set[str] = set()
+
         for actor_info in self._gpu_actor_lister():
             if not isinstance(actor_info, dict):
                 continue
@@ -615,16 +652,70 @@ class ModelActorPlacementReconciler:
             namespace = str(actor_info.get("namespace") or self._namespace).strip() or self._namespace
             if namespace != self._namespace:
                 continue
-            if name in keep_actor_names:
-                continue
             key = (namespace, name)
             if key in seen:
                 continue
             seen.add(key)
-            if self._gpu_actor_killer(actor_info, reason):
+            listed_names.add(name)
+
+            if name in keep_actor_names:
+                # Actor is desired/protected — clear any pending grace timer.
+                self._undesired_first_seen.pop(name, None)
+                continue
+
+            # Actor is NOT in keep set — apply grace period before killing.
+            first_seen = self._undesired_first_seen.get(name)
+            if first_seen is None:
+                # First time we notice this actor is undesired: start the clock.
+                self._undesired_first_seen[name] = now
+                logger.info(
+                    "[model_actor_placement] undesired mint GPU actor grace started"
+                    " actor=%s namespace=%s grace_s=%.1f",
+                    name,
+                    namespace,
+                    grace,
+                )
+                continue
+            elapsed = now - first_seen
+            if elapsed < grace:
+                logger.debug(
+                    "[model_actor_placement] undesired mint GPU actor still in grace"
+                    " actor=%s elapsed_s=%.1f grace_s=%.1f",
+                    name,
+                    elapsed,
+                    grace,
+                )
+                continue
+
+            # Grace expired — kill the actor.  Logged at WARNING: reaching this
+            # point is an anomalous condition, and if the kill keeps failing the
+            # line repeats every reconcile tick, which should surface as a
+            # warning rather than INFO noise.
+            logger.warning(
+                "[model_actor_placement] killing undesired mint GPU actor after grace"
+                " actor=%s namespace=%s elapsed_s=%.1f grace_s=%.1f",
+                name,
+                namespace,
+                elapsed,
+                grace,
+            )
+            killed = self._gpu_actor_killer(actor_info, reason)
+            if killed:
+                # Only drop the grace-timer entry on a successful kill.  If the
+                # kill fails the entry stays in place so the NEXT reconcile tick
+                # finds the clock already expired and retries immediately instead
+                # of restarting a fresh grace window.
+                self._undesired_first_seen.pop(name, None)
                 cleaned.append(name)
             for pg_name in actor_placement_group_names(name, namespace):
                 self._placement_group_remover(pg_name, namespace)
+
+        # Purge stale first_seen entries for actors no longer returned by the lister
+        # (they may have been killed externally or adopted into keep_actor_names).
+        stale = set(self._undesired_first_seen) - listed_names
+        for name in stale:
+            self._undesired_first_seen.pop(name, None)
+
         return cleaned
 
     def _cleanup_orphan_owned_pgs(self, owned_actor_names: set[str]) -> list[str]:

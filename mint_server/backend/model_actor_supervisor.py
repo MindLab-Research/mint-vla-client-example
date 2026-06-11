@@ -34,7 +34,11 @@ from .model_actor_launchers import (
     ModelActorLauncherRegistry,
     default_model_actor_launcher_registry,
 )
-from .model_actor_placement import model_actor_placement_reconciler
+from .model_actor_placement import (
+    _default_gpu_actor_lister,
+    _is_mint_gpu_actor_name,
+    model_actor_placement_reconciler,
+)
 from .model_work_scheduler import ModelReplicaRegistration, ModelWorkSchedulerClient, model_work_scheduler
 from .node_metrics_daemon import (
     NodeMetricsDaemonSpec,
@@ -1000,6 +1004,7 @@ class ModelActorSupervisorCore:
             else float(reconcile_interval_s)
         )
         self._reconcile_task: asyncio.Task | None = None
+        self._reconcile_loop_starting = False
         self._reconcile_inflight = False
         self._reconcile_inflight_started_at: float | None = None
         self._last_reconcile_loop_error: str | None = None
@@ -2508,8 +2513,139 @@ class ModelActorSupervisorCore:
     async def ensure_reconcile_loop_started(self) -> dict[str, Any]:
         if self._reconcile_task is not None and not self._reconcile_task.done():
             return self.snapshot()
-        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        # Re-entrancy guard: ModelActorSupervisorCore has max_concurrency=128,
+        # so two concurrent callers can both pass the task-done check above and
+        # then both await adoption and both create_task → two orphaned reconcile
+        # loops.  The flag collapses all concurrent late-comers to a no-op.
+        if self._reconcile_loop_starting:
+            return self.snapshot()
+        self._reconcile_loop_starting = True
+        try:
+            # Fix D (#727): re-adopt still-alive mint GPU workers into inventory
+            # BEFORE the first reconcile fires the reaper, so they appear in
+            # _reconcile_protected_actor_names and are never reaped on restart.
+            await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+            self._reconcile_task = asyncio.create_task(self._reconcile_loop())
+        finally:
+            self._reconcile_loop_starting = False
         return self.snapshot()
+
+    def _adopt_surviving_gpu_actors(self) -> None:
+        """Re-register still-alive mint GPU actors into inventory after a restart.
+
+        On supervisor control-plane restart the in-memory inventory is empty.
+        Any still-alive dense (or vLLM/Megatron) worker listed by Ray would
+        otherwise be reaped by _cleanup_undesired_mint_gpu_actors on the first
+        reconcile.  Calling this before the reconcile loop starts ensures those
+        actors appear in _reconcile_protected_actor_names and are left alone.
+
+        The method is idempotent: it skips actors already in the inventory.
+        Errors are caught and logged — adoption failure must never block startup.
+
+        Protection semantics: adopted actors enter the inventory and are therefore
+        shielded by _reconcile_protected_actor_names for their lifetime — the
+        SAME protection a normally-created dense/vLLM actor receives via its
+        registration.  This is parity with existing behavior, not a new
+        permanent-protection path; if the actor later disappears from Ray it will
+        be pruned from the inventory just like any other registered actor.
+        """
+        namespace = _ray_namespace()
+        try:
+            actors = list(_default_gpu_actor_lister())
+        except Exception as exc:
+            logger.warning(
+                "[model_actor_supervisor] _adopt_surviving_gpu_actors: lister failed"
+                " error_type=%s error=%s; skipping adoption",
+                type(exc).__name__,
+                exc,
+            )
+            return
+
+        adopted = 0
+        skipped_already_registered = 0
+        skipped_namespace = 0
+        skipped_non_mint = 0
+
+        for actor_info in actors:
+            if not isinstance(actor_info, dict):
+                continue
+            name = str(actor_info.get("name") or "").strip()
+            if not name:
+                continue
+            if not _is_mint_gpu_actor_name(name):
+                skipped_non_mint += 1
+                continue
+            actor_ns = str(actor_info.get("namespace") or namespace).strip() or namespace
+            if actor_ns != namespace:
+                skipped_namespace += 1
+                continue
+            if self.get(name) is not None:
+                skipped_already_registered += 1
+                continue
+
+            # Derive ActorType from the name prefix.
+            if name.startswith("mint_dense_"):
+                actor_type = ActorType.DENSE
+            elif name.startswith("mint_vllm_"):
+                actor_type = ActorType.VLLM
+            elif name.startswith("mint_megatron_"):
+                actor_type = ActorType.MEGATRON
+            elif name.startswith(("mint_openpi_shared_", "openpi_shared_runtime_", "mint_openpi_action_")):
+                actor_type = ActorType.OPENPI
+            else:
+                # mint_model_runtime_* wrapper actors are supervisor-owned and
+                # should not be adopted into the inventory directly.
+                continue
+
+            # num_gpus: use the lister record when available.
+            try:
+                num_gpus = max(1, int(float(actor_info.get("gpu") or 1)))
+            except (TypeError, ValueError):
+                num_gpus = 1
+
+            node_id = str(actor_info.get("node_id") or "").strip() or None
+
+            try:
+                self.register(
+                    actor_name=name,
+                    actor_type=actor_type,
+                    num_gpus=num_gpus,
+                    namespace=actor_ns,
+                    base_model="",
+                    node_id=node_id,
+                    protected=False,
+                    metadata={"adopted_on_restart": True},
+                )
+                # The actor is already alive — mark it ready so it is not
+                # treated as still-creating, which would suppress idle/reap logic.
+                self.mark_ready(name)
+                adopted += 1
+                logger.info(
+                    "[model_actor_supervisor] adopted surviving GPU actor"
+                    " actor=%s type=%s num_gpus=%d namespace=%s node_id=%s",
+                    name,
+                    actor_type.value,
+                    num_gpus,
+                    actor_ns,
+                    node_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[model_actor_supervisor] _adopt_surviving_gpu_actors:"
+                    " failed to register actor=%s error_type=%s error=%s",
+                    name,
+                    type(exc).__name__,
+                    exc,
+                )
+
+        logger.info(
+            "[model_actor_supervisor] _adopt_surviving_gpu_actors done"
+            " adopted=%d already_registered=%d skipped_namespace=%d skipped_non_mint=%d",
+            adopted,
+            skipped_already_registered,
+            skipped_namespace,
+            skipped_non_mint,
+        )
 
     async def _reconcile_loop(self) -> None:
         interval_s = max(0.1, float(self._reconcile_interval_s))
