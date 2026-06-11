@@ -23,7 +23,7 @@ from ..logging_context import (
     set_trace_id,
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
-from .control_plane_contracts import as_task_ledger
+from .control_plane_contracts import LeaseToken, as_task_ledger
 from .execution_context import ExecutionContext, bind_execution_context
 from .model_actor_supervisor import (
     _is_ray_get_timeout_error,
@@ -59,6 +59,25 @@ def _scheduler_claim_leases(result: Any) -> list[dict[str, Any]] | None:
         get_result = getattr(result, "get", None)
         leases = get_result("leases") if callable(get_result) else None
     return leases if isinstance(leases, list) else None
+
+
+def _lease_token(lease: dict[str, Any]) -> LeaseToken:
+    item = lease.get("item") if isinstance(lease, dict) else None
+    if not isinstance(item, dict):
+        raise RuntimeError(f"model work lease missing item: {lease!r}")
+    token_wire = {
+        "request_id": item["request_id"],
+        "lease_id": lease["lease_id"],
+        "attempt_id": lease["attempt_id"],
+        "scheduler_epoch": lease["scheduler_epoch"],
+        "consumer_id": lease.get("consumer_id", ""),
+        "consumer_generation": lease.get("consumer_generation", 0),
+    }
+    return LeaseToken.from_wire(token_wire)
+
+
+def _lease_id(lease: dict[str, Any]) -> str:
+    return str(lease["lease_id"])
 
 
 @dataclass(frozen=True)
@@ -735,7 +754,7 @@ class ModelRuntimeActor:
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
         item = lease["item"]
         request_id = str(item["request_id"])
-        lease_id = str(lease["lease_id"])
+        lease_id = _lease_id(lease)
         try:
             status = await self._task_futures.async_get_status(request_id)
         except KeyError:
@@ -770,7 +789,11 @@ class ModelRuntimeActor:
         return bool(out.get("failed")) if isinstance(out, dict) else False
 
     def _task_state_finalize_enabled(self, lease: dict[str, Any]) -> bool:
-        return lease.get("scheduler_epoch") is not None and bool(lease.get("attempt_id"))
+        try:
+            _lease_token(lease)
+        except Exception:
+            return False
+        return True
 
     def _require_task_state_finalize(self, lease: dict[str, Any]) -> None:
         if self._task_state_finalize_enabled(lease):
@@ -789,9 +812,8 @@ class ModelRuntimeActor:
         return str(extra.get("model_work_attempt_id") or "") or None
 
     def _payload_attempt_id_for_lease(self, lease: dict[str, Any]) -> str:
-        attempt_id = str(lease["attempt_id"])
-        lease_id = str(lease["lease_id"])
-        return f"{attempt_id}__{lease_id}"
+        token = _lease_token(lease)
+        return f"{token.attempt_id}__{token.lease_id}"
 
     def _staged_payload_path_for_lease(self, lease: dict[str, Any]) -> str:
         item = lease["item"]
@@ -837,7 +859,7 @@ class ModelRuntimeActor:
                 "domain_key": self._config.domain_key,
                 "replica_id": self._config.replica_id,
                 "queue_id": self._config.queue_id,
-                "lease_id": str(lease["lease_id"]),
+                "lease_id": _lease_id(lease),
                 "op": op,
                 "queue_state": "running",
                 "stage": "prefill",
@@ -894,7 +916,7 @@ class ModelRuntimeActor:
                         f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
                     )
                 result = await self._scheduler.renew(
-                    lease_id=str(lease["lease_id"]),
+                    lease_id=_lease_token(lease).lease_id,
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
                     lease_ttl_s=self._config.lease_ttl_s,
@@ -973,7 +995,7 @@ class ModelRuntimeActor:
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
         item = lease["item"]
         request_id = str(item["request_id"])
-        lease_id = str(lease["lease_id"])
+        lease_id = _lease_id(lease)
         attempt_id = self._lease_attempt_id(lease)
         self._active_leases[lease_id] = request_id
         self._active_request_id = request_id
@@ -1003,6 +1025,7 @@ class ModelRuntimeActor:
 
         stale_generation_error = self._recovered_stale_generation_error(lease)
         if stale_generation_error is not None:
+            token = _lease_token(lease)
             self._record_error(stale_generation_error)
             try:
                 begin_finalize = await self._scheduler.begin_finalize(
@@ -1015,8 +1038,8 @@ class ModelRuntimeActor:
                     await self._scheduler.finish_failure(
                         request_id=request_id,
                         lease_id=lease_id,
-                        attempt_id=str(lease["attempt_id"]),
-                        scheduler_epoch=int(lease["scheduler_epoch"]),
+                        attempt_id=token.attempt_id,
+                        scheduler_epoch=token.scheduler_epoch,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
                         error=f"executor failed: {stale_generation_error}",
@@ -1136,6 +1159,7 @@ class ModelRuntimeActor:
                 self._last_error_traceback = None
                 self._last_completed_at = time.time()
                 return
+            token = _lease_token(lease)
             finalization_started_at = time.time()
             try:
                 await self._task_futures.async_update_meta(
@@ -1203,8 +1227,8 @@ class ModelRuntimeActor:
                     finished = await self._scheduler.finish_success(
                         request_id=request_id,
                         lease_id=lease_id,
-                        attempt_id=str(lease["attempt_id"]),
-                        scheduler_epoch=int(lease["scheduler_epoch"]),
+                        attempt_id=token.attempt_id,
+                        scheduler_epoch=token.scheduler_epoch,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
                         result_path=str(payload_meta["path"]),
@@ -1216,8 +1240,8 @@ class ModelRuntimeActor:
                     finished = await self._scheduler.finish_failure(
                         request_id=request_id,
                         lease_id=lease_id,
-                        attempt_id=str(lease["attempt_id"]),
-                        scheduler_epoch=int(lease["scheduler_epoch"]),
+                        attempt_id=token.attempt_id,
+                        scheduler_epoch=token.scheduler_epoch,
                         consumer_id=self._config.consumer_id,
                         consumer_generation=self._config.actor_generation,
                         error=str(finalization.payload),
@@ -1315,11 +1339,31 @@ class ModelRuntimeActor:
                 self._requeued_total += 1
                 return
             try:
+                if not self._task_state_finalize_enabled(lease):
+                    await self._task_futures.async_fail(request_id, f"executor failed: {e}")
+                    failed = await self._scheduler.fail(
+                        lease_id=lease_id,
+                        consumer_id=self._config.consumer_id,
+                        consumer_generation=self._config.actor_generation,
+                        reason="future_failed",
+                        requeue=False,
+                    )
+                    if not _scheduler_result_ok(failed):
+                        logger.warning(
+                            "[model_runtime] legacy failure lease fail rejected actor=%s request_id=%s result=%s",
+                            self._config.actor_name,
+                            request_id,
+                            failed,
+                        )
+                    self._processed_total += 1
+                    self._failed_total += 1
+                    return
+                failure_token = _lease_token(lease)
                 finished = await self._scheduler.finish_failure(
                     request_id=request_id,
                     lease_id=lease_id,
-                    attempt_id=str(lease["attempt_id"]),
-                    scheduler_epoch=int(lease["scheduler_epoch"]),
+                    attempt_id=failure_token.attempt_id,
+                    scheduler_epoch=failure_token.scheduler_epoch,
                     consumer_id=self._config.consumer_id,
                     consumer_generation=self._config.actor_generation,
                     error=f"executor failed: {e}",
