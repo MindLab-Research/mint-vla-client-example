@@ -1346,6 +1346,7 @@ class InProcessSchedulerQueueAdapter:
         return await self.contains(**kwargs)
 
     async def cancel_request(self, **kwargs: Any) -> CancelTaskResult:
+        kwargs.pop("timeout_s", None)
         out = await self.actor.cancel_request(**kwargs)
         if isinstance(out, CancelTaskResult):
             return out

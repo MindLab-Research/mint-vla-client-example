@@ -19,7 +19,7 @@ from ..backend.queue_stage_timing import build_queue_stage_timing
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..logging_context import record_retrieve_future_wait_metric
-from ..models.types import FutureRetrieveRequest
+from ..models.types import FutureCancelRequest, FutureRetrieveRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -195,6 +195,46 @@ async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Requ
     if result.status not in {"ready", "failed"}:
         return None
     return await _present_gateway_terminal_result(result, http_request)
+
+
+@router.post("/cancel_future")
+async def cancel_future(body: FutureCancelRequest) -> dict:
+    """Cancel an async operation.
+
+    Model-work lifecycle cancellation is owned by the scheduler gateway. Legacy
+    non-model-work futures keep the existing best-effort TaskFutureService path.
+    """
+    request_id = str(body.request_id)
+    reason = str(body.reason or "cancelled")
+    try:
+        meta = await task_futures.async_get_meta(request_id)
+    except KeyError:
+        meta = None
+    except TaskStateStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    if _is_model_work_scheduler_meta(meta):
+        from ..backend.model_work_task_gateway import model_work_task_gateway
+
+        result = await model_work_task_gateway.cancel_task(
+            request_id=request_id,
+            reason=reason,
+        )
+        return result.to_wire()
+    try:
+        await task_futures.async_fail(request_id, reason)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Future not found")
+    except TaskStateStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    _pending_hint_clear(request_id)
+    _RECENT.pop(request_id, None)
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "cancelled": True,
+        "was_terminal": False,
+        "reason": reason,
+    }
 
 
 async def _wait_until_not_pending(request_id: str, http_request: Request) -> FutureStatus | None:

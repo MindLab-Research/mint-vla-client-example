@@ -2754,7 +2754,7 @@ async def test_scheduler_component_cancel_assigned_work_removes_scheduler_projec
         request_id = "component-cancel-assigned"
         await world.enqueue_sampling(request_id)
 
-        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        cancelled = await world.cancel(request_id, monkeypatch, reason="component-test")
         failed_status = await world.observe_future_status(request_id)
         status_code, payload = await world.retrieve(request_id, monkeypatch)
 
@@ -2778,7 +2778,7 @@ async def test_scheduler_component_cancel_assigned_work_survives_scheduler_resta
         request_id = "component-cancel-assigned-restart"
         await world.enqueue_sampling(request_id)
 
-        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        cancelled = await world.cancel(request_id, monkeypatch, reason="component-test")
         await world.acquire_owner(owner_id="component-scheduler-restart", now=time.time() + 31.0)
         world.replace_scheduler(owner_id="component-scheduler-restart")
         await world.start()
@@ -2810,7 +2810,7 @@ async def test_scheduler_component_cancel_leased_work_removes_scheduler_projecti
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
 
-        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        cancelled = await world.cancel(request_id, monkeypatch, reason="component-test")
         validate = await world.scheduler.validate(
             lease_id=lease["lease_id"],
             consumer_id=world.consumer_id,
@@ -2841,7 +2841,7 @@ async def test_scheduler_component_cancel_leased_work_survives_scheduler_restart
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
 
-        cancelled = await world.scheduler.cancel_request(request_id=request_id, reason="component-test")
+        cancelled = await world.cancel(request_id, monkeypatch, reason="component-test")
         await world.acquire_owner(owner_id="component-scheduler-restart", now=time.time() + 31.0)
         world.replace_scheduler(owner_id="component-scheduler-restart")
         await world.start()

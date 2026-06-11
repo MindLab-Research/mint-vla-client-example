@@ -415,6 +415,15 @@ def test_model_work_retrieve_route_uses_gateway_not_scheduler_orphan_probe() -> 
     assert ".retrieve_task(" in source
 
 
+def test_model_work_cancel_route_uses_gateway_cancel_task() -> None:
+    futures_path = REPO_ROOT / "mint_server" / "routes" / "futures.py"
+    source = _function_source(futures_path, "cancel_future")
+    assert ".cancel_task(" in source
+    assert ".cancel_request(" not in source
+    assert ".async_create_task(" not in source
+    assert ".async_cleanup(" not in source
+
+
 def _function_source(path: Path, function_name: str) -> str:
     source = path.read_text()
     tree = ast.parse(source, filename=str(path))

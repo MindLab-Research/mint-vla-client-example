@@ -10,6 +10,7 @@ from typing import Any, Awaitable, Callable
 from mint_server.backend.control_plane_contracts import (
     AsyncSchedulerQueue,
     AsyncTaskLedger,
+    CancelTaskResult,
     ExecutorOutcome,
     InProcessSchedulerQueueAdapter,
     ModelWorkTaskGateway,
@@ -26,7 +27,7 @@ from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
 from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
 from mint_server.backend.task_payload_store import TaskPayloadStore
 from mint_server.backend.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
-from mint_server.models.types import FutureRetrieveRequest
+from mint_server.models.types import FutureCancelRequest, FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
 from .faults import FaultController
@@ -423,6 +424,32 @@ class SchedulerComponentWorld:
             response,
         )
         return int(response.status_code), payload
+
+    async def cancel(
+        self,
+        request_id: str,
+        monkeypatch: Any,
+        *,
+        reason: str = "cancelled",
+        scheduler_override: Any | None = None,
+    ) -> CancelTaskResult:
+        monkeypatch.setattr(futures_route, "task_futures", self.future_service)
+        import mint_server.backend.model_work_scheduler as scheduler_module
+        import mint_server.backend.model_work_task_gateway as gateway_module
+
+        monkeypatch.setattr(scheduler_module, "model_work_scheduler", scheduler_override or self.scheduler)
+        monkeypatch.setattr(
+            gateway_module,
+            "model_work_task_gateway",
+            SchedulerModelWorkTaskGateway(
+                scheduler_client=scheduler_override or self.scheduler,
+                task_ledger_client=self.task_ledger if scheduler_override is None else self.task_state,
+            ),
+        )
+        payload = await futures_route.cancel_future(
+            FutureCancelRequest(request_id=request_id, reason=reason)
+        )
+        return CancelTaskResult.from_wire(payload)
 
     def supervisor(self) -> ModelActorSupervisorCore:
         async def _runtime_factory(spec: ModelActorSpec, generation: int) -> Any:
