@@ -1002,6 +1002,15 @@ def _create_mint_vllm_multinode_actor(
             ) == "1"
             if fully_sharded_loras:
                 _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
+            qwen35_vllm_config_path = materialize_qwen35_text_vllm_config(str(self.model_path))
+            if qwen35_vllm_config_path is not None:
+                install_vllm_qwen35_text_only_adapter_patches()
+                logger.info(
+                    "Using Qwen3.5 text-only vLLM adapter: model=%r hf_config_path=%r architecture=%s",
+                    self.model_path,
+                    qwen35_vllm_config_path,
+                    QWEN35_VLLM_ARCHITECTURE,
+                )
             lora_dtype_env = os.environ.get("MINT_VLLM_LORA_DTYPE", "auto").strip()
             lora_dtype_resolved = lora_dtype_env
             if self.enable_lora and lora_dtype_env.lower() == "auto":
@@ -1010,7 +1019,7 @@ def _create_mint_vllm_multinode_actor(
                 # weights are loaded in fp16 while model output is bf16, the kernel will
                 # read fp16 memory as bf16 and can produce NaNs. Default to bf16 for BF16
                 # model snapshots unless explicitly overridden.
-                inferred = infer_hf_torch_dtype_str(str(self.model_path))
+                inferred = infer_hf_torch_dtype_str(qwen35_vllm_config_path or str(self.model_path))
                 if inferred is not None:
                     lora_dtype_resolved = inferred
                 elif "BF16" in str(self.model_path).upper():
@@ -1025,15 +1034,6 @@ def _create_mint_vllm_multinode_actor(
             logger.info(
                 "vLLM LoRA dtype: env=%r resolved=%r", lora_dtype_env, lora_dtype_resolved
             )
-            qwen35_vllm_config_path = materialize_qwen35_text_vllm_config(str(self.model_path))
-            if qwen35_vllm_config_path is not None:
-                install_vllm_qwen35_text_only_adapter_patches()
-                logger.info(
-                    "Using Qwen3.5 text-only vLLM adapter: model=%r hf_config_path=%r architecture=%s",
-                    self.model_path,
-                    qwen35_vllm_config_path,
-                    QWEN35_VLLM_ARCHITECTURE,
-                )
             enable_return_routed_experts = (server_config.router_replay_mode == "R3")
             if enable_return_routed_experts:
                 import inspect

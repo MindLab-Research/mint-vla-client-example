@@ -205,6 +205,75 @@ def test_qwen35_text_adapter_dtype_prefers_text_config_without_autoconfig(monkey
     assert adapter.infer_hf_torch_dtype_str(str(model_dir)) == "bfloat16"
 
 
+@pytest.mark.asyncio
+async def test_qwen35_multinode_vllm_infers_lora_dtype_from_materialized_config(monkeypatch, tmp_path):
+    from mint_server.backend import multinode_inference as mni
+
+    materialized_config_dir = str(tmp_path / "runtime" / "qwen35-text-vllm-config" / "abc123")
+    dtype_inputs: list[str] = []
+    install_calls: list[bool] = []
+    created_engine_args: list[object] = []
+
+    class _FakeAsyncEngineArgs:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class _FakeAsyncLLMEngine:
+        @staticmethod
+        def from_engine_args(engine_args, stat_loggers=None):
+            created_engine_args.append(engine_args)
+            return object()
+
+    class _RemoteDecorator:
+        def __call__(self, *args, **kwargs):
+            def _decorate(cls):
+                return cls
+
+            return _decorate
+
+    monkeypatch.setattr(mni.ray, "remote", _RemoteDecorator())
+    monkeypatch.setattr(
+        mni,
+        "_import_vllm_async_engine_components",
+        lambda: (_FakeAsyncEngineArgs, _FakeAsyncLLMEngine),
+    )
+    monkeypatch.setattr(
+        mni,
+        "materialize_qwen35_text_vllm_config",
+        lambda model_path: materialized_config_dir,
+    )
+    monkeypatch.setattr(
+        mni,
+        "install_vllm_qwen35_text_only_adapter_patches",
+        lambda: install_calls.append(True),
+    )
+
+    def _fake_infer_hf_torch_dtype_str(model_path: str) -> str:
+        dtype_inputs.append(model_path)
+        return "bfloat16"
+
+    monkeypatch.setattr(mni, "infer_hf_torch_dtype_str", _fake_infer_hf_torch_dtype_str)
+    monkeypatch.setattr(mni, "install_vllm_iteration_observability_patches", lambda: None)
+    monkeypatch.setattr(mni, "make_vllm_stats_logger_factory", lambda observer: object())
+
+    engine_cls = mni._create_mint_vllm_multinode_actor()
+    engine = engine_cls(
+        model_path="/models/qwen35-raw",
+        tensor_parallel_size=1,
+        enable_lora=True,
+    )
+    engine.get_kv_debug_info = lambda: {}
+
+    await engine.initialize()
+
+    assert install_calls == [True]
+    assert dtype_inputs == [materialized_config_dir]
+    assert created_engine_args
+    kwargs = created_engine_args[0].kwargs
+    assert kwargs["hf_config_path"] == materialized_config_dir
+    assert kwargs["lora_dtype"] == "bfloat16"
+
+
 def test_qwen35_text_adapter_weight_packing_fails_fast_on_bad_shapes():
     config = types.SimpleNamespace(
         linear_num_key_heads=2,
