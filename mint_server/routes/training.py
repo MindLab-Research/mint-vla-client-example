@@ -432,7 +432,7 @@ async def _enqueue_training_model_work_route(
             "backend": backend,
         },
     )
-    return result.scheduler_result
+    return result.scheduler_result.to_wire()
 
 
 def _get_webhook_url(request: Request) -> str | None:

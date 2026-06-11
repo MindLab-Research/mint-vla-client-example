@@ -3,19 +3,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from .control_plane_contracts import AppendWorkResult
+
 TraceEnqueue = Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True)
 class ModelWorkAdmissionResult:
     request_id: str
-    scheduler_result: Any
+    scheduler_result: AppendWorkResult
 
 
 class ModelWorkAdmissionRejectedError(RuntimeError):
-    def __init__(self, scheduler_result: dict[str, Any]) -> None:
-        self.scheduler_result = dict(scheduler_result)
-        reason = str(self.scheduler_result.get("reason") or "admission_rejected")
+    def __init__(self, scheduler_result: AppendWorkResult | dict[str, Any]) -> None:
+        if isinstance(scheduler_result, dict):
+            scheduler_result = AppendWorkResult.from_wire(scheduler_result)
+        self.scheduler_result = scheduler_result
+        reason = str(scheduler_result.reason or "admission_rejected")
         self.reason = reason
         super().__init__(reason)
 
@@ -118,10 +122,13 @@ async def enqueue_model_work(
                 op=op,
                 enqueue_coro=append_coro,
             )
-        get_result = getattr(out, "get", None)
-        scheduler_confirmed = callable(get_result) and bool(get_result("ok"))
-        if callable(get_result) and not scheduler_confirmed:
-            reason = str(out.get("reason") or "")
+        if isinstance(out, dict):
+            out = AppendWorkResult.from_wire(out)
+        if not isinstance(out, AppendWorkResult):
+            raise TypeError(f"scheduler.append_work returned non-AppendWorkResult: {type(out)}")
+        scheduler_confirmed = out.ok
+        if not scheduler_confirmed:
+            reason = str(out.reason or "")
             if reason in {
                 "principal_domain_inflight_limit_exceeded",
                 "domain_inflight_limit_exceeded",
@@ -131,7 +138,7 @@ async def enqueue_model_work(
                 raise ModelWorkAdmissionRejectedError(out)
         return ModelWorkAdmissionResult(
             request_id=request_id,
-            scheduler_result=out if callable(get_result) else {},
+            scheduler_result=out,
         )
     except Exception:
         if scheduler_confirmed:
