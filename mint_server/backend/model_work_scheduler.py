@@ -1813,7 +1813,7 @@ class _ModelWorkSchedulerActor:
             "sampling_inflight_admission": admission,
         }
 
-    async def cancel_request(self, *, request_id: str, reason: str = "cancelled") -> dict[str, Any]:
+    async def cancel_request(self, *, request_id: str, reason: str = "cancelled") -> CancelTaskResult:
         request_id = str(request_id)
         if self._use_task_state_store:
             await self._ensure_task_state_ready()
@@ -1844,28 +1844,34 @@ class _ModelWorkSchedulerActor:
             if removed:
                 self._failed += 1
                 self._cv.notify_all()
-            return {"ok": True, "request_id": request_id, "cancelled": removed, "reason": str(reason)}
+            return CancelTaskResult(
+                ok=True,
+                request_id=request_id,
+                cancelled=removed,
+                was_terminal=not removed,
+                reason=str(reason),
+            )
 
     async def contains_request(
         self,
         *,
         request_id: str,
         hydrate_task_state: bool = True,
-    ) -> dict[str, Any]:
+    ) -> ContainsResult:
         request_id = str(request_id)
         if self._use_task_state_store and hydrate_task_state:
             await self._ensure_task_state_ready()
         async with self._cv:
             location = self._request_locations.get(request_id)
             lease_id = self._lease_id_by_request_id.get(request_id)
-            return {
-                "ok": True,
-                "request_id": request_id,
-                "present": location is not None,
-                "location": location,
-                "lease_id": lease_id,
-                "scheduler_instance_id": self._instance_id,
-            }
+            return ContainsResult(
+                ok=True,
+                request_id=request_id,
+                present=location is not None,
+                location=location,
+                lease_id=lease_id,
+                scheduler_instance_id=self._instance_id,
+            )
 
     async def is_empty(self) -> bool:
         if self._use_task_state_store:
@@ -2979,10 +2985,11 @@ def _create_ray_actor_handle():
             request_id: str,
             hydrate_task_state: bool = True,
         ) -> dict[str, Any]:
-            return await super().contains_request(
+            out = await super().contains_request(
                 request_id=request_id,
                 hydrate_task_state=hydrate_task_state,
             )
+            return out.to_wire()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
         use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),

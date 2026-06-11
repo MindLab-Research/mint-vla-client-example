@@ -1262,13 +1262,18 @@ class InProcessSchedulerQueueAdapter:
 
     async def contains(self, **kwargs: Any) -> ContainsResult:
         kwargs.pop("timeout_s", None)
-        return ContainsResult.from_wire(await self.actor.contains_request(**kwargs))
+        out = await self.actor.contains_request(**kwargs)
+        if isinstance(out, ContainsResult):
+            return out
+        return ContainsResult.from_wire(out)
 
     async def contains_request(self, **kwargs: Any) -> ContainsResult:
         return await self.contains(**kwargs)
 
     async def cancel_request(self, **kwargs: Any) -> CancelTaskResult:
         out = await self.actor.cancel_request(**kwargs)
+        if isinstance(out, CancelTaskResult):
+            return out
         if "was_terminal" not in out:
             out = {**out, "was_terminal": not bool(out.get("cancelled"))}
         return CancelTaskResult.from_wire(out)
