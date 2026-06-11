@@ -55,16 +55,32 @@ forbids.
 | `MINT_DEV_DEPLOYMENT_ENV` | optional deployment policy (models, placement, prewarm, OTEL) | optional; must not set code root or namespace |
 | `MINT_RAY_JOB_WORKING_DIR` | (not recommended) Ray working_dir override | leave unset |
 
-Do **not** set `MINT_RAY_JOB_WORKING_DIR`. Workers access code via `PYTHONPATH`
-which already points at PFS paths — no upload needed. Setting this variable
-causes Ray to package and upload the entire directory over the Ray Client
-connection (~100 MB per job). Leave it unset; a missing module will fail loudly
-at import time rather than silently using uploaded stale code.
+Do **not** set `MINT_RAY_JOB_WORKING_DIR`. Setting it causes Ray to package and
+upload the entire directory (~100-240 MB) over the Ray Client connection on
+every job. Workers access code via `PYTHONPATH` which already points at the PFS
+path in `MINT_CODE_ROOT`.
 
-`MINT_CODE_ROOT` has no default on purpose: the launcher never silently runs the
-shared `/vePFS-Mindverse/share/mint/dev/mint-server` checkout. If it is unset,
-the launcher refuses. **Ask the user which checkout to run** before launching;
-do not guess.
+`MINT_CODE_ROOT` has no default on purpose. It **must** be a path under
+`/vePFS-Mindverse/share/` that is visible to all Ray nodes (head + workers).
+Each user should maintain their own personal checkout — the exact path is up to
+you, as long as it is under `/vePFS-Mindverse/share/` and not the shared dev
+checkout. Do **not** use:
+
+- `/root/code/mint` or any other local path — Ray head nodes cannot see it
+- `/vePFS-Mindverse/user/<you>/...` — the `/user` subtree is not mounted on Ray nodes
+- `/vePFS-Mindverse/share/mint/dev/mint-server` — shared checkout, changes here affect everyone
+
+Sync your local checkout to your chosen share path before starting:
+
+```bash
+rsync -a --delete /root/code/mint/ /vePFS-Mindverse/share/<your-path>/
+MINT_CODE_ROOT=/vePFS-Mindverse/share/<your-path> MINT_DEV_USER=<you> \
+  MINT_DEV_DEPLOYMENT_ENV=/share/mint/dev/config/common.env \
+  nohup scripts/start_dev_server.sh >> /tmp/mint_dev.log 2>&1 &
+```
+
+If it is unset, the launcher refuses. **Ask the user which checkout to run**
+before launching; do not guess.
 
 `MINT_RAY_NAMESPACE` is user-scoped. The launcher derives `mint_<user>` from the
 effective non-root user and refuses `mint`, `root`, `mint_root`, or empty. **If

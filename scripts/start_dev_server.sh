@@ -10,8 +10,12 @@ set -eu
 # shared Ray namespace, both of which must be chosen per launch.
 #
 # Required (script refuses to start if absent):
-#   MINT_CODE_ROOT   mint-server checkout to run. No default: never silently
-#                    runs the shared /vePFS-Mindverse/share/mint/dev checkout.
+#   MINT_CODE_ROOT   Your personal mint-server checkout under /vePFS-Mindverse/share/.
+#                    Must be visible to all Ray nodes (head + workers).
+#                    Do NOT use: /root/code/mint (local, Ray head can't see it),
+#                    /vePFS-Mindverse/user/... (not mounted on Ray nodes), or
+#                    /vePFS-Mindverse/share/mint/dev/mint-server (shared, affects everyone).
+#                    Sync first: rsync -a --delete /root/code/mint/ /vePFS-Mindverse/share/<your-path>/
 #
 # Derived (override only if needed):
 #   MINT_RAY_NAMESPACE        mint_<user>; refuses root/empty.
@@ -53,9 +57,13 @@ esac
 
 export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
 export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
-# Do NOT set MINT_RAY_JOB_WORKING_DIR. Workers access code via PYTHONPATH which
-# already points at PFS paths. Setting this variable causes Ray to package and
-# upload the entire directory over the Ray Client connection (~100 MB per job).
+# MINT_RAY_JOB_WORKING_DIR: must point to a PFS path visible to all Ray nodes
+# (head + workers). Never set to a local path like /root/code/mint — Ray will
+# package and upload the entire directory (~100 MB) over the Ray Client
+# connection. MINT_CODE_ROOT must already be a PFS path; it is used as default.
+if [ -z "${MINT_RAY_JOB_WORKING_DIR:-}" ] && echo "${MINT_CODE_ROOT}" | grep -q "^/vePFS"; then
+  export MINT_RAY_JOB_WORKING_DIR="${MINT_CODE_ROOT}"
+fi
 # Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH. The driver must attach as
 # a Ray client (ray://...:10001); the file holds a bare IP that the server would
 # normalize to the GCS port (...:6379) and try to direct-attach, which hangs on a
