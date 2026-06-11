@@ -1375,7 +1375,6 @@ def _resolve_model_path(model_name: str) -> str:
         "Qwen/Qwen3-0.6B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/c1899de289a04d12100db370d81485cdf75e47ca",
         "Qwen/Qwen3-4B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/main",
         "Qwen/Qwen3-4B-Thinking-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-4B-Thinking-2507/snapshots/main",
-        "Qwen/Qwen3.5-27B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3.5-27B/snapshots/b7ca741b86de18df552fd2cc952861e04621a4bd",
         # MoE models (all share same architecture, different checkpoints)
         "Qwen/Qwen3-30B-A3B-Instruct-2507": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe",
         "Qwen/Qwen3-30B-A3B": "/vePFS-Mindverse/share/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/main",
@@ -1390,6 +1389,16 @@ def _resolve_model_path(model_name: str) -> str:
 
     resolved = model_paths.get(model_name)
     if resolved is None:
+        if model_name == "Qwen/Qwen3.5-27B":
+            try:
+                from .qwen35_text_vllm_adapter import resolve_hf_config_dir
+
+                qwen35_path = resolve_hf_config_dir(model_name)
+            except Exception:
+                logger.debug("Failed to resolve Qwen3.5 HF cache path", exc_info=True)
+                qwen35_path = None
+            if qwen35_path:
+                return qwen35_path
         return model_name
 
     resolved_path = Path(resolved)

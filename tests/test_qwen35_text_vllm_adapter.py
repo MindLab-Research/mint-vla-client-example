@@ -71,8 +71,11 @@ def test_qwen35_text_adapter_materializes_marked_text_only_config(tmp_path):
     assert config["model_type"] == "qwen3_next"
     assert config["architectures"] == [adapter.QWEN35_VLLM_ARCHITECTURE]
     assert config[adapter.QWEN35_TEXT_ONLY_SHIM_MARKER] is True
+    assert config[adapter.QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER] is True
     assert config["mint_source_model_type"] == adapter.QWEN35_MODEL_TYPE
     assert config["mint_supported_modality"] == adapter.QWEN35_SUPPORTED_MODALITY
+    assert config["bumblebee_source_model_type"] == adapter.QWEN35_MODEL_TYPE
+    assert config["bumblebee_supported_modality"] == adapter.QWEN35_SUPPORTED_MODALITY
     assert config["num_experts"] == 0
     assert "image_token_id" not in config
     assert "video_token_id" not in config
@@ -99,6 +102,32 @@ def test_qwen35_text_adapter_resolves_cached_repo_id(monkeypatch, tmp_path):
     config = json.loads((tmp_path / "runtime").glob("qwen35-text-vllm-config/*/config.json").__next__().read_text())
     assert config["model_type"] == "qwen3_next"
     assert adapter.resolve_hf_config_dir("Qwen/Qwen3.5-27B") == str(snapshot)
+
+
+def test_qwen35_text_adapter_prefers_bumblebee_runtime_checkpoint_dir(monkeypatch, tmp_path):
+    model_dir = tmp_path / "qwen35"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(json.dumps(_raw_qwen35_config()), encoding="utf-8")
+    monkeypatch.setenv("MINT_RUNTIME_CHECKPOINT_DIR", str(tmp_path / "mint-runtime"))
+    monkeypatch.setenv("BUMBLEBEE_RUNTIME_CHECKPOINT_DIR", str(tmp_path / "bumblebee-runtime"))
+
+    config_dir = adapter.materialize_qwen35_text_vllm_config(str(model_dir))
+
+    assert config_dir is not None
+    assert str(config_dir).startswith(str(tmp_path / "bumblebee-runtime"))
+
+
+def test_qwen35_text_adapter_accepts_bumblebee_shim_marker():
+    assert adapter.is_qwen35_text_only_shim_config(
+        {adapter.QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER: True}
+    )
+    assert adapter.is_qwen35_text_only_shim_model(
+        types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                **{adapter.QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER: True}
+            )
+        )
+    )
 
 
 def test_qwen35_text_adapter_ignores_non_qwen35_model(tmp_path):

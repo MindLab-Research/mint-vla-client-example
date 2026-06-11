@@ -22,6 +22,7 @@ QWEN35_MODEL_TYPE = "qwen3_5"
 QWEN35_TEXT_MODEL_TYPE = "qwen3_5_text"
 QWEN35_VLLM_ARCHITECTURE = "Qwen3NextForCausalLM"
 QWEN35_TEXT_ONLY_SHIM_MARKER = "mint_qwen35_text_only_shim"
+QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER = "bumblebee_qwen35_text_only_shim"
 QWEN35_SUPPORTED_MODALITY = "text_only"
 
 _QWEN35_LINEAR_ATTN_SPLIT_RE = re.compile(
@@ -288,8 +289,11 @@ def qwen35_text_as_qwen3next_config(raw_config: dict[str, Any]) -> dict[str, Any
     config["model_type"] = "qwen3_next"
     config["architectures"] = [QWEN35_VLLM_ARCHITECTURE]
     config[QWEN35_TEXT_ONLY_SHIM_MARKER] = True
+    config[QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER] = True
     config["mint_source_model_type"] = QWEN35_MODEL_TYPE
     config["mint_supported_modality"] = QWEN35_SUPPORTED_MODALITY
+    config["bumblebee_source_model_type"] = QWEN35_MODEL_TYPE
+    config["bumblebee_supported_modality"] = QWEN35_SUPPORTED_MODALITY
     config["tie_word_embeddings"] = bool(raw_config.get("tie_word_embeddings", False))
 
     rope_parameters = config.get("rope_parameters")
@@ -338,7 +342,11 @@ def materialize_qwen35_text_vllm_config(
         json.dumps(vllm_config, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()[:12]
     if root_dir is None:
-        root_dir = os.environ.get("MINT_RUNTIME_CHECKPOINT_DIR") or "/tmp/mint-vllm-config"
+        root_dir = (
+            os.environ.get("BUMBLEBEE_RUNTIME_CHECKPOINT_DIR")
+            or os.environ.get("MINT_RUNTIME_CHECKPOINT_DIR")
+            or "/tmp/mint-vllm-config"
+        )
     config_dir = os.path.join(root_dir, "qwen35-text-vllm-config", digest)
     os.makedirs(config_dir, exist_ok=True)
     config_path = os.path.join(config_dir, "config.json")
@@ -352,8 +360,14 @@ def is_qwen35_text_only_shim_config(config: Any) -> bool:
     if config is None:
         return False
     if isinstance(config, dict):
-        return bool(config.get(QWEN35_TEXT_ONLY_SHIM_MARKER))
-    return bool(getattr(config, QWEN35_TEXT_ONLY_SHIM_MARKER, False))
+        return bool(
+            config.get(QWEN35_TEXT_ONLY_SHIM_MARKER)
+            or config.get(QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER)
+        )
+    return bool(
+        getattr(config, QWEN35_TEXT_ONLY_SHIM_MARKER, False)
+        or getattr(config, QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER, False)
+    )
 
 
 def is_qwen35_text_only_shim_model(model: Any) -> bool:

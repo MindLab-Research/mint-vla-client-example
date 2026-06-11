@@ -1071,6 +1071,39 @@ class _ModelWorkSchedulerActor:
         )
         return status or "unknown"
 
+    async def _reconcile_pending_assign_conflict(
+        self,
+        item: ModelWorkItem,
+        *,
+        conflict: TaskStateConflictError,
+    ) -> str | None:
+        if "cannot assign from pending" not in str(conflict):
+            return None
+        try:
+            record = await self._task_state_call("get_task", request_id=item.request_id)
+        except TaskStateNotFoundError:
+            self._remove_request_location(item.request_id)
+            self._stale_dropped += 1
+            logger.warning(
+                "[model_work_scheduler] dropped stale backlog item with missing task state request_id=%s domain_key=%s",
+                item.request_id,
+                item.domain_key,
+            )
+            return "missing"
+        status = str(record.get("status") or "")
+        if status == "pending":
+            return None
+        self._remove_request_location(item.request_id)
+        self._stale_dropped += 1
+        logger.warning(
+            "[model_work_scheduler] dropped stale backlog item after task-state assign conflict request_id=%s domain_key=%s status=%s terminal=%s",
+            item.request_id,
+            item.domain_key,
+            status or "unknown",
+            status in TERMINAL_TASK_STATUSES,
+        )
+        return status or "unknown"
+
     async def _expire_leases_locked(self, *, now: float) -> int:
         expired = 0
         for lease_id, lease in list(self._leases_by_id.items()):
@@ -1117,12 +1150,25 @@ class _ModelWorkSchedulerActor:
                     skipped_domains.append(domain_key)
                     break
                 if self._use_task_state_store:
-                    await self._task_state_call(
-                        "assign_task",
-                        request_id=item.request_id,
-                        subqueue_id=replica.effective_queue_id,
-                        scheduler_epoch=int(self._scheduler_epoch or 0),
-                    )
+                    try:
+                        await self._task_state_call(
+                            "assign_task",
+                            request_id=item.request_id,
+                            subqueue_id=replica.effective_queue_id,
+                            scheduler_epoch=int(self._scheduler_epoch or 0),
+                        )
+                    except Exception as e:
+                        conflict = self._claim_conflict_cause(e)
+                        if conflict is None:
+                            raise
+                        reconciled = await self._reconcile_pending_assign_conflict(
+                            item,
+                            conflict=conflict,
+                        )
+                        if reconciled is None:
+                            raise
+                        backlog.popleft()
+                        continue
                 backlog.popleft()
                 queue = self._queue(replica.domain_key, replica.replica_id)
                 queue.append(

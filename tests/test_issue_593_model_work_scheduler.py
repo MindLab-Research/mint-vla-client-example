@@ -1116,6 +1116,44 @@ def test_issue_645_scheduler_requeues_pending_stale_head() -> None:
         store.close()
 
 
+def test_issue_645_scheduler_drops_terminal_stale_backlog_head_and_assigns_next() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-stale"), assign=False))["ok"] is True
+        assert (await actor.append(_work("req-valid"), assign=False))["ok"] is True
+        assert actor.stats()["backlog_depth"] == 2
+
+        store.complete_task_failure(
+            request_id="req-stale",
+            error="client_abandoned",
+            result_path=None,
+        )
+        store.mark_task_retrieved(request_id="req-stale")
+
+        synced = await actor.sync_replicas([_replica("replica-0")])
+
+        assert synced["assigned"]["assigned"] == 1
+        assert store.get_task("req-stale")["status"] == "retrieved"
+        assert store.get_task("req-valid")["status"] == "assigned"
+        assert (await actor.contains_request(request_id="req-stale"))["present"] is False
+        assert actor.stats()["backlog_depth"] == 0
+        assert actor.stats()["replica_queues"][
+            "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507::replica-0"
+        ]["depth"] == 1
+        assert actor.stats()["counters"]["stale_dropped"] == 1
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
+
+
 def test_issue_645_scheduler_recognizes_wrapped_task_state_conflict() -> None:
     actor = _ModelWorkSchedulerActor()
 
@@ -1126,6 +1164,33 @@ def test_issue_645_scheduler_recognizes_wrapped_task_state_conflict() -> None:
     conflict = actor._claim_conflict_cause(_WrappedConflict("RayTaskError(TaskStateConflictError)"))
 
     assert isinstance(conflict, TaskStateConflictError)
+
+
+def test_issue_645_scheduler_does_not_reconcile_unrelated_assign_conflict() -> None:
+    store = TaskStateStore.in_memory()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-test",
+    )
+
+    async def _run() -> None:
+        assert (await actor.append(_work("req-conflict"), assign=False))["ok"] is True
+
+        async def _raise_unrelated(method: str, **kwargs):
+            if method == "assign_task":
+                raise TaskStateConflictError("terminal task commit payload mismatch")
+            return getattr(store, method)(**kwargs)
+
+        actor._task_state_call = _raise_unrelated  # type: ignore[method-assign]
+
+        with pytest.raises(TaskStateConflictError, match="terminal task commit payload mismatch"):
+            await actor.sync_replicas([_replica("replica-0")])
+
+    try:
+        asyncio.run(_run())
+    finally:
+        store.close()
 
 
 def test_issue_645_scheduler_does_not_reconcile_unrelated_task_state_conflict() -> None:

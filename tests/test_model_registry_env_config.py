@@ -122,7 +122,7 @@ def test_is_topology_desired_model_accepts_snapshot_entries(monkeypatch, tmp_pat
     assert mr.is_topology_desired_model("Qwen/Qwen3-0.6B")
 
 
-def test_qwen35_27b_registry_and_path():
+def test_qwen35_27b_registry_and_path(monkeypatch, tmp_path):
     from mint_server.backend.model_registry import get_model_config
     from mint_server.backend.multi_lora_engine import _resolve_model_path
 
@@ -133,5 +133,14 @@ def test_qwen35_27b_registry_and_path():
     assert cfg.max_loras >= 1
     assert cfg.supported_modalities == ("text",)
 
+    cache_root = tmp_path / "hf-cache"
+    repo_cache = cache_root / "models--Qwen--Qwen3.5-27B"
+    snapshot = repo_cache / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (repo_cache / "refs").mkdir()
+    (repo_cache / "refs" / "main").write_text("abc123\n", encoding="utf-8")
+    (snapshot / "config.json").write_text('{"model_type": "qwen3_5"}', encoding="utf-8")
+    monkeypatch.setenv("HUGGINGFACE_HUB_CACHE", str(cache_root))
+
     path = _resolve_model_path("Qwen/Qwen3.5-27B")
-    assert "models--Qwen--Qwen3.5-27B" in path
+    assert path == str(snapshot)

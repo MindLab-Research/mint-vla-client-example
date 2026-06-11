@@ -669,6 +669,10 @@ def _checkpoint_owner_id(explicit_owner_id: str | None = None) -> str | None:
     return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
 
 
+def _checkpoint_owner_id_from_save_result(save_result: Any) -> str:
+    return str(getattr(save_result, "owner_id", None) or "anonymous")
+
+
 def _mint_checkpoint_uri(model_path: str) -> str:
     if model_path.startswith("mint://"):
         return model_path
@@ -1056,6 +1060,8 @@ def _save_weights_and_get_sampling_client_with_retry(
 ) -> Any:
     last_exc: Exception | None = None
     for attempt in range(max_retries):
+        sampling_path = None
+        checkpoint_owner_id = None
         try:
             save_fut = training_client.save_weights_for_sampler(name=name)
             _dbg(f"save_weights_for_sampler submitted name={name!r}")
@@ -1067,7 +1073,7 @@ def _save_weights_and_get_sampling_client_with_retry(
                 extra={"name": name},
             )
             sampling_path = save_result.path
-            checkpoint_owner_id = getattr(save_result, "owner_id", None)
+            checkpoint_owner_id = _checkpoint_owner_id_from_save_result(save_result)
             sampling_client = _time_call(
                 lambda: _create_sampling_client_for_checkpoint(
                     service_client,
@@ -1083,7 +1089,7 @@ def _save_weights_and_get_sampling_client_with_retry(
             return sampling_client
         except Exception as e:
             last_exc = e
-            if sampling_path := locals().get("sampling_path"):
+            if sampling_path:
                 print(
                     f"create_sampling_client({name!r}) failed after successful save: {e} "
                     f"(attempt 1/{max_retries})"
