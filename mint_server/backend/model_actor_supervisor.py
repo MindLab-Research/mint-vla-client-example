@@ -2097,7 +2097,10 @@ class ModelActorSupervisorCore:
             if self._scheduler_sync is not None:
                 await _maybe_await(self._scheduler_sync(registrations))
             else:
-                await self._scheduler.sync_replicas(registrations)
+                await self._scheduler.sync_replicas(
+                    registrations,
+                    hydrate_task_state=False,
+                )
             self._last_scheduler_sync_at = time.time()
             return True
         except Exception as e:

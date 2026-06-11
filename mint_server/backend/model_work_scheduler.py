@@ -1346,11 +1346,19 @@ class _ModelWorkSchedulerActor:
                 and not self._leases_by_id
             )
 
-    async def sync_replicas(self, replicas: list[dict[str, Any]]) -> dict[str, Any]:
+    async def sync_replicas(
+        self,
+        replicas: list[dict[str, Any]],
+        *,
+        hydrate_task_state: bool = True,
+    ) -> dict[str, Any]:
         self._ensure_assignment_loop_started()
         now = time.time()
         if self._use_task_state_store:
-            await self._ensure_task_state_ready()
+            if hydrate_task_state:
+                await self._ensure_task_state_ready()
+            else:
+                await self._ensure_task_state_owner()
         incoming = {
             _queue_key(reg.domain_key, reg.replica_id): reg
             for reg in (ModelReplicaRegistration.from_dict(replica) for replica in replicas)
@@ -1428,7 +1436,7 @@ class _ModelWorkSchedulerActor:
     async def assign_pending(self, *, max_items: int | None = None) -> dict[str, Any]:
         self._ensure_assignment_loop_started()
         if self._use_task_state_store:
-            await self._ensure_task_state_ready()
+            await self._ensure_task_state_owner()
         async with self._cv:
             expired = await self._expire_leases_locked(now=time.time())
             out = await self._assign_pending_locked(max_items=max_items)
@@ -1836,26 +1844,12 @@ def _create_ray_actor(*, require_ready: bool = True):
         num_cpus=0,
         max_concurrency=max_concurrency,
         max_restarts=0,
-        concurrency_groups={"health": 8, "lookup": 16, "enqueue": 16},
+        concurrency_groups={"health": 8, "lookup": 16},
     )
     class _RayModelWorkSchedulerActor(_ModelWorkSchedulerActor):
         @ray.method(concurrency_group="health")
         def ping(self) -> dict[str, Any]:
             return super().ping()
-
-        @ray.method(concurrency_group="enqueue")
-        async def append(
-            self,
-            item: dict[str, Any],
-            *,
-            assign: bool = False,
-            assign_max_items: int | None = None,
-        ) -> dict[str, Any]:
-            return await super().append(
-                item,
-                assign=assign,
-                assign_max_items=assign_max_items,
-            )
 
         @ray.method(concurrency_group="lookup")
         async def contains_request(
@@ -2042,6 +2036,7 @@ class ModelWorkSchedulerClient:
         self,
         replicas: list[ModelReplicaRegistration | dict[str, Any]],
         *,
+        hydrate_task_state: bool = True,
         timeout_s: float = 10.0,
     ) -> dict[str, Any]:
         actor = await self._get_ray_actor_async(create_if_missing=False)
@@ -2049,7 +2044,13 @@ class ModelWorkSchedulerClient:
             replica.to_dict() if isinstance(replica, ModelReplicaRegistration) else dict(replica)
             for replica in replicas
         ]
-        out = await self._await_ray_ref(actor.sync_replicas.remote(payload), timeout_s=timeout_s)
+        out = await self._await_ray_ref(
+            actor.sync_replicas.remote(
+                payload,
+                hydrate_task_state=bool(hydrate_task_state),
+            ),
+            timeout_s=timeout_s,
+        )
         if not isinstance(out, dict):
             raise TypeError(f"ModelWorkScheduler.sync_replicas returned non-dict: {type(out)}")
         return out

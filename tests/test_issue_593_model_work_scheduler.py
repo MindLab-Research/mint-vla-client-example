@@ -236,6 +236,52 @@ def test_scheduler_client_rejects_stale_code_identity() -> None:
         client._validate_code_identity({"code_identity": "stale-scheduler-code"})
 
 
+def test_scheduler_client_forwards_sync_replicas_hydration_flag(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _RemoteMethod:
+        def __init__(self) -> None:
+            self.calls: list[tuple[tuple, dict]] = []
+
+        def remote(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return {"ok": True}
+
+    class _Actor:
+        def __init__(self) -> None:
+            self.sync_replicas = _RemoteMethod()
+
+    actor = _Actor()
+    client = ModelWorkSchedulerClient()
+
+    async def _get_actor(*, create_if_missing: bool = False):
+        assert create_if_missing is False
+        return actor
+
+    async def _await_ref(ref, *, timeout_s: float):
+        assert timeout_s == 3.0
+        return ref
+
+    client._get_ray_actor_async = _get_actor  # type: ignore[method-assign]
+    client._await_ray_ref = _await_ref  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        out = await client.sync_replicas(
+            [_replica("replica-0")],
+            hydrate_task_state=False,
+            timeout_s=3.0,
+        )
+
+        assert out == {"ok": True}
+
+    asyncio.run(_run())
+
+    assert actor.sync_replicas.calls == [
+        (
+            ([_replica("replica-0")],),
+            {"hydrate_task_state": False},
+        )
+    ]
+
+
 def test_issue_638_scheduler_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.logging_context as logging_context
 
@@ -385,17 +431,13 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
             actor = self._cls(**kwargs)
 
             class _RemoteMethod:
-                def __init__(self, fn, *, accepts_item: bool = False):
+                def __init__(self, fn):
                     self._fn = fn
-                    self._accepts_item = accepts_item
 
-                def remote(self, *args, **method_kwargs):
-                    if self._accepts_item:
-                        return self._fn(*args, **method_kwargs)
+                def remote(self, **method_kwargs):
                     return self._fn(**method_kwargs)
 
             actor.ping = _RemoteMethod(actor.ping)
-            actor.append = _RemoteMethod(actor.append, accepts_item=True)
             actor.contains_request = _RemoteMethod(actor.contains_request)
             return actor
 
@@ -432,13 +474,8 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
 
     module._create_ray_actor(require_ready=True)
 
-    assert captured["remote_kwargs"]["concurrency_groups"] == {
-        "health": 8,
-        "lookup": 16,
-        "enqueue": 16,
-    }
+    assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
     assert captured["methods"]["ping"] == {"concurrency_group": "health"}
-    assert captured["methods"]["append"] == {"concurrency_group": "enqueue"}
     assert captured["methods"]["contains_request"] == {"concurrency_group": "lookup"}
 
 
@@ -511,6 +548,30 @@ def test_append_does_not_hydrate_task_state_store_before_enqueue() -> None:
         asyncio.run(_run())
     finally:
         store.close()
+
+
+def test_sync_replicas_can_skip_task_state_store_hydration() -> None:
+    actor = _ModelWorkSchedulerActor(use_task_state_store=True)
+
+    async def _noop_owner():
+        return 1
+
+    async def _unexpected_hydrate():
+        raise AssertionError("sync_replicas must not scan active task-state before syncing replicas")
+
+    actor._ensure_task_state_owner = _noop_owner  # type: ignore[method-assign]
+    actor._ensure_task_state_ready = _unexpected_hydrate  # type: ignore[method-assign]
+
+    async def _run() -> None:
+        out = await actor.sync_replicas(
+            [_replica("replica-0")],
+            hydrate_task_state=False,
+        )
+
+        assert out["ok"] is True
+        assert out["replicas"] == 1
+
+    asyncio.run(_run())
 
 
 def test_sampling_inflight_admission_observe_records_would_reject(
