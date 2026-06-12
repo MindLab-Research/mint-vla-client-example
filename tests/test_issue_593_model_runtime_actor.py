@@ -102,6 +102,7 @@ class _FakeScheduler:
         self.failed: list[dict] = []
         self.assigned: list[dict] = []
         self.request_id_by_lease_id: dict[str, str] = {}
+        self.finalizing_payloads: dict[str, dict[str, object]] = {}
 
     def _kwargs_with_lease_fields(self, kwargs: dict, *, include_full: bool = False) -> dict:
         lease = kwargs.pop("lease", None)
@@ -134,6 +135,13 @@ class _FakeScheduler:
         self.begin_finalized.append(kwargs)
         if not self.begin_finalize_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
+        lease_id = str(kwargs.get("lease_id"))
+        if kwargs.get("staged_payload_path") is not None:
+            self.finalizing_payloads[lease_id] = {
+                "result_path": kwargs.get("staged_payload_path"),
+                "result_checksum": "sha256:staged",
+                "result_size_bytes": 12,
+            }
         return {"ok": True, **kwargs}
 
     async def complete(self, **kwargs):
@@ -171,6 +179,27 @@ class _FakeScheduler:
         kwargs = self._kwargs_with_lease_fields(kwargs)
         self.failed.append(kwargs)
         return {"ok": True, **kwargs}
+
+    async def resume_finalizing_payload(self, lease: LeaseToken):
+        return self.finalizing_payloads.get(str(lease.lease_id))
+
+
+class _FakeEngineLifecycle:
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = bool(ready)
+        self.unhealthy_reasons: list[str] = []
+        self.restart_calls = 0
+
+    async def is_ready(self) -> bool:
+        return self.ready
+
+    async def mark_unhealthy(self, reason: str) -> None:
+        self.ready = False
+        self.unhealthy_reasons.append(str(reason))
+
+    async def restart(self) -> None:
+        self.restart_calls += 1
+        self.ready = True
 
 
 class _FakeTaskFutureService:
@@ -674,10 +703,11 @@ async def test_issue_593_model_runtime_executor_exception_requeues_lease() -> No
 
 
 @pytest.mark.anyio
-async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_requeues_gpu_actor_died() -> None:
+async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_terminal_fails_gpu_actor_died() -> None:
     lease = _lease("runtime-req-gpu-actor-died")
     scheduler = _FakeScheduler(claims=[[lease]])
     task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    engine = _FakeEngineLifecycle()
 
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="fatal_backend_death", error="backend actor died")
@@ -689,6 +719,7 @@ async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_requeues_gpu_
         actor_generation=3,
         scheduler_client=scheduler,
         task_futures_client=task_futures,
+        engine_lifecycle=engine,
         executor=_executor,
     )
 
@@ -696,21 +727,137 @@ async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_requeues_gpu_
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
+    assert scheduler.failed == []
+    assert scheduler.finished_failure == [
+        _finish_failure_kwargs(
+            lease,
+            consumer_id="vllm:model-a::replica-0::generation::3",
+            error="engine died: backend actor died",
+        )
+    ]
+    assert engine.unhealthy_reasons == ["backend actor died"]
+    assert engine.restart_calls == 1
+    snapshot = actor.health_snapshot()
+    assert snapshot["engine_restarting"] is False
+    assert snapshot["failed_total"] == 1
+    assert snapshot["requeued_total"] == 0
+    assert snapshot["active_lease_count"] == 0
+    assert "backend actor died" in snapshot["last_error"]
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_skips_claim_when_engine_not_ready() -> None:
+    scheduler = _FakeScheduler(claims=[[_lease("runtime-req-engine-not-ready")]])
+    engine = _FakeEngineLifecycle(ready=False)
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        engine_lifecycle=engine,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0, "engine_ready": False}
+    assert scheduler.claim_calls == []
+    assert actor.health_snapshot()["engine_ready"] is False
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_terminal_fails_all_active_leases_on_engine_death() -> None:
+    lease_a = _lease("runtime-req-engine-died-a")
+    lease_b = _lease("runtime-req-engine-died-b")
+    scheduler = _FakeScheduler(claims=[[lease_a, lease_b]])
+    task_futures = _FakeTaskFutureService(
+        statuses={
+            lease_a["item"]["request_id"]: FutureStatus.PENDING,
+            lease_b["item"]["request_id"]: FutureStatus.PENDING,
+        }
+    )
+    engine = _FakeEngineLifecycle()
+    started: set[str] = set()
+    both_started = asyncio.Event()
+
+    async def _executor(lease: dict) -> ExecutorOutcome:
+        request_id = lease["item"]["request_id"]
+        started.add(request_id)
+        if len(started) == 2:
+            both_started.set()
+        await both_started.wait()
+        if request_id == lease_a["item"]["request_id"]:
+            return ExecutorOutcome(kind="fatal_backend_death", error="engine process exited")
+        await asyncio.sleep(0.05)
+        return ExecutorOutcome(kind="success", payload={"should_not_commit": True})
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        engine_lifecycle=engine,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 2, "executed": 2}
+    assert scheduler.failed == []
+    assert scheduler.finished_success == []
+    failed_request_ids = {call["request_id"] for call in scheduler.finished_failure}
+    assert failed_request_ids == {
+        lease_a["item"]["request_id"],
+        lease_b["item"]["request_id"],
+    }
+    assert all(call["error"] == "engine died: engine process exited" for call in scheduler.finished_failure)
+    assert engine.restart_calls == 1
+    assert actor.health_snapshot()["active_lease_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_resumes_durable_finalize_on_engine_death() -> None:
+    lease = _lease("runtime-req-engine-died-finalizing")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    scheduler.finalizing_payloads[lease["lease_id"]] = {
+        "result_path": "/payload/staged.json",
+        "result_checksum": "sha256:abc",
+        "result_size_bytes": 123,
+    }
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    engine = _FakeEngineLifecycle()
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="fatal_backend_death", error="engine died after durable finalize")
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        engine_lifecycle=engine,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert scheduler.failed == []
     assert scheduler.finished_failure == []
-    assert scheduler.failed == [
+    assert scheduler.finished_success == [
         {
+            "request_id": lease["item"]["request_id"],
             "lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+            "scheduler_epoch": lease["scheduler_epoch"],
             "consumer_id": "vllm:model-a::replica-0::generation::3",
             "consumer_generation": 3,
-            "reason": "gpu_actor_died",
-            "requeue": True,
-            "abort_finalize": True,
+            "result_path": "/payload/staged.json",
+            "result_checksum": "sha256:abc",
+            "result_size_bytes": 123,
+            "billing_observations": None,
         }
     ]
     snapshot = actor.health_snapshot()
+    assert snapshot["completed_total"] == 1
     assert snapshot["failed_total"] == 0
-    assert snapshot["requeued_total"] == 1
-    assert "backend actor died" in snapshot["last_error"]
+    assert snapshot["active_lease_count"] == 0
 
 
 @pytest.mark.anyio

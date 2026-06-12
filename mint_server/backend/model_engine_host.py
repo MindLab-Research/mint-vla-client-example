@@ -10,6 +10,7 @@ import re
 import time
 import traceback
 from dataclasses import dataclass
+from enum import StrEnum
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
@@ -36,10 +37,16 @@ logger = logging.getLogger(__name__)
 
 ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None] | ExecutorOutcome | None]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
+EngineLifecycleHook = Any
 _EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
 VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
+
+
+class EngineDeathLeaseDisposition(StrEnum):
+    TERMINAL_FAILED = "terminal_failed"
+    RESUMED_SUCCESS = "resumed_success"
 
 
 def _scheduler_result_ok(result: Any) -> bool:
@@ -355,6 +362,7 @@ class ModelEngineHost:
         payload_store: TaskPayloadStore | None = None,
         executor: ModelWorkExecutor | None = None,
         token_budget_provider: TokenBudgetProvider | None = None,
+        engine_lifecycle: EngineLifecycleHook | None = None,
         ray_address: str | None = None,
     ) -> None:
         domain = str(domain_key).strip()
@@ -407,13 +415,20 @@ class ModelEngineHost:
         self._token_budget_provider = (
             token_budget_provider if token_budget_provider is not None else self._default_token_budget_provider
         )
+        self._engine_lifecycle = engine_lifecycle
 
         self._running = False
         self._draining = False
+        self._engine_restarting = False
+        self._engine_ready: bool | None = None
+        self._engine_restart_deadline_at: float | None = None
+        self._engine_restart_count = 0
+        self._engine_failure_epoch = 0
+        self._engine_death_lock = asyncio.Lock()
         self._loop_task: asyncio.Task | None = None
         self._active_request_id: str | None = None
         self._active_lease_id: str | None = None
-        self._active_leases: dict[str, str] = {}
+        self._active_leases: dict[str, dict[str, Any]] = {}
         self._started_at = time.time()
         self._last_claimed_at: float | None = None
         self._last_completed_at: float | None = None
@@ -472,9 +487,16 @@ class ModelEngineHost:
             "draining": bool(self._draining),
             "active_request_id": self._active_request_id,
             "active_lease_id": self._active_lease_id,
-            "active_request_ids": list(self._active_leases.values()),
+            "active_request_ids": [
+                str(_lease_item_wire(lease)["request_id"]) for lease in self._active_leases.values()
+            ],
             "active_lease_ids": list(self._active_leases.keys()),
             "active_lease_count": len(self._active_leases),
+            "engine_ready": self._engine_ready,
+            "engine_restarting": bool(self._engine_restarting),
+            "engine_restart_deadline_at": self._engine_restart_deadline_at,
+            "engine_restart_count": int(self._engine_restart_count),
+            "engine_failure_epoch": int(self._engine_failure_epoch),
             "started_at": float(self._started_at),
             "last_claimed_at": self._last_claimed_at,
             "last_completed_at": self._last_completed_at,
@@ -549,6 +571,10 @@ class ModelEngineHost:
     async def run_once(self) -> dict[str, Any]:
         if self._draining:
             return {"claimed": 0, "executed": 0, "draining": True}
+        engine_ready = await self._engine_is_ready()
+        if not engine_ready:
+            self._empty_polls_total += 1
+            return {"claimed": 0, "executed": 0, "engine_ready": False}
         max_items, token_budget = await self._claim_limits()
         claimed = await self._scheduler.claim(
             domain_key=self._config.domain_key,
@@ -694,7 +720,10 @@ class ModelEngineHost:
 
     def _clear_active_lease(self, lease_id: str) -> None:
         self._active_leases.pop(str(lease_id), None)
-        self._active_request_id = next(iter(self._active_leases.values()), None)
+        next_lease = next(iter(self._active_leases.values()), None)
+        self._active_request_id = (
+            str(_lease_item_wire(next_lease)["request_id"]) if isinstance(next_lease, dict) else None
+        )
         self._active_lease_id = next(iter(self._active_leases.keys()), None)
 
     def _record_error(self, e: BaseException) -> None:
@@ -878,6 +907,160 @@ class ModelEngineHost:
             attempt_id=self._payload_attempt_id_for_lease(lease),
             payload=payload,
         )
+
+    async def _engine_is_ready(self) -> bool:
+        if self._engine_lifecycle is None:
+            self._engine_ready = True
+            return True
+        checker = getattr(self._engine_lifecycle, "is_ready", None)
+        if not callable(checker):
+            self._engine_ready = True
+            return True
+        try:
+            ready = checker()
+            if inspect.isawaitable(ready):
+                ready = await ready
+            self._engine_ready = bool(ready)
+            return bool(ready)
+        except Exception as exc:
+            self._record_error(exc)
+            self._engine_ready = False
+            return False
+
+    async def _mark_engine_unhealthy(self, reason: str) -> None:
+        self._engine_ready = False
+        marker = getattr(self._engine_lifecycle, "mark_unhealthy", None)
+        if callable(marker):
+            out = marker(str(reason))
+            if inspect.isawaitable(out):
+                await out
+
+    async def _restart_engine(self) -> None:
+        self._engine_restarting = True
+        self._engine_restart_deadline_at = time.time() + 30.0 * 60.0
+        self._engine_restart_count += 1
+        restarter = getattr(self._engine_lifecycle, "restart", None)
+        try:
+            if callable(restarter):
+                out = restarter()
+                if inspect.isawaitable(out):
+                    await out
+            self._engine_ready = await self._engine_is_ready()
+        finally:
+            self._engine_restarting = False
+
+    async def _settle_lease_for_engine_death(
+        self,
+        lease: dict[str, Any],
+        *,
+        error: str,
+    ) -> EngineDeathLeaseDisposition | None:
+        token = _scheduler_lease_token(lease)
+        if not token.request_id or not token.attempt_id or not token.scheduler_epoch:
+            failed = await self._scheduler.fail(
+                lease=token,
+                reason="gpu_actor_died",
+                requeue=False,
+                abort_finalize=True,
+            )
+            return EngineDeathLeaseDisposition.TERMINAL_FAILED if _scheduler_result_ok(failed) else None
+        staged_payload = await self._resume_finalizing_payload(token)
+        if staged_payload is not None:
+            finished = await self._scheduler.finish_success(
+                lease=token,
+                result_path=str(staged_payload["result_path"]),
+                result_checksum=(
+                    None
+                    if staged_payload.get("result_checksum") is None
+                    else str(staged_payload.get("result_checksum"))
+                ),
+                result_size_bytes=(
+                    None
+                    if staged_payload.get("result_size_bytes") is None
+                    else int(staged_payload.get("result_size_bytes") or 0)
+                ),
+                billing_observations=staged_payload.get("billing_observations"),
+            )
+            if _scheduler_result_ok(finished):
+                return EngineDeathLeaseDisposition.RESUMED_SUCCESS
+        begin_finalize = await self._scheduler.begin_finalize(
+            lease=token,
+            finalize_ttl_s=self._config.lease_ttl_s,
+        )
+        if not _scheduler_result_ok(begin_finalize):
+            failed = await self._scheduler.fail(
+                lease=_legacy_lease_token(lease),
+                reason="gpu_actor_died",
+                requeue=False,
+                abort_finalize=True,
+            )
+            return EngineDeathLeaseDisposition.TERMINAL_FAILED if _scheduler_result_ok(failed) else None
+        finished = await self._scheduler.finish_failure(
+            lease=token,
+            error=f"engine died: {error}",
+        )
+        return EngineDeathLeaseDisposition.TERMINAL_FAILED if _scheduler_result_ok(finished) else None
+
+    async def _resume_finalizing_payload(self, token: LeaseToken) -> dict[str, Any] | None:
+        hook = getattr(self._scheduler, "resume_finalizing_payload", None)
+        if callable(hook):
+            out = hook(token)
+            if inspect.isawaitable(out):
+                out = await out
+            return dict(out) if isinstance(out, dict) else None
+        try:
+            record = await self._task_state_store.get_task(request_id=token.request_id)
+        except Exception:
+            return None
+        data = record if isinstance(record, dict) else getattr(record, "data", None)
+        if not isinstance(data, dict):
+            return None
+        status = str(data.get("status") or "")
+        if status != "finalizing":
+            return None
+        if str(data.get("lease_id") or "") != token.lease_id:
+            return None
+        result_path = data.get("staged_payload_path") or data.get("result_path")
+        if result_path is None:
+            return None
+        return {
+            "result_path": str(result_path),
+            "result_checksum": data.get("result_checksum"),
+            "result_size_bytes": data.get("result_size_bytes"),
+            "billing_observations": data.get("billing_observations"),
+        }
+
+    async def _handle_engine_death(self, *, error: str) -> None:
+        async with self._engine_death_lock:
+            self._engine_failure_epoch += 1
+            self._record_error(RuntimeError(error))
+            await self._mark_engine_unhealthy(error)
+            leases = list(self._active_leases.values())
+            if not leases:
+                await self._restart_engine()
+                return
+            for lease in leases:
+                lease_id = str(lease.get("lease_id"))
+                try:
+                    disposition = await self._settle_lease_for_engine_death(lease, error=error)
+                    if disposition == EngineDeathLeaseDisposition.TERMINAL_FAILED:
+                        self._failed_total += 1
+                    elif disposition == EngineDeathLeaseDisposition.RESUMED_SUCCESS:
+                        self._completed_total += 1
+                except Exception as exc:
+                    self._record_error(exc)
+                    try:
+                        await self._scheduler.fail(
+                            lease=_legacy_lease_token(lease),
+                            reason="gpu_actor_died_terminal_fail_failed",
+                            requeue=False,
+                            abort_finalize=True,
+                        )
+                    except Exception:
+                        pass
+                finally:
+                    self._clear_active_lease(lease_id)
+            await self._restart_engine()
 
     async def _mark_running(self, lease: dict[str, Any]) -> None:
         item = _lease_item_wire(lease)
@@ -1072,7 +1255,7 @@ class ModelEngineHost:
         lease_id = legacy_token.lease_id
         token: LeaseToken | None = None
         attempt_id = self._lease_attempt_id(lease)
-        self._active_leases[lease_id] = request_id
+        self._active_leases[lease_id] = lease
         self._active_request_id = request_id
         self._active_lease_id = lease_id
         self._restore_item_context(lease)
@@ -1141,6 +1324,7 @@ class ModelEngineHost:
             return
 
         task: asyncio.Task | None = None
+        lease_engine_failure_epoch = int(self._engine_failure_epoch)
         try:
             executor_started_at = time.time()
             with model_work_execution_context(
@@ -1169,10 +1353,15 @@ class ModelEngineHost:
                 pass
             if outcome.kind in {"retryable_failure", "fatal_backend_death"}:
                 error = outcome.error or f"executor returned {outcome.kind}"
+                if outcome.kind == "fatal_backend_death":
+                    if int(self._engine_failure_epoch) != lease_engine_failure_epoch:
+                        return
+                    await self._handle_engine_death(error=error)
+                    return
                 self._record_error(RuntimeError(error))
                 failed = await self._scheduler.fail(
                     lease=legacy_token,
-                    reason="gpu_actor_died" if outcome.kind == "fatal_backend_death" else "executor_retryable_failure",
+                    reason="executor_retryable_failure",
                     requeue=True,
                     abort_finalize=True,
                 )
@@ -1184,6 +1373,8 @@ class ModelEngineHost:
                         failed,
                     )
                 self._requeued_total += 1
+                return
+            if int(self._engine_failure_epoch) != lease_engine_failure_epoch:
                 return
             finalization = _finalization_from_outcome(request_id=request_id, outcome=outcome)
             if finalization.request_id != request_id:
