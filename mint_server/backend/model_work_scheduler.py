@@ -2706,6 +2706,8 @@ class _ModelWorkSchedulerActor:
                     or int(lease.scheduler_epoch or 0) != scheduler_epoch
                 ):
                     return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                if self._request_locations.get(request_id) == "finalizing":
+                    return FinishResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
             elif self._request_locations.get(request_id) is not None:
                 return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if self._use_task_state_store:
@@ -2756,6 +2758,20 @@ class _ModelWorkSchedulerActor:
                         result_checksum=result_checksum,
                         result_size_bytes=result_size_bytes,
                     )
+            except TaskStateConflictError:
+                async with self._cv:
+                    current = self._leases_by_id.get(lease_id)
+                    if current is not None and not self._current_lease_matches_locked(
+                        current,
+                        expected=lease,
+                        lease_id=lease_id,
+                        consumer_id=consumer_id,
+                        consumer_generation=consumer_generation,
+                    ):
+                        return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                    if current is None and self._request_locations.get(request_id) is not None:
+                        return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
+                return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
             except asyncio.CancelledError:
                 if lease is not None:
                     terminal = await self._terminal_task_state_for_lease(lease)

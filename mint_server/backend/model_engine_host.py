@@ -891,16 +891,55 @@ class ModelEngineHost:
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
         item = _lease_item_wire(lease)
         request_id = str(item["request_id"])
-        token = _scheduler_lease_token(lease)
         try:
             status = await self._task_futures.async_get_status(request_id)
         except KeyError:
-            await self._scheduler.complete(lease=token)
+            await self._finish_non_pending_scheduler_lease(
+                lease,
+                status=None,
+                error="model work task disappeared before runtime execution",
+            )
             return False
         if status is not None and status != FutureStatus.PENDING:
-            await self._scheduler.complete(lease=token)
+            await self._finish_non_pending_scheduler_lease(
+                lease,
+                status=status,
+                error=f"model work task is already terminal: {status.value}",
+            )
             return False
         return True
+
+    async def _finish_non_pending_scheduler_lease(
+        self,
+        lease: dict[str, Any],
+        *,
+        status: FutureStatus | None,
+        error: str,
+    ) -> None:
+        token = _scheduler_lease_token(lease)
+        if status == FutureStatus.DONE and self._task_state_finalize_enabled(lease):
+            finished = await self._scheduler.finish_success(
+                lease=_lease_token(lease),
+                result_path="",
+                result_checksum=None,
+                result_size_bytes=None,
+                billing_observations=None,
+            )
+            if _scheduler_result_ok(finished):
+                return
+        if status == FutureStatus.FAILED and self._task_state_finalize_enabled(lease):
+            finished = await self._scheduler.finish_failure(
+                lease=_lease_token(lease),
+                error=error,
+            )
+            if _scheduler_result_ok(finished):
+                return
+        await self._scheduler.fail(
+            lease=token,
+            reason="task_not_pending",
+            requeue=False,
+            abort_finalize=True,
+        )
 
     async def _fail_lost_lease_if_still_pending(
         self,
@@ -1593,13 +1632,18 @@ class ModelEngineHost:
                         finalization.payload,
                         billing_observations=finalization.billing_observations,
                     )
-                    completed = await self._scheduler.complete(lease=legacy_token)
-                    if not _scheduler_result_ok(completed):
+                    failed = await self._scheduler.fail(
+                        lease=legacy_token,
+                        reason="future_resolved_without_finalize_identity",
+                        requeue=False,
+                        abort_finalize=True,
+                    )
+                    if not _scheduler_result_ok(failed):
                         logger.warning(
-                            "[model_runtime] legacy lease complete rejected after future resolve actor=%s request_id=%s result=%s",
+                            "[model_runtime] legacy lease release rejected after future resolve actor=%s request_id=%s result=%s",
                             self._config.actor_name,
                             request_id,
-                            completed,
+                            failed,
                         )
                     self._processed_total += 1
                     self._completed_total += 1

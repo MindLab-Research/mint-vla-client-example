@@ -34,6 +34,21 @@ def token(
     )
 
 
+async def finish_success_for_test(
+    world: SchedulerComponentWorld,
+    lease: dict[str, Any],
+    *,
+    result_path: str | None = None,
+) -> Any:
+    return await world.scheduler.finish_success(
+        lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+        result_path=result_path or str(world.tmp_path / "result.json"),
+        result_checksum=None,
+        result_size_bytes=None,
+        billing_observations=None,
+    )
+
+
 async def assert_stats_progress_while_blocked(
     world: SchedulerComponentWorld,
     call: Callable[[], Coroutine[Any, Any, Any]],

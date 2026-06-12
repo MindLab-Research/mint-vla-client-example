@@ -10,6 +10,7 @@ from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedE
 from .helpers import (
     assert_scheduler_surfaces_progress_while_blocked,
     assert_stats_progress_while_blocked,
+    finish_success_for_test,
     token,
 )
 from .harness import SchedulerComponentWorld
@@ -505,15 +506,12 @@ async def test_scheduler_component_same_session_sampling_is_serialized_by_orderi
         assert first["item"]["request_id"] == "component-session-serial-a"
         assert blocked.leases == []
 
-        await world.future_service.async_resolve(
-            "component-session-serial-a",
-            {"ok": True, "request_id": "component-session-serial-a"},
+        begin = await world.scheduler.begin_finalize(
+            lease=token(first, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            finalize_ttl_s=30.0,
         )
-        assert (
-            await world.scheduler.complete(
-                lease=token(first, consumer_id=world.consumer_id, consumer_generation=world.generation),
-            )
-        ).ok is True
+        assert begin.ok is True
+        assert (await finish_success_for_test(world, first)).ok is True
 
         second = await world.claim_one()
         assert second["item"]["request_id"] == "component-session-serial-b"

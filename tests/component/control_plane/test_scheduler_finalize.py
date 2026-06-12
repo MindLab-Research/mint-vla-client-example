@@ -7,7 +7,7 @@ from typing import Any, cast
 import pytest
 
 from .harness import SchedulerComponentWorld
-from .helpers import token
+from .helpers import finish_success_for_test, token
 from .invariants import (
     assert_every_terminal_has_payload_ref,
     assert_no_double_lease,
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.component
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
+async def test_scheduler_component_finish_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
@@ -35,14 +35,12 @@ async def test_scheduler_component_complete_defers_while_begin_finalize_is_infli
         )
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
 
-        completed = await world.scheduler.complete(
-            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
-        )
+        finished = await finish_success_for_test(world, lease)
 
         block.release.set()
         finalized = await finalize_task
 
-        assert completed.ok is False and completed.reason == "finalize_inflight"
+        assert finished.ok is False and finished.reason == "finalize_inflight"
         assert finalized.ok is True
         assert (
             await world.scheduler.validate(
@@ -55,7 +53,7 @@ async def test_scheduler_component_complete_defers_while_begin_finalize_is_infli
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_projection(tmp_path) -> None:
+async def test_scheduler_component_stale_finish_cannot_clear_new_attempt_projection(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
@@ -80,8 +78,9 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
 
         block = world.faults.block("task_state.get_task.after")
         complete_task = asyncio.create_task(
-            world.scheduler.complete(
+            world.scheduler.finish_failure(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                error="old attempt failed",
             )
         )
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
@@ -92,14 +91,14 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
         new_lease = await world.claim_one()
 
         block.release.set()
-        stale_complete = await complete_task
+        stale_finish = await complete_task
 
         assert begin.ok is True
         assert committed.ok is True
         assert expired.ok is True and expired.expired == 0
         assert new_lease["item"]["request_id"] == request_id
         assert new_lease["lease_id"] != old_lease["lease_id"]
-        assert stale_complete.ok is False and stale_complete.reason == "stale_consumer"
+        assert stale_finish.ok is False and stale_finish.reason == "stale_consumer"
         assert (
             await world.scheduler.validate(
                 lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
@@ -153,30 +152,29 @@ async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_complete_requires_durable_terminal_commit(tmp_path) -> None:
+async def test_scheduler_component_finish_success_commits_after_begin_finalize(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
         await world.enqueue_sampling("component-complete-before-commit")
         lease = await world.claim_one()
+        staged_payload_path = str(world.tmp_path / "staged.json")
         begin = await world.scheduler.begin_finalize(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
-            staged_payload_path=str(world.tmp_path / "staged.json"),
+            staged_payload_path=staged_payload_path,
         )
 
-        premature_complete = await world.scheduler.complete(
-            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
-        )
+        finished = await finish_success_for_test(world, lease, result_path=staged_payload_path)
 
         assert begin.ok is True
-        assert premature_complete.ok is False and premature_complete.reason == "not_terminal"
+        assert finished.ok is True
         assert (
             await world.scheduler.validate(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
-        ).ok is True
-        assert (await world.observe_task("component-complete-before-commit"))["status"] == "finalizing"
+        ).ok is False
+        assert (await world.observe_task("component-complete-before-commit"))["status"] == "done"
     finally:
         world.close()
 

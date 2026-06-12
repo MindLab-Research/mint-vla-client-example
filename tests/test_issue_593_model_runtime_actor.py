@@ -1651,12 +1651,15 @@ async def test_issue_593_model_runtime_completes_without_task_state_finalize_met
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == [(lease["item"]["request_id"], {"ok": True})]
-    assert scheduler.failed == []
-    assert scheduler.completed == [
+    assert scheduler.completed == []
+    assert scheduler.failed == [
         {
             "lease_id": lease["lease_id"],
             "consumer_id": "vllm:model-a::replica-0::generation::3",
             "consumer_generation": 3,
+            "reason": "future_resolved_without_finalize_identity",
+            "requeue": False,
+            "abort_finalize": True,
         }
     ]
     snapshot = actor.health_snapshot()
@@ -1950,11 +1953,19 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
 
     assert result == {"claimed": 1, "executed": 1}
     assert executed is False
-    assert scheduler.completed == [
+    assert scheduler.completed == []
+    assert scheduler.finished_success == [
         {
+            "request_id": "runtime-req-done",
             "lease_id": lease["lease_id"],
+            "attempt_id": lease["attempt_id"],
+            "scheduler_epoch": lease["scheduler_epoch"],
             "consumer_id": "vllm:model-a::replica-0::generation::3",
             "consumer_generation": 3,
+            "result_path": "",
+            "result_checksum": None,
+            "result_size_bytes": None,
+            "billing_observations": None,
         }
     ]
     assert task_futures.running == []

@@ -103,6 +103,31 @@ def test_model_engine_host_terminal_commit_goes_through_scheduler_finish_surface
     assert "finish_failure(" in runtime_source
 
 
+def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
+    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    contracts_path = REPO_ROOT / "mint_server" / "backend" / "control_plane_contracts.py"
+    runtime_tree = ast.parse(runtime_path.read_text(), filename=str(runtime_path))
+    contracts_source = contracts_path.read_text()
+    protocols = _class_methods(contracts_path)
+
+    scheduler_calls: list[str] = []
+    for node in ast.walk(runtime_tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        owner = node.func.value
+        if (
+            isinstance(owner, ast.Attribute)
+            and owner.attr == "_scheduler"
+            and isinstance(owner.value, ast.Name)
+            and owner.value.id == "self"
+        ):
+            scheduler_calls.append(node.func.attr)
+
+    assert "complete" not in scheduler_calls
+    assert "complete" not in protocols["AsyncSchedulerQueue"]
+    assert "COMPLETE = \"complete\"" not in contracts_source
+
+
 def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor() -> None:
     runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(runtime_path)

@@ -8,7 +8,7 @@ import pytest
 
 from mint_server.backend.task_state_store import FutureStatus
 
-from .helpers import token
+from .helpers import finish_success_for_test, token
 from .harness import SchedulerComponentWorld
 from .invariants import assert_no_double_lease, assert_no_orphan_assigned
 
@@ -560,10 +560,12 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
-        complete = await world.scheduler.complete(
+        terminal_fail = await world.scheduler.fail(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            requeue=False,
+            reason="not-yet-terminal",
         )
-        assert complete.ok is False and complete.reason == "not_terminal"
+        assert terminal_fail.ok is False and terminal_fail.reason == "not_terminal"
         expired = await world.scheduler.expire(now=time.time() + 29.0)
         assert expired.ok is True and expired.expired == 0
         committed = await world.task_state.async_commit_finalize_success(
@@ -576,9 +578,7 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
             result_checksum=None,
             result_size_bytes=None,
         )
-        completed = await world.scheduler.complete(
-            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
-        )
+        completed = await finish_success_for_test(world, lease)
 
         assert committed.ok is True
         assert completed.ok is True and completed.request_id == request_id

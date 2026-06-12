@@ -31,7 +31,6 @@ class SchedulerQueueOp(StrEnum):
     CLAIM = "claim"
     RENEW = "renew"
     BEGIN_FINALIZE = "begin_finalize"
-    COMPLETE = "complete"
     FAIL = "fail"
     VALIDATE = "validate"
     EXPIRE = "expire"
@@ -1025,13 +1024,6 @@ class AsyncSchedulerQueue(Protocol):
         timeout_s: float | None = None,
     ) -> LeaseResult: ...
 
-    async def complete(
-        self,
-        *,
-        lease: LeaseToken,
-        timeout_s: float | None = None,
-    ) -> FinishResult: ...
-
     async def finish_success(
         self,
         *,
@@ -1302,18 +1294,6 @@ class InProcessSchedulerQueueAdapter:
         if isinstance(out, LeaseResult):
             return out
         return LeaseResult.from_wire(out)
-
-    async def complete(
-        self,
-        *,
-        lease: LeaseToken,
-        timeout_s: float | None = None,
-    ) -> FinishResult:
-        kwargs = _lease_to_actor_kwargs(lease)
-        out = await self.actor.complete_lease(**kwargs)
-        if isinstance(out, FinishResult):
-            return out
-        return FinishResult.from_wire(out)
 
     async def finish_success(
         self,

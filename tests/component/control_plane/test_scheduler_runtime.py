@@ -50,7 +50,7 @@ class _FlakyComponentLivenessPush:
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_complete_cleans_scheduler_lease_for_missing_task(tmp_path) -> None:
+async def test_scheduler_component_fail_cleans_scheduler_lease_for_missing_task(tmp_path) -> None:
     world = cast(Any, SchedulerComponentWorld(tmp_path))
     try:
         await world.start()
@@ -59,11 +59,14 @@ async def test_scheduler_component_complete_cleans_scheduler_lease_for_missing_t
         lease = await world.claim_one()
         await world.task_state.async_forget_task(request_id=request_id)
 
-        completed = await world.scheduler.complete(
+        failed = await world.scheduler.fail(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            requeue=False,
+            reason="missing-task",
+            abort_finalize=True,
         )
 
-        assert completed.ok is True and completed.request_id == request_id
+        assert failed.ok is True and failed.request_id == request_id
         assert (await world.observe_scheduler(request_id)).present is False
     finally:
         world.close()

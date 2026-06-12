@@ -9,7 +9,7 @@ import pytest
 from mint_server.backend.task_state_store import FutureStatus, TaskStateStore
 
 from .harness import SchedulerComponentWorld
-from .helpers import token
+from .helpers import finish_success_for_test, token
 from .invariants import (
     assert_lease_consistency,
     assert_no_double_lease,
@@ -154,9 +154,7 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
-        stale_complete = await world.scheduler.complete(
-            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
-        )
+        stale_finish = await finish_success_for_test(world, old_lease)
         valid_new = await world.scheduler.validate(
             lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
@@ -165,7 +163,7 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
         assert assigned.assigned == 1
         assert old_lease["lease_id"] != new_lease["lease_id"]
         assert stale_finalize.ok is False and stale_finalize.reason == "unknown_lease"
-        assert stale_complete.ok is False and stale_complete.reason == "unknown_lease"
+        assert stale_finish.ok is False and stale_finish.reason == "stale_consumer"
         assert valid_new.ok is True
         record = await world.observe_task("component-stale-finalizer")
         assert record["status"] == "leased"
@@ -334,7 +332,7 @@ async def test_scheduler_component_concurrent_reapers_recover_lost_pending_once(
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_old_generation_cannot_renew_complete_or_fail_after_sync(tmp_path) -> None:
+async def test_scheduler_component_old_generation_cannot_renew_finish_or_fail_after_sync(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
@@ -349,8 +347,12 @@ async def test_scheduler_component_old_generation_cannot_renew_complete_or_fail_
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             lease_ttl_s=30.0,
         )
-        completed = await world.scheduler.complete(
+        finished = await world.scheduler.finish_success(
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+            result_path=str(world.tmp_path / "result.json"),
+            result_checksum=None,
+            result_size_bytes=None,
+            billing_observations=None,
         )
         failed = await world.scheduler.fail(
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
@@ -359,7 +361,7 @@ async def test_scheduler_component_old_generation_cannot_renew_complete_or_fail_
         )
 
         assert renewed.ok is False and renewed.reason == "unknown_lease"
-        assert completed.ok is False and completed.reason == "unknown_lease"
+        assert finished.ok is False and finished.reason == "stale_consumer"
         assert failed.ok is False and failed.reason == "unknown_lease"
         assert (await world.observe_task("component-stale-runtime-active"))["status"] == "assigned"
         assigned = await world.scheduler.assign_pending(max_items=1)
