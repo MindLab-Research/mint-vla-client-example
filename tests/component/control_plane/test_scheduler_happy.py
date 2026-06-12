@@ -11,7 +11,12 @@ from mint_server.backend.control_plane_contracts import (
 from mint_server.backend.task_state_store import FutureStatus
 
 from .harness import SchedulerComponentWorld
-from .invariants import assert_terminal_not_scheduled
+from .invariants import (
+    assert_lease_consistency,
+    assert_no_double_lease,
+    assert_no_orphan_assigned,
+    assert_terminal_not_scheduled,
+)
 
 
 pytestmark = pytest.mark.component
@@ -42,6 +47,43 @@ async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, 
         assert status_code == 200
         assert payload == {"ok": True, "request_id": "component-happy"}
         await assert_terminal_not_scheduled(world, "component-happy")
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_manual_assign_happy_path_reaches_retrieve_future(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-happy-manual-assign"
+        submitted = cast(Any, await world.enqueue_sampling(request_id, assign=False))
+
+        contains_before = cast(Any, await world.observe_scheduler(request_id))
+        assigned = await world.scheduler.assign_pending(max_items=1)
+        contains_assigned = cast(Any, await world.observe_scheduler(request_id))
+        await assert_no_orphan_assigned(world)
+
+        await world.runtime_once()
+
+        assert submitted.scheduler_result.ok is True
+        assert submitted.scheduler_result.assigned.get("assigned") == 0
+        assert contains_before.present is True
+        assert contains_before.location == "backlog"
+        assert assigned.assigned == 1
+        assert contains_assigned.present is True
+        assert contains_assigned.location == "assigned"
+        assert await world.observe_future_status(request_id) == FutureStatus.DONE
+        status_code, payload = await world.retrieve(request_id, monkeypatch)
+        assert status_code == 200
+        assert payload == {"ok": True, "request_id": request_id}
+        await assert_terminal_not_scheduled(world, request_id)
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
+        await assert_no_orphan_assigned(world)
     finally:
         world.close()
 
