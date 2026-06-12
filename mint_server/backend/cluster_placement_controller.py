@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -44,6 +45,9 @@ ObservedGpuSource = Callable[[], Mapping[str, int] | Awaitable[Mapping[str, int]
 PlacementGroupTableSource = Callable[[], Mapping[str, Any] | Iterable[Any] | Awaitable[Mapping[str, Any] | Iterable[Any]]]
 PlacementGroupFactory = Callable[..., Any | Awaitable[Any]]
 PlacementGroupRemover = Callable[[Any], Any | Awaitable[Any]]
+TopologyResolver = Callable[[dict[tuple[str, str], Any]], Any | Awaitable[dict[str, Any]]]
+PlacementReconciler = Callable[..., Any | Awaitable[dict[str, Any]]]
+SpecResolver = Callable[[Any, list[str] | None, tuple[tuple[str, str, int], ...] | None], Any]
 
 
 @dataclass(frozen=True)
@@ -285,6 +289,42 @@ class PlacementReservationSnapshot:
     blocked_replicas: tuple[tuple[str, PlacementBlockReason, float], ...] = ()
 
 
+@dataclass(frozen=True)
+class PlacementReconcileRequest:
+    desired: Mapping[tuple[str, str], Any]
+    protected_actor_names: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class PlacementReconcileResult:
+    ok: bool
+    node_pins: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    blocked: tuple[tuple[str, str], ...] = ()
+    placement_group_requests: tuple[PlacementGroupCreateRequest, ...] = ()
+    protected_actor_names: frozenset[str] = frozenset()
+    error: str | None = None
+
+    @property
+    def node_pins_by_label(self) -> dict[str, list[str]]:
+        return {label: list(pins) for label, pins in self.node_pins}
+
+    @property
+    def blocked_by_label(self) -> dict[str, str]:
+        return dict(self.blocked)
+
+    def to_legacy_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "ok": bool(self.ok),
+            "blocked": self.blocked_by_label,
+            "node_pins": self.node_pins_by_label,
+            "placement_group_requests": list(self.placement_group_requests),
+            "protected_actor_names": sorted(self.protected_actor_names),
+        }
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+
 class ClusterPlacementController:
     """In-process placement reservation authority for model actor placement."""
 
@@ -295,6 +335,9 @@ class ClusterPlacementController:
         placement_group_table: PlacementGroupTableSource | None = None,
         placement_group_factory: PlacementGroupFactory | None = None,
         placement_group_remover: PlacementGroupRemover | None = None,
+        topology_resolver: TopologyResolver | None = None,
+        placement_reconciler: PlacementReconciler | None = None,
+        spec_resolver: SpecResolver | None = None,
         namespace: str | None = None,
         monotonic: Callable[[], float] | None = None,
         initial_backoff_s: float = 5.0,
@@ -304,6 +347,9 @@ class ClusterPlacementController:
         self._placement_group_table = placement_group_table
         self._placement_group_factory = placement_group_factory
         self._placement_group_remover = placement_group_remover
+        self._topology_resolver = topology_resolver
+        self._placement_reconciler = placement_reconciler
+        self._spec_resolver = spec_resolver
         self._namespace = namespace
         self._monotonic = monotonic or time.monotonic
         self._initial_backoff_s = max(0.0, float(initial_backoff_s))
@@ -312,6 +358,89 @@ class ClusterPlacementController:
         self._reservations: dict[str, PlacementReservationToken] = {}
         self._rebuilt_gpus_by_node: dict[str, int] = {}
         self._blocked: dict[str, tuple[PlacementBlockReason, float, float]] = {}
+
+    async def reconcile(self, request: PlacementReconcileRequest) -> PlacementReconcileResult:
+        desired = dict(request.desired)
+        topology_blocked: dict[str, str] = {}
+        topology_node_pins: dict[str, list[str]] = {}
+        topology_placement_slices: dict[str, tuple[tuple[str, str, int], ...]] = {}
+        if self._topology_resolver is not None:
+            raw_topology = self._topology_resolver(dict(desired))
+            topology_out = await raw_topology if inspect.isawaitable(raw_topology) else raw_topology
+            if isinstance(topology_out, dict):
+                topology_blocked = _string_dict(topology_out.get("blocked"))
+                topology_node_pins = _list_dict(topology_out.get("node_pins"))
+                topology_placement_slices = _placement_slices_dict(topology_out.get("placement_slices"))
+                desired = self._apply_resolved_topology(
+                    desired,
+                    node_pins=topology_node_pins,
+                    placement_slices=topology_placement_slices,
+                )
+
+        placement_blocked: dict[str, str] = {}
+        placement_node_pins: dict[str, list[str]] = {}
+        if self._placement_reconciler is not None:
+            try:
+                raw_placement = self._placement_reconciler(
+                    dict(desired),
+                    protected_actor_names=set(request.protected_actor_names),
+                )
+            except TypeError as exc:
+                if "protected_actor_names" not in str(exc):
+                    raise
+                raw_placement = self._placement_reconciler(dict(desired))
+            placement_out = await raw_placement if inspect.isawaitable(raw_placement) else raw_placement
+            if isinstance(placement_out, dict):
+                placement_blocked = _string_dict(placement_out.get("blocked"))
+                placement_node_pins = _list_dict(placement_out.get("node_pins"))
+
+        node_pins: dict[str, tuple[str, ...]] = {}
+        blocked: dict[str, str] = dict(topology_blocked)
+        blocked.update(placement_blocked)
+        create_requests: list[PlacementGroupCreateRequest] = []
+        for key, spec in sorted(desired.items(), key=lambda item: _label(item[0])):
+            label = _label(key)
+            try:
+                bundle_request = placement_group_bundle_request_for_spec(spec)
+            except ValueError:
+                continue
+            except Exception as exc:
+                blocked[label] = f"{type(exc).__name__}: {exc}"
+                continue
+            pins = tuple(placement_node_pins.get(label) or topology_node_pins.get(label) or list(_spec_node_pins(spec)))
+            if pins:
+                node_pins[label] = pins
+            if label not in blocked:
+                create_requests.append(bundle_request.to_create_request())
+        return PlacementReconcileResult(
+            ok=not blocked,
+            node_pins=tuple(sorted(node_pins.items())),
+            blocked=tuple(sorted(blocked.items())),
+            placement_group_requests=tuple(create_requests),
+            protected_actor_names=frozenset(str(name) for name in request.protected_actor_names),
+        )
+
+    def _apply_resolved_topology(
+        self,
+        desired: dict[tuple[str, str], Any],
+        *,
+        node_pins: Mapping[str, list[str]],
+        placement_slices: Mapping[str, tuple[tuple[str, str, int], ...]],
+    ) -> dict[tuple[str, str], Any]:
+        if self._spec_resolver is None:
+            return desired
+        resolved: dict[tuple[str, str], Any] = {}
+        for key, spec in desired.items():
+            label = _label(key)
+            if label in node_pins or label in placement_slices:
+                resolved[key] = self._spec_resolver(
+                    spec,
+                    node_pins.get(label),
+                    placement_slices.get(label),
+                )
+            else:
+                resolved[key] = spec
+        return resolved
 
     async def create_pg(self, request: PlacementGroupCreateRequest) -> PlacementGroupCreateResult:
         blocked = self._blocked.get(request.replica_key)
@@ -540,6 +669,190 @@ class ClusterPlacementController:
         return retry_at
 
 
+def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRequest:
+    launcher_key = str(getattr(spec, "launcher_key", "") or "").strip().lower()
+    domain_key = str(getattr(spec, "domain_key", "") or "")
+    replica_id = str(getattr(spec, "replica_id", "") or "replica-0")
+    replica_key = f"{domain_key}::{replica_id}"
+    base_model = _base_model_from_spec(spec)
+    node_pins = _spec_node_pins(spec)
+    placement_slices = _spec_placement_slices(spec)
+    namespace = _ray_namespace()
+    actor_name = str(_call_spec_method(spec, "normalized_actor_name") or _default_model_actor_name(domain_key, replica_id))
+
+    if launcher_key == "dense" or domain_key.startswith("dense:"):
+        dense_actor_name = _dense_actor_name(base_model or domain_key)
+        return PlacementGroupBundleRequest.for_dense(
+            replica_key=replica_key,
+            placement_group_name=_namespace_actor_pg_name(dense_actor_name, namespace),
+            node_ip=node_pins[0] if node_pins else None,
+            namespace=namespace,
+        )
+
+    if launcher_key in {"megatron", "bumblebee"} or domain_key.startswith(("megatron:", "bumblebee:")):
+        training_actor_name = (
+            _bumblebee_actor_name(base_model or domain_key)
+            if launcher_key == "bumblebee" or domain_key.startswith("bumblebee:")
+            else _megatron_actor_name(base_model or domain_key)
+        )
+        return PlacementGroupBundleRequest.for_distributed_training(
+            replica_key=replica_key,
+            placement_group_name=_namespace_actor_pg_name(training_actor_name, namespace),
+            parallel=_parallel_topology_from_spec(spec),
+            placement_slices=placement_slices,
+            namespace=namespace,
+        )
+
+    worker_gpus = int(getattr(spec, "gpu_count", None) or 1)
+    return PlacementGroupBundleRequest.for_vllm(
+        replica_key=replica_key,
+        placement_group_name=f"{actor_name}_pg",
+        worker_gpus=worker_gpus,
+        node_ips=node_pins,
+        namespace=namespace,
+    )
+
+
+def _label(key: tuple[str, str]) -> str:
+    return f"{key[0]}::{key[1]}"
+
+
+def _call_spec_method(spec: Any, method_name: str) -> Any | None:
+    method = getattr(spec, method_name, None)
+    if callable(method):
+        return method()
+    return None
+
+
+def _base_model_from_spec(spec: Any) -> str | None:
+    raw = getattr(spec, "base_model", None)
+    if raw:
+        return str(raw)
+    domain_key = str(getattr(spec, "domain_key", "") or "")
+    for prefix in ("vllm:", "training:", "megatron:", "bumblebee:", "dense:"):
+        if domain_key.startswith(prefix):
+            model = domain_key.removeprefix(prefix).strip()
+            return model or None
+    return None
+
+
+def _spec_node_pins(spec: Any) -> tuple[str, ...]:
+    raw = _call_spec_method(spec, "normalized_node_pins")
+    if raw is None:
+        raw = getattr(spec, "node_pins", ())
+        node_pin = getattr(spec, "node_pin", None)
+        if node_pin:
+            raw = (*tuple(raw or ()), node_pin)
+    return tuple(dict.fromkeys(str(pin) for pin in (raw or ()) if str(pin).strip()))
+
+
+def _spec_placement_slices(spec: Any) -> tuple[tuple[str, str, int], ...]:
+    out: list[tuple[str, str, int]] = []
+    for raw in getattr(spec, "placement_slices", ()) or ():
+        if len(raw) != 3:
+            continue
+        replica_id, node_ip, gpu_count = raw
+        out.append((str(replica_id), str(node_ip), int(gpu_count)))
+    return tuple(out)
+
+
+def _default_model_actor_name(domain_key: str, replica_id: str) -> str:
+    return f"mint_model_runtime_{_sanitize_actor_name_part(domain_key).lower()}_{_sanitize_actor_name_part(replica_id).lower()}"
+
+
+def _sanitize_actor_name_part(value: str) -> str:
+    out = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
+    return out or "unknown"
+
+
+def _sanitize_pg_component(value: str | None) -> str:
+    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", (value or "").strip())
+    cleaned = cleaned.strip("_")
+    return cleaned or "default"
+
+
+def _namespace_actor_pg_name(actor_name: str, namespace: str) -> str:
+    return f"{actor_name}_{_sanitize_pg_component(namespace)}_pg"
+
+
+def _dense_actor_name(base_model: str) -> str:
+    model_key = str(base_model or "").strip()
+    if model_key.startswith("/"):
+        model_key = model_key.split("/")[-1]
+    else:
+        model_key = model_key.replace("/", "__")
+    model_key = (
+        model_key.replace("-", "_")
+        .replace(".", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+        .lower()
+    )
+    return f"mint_dense_{model_key or 'unknown'}"
+
+
+def _megatron_actor_name(base_model: str) -> str:
+    match = re.search(r"models--([^/]+)--([^/]+)/snapshots", str(base_model))
+    if match:
+        model_name = match.group(2).lower().replace("-", "_").replace(".", "_")
+    else:
+        model_name = str(base_model).split("/")[-1].lower().replace("-", "_").replace(".", "_")
+    return f"mint_megatron_{model_name}"
+
+
+def _bumblebee_actor_name(base_model: str) -> str:
+    match = re.search(r"models--([^/]+)--([^/]+)/snapshots", str(base_model))
+    model_name = match.group(2) if match else str(base_model).split("/")[-1]
+    model_name = model_name.lower().replace("-", "_").replace(".", "_")
+    return f"mint_bumblebee_{model_name}"
+
+
+def _parallel_topology_from_spec(spec: Any) -> ParallelTopology:
+    explicit_fields = (
+        "tensor_parallel_size",
+        "pipeline_parallel_size",
+        "expert_parallel_size",
+        "expert_tensor_parallel_size",
+        "context_parallel_size",
+    )
+    if not any(hasattr(spec, field) for field in explicit_fields):
+        gpu_count = int(getattr(spec, "gpu_count", None) or 1)
+        if gpu_count > 1:
+            return ParallelTopology(tensor_parallel_size=gpu_count)
+    return ParallelTopology(
+        tensor_parallel_size=int(getattr(spec, "tensor_parallel_size", 1) or 1),
+        pipeline_parallel_size=int(getattr(spec, "pipeline_parallel_size", 1) or 1),
+        expert_parallel_size=int(getattr(spec, "expert_parallel_size", 1) or 1),
+        expert_tensor_parallel_size=_optional_positive_int(getattr(spec, "expert_tensor_parallel_size", None)),
+        context_parallel_size=int(getattr(spec, "context_parallel_size", 1) or 1),
+    )
+
+
+def _optional_positive_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    out = int(value)
+    return out if out > 0 else None
+
+
+def _ray_namespace() -> str:
+    env_ns = None
+    try:
+        import os
+
+        env_ns = os.environ.get("MINT_RAY_NAMESPACE")
+    except Exception:
+        env_ns = None
+    if env_ns:
+        return str(env_ns)
+    try:
+        from ..config import RAY_NAMESPACE
+
+        return str(RAY_NAMESPACE)
+    except Exception:
+        return "mint"
+
+
 def _normalize_gpu_by_node(values: Mapping[str, int]) -> GpuByNode:
     normalized: dict[str, int] = {}
     for raw_node_ip, raw_gpu_count in values.items():
@@ -645,6 +958,44 @@ def _ray_get(ref: Any) -> Any:
     return ray.get(ref)
 
 
+def _string_dict(raw: object) -> dict[str, str]:
+    if not isinstance(raw, Mapping):
+        return {}
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def _list_dict(raw: object) -> dict[str, list[str]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            values = [value]
+        elif isinstance(value, Iterable):
+            values = [str(item) for item in value if str(item).strip()]
+        else:
+            values = []
+        out[str(key)] = values
+    return out
+
+
+def _placement_slices_dict(raw: object) -> dict[str, tuple[tuple[str, str, int], ...]]:
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[str, tuple[tuple[str, str, int], ...]] = {}
+    for key, value in raw.items():
+        slices: list[tuple[str, str, int]] = []
+        if isinstance(value, Iterable) and not isinstance(value, str | bytes):
+            for item in value:
+                if isinstance(item, Iterable) and not isinstance(item, str | bytes):
+                    parts = tuple(item)
+                    if len(parts) == 3:
+                        replica_id, node_ip, gpu_count = parts
+                        slices.append((str(replica_id), str(node_ip), int(gpu_count)))
+        out[str(key)] = tuple(slices)
+    return out
+
+
 def _placement_group_rows(table: Mapping[str, Any] | Iterable[Any]) -> tuple[dict[str, Any], ...]:
     if isinstance(table, Mapping):
         values = table.values()
@@ -705,6 +1056,8 @@ def _gpu_by_pinned_node_from_pg(row: Mapping[str, Any]) -> dict[str, int]:
 
 __all__ = [
     "ClusterPlacementController",
+    "PlacementReconcileRequest",
+    "PlacementReconcileResult",
     "PlacementGroupBundleRequest",
     "PlacementBlockReason",
     "PlacementGroupCreateRequest",
@@ -715,4 +1068,5 @@ __all__ = [
     "PlacementReservationSnapshot",
     "PlacementReservationStatus",
     "PlacementReservationToken",
+    "placement_group_bundle_request_for_spec",
 ]

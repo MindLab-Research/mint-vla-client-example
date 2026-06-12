@@ -11,9 +11,12 @@ from mint_server.backend.cluster_placement_controller import (
     PlacementGroupBundleRequest,
     PlacementGroupCreateRequest,
     PlacementGroupCreateStatus,
+    PlacementReconcileRequest,
     PlacementReservationRequest,
     PlacementReservationStatus,
+    placement_group_bundle_request_for_spec,
 )
+from mint_server.backend.model_actor_supervisor import ModelActorSpec
 from mint_server.backend.model_placement_topology import ParallelTopology
 
 
@@ -117,6 +120,80 @@ async def test_cluster_placement_controller_reserves_unpinned_cluster_capacity()
     snapshot = await controller.snapshot()
     assert snapshot.in_flight_gpus_by_node == (("__cluster__", 3),)
     assert snapshot.available_gpus_by_node == (("10.0.0.7", 0), ("10.0.0.8", 1))
+
+
+def test_cluster_placement_controller_builds_backend_attach_compatible_pg_requests() -> None:
+    dense = placement_group_bundle_request_for_spec(
+        ModelActorSpec(
+            domain_key="dense:Qwen/Test",
+            replica_id="replica-0",
+            base_model="Qwen/Test",
+            launcher_key="dense",
+            node_pin="10.0.0.7",
+            gpu_count=1,
+        )
+    )
+    assert dense.placement_group_name == "mint_dense_qwen__test_mint_pg"
+    assert dense.required_gpus_by_node == (("10.0.0.7", 1),)
+
+    vllm = placement_group_bundle_request_for_spec(
+        ModelActorSpec(
+            domain_key="vllm:Qwen/Test",
+            replica_id="replica-0",
+            base_model="Qwen/Test",
+            actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+            launcher_key="vllm",
+            node_pins=("10.0.0.8", "10.0.0.9"),
+            gpu_count=2,
+        )
+    )
+    assert vllm.placement_group_name == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
+    assert vllm.required_gpus_by_node == (("10.0.0.8", 1), ("10.0.0.9", 1))
+    assert vllm.controller_bundle_index == 2
+
+    megatron = placement_group_bundle_request_for_spec(
+        ModelActorSpec(
+            domain_key="megatron:Qwen/Qwen3-30B-A3B",
+            replica_id="replica-0",
+            base_model="Qwen/Qwen3-30B-A3B",
+            launcher_key="megatron",
+            placement_slices=(("replica-0", "10.0.0.10", 2),),
+            gpu_count=2,
+        )
+    )
+    assert megatron.placement_group_name == "mint_megatron_qwen3_30b_a3b_mint_pg"
+    assert megatron.required_gpus_by_node == (("10.0.0.10", 2),)
+
+
+@pytest.mark.anyio
+async def test_cluster_placement_controller_reconcile_returns_node_pins_blocked_and_pg_requests() -> None:
+    controller = ClusterPlacementController(
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 1},
+    )
+    desired = {
+        ("vllm:Qwen/Test", "replica-0"): ModelActorSpec(
+            domain_key="vllm:Qwen/Test",
+            replica_id="replica-0",
+            base_model="Qwen/Test",
+            actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+            node_pin="10.0.0.7",
+            gpu_count=1,
+        )
+    }
+
+    result = await controller.reconcile(
+        PlacementReconcileRequest(
+            desired=desired,
+            protected_actor_names=frozenset({"mint_model_runtime_vllm-qwen-test_replica-0"}),
+        )
+    )
+
+    assert result.ok is True
+    assert result.node_pins_by_label == {"vllm:Qwen/Test::replica-0": ["10.0.0.7"]}
+    assert result.blocked_by_label == {}
+    assert len(result.placement_group_requests) == 1
+    assert result.placement_group_requests[0].placement_group_name == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
+    assert result.protected_actor_names == frozenset({"mint_model_runtime_vllm-qwen-test_replica-0"})
 
 
 @pytest.mark.anyio

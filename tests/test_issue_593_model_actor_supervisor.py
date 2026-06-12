@@ -10,6 +10,10 @@ import pytest
 import yaml
 
 from mint_server.backend.model_actor_inventory import ActorType
+from mint_server.backend.cluster_placement_controller import (
+    ClusterPlacementController,
+    PlacementGroupCreateStatus,
+)
 from mint_server.backend.model_actor_launchers import (
     ModelActorLauncherRegistry,
     _model_runtime_max_claim_for_spec,
@@ -2831,3 +2835,136 @@ async def test_issue_593_supervisor_blocks_placement_capacity_failure_without_cr
     assert replica["last_action"] == "blocked:placement"
     assert "blocker_pg" in replica["last_error"]
     assert synced[-1][0]["status"] == "blocked"
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_precreates_controller_pg_before_runtime() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+    pg_calls: list[dict] = []
+
+    class _ReadyPg:
+        async def ready(self):
+            return self
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        assert pg_calls, "runtime must not be created before controller-created PG is ready"
+        return actor
+
+    async def _create_pg(**kwargs):
+        pg_calls.append(dict(kwargs))
+        return _ReadyPg()
+
+    controller = ClusterPlacementController(
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 1},
+        placement_group_factory=_create_pg,
+    )
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:Qwen/Test",
+                replica_id="replica-0",
+                base_model="Qwen/Test",
+                actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+                node_pin="10.0.0.7",
+                gpu_count=1,
+            )
+        ],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        placement_controller=controller,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    assert len(created) == 1
+    assert len(pg_calls) == 1
+    assert pg_calls[0]["name"] == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
+    assert pg_calls[0]["bundles"] == ({"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1})
+    replica = out["snapshot"]["replicas"]["vllm:Qwen/Test::replica-0"]
+    assert replica["state"] == "healthy"
+    assert replica["node_pins"] == ["10.0.0.7"]
+    assert out["snapshot"]["placement_groups_created_total"] == 1
+    assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_blocks_when_controller_pg_create_blocks() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    class _BlockedPlacementController(ClusterPlacementController):
+        async def create_pg(self, request):
+            from mint_server.backend.cluster_placement_controller import (
+                PlacementBlockReason,
+                PlacementGroupCreateResult,
+            )
+
+            return PlacementGroupCreateResult(
+                status=PlacementGroupCreateStatus.BLOCKED,
+                placement_group_name=request.placement_group_name,
+                reason=PlacementBlockReason.INSUFFICIENT_GPU,
+                message="no gpu",
+                retry_at=123.0,
+            )
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    controller = _BlockedPlacementController(
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 0},
+    )
+    supervisor = ModelActorSupervisor(
+        specs=[
+            ModelActorSpec(
+                domain_key="vllm:Qwen/Test",
+                replica_id="replica-0",
+                base_model="Qwen/Test",
+                actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+                node_pin="10.0.0.7",
+                gpu_count=1,
+            )
+        ],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        placement_controller=controller,
+        **_disabled_control_plane_kwargs(),
+    )
+
+    out = await supervisor.reconcile_once()
+
+    assert created == []
+    replica = out["snapshot"]["replicas"]["vllm:Qwen/Test::replica-0"]
+    assert replica["state"] == "blocked"
+    assert replica["last_action"] == "blocked:placement_group"
+    assert "no gpu" in replica["last_error"]
+    assert replica["placement_retry_at"] == 123.0
+    assert synced[-1][0]["status"] == "blocked"
+
+
+def test_issue_593_supervisor_defaults_to_cluster_placement_controller_for_real_launchers() -> None:
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        **_disabled_control_plane_kwargs(),
+    )
+
+    assert isinstance(supervisor._placement_controller, ClusterPlacementController)

@@ -21,6 +21,12 @@ from ..config import (
 from ..runtime_env import env_nonempty
 from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .cluster_placement_controller import (
+    ClusterPlacementController,
+    PlacementGroupCreateStatus,
+    PlacementReconcileRequest,
+    PlacementReconcileResult,
+)
 from .model_actor_inventory import (
     ActorEntry,
     ActorType,
@@ -432,6 +438,7 @@ OrphanPlacementGroupCleaner = Callable[[dict[tuple[str, str], ModelActorSpec]], 
 PlacementReconciler = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 TopologyResolver = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 NodeMetricsFactory = Callable[[NodeMetricsDaemonSpec], Any | Awaitable[Any]]
+PlacementController = ClusterPlacementController
 SupervisorStateStore = SupervisorMemoryStateStore | SupervisorSQLiteStateStore
 
 
@@ -892,6 +899,31 @@ def _is_ray_get_timeout_error(exc: BaseException) -> bool:
     return False
 
 
+def _observed_free_gpus_by_node() -> dict[str, int]:
+    try:
+        from .node_placement import _list_alive_gpu_nodes
+
+        return {
+            str(node.node_ip): max(0, int(node.available_gpus))
+            for node in _list_alive_gpu_nodes()
+            if str(node.node_ip).strip()
+        }
+    except Exception:
+        logger.debug("[model_actor_supervisor] observed GPU lookup failed", exc_info=True)
+        return {}
+
+
+def _placement_group_table() -> dict[str, Any]:
+    try:
+        import ray
+
+        table = ray.util.placement_group_table()
+        return table if isinstance(table, dict) else {}
+    except Exception:
+        logger.debug("[model_actor_supervisor] placement group table lookup failed", exc_info=True)
+        return {}
+
+
 class ModelActorSupervisorCore:
     def __init__(
         self,
@@ -903,6 +935,7 @@ class ModelActorSupervisorCore:
         scheduler_sync: SchedulerSync | None = None,
         scheduler_stats: SchedulerStats | None = None,
         orphan_pg_cleaner: OrphanPlacementGroupCleaner | None = None,
+        placement_controller: PlacementController | None = None,
         placement_reconciler: PlacementReconciler | None = None,
         topology_resolver: TopologyResolver | None = None,
         topology_manager: TopologyManager | None = None,
@@ -937,9 +970,17 @@ class ModelActorSupervisorCore:
         self._scheduler_sync = scheduler_sync
         self._scheduler_stats = scheduler_stats
         self._orphan_pg_cleaner = orphan_pg_cleaner
-        self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._topology_manager = topology_manager if topology_manager is not None else TopologyManager()
         self._topology_resolver = topology_resolver or self._resolve_topology_placements
+        if placement_controller is not None:
+            self._placement_controller = placement_controller
+            self._placement_reconciler = None
+        elif placement_reconciler is None and runtime_factory is None:
+            self._placement_controller = self._default_placement_controller()
+            self._placement_reconciler = None
+        else:
+            self._placement_controller = None
+            self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._node_metrics_factory = node_metrics_factory
         self._node_metrics_enabled = (
             _node_metrics_enabled_by_default()
@@ -974,6 +1015,7 @@ class ModelActorSupervisorCore:
         self._placement_reconcile_failures_total = 0
         self._topology_reconcile_failures_total = 0
         self._placement_reclaimed_total = 0
+        self._placement_groups_created_total = 0
         self._last_reconcile_at: float | None = None
         self._last_scheduler_sync_at: float | None = None
         self._last_placement_reconcile: dict[str, Any] | None = None
@@ -1013,6 +1055,13 @@ class ModelActorSupervisorCore:
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
+
+    def _default_placement_controller(self) -> ClusterPlacementController:
+        return ClusterPlacementController(
+            observed_free_gpus_by_node=_observed_free_gpus_by_node,
+            placement_group_table=_placement_group_table,
+            placement_reconciler=model_actor_placement_reconciler,
+        )
 
     @staticmethod
     def _default_owner_id() -> str:
@@ -2051,6 +2100,62 @@ class ModelActorSupervisorCore:
             raise
         return actor
 
+    async def _ensure_runtime_placement_group(self, spec: ModelActorSpec) -> dict[str, Any] | None:
+        controller = self._placement_controller
+        if controller is None:
+            return None
+        try:
+            from .cluster_placement_controller import placement_group_bundle_request_for_spec
+
+            create_request = placement_group_bundle_request_for_spec(spec).to_create_request()
+        except ValueError:
+            return None
+        result = await controller.create_pg(create_request)
+        if result.status is PlacementGroupCreateStatus.READY:
+            self._placement_groups_created_total += 1
+            return {
+                "ok": True,
+                "placement_group_name": result.placement_group_name,
+            }
+        return {
+            "ok": False,
+            "placement_group_name": result.placement_group_name,
+            "reason": None if result.reason is None else result.reason.value,
+            "message": result.message,
+            "retry_at": result.retry_at,
+        }
+
+    def _runtime_placement_blocked_state(
+        self,
+        spec: ModelActorSpec,
+        *,
+        original_spec: ModelActorSpec,
+        resolved_node_pins: list[str],
+        pg_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        message = str(pg_result.get("message") or pg_result.get("reason") or "placement group create blocked")
+        placement_group_name = str(pg_result.get("placement_group_name") or "")
+        if placement_group_name:
+            message = f"{placement_group_name}: {message}"
+        return {
+            **self._states.get(spec.key, {}),
+            "domain_key": spec.domain_key,
+            "replica_id": spec.replica_id,
+            "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+            "state": "blocked",
+            "actor_name": spec.normalized_actor_name(),
+            "launcher_key": spec.launcher_key,
+            "node_pins": resolved_node_pins,
+            "worker_aliases": original_spec.normalized_worker_aliases(),
+            "gpu_count": spec.gpu_count,
+            "last_error": f"placement group blocked: {message}",
+            "last_action": "blocked:placement_group",
+            "last_action_at": time.time(),
+            "placement_group_name": placement_group_name or None,
+            "placement_retry_at": pg_result.get("retry_at"),
+            "scheduler_status": "blocked",
+        }
+
     def _replica_registration_for_state(
         self,
         spec: ModelActorSpec,
@@ -2192,7 +2297,32 @@ class ModelActorSupervisorCore:
                     placement_slices=topology_placement_slices.get(label),
                 )
         placement_out: dict[str, Any] = {}
-        if self._placement_reconciler is not None:
+        if self._placement_controller is not None:
+            try:
+                protected_actor_names = self._reconcile_protected_actor_names(resolved_desired)
+                candidate = await self._placement_controller.reconcile(
+                    PlacementReconcileRequest(
+                        desired=dict(resolved_desired),
+                        protected_actor_names=frozenset(protected_actor_names),
+                    )
+                )
+                if isinstance(candidate, PlacementReconcileResult):
+                    placement_out = candidate.to_legacy_dict()
+                elif isinstance(candidate, dict):
+                    placement_out = candidate
+                else:
+                    placement_out = {"ok": True, "result": candidate}
+                self._last_placement_reconcile = dict(placement_out)
+            except Exception as e:
+                self._placement_reconcile_failures_total += 1
+                placement_out = {"ok": False, "error": f"{type(e).__name__}: {e}", "blocked": {}}
+                self._last_placement_reconcile = dict(placement_out)
+                logger.warning(
+                    "[model_actor_supervisor] placement controller reconcile failed: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+        elif self._placement_reconciler is not None:
             try:
                 protected_actor_names = self._reconcile_protected_actor_names(resolved_desired)
                 try:
@@ -2307,6 +2437,17 @@ class ModelActorSupervisorCore:
 
             actor = self._actors.get(key)
             if actor is None:
+                pg_result = await self._ensure_runtime_placement_group(spec)
+                if pg_result is not None and not bool(pg_result.get("ok")):
+                    self._blocked_total += 1
+                    self._states[key] = self._runtime_placement_blocked_state(
+                        spec,
+                        original_spec=original_spec,
+                        resolved_node_pins=resolved_node_pins,
+                        pg_result=pg_result,
+                    )
+                    results[label] = self._states[key]
+                    continue
                 try:
                     await self._create_runtime(spec, reason="missing")
                 except Exception as e:
@@ -2388,6 +2529,17 @@ class ModelActorSupervisorCore:
                     self._actors.pop(key, None)
                     self._actor_generations.pop(key, None)
                     try:
+                        pg_result = await self._ensure_runtime_placement_group(spec)
+                        if pg_result is not None and not bool(pg_result.get("ok")):
+                            self._blocked_total += 1
+                            self._states[key] = self._runtime_placement_blocked_state(
+                                spec,
+                                original_spec=original_spec,
+                                resolved_node_pins=resolved_node_pins,
+                                pg_result=pg_result,
+                            )
+                            results[label] = self._states[key]
+                            continue
                         await self._create_runtime(spec, reason="unhealthy")
                         self._states[key]["crash_count"] = crash_count
                     except Exception as e:
@@ -2488,6 +2640,17 @@ class ModelActorSupervisorCore:
                 self._actors.pop(key, None)
                 self._actor_generations.pop(key, None)
                 try:
+                    pg_result = await self._ensure_runtime_placement_group(spec)
+                    if pg_result is not None and not bool(pg_result.get("ok")):
+                        self._blocked_total += 1
+                        self._states[key] = self._runtime_placement_blocked_state(
+                            spec,
+                            original_spec=original_spec,
+                            resolved_node_pins=resolved_node_pins,
+                            pg_result=pg_result,
+                        )
+                        results[label] = self._states[key]
+                        continue
                     await self._create_runtime(spec, reason="dead")
                     self._states[key]["crash_count"] = crash_count
                 except Exception as create_error:
@@ -2776,6 +2939,7 @@ class ModelActorSupervisorCore:
             "control_plane_ensure_failures_total": int(self._control_plane_ensure_failures_total),
             "state_store_failures_total": int(self._state_store_failures_total),
             "placement_reclaimed_total": int(self._placement_reclaimed_total),
+            "placement_groups_created_total": int(self._placement_groups_created_total),
             "last_reconcile_at": self._last_reconcile_at,
             "reconcile_inflight": bool(self._reconcile_inflight),
             "reconcile_inflight_started_at": self._reconcile_inflight_started_at,
