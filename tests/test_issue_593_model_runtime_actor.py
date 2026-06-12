@@ -185,8 +185,16 @@ class _FakeScheduler:
 
 
 class _FakeEngineLifecycle:
-    def __init__(self, *, ready: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        ready: bool = True,
+        ready_after_restart: bool = True,
+        restart_event: asyncio.Event | None = None,
+    ) -> None:
         self.ready = bool(ready)
+        self.ready_after_restart = bool(ready_after_restart)
+        self.restart_event = restart_event
         self.unhealthy_reasons: list[str] = []
         self.restart_calls = 0
 
@@ -199,7 +207,9 @@ class _FakeEngineLifecycle:
 
     async def restart(self) -> None:
         self.restart_calls += 1
-        self.ready = True
+        if self.restart_event is not None:
+            await self.restart_event.wait()
+        self.ready = self.ready_after_restart
 
 
 class _FakeTaskFutureService:
@@ -858,6 +868,80 @@ async def test_model_engine_host_resumes_durable_finalize_on_engine_death() -> N
     assert snapshot["completed_total"] == 1
     assert snapshot["failed_total"] == 0
     assert snapshot["active_lease_count"] == 0
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_self_exits_when_engine_restart_times_out() -> None:
+    lease = _lease("runtime-req-engine-restart-timeout")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    engine = _FakeEngineLifecycle(restart_event=asyncio.Event())
+    self_exit_reasons: list[str] = []
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="fatal_backend_death", error="engine never restarted")
+
+    async def _self_exit(reason: str) -> None:
+        self_exit_reasons.append(str(reason))
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,  # type: ignore[arg-type]
+        task_futures_client=task_futures,
+        engine_lifecycle=engine,
+        engine_restart_timeout_s=0.01,
+        self_exit=_self_exit,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert engine.restart_calls == 1
+    assert len(self_exit_reasons) == 1
+    assert "engine restart exceeded 0.01s" in self_exit_reasons[0]
+    snapshot = actor.health_snapshot()
+    assert snapshot["running"] is False
+    assert snapshot["draining"] is True
+    assert snapshot["engine_restart_timed_out"] is True
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_self_exits_when_engine_stays_unready_past_restart_deadline() -> None:
+    lease = _lease("runtime-req-engine-stays-unready")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    engine = _FakeEngineLifecycle(ready_after_restart=False)
+    self_exit_reasons: list[str] = []
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="fatal_backend_death", error="engine stays unready")
+
+    async def _self_exit(reason: str) -> None:
+        self_exit_reasons.append(str(reason))
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,  # type: ignore[arg-type]
+        task_futures_client=task_futures,
+        engine_lifecycle=engine,
+        engine_restart_timeout_s=0.01,
+        self_exit=_self_exit,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert self_exit_reasons == []
+    await asyncio.sleep(0.02)
+    assert await actor.run_once() == {"claimed": 0, "executed": 0, "engine_ready": False, "self_exit": True}
+    assert len(self_exit_reasons) == 1
+    assert "engine restart deadline exceeded" in self_exit_reasons[0]
+    snapshot = actor.health_snapshot()
+    assert snapshot["running"] is False
+    assert snapshot["draining"] is True
+    assert snapshot["engine_restart_timed_out"] is True
 
 
 @pytest.mark.anyio

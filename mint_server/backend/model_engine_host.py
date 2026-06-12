@@ -38,10 +38,12 @@ logger = logging.getLogger(__name__)
 ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None] | ExecutorOutcome | None]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
 EngineLifecycleHook = Any
+SelfExitHook = Callable[[str], Awaitable[None] | None]
 _EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
 VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
+ENGINE_RESTART_TIMEOUT_S = 30.0 * 60.0
 
 
 class EngineDeathLeaseDisposition(StrEnum):
@@ -152,6 +154,7 @@ class ModelEngineHostConfig:
     max_claim: int = 1
     token_budget: int | None = None
     execution_timeout_s: float | None = None
+    engine_restart_timeout_s: float = ENGINE_RESTART_TIMEOUT_S
     runtime_env_fingerprint: str | None = None
 
     @property
@@ -206,6 +209,7 @@ def get_or_create_model_engine_host(
     max_claim: int = 1,
     token_budget: int | None = None,
     execution_timeout_s: float | None = None,
+    engine_restart_timeout_s: float | None = None,
     runtime_env_extra: dict[str, str] | None = None,
 ) -> Any:
     import ray
@@ -287,6 +291,7 @@ def get_or_create_model_engine_host(
         max_claim=max_claim,
         token_budget=token_budget,
         execution_timeout_s=execution_timeout_s,
+        engine_restart_timeout_s=engine_restart_timeout_s,
         runtime_env_fingerprint=expected_runtime_env_fingerprint,
         ray_address=ray_address,
     )
@@ -363,6 +368,8 @@ class ModelEngineHost:
         executor: ModelWorkExecutor | None = None,
         token_budget_provider: TokenBudgetProvider | None = None,
         engine_lifecycle: EngineLifecycleHook | None = None,
+        engine_restart_timeout_s: float | None = None,
+        self_exit: SelfExitHook | None = None,
         ray_address: str | None = None,
     ) -> None:
         domain = str(domain_key).strip()
@@ -403,6 +410,17 @@ class ModelEngineHost:
                 if execution_timeout_s is not None
                 else os.environ.get("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_S")
             ),
+            engine_restart_timeout_s=max(
+                0.001,
+                float(
+                    engine_restart_timeout_s
+                    if engine_restart_timeout_s is not None
+                    else os.environ.get(
+                        "MINT_MODEL_RUNTIME_ENGINE_RESTART_TIMEOUT_S",
+                        str(ENGINE_RESTART_TIMEOUT_S),
+                    )
+                ),
+            ),
             runtime_env_fingerprint=runtime_env_fingerprint,
         )
         self._scheduler = scheduler_client if scheduler_client is not None else model_work_scheduler
@@ -416,6 +434,7 @@ class ModelEngineHost:
             token_budget_provider if token_budget_provider is not None else self._default_token_budget_provider
         )
         self._engine_lifecycle = engine_lifecycle
+        self._self_exit = self_exit if self_exit is not None else self._ray_actor_self_exit
 
         self._running = False
         self._draining = False
@@ -424,6 +443,8 @@ class ModelEngineHost:
         self._engine_restart_deadline_at: float | None = None
         self._engine_restart_count = 0
         self._engine_failure_epoch = 0
+        self._engine_restart_timed_out = False
+        self._self_exit_requested = False
         self._engine_death_lock = asyncio.Lock()
         self._loop_task: asyncio.Task | None = None
         self._active_request_id: str | None = None
@@ -496,7 +517,10 @@ class ModelEngineHost:
             "engine_restarting": bool(self._engine_restarting),
             "engine_restart_deadline_at": self._engine_restart_deadline_at,
             "engine_restart_count": int(self._engine_restart_count),
+            "engine_restart_timeout_s": float(self._config.engine_restart_timeout_s),
+            "engine_restart_timed_out": bool(self._engine_restart_timed_out),
             "engine_failure_epoch": int(self._engine_failure_epoch),
+            "self_exit_requested": bool(self._self_exit_requested),
             "started_at": float(self._started_at),
             "last_claimed_at": self._last_claimed_at,
             "last_completed_at": self._last_completed_at,
@@ -571,8 +595,12 @@ class ModelEngineHost:
     async def run_once(self) -> dict[str, Any]:
         if self._draining:
             return {"claimed": 0, "executed": 0, "draining": True}
+        if await self._engine_restart_deadline_expired():
+            return {"claimed": 0, "executed": 0, "engine_ready": False, "self_exit": True}
         engine_ready = await self._engine_is_ready()
         if not engine_ready:
+            if await self._engine_restart_deadline_expired():
+                return {"claimed": 0, "executed": 0, "engine_ready": False, "self_exit": True}
             self._empty_polls_total += 1
             return {"claimed": 0, "executed": 0, "engine_ready": False}
         max_items, token_budget = await self._claim_limits()
@@ -927,6 +955,50 @@ class ModelEngineHost:
             self._engine_ready = False
             return False
 
+    async def _ray_actor_self_exit(self, reason: str) -> None:
+        logger.error(
+            "[model_runtime] self exiting actor=%s domain=%s replica=%s reason=%s",
+            self._config.actor_name,
+            self._config.domain_key,
+            self._config.replica_id,
+            reason,
+        )
+        try:
+            import ray
+
+            actor_module = getattr(ray, "actor", None)
+            exit_actor = getattr(actor_module, "exit_actor", None)
+            if callable(exit_actor):
+                exit_actor()
+        except Exception:
+            pass
+
+    async def _request_self_exit(self, reason: str) -> None:
+        if self._self_exit_requested:
+            return
+        self._self_exit_requested = True
+        self._engine_restart_timed_out = True
+        self._running = False
+        self._draining = True
+        self._record_error(RuntimeError(reason))
+        out = self._self_exit(str(reason))
+        if inspect.isawaitable(out):
+            await out
+
+    async def _engine_restart_deadline_expired(self) -> bool:
+        deadline = self._engine_restart_deadline_at
+        if deadline is None:
+            return False
+        if self._engine_ready is not False:
+            return False
+        if time.time() < float(deadline):
+            return False
+        await self._request_self_exit(
+            "engine restart deadline exceeded "
+            f"timeout_s={self._config.engine_restart_timeout_s:.2f}"
+        )
+        return True
+
     async def _mark_engine_unhealthy(self, reason: str) -> None:
         self._engine_ready = False
         marker = getattr(self._engine_lifecycle, "mark_unhealthy", None)
@@ -937,15 +1009,19 @@ class ModelEngineHost:
 
     async def _restart_engine(self) -> None:
         self._engine_restarting = True
-        self._engine_restart_deadline_at = time.time() + 30.0 * 60.0
+        timeout_s = float(self._config.engine_restart_timeout_s)
+        self._engine_restart_deadline_at = time.time() + timeout_s
         self._engine_restart_count += 1
         restarter = getattr(self._engine_lifecycle, "restart", None)
         try:
             if callable(restarter):
                 out = restarter()
                 if inspect.isawaitable(out):
-                    await out
+                    await asyncio.wait_for(out, timeout=timeout_s)
             self._engine_ready = await self._engine_is_ready()
+        except TimeoutError:
+            self._engine_ready = False
+            await self._request_self_exit(f"engine restart exceeded {timeout_s:g}s")
         finally:
             self._engine_restarting = False
 
