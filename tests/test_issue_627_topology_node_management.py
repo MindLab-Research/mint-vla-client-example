@@ -62,7 +62,14 @@ class _FakeVolcanoClient:
 
     def list_jobs(self, request):
         self.list_jobs_requests.append(request)
-        return _SdkModel(items=self.jobs)
+        jobs = self.jobs
+        state = str(getattr(request, "state", "") or "").strip()
+        if state:
+            jobs = [job for job in jobs if str(getattr(getattr(job, "status", None), "state", "") or "").strip() == state]
+        page_size = int(getattr(request, "page_size", 0) or len(self.jobs) or 1)
+        page_number = int(getattr(request, "page_number", 1) or 1)
+        start = (page_number - 1) * page_size
+        return _SdkModel(items=jobs[start : start + page_size])
 
     def list_job_instances(self, request):
         self.list_job_instances_requests.append(request)
@@ -909,6 +916,71 @@ def test_issue_627_volcano_provider_treats_deploying_as_live_and_dedupes_alias(
     assert states[0].raw_state == "Queueing"
 
 
+def test_volcano_provider_paginates_and_prefers_running_task_with_node_ip(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    config = load_topology_config(_write_topology_config(tmp_path))
+    noise_jobs = [
+        _SdkModel(id=f"t-noise-{idx}", name="mint-prod-worker-8", status=_SdkModel(state="Failed"))
+        for idx in range(99)
+    ]
+    client = _FakeVolcanoClient(
+        jobs=[
+            _SdkModel(id="t-new", name="mint-prod-worker-1", status=_SdkModel(state="Queueing")),
+            *noise_jobs,
+            _SdkModel(id="t-old", name="mint-prod-worker-1", status=_SdkModel(state="Running")),
+        ],
+        instances={
+            "t-old": [
+                _SdkModel(ips=_SdkModel(primary_ip="10.0.0.7")),
+            ],
+        },
+    )
+
+    states = list(VolcanoTopologyProvider(client=client).list_tasks(config))
+
+    assert len(states) == 1
+    assert states[0].task_id == "t-old"
+    assert states[0].raw_state == "Running"
+    assert states[0].node_ip == "10.0.0.7"
+    assert [(request.state, request.page_number) for request in client.list_jobs_requests] == [("Running", 1)]
+
+
+def test_volcano_provider_paginates_filtered_running_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    _install_fake_volcano_sdk(monkeypatch)
+    config = load_topology_config(_write_topology_config(tmp_path))
+    running_noise = [
+        _SdkModel(id=f"t-running-noise-{idx}", name="mint-prod-worker-8", status=_SdkModel(state="Running"))
+        for idx in range(100)
+    ]
+    client = _FakeVolcanoClient(
+        jobs=[
+            *running_noise,
+            _SdkModel(id="t-old", name="mint-prod-worker-1", status=_SdkModel(state="Running")),
+        ],
+        instances={
+            "t-old": [
+                _SdkModel(ips=_SdkModel(primary_ip="10.0.0.7")),
+            ],
+        },
+    )
+
+    states = list(VolcanoTopologyProvider(client=client).list_tasks(config))
+
+    assert len(states) == 1
+    assert states[0].task_id == "t-old"
+    assert states[0].node_ip == "10.0.0.7"
+    assert [(request.state, request.page_number) for request in client.list_jobs_requests] == [
+        ("Running", 1),
+        ("Running", 2),
+    ]
+
+
 def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -939,6 +1011,7 @@ def test_issue_627_volcano_provider_uses_sdk_default_credentials_not_submit_host
 
     assert states[0].task_name == "mint-prod-worker-1"
     assert client.list_jobs_requests[0].page_size == 100
+    assert client.list_jobs_requests[0].state == "Running"
 
 
 def test_issue_627_volcano_sdk_jobs_list_clamps_page_size(

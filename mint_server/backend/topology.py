@@ -117,13 +117,22 @@ ProviderTaskSubmitter = Callable[[TopologyConfig, TopologyNodeDesired], Any]
 RayNodeLister = Callable[[], Iterable[RayNodeState]]
 
 LIVE_PROVIDER_TASK_STATES = {
+    "Creating",
     "Deploying",
     "Initialized",
     "Queue",
     "Queueing",
     "Running",
     "Staging",
+    "Waiting",
 }
+LIVE_PROVIDER_TASK_QUERY_STATES = (
+    "Running",
+    "Deploying",
+    "Queueing",
+    "Waiting",
+    "Creating",
+)
 TERMINAL_PROVIDER_TASK_STATES = {"Succeeded", "Failed", "Cancelled", "Stopped", "Killing", "Terminated"}
 
 
@@ -498,8 +507,10 @@ def _job_name(task: Any) -> str:
     return str(_object_get(task, "JobName", "Name", "name") or "").strip()
 
 
-def _provider_task_sort_key(state: ProviderTaskState) -> tuple[int, str]:
-    return (1 if state.live else 0, state.task_id or "")
+def _provider_task_sort_key(state: ProviderTaskState) -> tuple[int, int, int, str]:
+    has_node_ip = 1 if state.node_ip else 0
+    is_running = 1 if state.raw_state == "Running" else 0
+    return (1 if state.live else 0, has_node_ip, is_running, state.task_id or "")
 
 
 def _extract_instance_node_ip(instance: Any) -> str | None:
@@ -538,54 +549,69 @@ class VolcanoTopologyProvider:
 
     def list_tasks(self, config: TopologyConfig) -> Iterable[ProviderTaskState]:
         sdk = _volcano_sdk_module()
-        response = self.client.list_jobs(
-            sdk.ListJobsRequest(
-                name_contains=f"mint-{config.deployment_env}-worker-",
-                page_number=1,
-                page_size=100,
-            )
-        )
-        tasks = _object_get(response, "Items", "items") or []
         task_names = {
             stable_provider_task_name(config.deployment_env, alias): alias
             for alias in config.nodes
         }
         states_by_alias: dict[str, ProviderTaskState] = {}
-        for task in tasks:
-            task_name = _job_name(task)
-            alias = task_names.get(task_name)
-            if alias is None:
-                continue
-            raw_state = _job_state(task)
-            live = raw_state in LIVE_PROVIDER_TASK_STATES
-            task_id = _job_id(task)
-            node_ip = None
-            error = None
-            if live and task_id:
-                try:
-                    instance_response = self.client.list_job_instances(
-                        sdk.ListJobInstancesRequest(job_id=task_id, page_number=1, page_size=20)
+        page_size = 100
+        for query_state in LIVE_PROVIDER_TASK_QUERY_STATES:
+            page_number = 1
+            while True:
+                response = self.client.list_jobs(
+                    sdk.ListJobsRequest(
+                        name_contains=f"mint-{config.deployment_env}-worker-",
+                        page_number=page_number,
+                        page_size=page_size,
+                        state=query_state,
                     )
-                    for instance in _object_get(instance_response, "Items", "items") or []:
-                        node_ip = _extract_instance_node_ip(instance)
-                        if node_ip:
-                            break
-                except Exception as e:
-                    error = f"volcano list_job_instances failed: {type(e).__name__}: {e}"
-            state = ProviderTaskState(
-                alias=alias,
-                provider="volcano",
-                task_name=task_name,
-                live=live,
-                task_id=task_id,
-                node_ip=node_ip,
-                gpu_count=_task_gpu_count(task),
-                raw_state=raw_state,
-                error=error,
-            )
-            previous = states_by_alias.get(alias)
-            if previous is None or _provider_task_sort_key(state) > _provider_task_sort_key(previous):
-                states_by_alias[alias] = state
+                )
+                tasks = _object_get(response, "Items", "items") or []
+                for task in tasks:
+                    task_name = _job_name(task)
+                    alias = task_names.get(task_name)
+                    if alias is None:
+                        continue
+                    raw_state = _job_state(task)
+                    live = raw_state in LIVE_PROVIDER_TASK_STATES
+                    task_id = _job_id(task)
+                    node_ip = None
+                    error = None
+                    if live and task_id:
+                        try:
+                            instance_response = self.client.list_job_instances(
+                                sdk.ListJobInstancesRequest(job_id=task_id, page_number=1, page_size=20)
+                            )
+                            for instance in _object_get(instance_response, "Items", "items") or []:
+                                node_ip = _extract_instance_node_ip(instance)
+                                if node_ip:
+                                    break
+                        except Exception as e:
+                            error = f"volcano list_job_instances failed: {type(e).__name__}: {e}"
+                    state = ProviderTaskState(
+                        alias=alias,
+                        provider="volcano",
+                        task_name=task_name,
+                        live=live,
+                        task_id=task_id,
+                        node_ip=node_ip,
+                        gpu_count=_task_gpu_count(task),
+                        raw_state=raw_state,
+                        error=error,
+                    )
+                    previous = states_by_alias.get(alias)
+                    if previous is None or _provider_task_sort_key(state) > _provider_task_sort_key(previous):
+                        states_by_alias[alias] = state
+                if len(tasks) < page_size:
+                    break
+                page_number += 1
+            if states_by_alias and all(
+                _provider_task_sort_key(state) >= (1, 1, 1, "")
+                for state in states_by_alias.values()
+            ):
+                missing_aliases = set(config.nodes) - set(states_by_alias)
+                if not missing_aliases:
+                    break
         return states_by_alias.values()
 
     def submit_task(self, config: TopologyConfig, node: TopologyNodeDesired) -> None:
