@@ -90,20 +90,19 @@ class _FakeScheduler:
     def __init__(
         self,
         claims: list[list[dict]] | None = None,
-        complete_ok: bool = True,
+        finish_ok: bool = True,
         begin_finalize_ok: bool = True,
         finish_success_error: Exception | None = None,
         finish_failure_error: Exception | None = None,
     ) -> None:
         self.claims = claims or []
-        self.complete_ok = bool(complete_ok)
+        self.finish_ok = bool(finish_ok)
         self.begin_finalize_ok = bool(begin_finalize_ok)
         self.finish_success_error = finish_success_error
         self.finish_failure_error = finish_failure_error
         self.claim_calls: list[dict] = []
         self.renewed: list[dict] = []
         self.begin_finalized: list[dict] = []
-        self.completed: list[dict] = []
         self.finished_success: list[dict] = []
         self.finished_failure: list[dict] = []
         self.failed: list[dict] = []
@@ -151,19 +150,12 @@ class _FakeScheduler:
             }
         return {"ok": True, **kwargs}
 
-    async def complete(self, **kwargs):
-        kwargs = self._kwargs_with_lease_fields(kwargs)
-        self.completed.append(kwargs)
-        if not self.complete_ok:
-            return {"ok": False, "reason": "unknown_lease", **kwargs}
-        return {"ok": True, **kwargs}
-
     async def finish_success(self, **kwargs):
         kwargs = self._kwargs_with_lease_fields(kwargs, include_full=True)
         self.finished_success.append(kwargs)
         if self.finish_success_error is not None:
             raise self.finish_success_error
-        if not self.complete_ok:
+        if not self.finish_ok:
             return {"ok": False, "reason": "unknown_lease", **kwargs}
         return {
             "ok": True,
@@ -460,7 +452,6 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     assert scheduler.begin_finalized[0]["staged_payload_path"].endswith(
         "/ru/runtime-req-1/attempt-runtime-req-1__lease-runtime-req-1.json"
     )
-    assert scheduler.completed == []
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 1
@@ -642,7 +633,6 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
     assert task_futures.resolved == []
     assert task_state_store.successes == []
     assert len(scheduler.finished_success) == 1
-    assert scheduler.completed == []
     assert scheduler.failed == []
     assert actor.health_snapshot()["completed_total"] == 1
 
@@ -724,7 +714,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_user_er
     assert task_futures.failed == []
     assert task_state_store.failures == []
     assert len(scheduler.finished_failure) == 1
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     assert scheduler.failed == []
     assert actor.health_snapshot()["failed_total"] == 1
 
@@ -767,7 +757,7 @@ async def test_issue_593_model_runtime_executor_exception_requeues_lease() -> No
             "abort_finalize": True,
         }
     ]
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
     assert snapshot["failed_total"] == 0
@@ -1259,7 +1249,7 @@ async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease()
             ),
         )
     ]
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
@@ -1581,7 +1571,7 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
             error="engine startup failed",
         )
     ]
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     assert scheduler.failed == []
     snapshot = actor.health_snapshot()
     assert snapshot["completed_total"] == 0
@@ -1614,7 +1604,6 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == []
-    assert scheduler.completed == []
     assert len(scheduler.finished_success) == 1
     assert scheduler.failed == [
         {
@@ -1651,7 +1640,7 @@ async def test_issue_593_model_runtime_completes_without_task_state_finalize_met
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.resolved == [(lease["item"]["request_id"], {"ok": True})]
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     assert scheduler.failed == [
         {
             "lease_id": lease["lease_id"],
@@ -1876,7 +1865,7 @@ async def test_issue_593_model_runtime_requeues_if_task_state_user_error_finish_
 
     assert result == {"claimed": 1, "executed": 1}
     assert task_futures.failed == []
-    assert scheduler.completed == []
+    assert scheduler.finished_success == []
     assert len(scheduler.finished_failure) == 1
     assert scheduler.failed == [
         {
@@ -1953,7 +1942,6 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
 
     assert result == {"claimed": 1, "executed": 1}
     assert executed is False
-    assert scheduler.completed == []
     assert scheduler.finished_success == [
         {
             "request_id": "runtime-req-done",
