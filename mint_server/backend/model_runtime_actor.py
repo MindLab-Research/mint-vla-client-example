@@ -1051,7 +1051,7 @@ class ModelRuntimeActor:
         return result
 
     async def _run_executor(self, lease: dict[str, Any]) -> ExecutorOutcome:
-        item = lease.get("item") if isinstance(lease, dict) else {}
+        item = _lease_item_wire(lease)
         tracer = get_otel_tracer()
         if tracer is None:
             return await self._call_executor(lease) or ExecutorOutcome(kind="success")
