@@ -1947,7 +1947,7 @@ class _ModelWorkSchedulerActor:
                 request_id=request_id,
                 cancelled=removed,
                 was_terminal=not removed,
-                reason=str(reason),
+                reason=ConflictReason.CANCELLED,
             )
 
     async def contains_request(
@@ -2464,7 +2464,7 @@ class _ModelWorkSchedulerActor:
                 raise
             if isinstance(renewed, TaskMutationResult):
                 if not renewed.ok:
-                    renew_rejected = str(renewed.reason or "renew_rejected")
+                    renew_rejected = renewed.reason or ConflictReason.RENEW_REJECTED
                 record = renewed.record
                 if isinstance(record, dict) and record.get("lease_expires_at") is not None:
                     new_expires_at = float(record["lease_expires_at"])
@@ -2480,7 +2480,7 @@ class _ModelWorkSchedulerActor:
             ):
                 return LeaseResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
             if renew_rejected is not None:
-                if renew_rejected == "terminal":
+                if renew_rejected == ConflictReason.TERMINAL:
                     self._remove_request_from_memory_locked(request_id)
                     self._cv.notify_all()
                 return LeaseResult(ok=False, reason=renew_rejected)

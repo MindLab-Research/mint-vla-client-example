@@ -42,6 +42,7 @@ class SchedulerQueueOp(StrEnum):
 class ConflictReason(StrEnum):
     ADMISSION_REJECTED = "admission_rejected"
     ALREADY_TERMINAL = "already_terminal"
+    CANCELLED = "cancelled"
     CANCELLED_AFTER_REQUEUE_COMMIT = "cancelled_after_requeue_commit"
     DOMAIN_INFLIGHT_LIMIT_EXCEEDED = "domain_inflight_limit_exceeded"
     DOMAIN_TOKEN_BUDGET_EXCEEDED = "domain_token_budget_exceeded"
@@ -59,6 +60,7 @@ class ConflictReason(StrEnum):
     PRINCIPAL_DOMAIN_INFLIGHT_LIMIT_EXCEEDED = "principal_domain_inflight_limit_exceeded"
     PRINCIPAL_DOMAIN_TOKEN_BUDGET_EXCEEDED = "principal_domain_token_budget_exceeded"
     RETRY_REQUIRED = "retry_required"
+    RENEW_REJECTED = "renew_rejected"
     STALE_CONSUMER = "stale_consumer"
     STALE_EPOCH = "stale_epoch"
     STALE_GENERATION = "stale_generation"

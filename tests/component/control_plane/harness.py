@@ -413,6 +413,7 @@ class SchedulerComponentWorld:
                 task_ledger_client=self.task_ledger if scheduler_override is None else self.task_state,
             ),
         )
+        monkeypatch.setattr(futures_route, "task_payload_store", self.payload_store)
         monkeypatch.setattr(futures_route, "_retrieve_wait_timeout_s", lambda: float(wait_timeout_s))
         monkeypatch.setattr(futures_route, "_is_privileged", lambda _request: bool(admin))
         response = SimpleNamespace(status_code=200, headers={})

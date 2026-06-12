@@ -93,6 +93,13 @@ def _scheduler_lease_token(lease: dict[str, Any]) -> LeaseToken:
         return _legacy_lease_token(lease)
 
 
+def _lease_item_wire(lease: dict[str, Any]) -> dict[str, Any]:
+    item = lease.get("item") if isinstance(lease, dict) else None
+    if not isinstance(item, dict):
+        raise RuntimeError(f"model work lease missing item: {lease!r}")
+    return item
+
+
 def _outcome_from_finalize_buffer(finalize_buffer: ModelWorkFinalizeBuffer) -> ExecutorOutcome | None:
     finalization = finalize_buffer.finalization
     if finalization is None:
@@ -815,7 +822,7 @@ class ModelRuntimeActor:
             )
 
     async def _status_is_pending(self, lease: dict[str, Any]) -> bool:
-        item = lease["item"]
+        item = _lease_item_wire(lease)
         request_id = str(item["request_id"])
         token = _scheduler_lease_token(lease)
         try:
@@ -862,7 +869,7 @@ class ModelRuntimeActor:
         attempt_id = _scheduler_lease_token(lease).attempt_id or None
         if attempt_id:
             return attempt_id
-        item = lease.get("item") if isinstance(lease, dict) else {}
+        item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
         return str(extra.get("model_work_attempt_id") or "") or None
 
@@ -871,7 +878,7 @@ class ModelRuntimeActor:
         return f"{token.attempt_id}__{token.lease_id}"
 
     def _staged_payload_path_for_lease(self, lease: dict[str, Any]) -> str:
-        item = lease["item"]
+        item = _lease_item_wire(lease)
         return str(
             self._payload_store.payload_path(
                 request_id=str(item["request_id"]),
@@ -886,7 +893,7 @@ class ModelRuntimeActor:
         payload: Any,
     ) -> dict[str, Any]:
         self._require_task_state_finalize(lease)
-        item = lease["item"]
+        item = _lease_item_wire(lease)
         request_id = str(item["request_id"])
         return await asyncio.to_thread(
             self._payload_store.write_json_payload,
@@ -896,7 +903,7 @@ class ModelRuntimeActor:
         )
 
     async def _mark_running(self, lease: dict[str, Any]) -> None:
-        item = lease["item"]
+        item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) else {}
         extra = extra if isinstance(extra, dict) else {}
         running_at = time.time()
@@ -1082,7 +1089,7 @@ class ModelRuntimeActor:
             return out or ExecutorOutcome(kind="success")
 
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
-        item = lease["item"]
+        item = _lease_item_wire(lease)
         request_id = str(item["request_id"])
         legacy_token = _legacy_lease_token(lease)
         lease_id = legacy_token.lease_id

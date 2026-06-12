@@ -1543,7 +1543,7 @@ class TaskStateStore:
             metadata=metadata,
             billing_observations=billing_observations,
             now=now,
-        )
+        ).to_wire()
 
     def stage_payload(
         self,
@@ -1610,7 +1610,7 @@ class TaskStateStore:
         result_size_bytes: int | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._complete_task_direct(
             request_id=request_id,
             status="failed",
@@ -2132,9 +2132,9 @@ class TaskStateStore:
         metadata: dict[str, Any] | None,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
-        out: dict[str, Any]
+        out: TaskMutationResult
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -2145,7 +2145,7 @@ class TaskStateStore:
                     and row["result_size_bytes"] == result_size_bytes
                     and row["error"] == error
                 ):
-                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                    out = TaskMutationResult(ok=True, idempotent=True, record=self._row_to_record(row))
                 else:
                     raise TaskStateConflictError("terminal task commit payload mismatch")
             else:
@@ -2195,18 +2195,29 @@ class TaskStateStore:
                     },
                     now=ts,
                 )
-                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                out = TaskMutationResult(
+                    ok=True,
+                    idempotent=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
         if status == "done" and billing_observations:
             billing_metadata = self._append_billing_outbox_after_terminal_success(
                 observations=billing_observations,
                 source="task_terminal",
                 now=ts,
             )
-            out["record"] = self._best_effort_update_billing_metadata(
-                request_id=request_id,
-                metadata=billing_metadata,
-                now=ts,
-                fallback=dict(out["record"]),
+            out = TaskMutationResult(
+                ok=out.ok,
+                record=self._best_effort_update_billing_metadata(
+                    request_id=request_id,
+                    metadata=billing_metadata,
+                    now=ts,
+                    fallback=dict(out.record or {}),
+                ),
+                reason=out.reason,
+                idempotent=out.idempotent,
+                retry_required=out.retry_required,
+                deleted=out.deleted,
             )
         return out
 
@@ -3660,7 +3671,7 @@ class _TaskStateStoreActor:
     def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.complete_task_failure(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.mark_task_retrieved(**kwargs)

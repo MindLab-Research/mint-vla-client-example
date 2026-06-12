@@ -121,6 +121,7 @@ def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -
         "begin_finalize": "TaskMutationResult",
         "commit_finalize_success": "TaskMutationResult",
         "commit_finalize_failure": "TaskMutationResult",
+        "complete_task_failure": "TaskMutationResult",
         "requeue_task": "TaskMutationResult",
     }
     for name, expected in expected_returns.items():
@@ -146,6 +147,7 @@ def test_task_state_store_actor_ledger_methods_wire_typed_results() -> None:
         "begin_finalize",
         "commit_finalize_success",
         "commit_finalize_failure",
+        "complete_task_failure",
         "requeue_task",
     ):
         fn_source = ast.get_source_segment(source, functions[name]) or ""
@@ -472,6 +474,18 @@ def test_model_work_retrieve_route_uses_gateway_not_scheduler_orphan_probe() -> 
     assert "model_work_orphan_failed" not in source
     assert "recovered without this request" not in source
     assert ".retrieve_task(" in source
+
+
+def test_model_work_retrieve_route_exits_before_legacy_terminal_facade() -> None:
+    futures_path = REPO_ROOT / "mint_server" / "routes" / "futures.py"
+    source = _function_source(futures_path, "retrieve_future")
+    model_work_check = source.index("_is_model_work_scheduler_meta(meta)")
+    legacy_result = source.index("task_futures.async_get_result")
+    legacy_cleanup = source.index("task_futures.async_cleanup")
+
+    assert model_work_check < legacy_result
+    assert model_work_check < legacy_cleanup
+    assert "_retrieve_model_work_via_gateway(" in source
 
 
 def test_model_work_cancel_route_uses_gateway_cancel_task() -> None:

@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
 from ..backend.queue_stage_timing import build_queue_stage_timing
+from ..backend.task_payload_store import TaskPayloadStore
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..logging_context import record_retrieve_future_wait_metric
@@ -23,6 +24,7 @@ from ..models.types import FutureCancelRequest, FutureRetrieveRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+task_payload_store = TaskPayloadStore()
 
 
 def _retrieve_grace_s() -> float:
@@ -175,9 +177,31 @@ async def _present_gateway_terminal_result(result: Any, http_request: Request) -
     payload = await present_terminal_retrieve_result(
         result,
         error_presenter=lambda error: _failed_payload(error, http_request),
+        payload_store=task_payload_store,
     )
     _recent_put(result.request_id, payload, ttl_s=_local_hot_ttl_s())
     return payload
+
+
+async def _retrieve_model_work_via_gateway(
+    *,
+    request_id: str,
+    wait_timeout_s: float,
+    http_request: Request,
+) -> Any:
+    from ..backend.model_work_task_gateway import model_work_task_gateway
+
+    result = await model_work_task_gateway.retrieve_task(
+        request_id=request_id,
+        wait_timeout_s=wait_timeout_s,
+        privileged=_is_privileged(http_request),
+    )
+    if result.status in {"ready", "failed"}:
+        _pending_hint_clear(request_id)
+        return await _present_gateway_terminal_result(result, http_request)
+    if result.status == "unavailable":
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    return None
 
 
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
@@ -493,40 +517,44 @@ async def retrieve_future(
             _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
             raise HTTPException(status_code=404, detail=detail)
 
-    if status == FutureStatus.PENDING:
+    meta = None
+    try:
+        meta = await task_futures.async_get_meta(body.request_id)
+    except Exception:
         meta = None
+    if _is_model_work_scheduler_meta(meta):
         try:
-            meta = await task_futures.async_get_meta(body.request_id)
+            payload = await _retrieve_model_work_via_gateway(
+                request_id=body.request_id,
+                wait_timeout_s=0.0 if waited_for_status_change else _retrieve_wait_timeout_s(),
+                http_request=http_request,
+            )
+        except HTTPException:
+            raise
         except Exception:
-            meta = None
-        if _is_model_work_scheduler_meta(meta):
-            try:
-                from ..backend.model_work_task_gateway import model_work_task_gateway
-
-                retrieve_result = await model_work_task_gateway.retrieve_task(
-                    request_id=body.request_id,
-                    wait_timeout_s=0.0 if waited_for_status_change else _retrieve_wait_timeout_s(),
-                    privileged=_is_privileged(http_request),
-                )
-            except Exception:
-                logger.exception(
-                    "[retrieve_future] model-work retrieve gateway failed request_id=%s",
+            logger.exception(
+                "[retrieve_future] model-work retrieve gateway failed request_id=%s",
+                body.request_id,
+            )
+            if status != FutureStatus.PENDING:
+                raise
+        else:
+            if payload is not None:
+                logger.info(
+                    "[retrieve_future] request_id=%s status=%s served=model_work_gateway",
                     body.request_id,
+                    status.value,
                 )
-            else:
-                if retrieve_result.status in {"ready", "failed"}:
-                    _pending_hint_clear(body.request_id)
-                    payload = await _present_gateway_terminal_result(retrieve_result, http_request)
-                    logger.info(
-                        "[retrieve_future] request_id=%s status=%s served=model_work_gateway",
-                        body.request_id,
-                        retrieve_result.status,
-                    )
-                    _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-                    return payload
-                if retrieve_result.status == "unavailable":
-                    _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
-                    raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                return payload
+            if status != FutureStatus.PENDING:
+                pending = pending_future_http_response(retry_after_s=1)
+                response.status_code = pending.status_code
+                response.headers.update(pending.headers)
+                _record_retrieve_wait(path="local", outcome="timeout", waited=waited_for_status_change)
+                return pending.body
+
+    if status == FutureStatus.PENDING:
         if isinstance(meta, dict):
             actor_name = meta.get("actor_name")
             tracked_session_id = meta.get("model_id")
