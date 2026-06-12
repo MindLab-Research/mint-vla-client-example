@@ -5,6 +5,7 @@ from typing import Any, cast
 import pytest
 
 from mint_server.backend.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.model_engine_host import ModelEngineHost
 from mint_server.backend.task_state_store import FutureStatus
 
 from .helpers import token
@@ -13,6 +14,24 @@ from .invariants import assert_terminal_not_scheduled
 
 
 pytestmark = pytest.mark.component
+
+
+class _ComponentEngineLifecycle:
+    def __init__(self) -> None:
+        self.ready = True
+        self.unhealthy_reasons: list[str] = []
+        self.restart_calls = 0
+
+    async def is_ready(self) -> bool:
+        return self.ready
+
+    async def mark_unhealthy(self, reason: str) -> None:
+        self.ready = False
+        self.unhealthy_reasons.append(str(reason))
+
+    async def restart(self) -> None:
+        self.restart_calls += 1
+        self.ready = True
 
 
 @pytest.mark.anyio
@@ -133,5 +152,70 @@ async def test_scheduler_component_payload_write_failure_requeues_without_termin
         assert assigned.assigned == 1
         assert await world.observe_future_status("component-payload-write-failed") == FutureStatus.DONE
         await assert_terminal_not_scheduled(world, "component-payload-write-failed")
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_runtime_resumes_durable_finalize_after_engine_death(
+    tmp_path,
+) -> None:
+    world = cast(Any, SchedulerComponentWorld(tmp_path))
+    try:
+        await world.start()
+        request_id = "component-engine-death-mid-finalize"
+        staged_payload_path = str(world.tmp_path / "component-engine-death-mid-finalize.json")
+        await world.enqueue_sampling(request_id)
+        engine = _ComponentEngineLifecycle()
+
+        async def _executor(lease: dict[str, Any]) -> ExecutorOutcome:
+            begin = await world.scheduler.begin_finalize(
+                lease=token(
+                    lease,
+                    consumer_id=world.consumer_id,
+                    consumer_generation=world.generation,
+                ),
+                finalize_ttl_s=30.0,
+                staged_payload_path=staged_payload_path,
+            )
+            assert begin.ok is True
+            return ExecutorOutcome(
+                kind="fatal_backend_death",
+                error="synthetic engine died after durable finalize",
+            )
+
+        actor = ModelEngineHost(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            actor_name=f"component-runtime-{world.replica_id}",
+            actor_generation=world.generation,
+            poll_interval_s=0.01,
+            lease_ttl_s=1.0,
+            max_claim=1,
+            scheduler_client=world.scheduler,
+            task_futures_client=world.future_service,
+            task_state_store_client=world.task_state,
+            payload_store=world.payload_store,
+            engine_lifecycle=engine,
+            executor=_executor,
+        )
+
+        assert await actor.run_once() == {"claimed": 1, "executed": 1}
+
+        snapshot = actor.health_snapshot()
+        record = await world.observe_task(request_id)
+        contains = await world.observe_scheduler(request_id)
+        stats = await world.scheduler.stats()
+
+        assert snapshot["completed_total"] == 1
+        assert snapshot["failed_total"] == 0
+        assert snapshot["active_lease_count"] == 0
+        assert engine.unhealthy_reasons == ["synthetic engine died after durable finalize"]
+        assert engine.restart_calls == 1
+        assert record["status"] == "done"
+        assert record["result_path"] == staged_payload_path
+        assert contains.present is False
+        assert stats["leases"] == []
+        await assert_terminal_not_scheduled(world, request_id)
     finally:
         world.close()
