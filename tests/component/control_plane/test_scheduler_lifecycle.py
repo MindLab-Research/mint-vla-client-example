@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any, cast
 
@@ -255,6 +256,79 @@ async def test_scheduler_component_reaper_recovers_lost_pending_after_hydration(
         assert assigned.assigned == 1
         assert await world.observe_future_status(request_id) == FutureStatus.DONE
         assert (await world.observe_task(request_id))["status"] == "done"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_concurrent_reapers_recover_lost_pending_once(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-reaper-race-lost-pending"
+        created = cast(
+            Any,
+            await world.task_state.async_create_task(
+                request_id=request_id,
+                op="sampling.asample",
+                domain_key=world.domain_key,
+                request_json=b'{"prompt":"lost"}',
+                metadata={
+                    **sampling_meta(world.domain_key),
+                    "user_id": "user-a",
+                    "apikey_id": "key-a",
+                    "throttle_principal": "apikey:key-a",
+                    "affinity_group": "lora:session-a:generation:1",
+                    "token_cost": 1,
+                },
+            ),
+        )
+
+        original_list_active_tasks = world.task_state.async_list_active_tasks
+        first_snapshot_ready = asyncio.Event()
+        release_first_snapshot = asyncio.Event()
+        list_calls = 0
+
+        async def list_active_tasks_with_reaper_race(**kwargs: Any) -> list[dict[str, Any]]:
+            nonlocal list_calls
+            list_calls += 1
+            records = await original_list_active_tasks(**kwargs)
+            if list_calls == 1:
+                first_snapshot_ready.set()
+                await release_first_snapshot.wait()
+            return records
+
+        world.task_state.async_list_active_tasks = list_active_tasks_with_reaper_race
+        first_reaper = asyncio.create_task(
+            world.scheduler.reap_lost_pending_tasks(reason="component-test-reaper-race-first")
+        )
+        await asyncio.wait_for(first_snapshot_ready.wait(), timeout=1.0)
+        second = await world.scheduler.reap_lost_pending_tasks(reason="component-test-reaper-race-second")
+        release_first_snapshot.set()
+        first = await first_reaper
+
+        stats = await world.scheduler.stats()
+        assigned = await world.scheduler.assign_pending(max_items=2)
+        claimed = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=world.consumer_id,
+            consumer_generation=world.generation,
+            max_items=2,
+            lease_ttl_s=30.0,
+        )
+
+        assert created.created is True
+        assert first["recovered"] + second["recovered"] == 1
+        assert stats["counters"]["reaper_recovered"] == 1
+        assert assigned.assigned == 1
+        assert len(claimed.leases) == 1
+        assert claimed.leases[0]["item"]["request_id"] == request_id
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
+        await assert_no_orphan_assigned(world)
     finally:
         world.close()
 
