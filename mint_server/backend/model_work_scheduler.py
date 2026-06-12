@@ -370,7 +370,7 @@ class _ModelWorkSchedulerActor:
             init_actor_observability()
         except Exception:
             logger.debug("[model_work_scheduler] actor observability init skipped", exc_info=True)
-        self._cv = asyncio.Condition()
+        self._cv = asyncio.Lock()
         self._instance_id = uuid.uuid4().hex
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
         self._use_task_state_store = bool(use_task_state_store)
@@ -1173,7 +1173,6 @@ class _ModelWorkSchedulerActor:
             self._reaper_recovered += recovered
             if recovered:
                 self._requeued += recovered
-                self._cv.notify_all()
         if recovered:
             logger.warning(
                 "[model_work_scheduler] recovered lost pending tasks scanned=%s recovered=%s reason=%s",
@@ -1354,7 +1353,6 @@ class _ModelWorkSchedulerActor:
             if not self._use_task_state_store:
                 for assigned in reversed(pending):
                     self._restore_assigning_to_backlog_locked(assigned)
-                self._cv.notify_all()
                 return
         for assigned in pending:
             durable_assigned = False
@@ -1375,7 +1373,6 @@ class _ModelWorkSchedulerActor:
                     self._commit_assigned_locked(assigned)
                 else:
                     self._restore_assigning_to_backlog_locked(assigned)
-                self._cv.notify_all()
 
     def _prepare_assignments_locked(self, *, max_items: int | None = None) -> tuple[list[_AssignedWork], list[str]]:
         pending: list[_AssignedWork] = []
@@ -1437,13 +1434,11 @@ class _ModelWorkSchedulerActor:
                 async with self._cv:
                     for unprocessed in reversed(pending[index:]):
                         self._restore_assigning_to_backlog_locked(unprocessed)
-                    self._cv.notify_all()
                 raise
             async with self._cv:
                 if self._assigned_matches_locked(assigned, location="assigning"):
                     self._commit_assigned_locked(assigned)
                     assigned_count += 1
-                    self._cv.notify_all()
         return AssignPendingResult(ok=True, assigned=assigned_count, skipped_domains=skipped_domains)
 
     async def _assign_pending_if_no_inflight_unlocked(
@@ -1612,7 +1607,6 @@ class _ModelWorkSchedulerActor:
                 return
             if durable_record is None:
                 self._restore_assigned_to_queue_locked(assigned)
-                self._cv.notify_all()
                 return
             now = time.time()
             lease_expires_at = durable_record.get("lease_expires_at")
@@ -1638,7 +1632,6 @@ class _ModelWorkSchedulerActor:
             self._leases_by_id[str(lease_id)] = lease
             self._lease_id_by_request_id[assigned.item.request_id] = str(lease_id)
             self._request_locations[assigned.item.request_id] = "leased"
-            self._cv.notify_all()
 
     async def _reconcile_assigned_claim_conflict(
         self,
@@ -1654,12 +1647,11 @@ class _ModelWorkSchedulerActor:
         except TaskStateNotFoundError:
             async with self._cv:
                 if self._drop_claiming_request_locked(assigned):
-                    self._cv.notify_all()
-            logger.warning(
-                "[model_work_scheduler] dropped stale assigned queue item with missing task state request_id=%s queue_id=%s",
-                assigned.item.request_id,
-                assigned.queue_id,
-            )
+                    logger.warning(
+                        "[model_work_scheduler] dropped stale assigned queue item with missing task state request_id=%s queue_id=%s",
+                        assigned.item.request_id,
+                        assigned.queue_id,
+                    )
             return "missing"
         status = str(record.get("status") or "")
         scheduler_epoch = int(self._scheduler_epoch or 0)
@@ -1677,7 +1669,6 @@ class _ModelWorkSchedulerActor:
                 self._backlog(assigned.item.domain_key).appendleft(assigned.item)
                 self._request_locations[assigned.item.request_id] = "backlog"
                 self._requeued += 1
-                self._cv.notify_all()
                 logger.warning(
                     "[model_work_scheduler] requeued stale assigned queue item whose task state is pending request_id=%s queue_id=%s",
                     assigned.item.request_id,
@@ -1686,7 +1677,6 @@ class _ModelWorkSchedulerActor:
                 return "pending_requeued"
             self._remove_request_location(assigned.item.request_id)
             self._stale_dropped += 1
-            self._cv.notify_all()
         logger.warning(
             "[model_work_scheduler] dropped stale assigned queue item after task-state claim conflict request_id=%s queue_id=%s status=%s terminal=%s",
             assigned.item.request_id,
@@ -1712,7 +1702,6 @@ class _ModelWorkSchedulerActor:
                 if self._request_locations.get(item.request_id) == "assigning":
                     self._remove_request_from_memory_locked(item.request_id)
                     self._stale_dropped += 1
-                    self._cv.notify_all()
             logger.warning(
                 "[model_work_scheduler] dropped stale backlog item with missing task state request_id=%s domain_key=%s",
                 item.request_id,
@@ -1726,7 +1715,6 @@ class _ModelWorkSchedulerActor:
             if self._request_locations.get(item.request_id) == "assigning":
                 self._remove_request_from_memory_locked(item.request_id)
                 self._stale_dropped += 1
-                self._cv.notify_all()
         logger.warning(
             "[model_work_scheduler] dropped stale backlog item after task-state assign conflict request_id=%s domain_key=%s status=%s terminal=%s",
             item.request_id,
@@ -1806,7 +1794,6 @@ class _ModelWorkSchedulerActor:
                     committed_request_ids.add(assigned.item.request_id)
                 else:
                     self._restore_pending_requeue_locked(pending)
-                self._cv.notify_all()
         return committed_request_ids
 
     async def _commit_requeues_unlocked(self, requeue_items: list[_PendingRequeue], *, reason: str) -> int:
@@ -1829,7 +1816,6 @@ class _ModelWorkSchedulerActor:
                 async with self._cv:
                     for unprocessed in requeue_items[index:]:
                         self._restore_pending_requeue_locked(unprocessed)
-                    self._cv.notify_all()
                 setattr(exc, "_model_work_requeue_committed_request_ids", set(committed_request_ids))
                 raise
             async with self._cv:
@@ -1841,7 +1827,6 @@ class _ModelWorkSchedulerActor:
                 else:
                     self._remove_request_location(assigned.item.request_id)
                 committed_request_ids.add(assigned.item.request_id)
-                self._cv.notify_all()
         return requeued
 
     async def _expire_leases_unlocked(self, *, now: float) -> int:
@@ -1849,7 +1834,6 @@ class _ModelWorkSchedulerActor:
             expired = self._prepare_expired_leases_locked(now=now)
             if not expired:
                 return 0
-            self._cv.notify_all()
         return await self._commit_requeues_unlocked(expired, reason="lease_expired")
 
     async def append(
@@ -1952,7 +1936,6 @@ class _ModelWorkSchedulerActor:
                 self._request_locations[work.request_id] = "backlog"
                 self._appended += 1
                 self._track_sampling_inflight_locked(work)
-                self._cv.notify_all()
                 backlog_depth = len(self._backlog(work.domain_key))
             assigned = (
                 (await self.assign_pending(max_items=assign_max_items)).to_wire()
@@ -1965,7 +1948,6 @@ class _ModelWorkSchedulerActor:
                 durable_transition_committed = location in {"assigned", "leased", "finalizing"}
                 if not durable_transition_committed:
                     self._remove_request_from_memory_locked(work.request_id)
-                self._cv.notify_all()
             if self._use_task_state_store and isinstance(created, CreateTaskResult) and created.created:
                 await self._forget_created_task_after_append_cancel(
                     work,
@@ -1975,7 +1957,6 @@ class _ModelWorkSchedulerActor:
         except Exception:
             async with self._cv:
                 self._remove_request_from_memory_locked(work.request_id)
-                self._cv.notify_all()
             if self._use_task_state_store and isinstance(created, CreateTaskResult) and created.created:
                 await self._forget_created_task_after_append_cancel(
                     work,
@@ -2022,7 +2003,6 @@ class _ModelWorkSchedulerActor:
             removed = self._remove_request_from_memory_locked(request_id)
             if removed:
                 self._failed += 1
-                self._cv.notify_all()
             return CancelTaskResult(
                 ok=True,
                 request_id=request_id,
@@ -2152,7 +2132,6 @@ class _ModelWorkSchedulerActor:
                 self._replica_queues.pop(key, None)
 
             expired_items = self._prepare_expired_leases_locked(now=now)
-            self._cv.notify_all()
             replica_count = len(self._replicas)
             removed_count = len(removed)
         try:
@@ -2173,7 +2152,6 @@ class _ModelWorkSchedulerActor:
                     self._restore_pending_requeue_locked(expired_pending)
                 self._replicas = previous_replicas
                 self._replica_queues = previous_queues
-                self._cv.notify_all()
             raise
         except Exception as exc:
             committed_request_ids = set(getattr(exc, "_model_work_requeue_committed_request_ids", set()))
@@ -2191,7 +2169,6 @@ class _ModelWorkSchedulerActor:
                     self._restore_pending_requeue_locked(expired_pending)
                 self._replicas = previous_replicas
                 self._replica_queues = previous_queues
-                self._cv.notify_all()
             raise
         expired = await self._commit_requeues_unlocked(expired_items, reason="lease_expired")
         assigned_pending = await self._assign_pending_if_no_inflight_unlocked(
@@ -2316,7 +2293,6 @@ class _ModelWorkSchedulerActor:
                     assigned.item = item
                 queue.popleft()
                 self._request_locations[assigned.item.request_id] = "claiming"
-                self._cv.notify_all()
             if self._use_task_state_store:
                 try:
                     await self._task_state_call(
@@ -2344,28 +2320,26 @@ class _ModelWorkSchedulerActor:
                     if self._task_not_found_cause(e) is not None:
                         async with self._cv:
                             if self._drop_claiming_request_locked(assigned):
-                                self._cv.notify_all()
-                        logger.warning(
-                            "[model_work_scheduler] dropped stale assigned queue item with missing task state during claim request_id=%s queue_id=%s",
-                            assigned.item.request_id,
-                            assigned.queue_id,
-                        )
+                                logger.warning(
+                                    "[model_work_scheduler] dropped stale assigned queue item with missing task state during claim request_id=%s queue_id=%s",
+                                    assigned.item.request_id,
+                                    assigned.queue_id,
+                                )
                         continue
                     conflict = self._claim_conflict_cause(e)
                     if conflict is None:
                         async with self._cv:
                             if self._request_locations.get(assigned.item.request_id) == "claiming":
                                 self._restore_assigned_to_queue_locked(assigned)
-                                self._cv.notify_all()
                         raise
                     reconciled = await self._reconcile_assigned_claim_conflict(
                         assigned,
                         conflict=conflict,
                     )
                     async with self._cv:
-                        self._cv.notify_all()
-                    if reconciled is None:
-                        raise
+                        if reconciled is None:
+                            self._restore_assigned_to_queue_locked(assigned)
+                            raise
                     continue
             async with self._cv:
                 if self._request_locations.get(assigned.item.request_id) != "claiming":
@@ -2392,7 +2366,6 @@ class _ModelWorkSchedulerActor:
                 if claim_affinity_group is None:
                     claim_affinity_group = assigned_affinity_group
                 spent += cost
-                self._cv.notify_all()
         async with self._cv:
             self._claimed += 1
             remaining_queue_depth = len(self._queue(domain_key, replica_id))
@@ -2422,7 +2395,6 @@ class _ModelWorkSchedulerActor:
             attempt_id = lease.attempt_id
             scheduler_epoch = int(self._scheduler_epoch or 0)
             self._request_locations[request_id] = "finalizing"
-            self._cv.notify_all()
         if self._use_task_state_store:
             try:
                 await self._task_state_call(
@@ -2463,8 +2435,7 @@ class _ModelWorkSchedulerActor:
                             lease.finalizing_until = time.time() + max(1.0, float(finalize_ttl_s))
                             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
                         self._request_locations[request_id] = "leased"
-                        self._cv.notify_all()
-                raise
+                    raise
             except Exception:
                 async with self._cv:
                     lease = self._leases_by_id.get(str(lease_id))
@@ -2477,7 +2448,6 @@ class _ModelWorkSchedulerActor:
                         and self._request_locations.get(request_id) == "finalizing"
                     ):
                         self._request_locations[request_id] = "leased"
-                        self._cv.notify_all()
                 raise
         async with self._cv:
             lease = self._leases_by_id.get(str(lease_id))
@@ -2493,7 +2463,6 @@ class _ModelWorkSchedulerActor:
             lease.finalizing_until = now + max(1.0, float(finalize_ttl_s))
             lease.lease_expires_at = max(float(lease.lease_expires_at), lease.finalizing_until)
             self._request_locations[request_id] = "leased"
-            self._cv.notify_all()
             return LeaseResult(ok=True, lease=lease.to_dict())
 
     async def renew_lease(
@@ -2536,7 +2505,6 @@ class _ModelWorkSchedulerActor:
                         current = self._leases_by_id.get(str(lease_id))
                         if current is not None and current.item.request_id == request_id:
                             self._remove_request_from_memory_locked(request_id)
-                            self._cv.notify_all()
                     return LeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
                 raise
             if isinstance(renewed, TaskMutationResult):
@@ -2559,7 +2527,6 @@ class _ModelWorkSchedulerActor:
             if renew_rejected is not None:
                 if renew_rejected == ConflictReason.TERMINAL:
                     self._remove_request_from_memory_locked(request_id)
-                    self._cv.notify_all()
                 return LeaseResult(ok=False, reason=renew_rejected)
             lease.lease_expires_at = new_expires_at
             return LeaseResult(ok=True, lease=lease.to_dict())
@@ -2947,7 +2914,6 @@ class _ModelWorkSchedulerActor:
                             current = self._leases_by_id.get(str(lease_id))
                             if current is not None and current.item.request_id == request_id:
                                 self._remove_request_from_memory_locked(request_id)
-                                self._cv.notify_all()
                         return FailLeaseResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
                     raise
                 status = str(record.get("status") or "")
@@ -2996,7 +2962,6 @@ class _ModelWorkSchedulerActor:
             else:
                 self._remove_request_location(request_id)
                 self._failed += 1
-            self._cv.notify_all()
         if requeue:
             requeued_out = bool(
                 await self._commit_requeues_unlocked(

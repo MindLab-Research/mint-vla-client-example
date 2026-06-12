@@ -121,6 +121,14 @@ def test_backend_placement_group_creation_is_controller_owned() -> None:
         assert "ray.util.remove_placement_group(e.pg)" not in source
 
 
+def test_model_work_scheduler_uses_lock_not_condition_for_mutex() -> None:
+    source = (REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py").read_text()
+    assert "asyncio.Condition(" not in source
+    assert ".notify_all(" not in source
+    assert "._cv.wait(" not in source
+    assert "asyncio.Lock()" in source
+
+
 def test_vllm_backend_attach_preserves_child_task_capture() -> None:
     source = (REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py").read_text()
     assert "get_named_placement_group(" in source
