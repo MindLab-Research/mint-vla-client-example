@@ -13,7 +13,12 @@ from .helpers import (
     token,
 )
 from .harness import SchedulerComponentWorld
-from .invariants import assert_no_orphan_assigned, assert_terminal_not_scheduled
+from .invariants import (
+    assert_lease_consistency,
+    assert_no_double_lease,
+    assert_no_orphan_assigned,
+    assert_terminal_not_scheduled,
+)
 
 
 pytestmark = pytest.mark.component
@@ -381,6 +386,62 @@ async def test_scheduler_component_replica_capacity_exhaustion_leaves_extra_work
         assert empty_b.leases == []
         assert remaining.present is True
         assert remaining.location == "backlog"
+        await assert_no_orphan_assigned(world)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_concurrent_multi_replica_claims_do_not_duplicate_work(tmp_path) -> None:
+    world = cast(Any, SchedulerComponentWorld(tmp_path))
+    try:
+        await world.scheduler.sync_replicas(
+            [
+                world.replica(replica_id="replica-a", status="healthy", capacity=1),
+                world.replica(replica_id="replica-b", status="healthy", capacity=1),
+            ]
+        )
+        await world.enqueue_sampling("component-concurrent-claim-a", assign=False, affinity_group="lora:a")
+        await world.enqueue_sampling("component-concurrent-claim-b", assign=False, affinity_group="lora:b")
+        assigned = await world.scheduler.assign_pending(max_items=2)
+
+        claim_a, claim_b = await asyncio.gather(
+            world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id="replica-a",
+                consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            ),
+            world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id="replica-b",
+                consumer_id=world.replica(replica_id="replica-b")["consumer_id"],
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            ),
+        )
+
+        leases = [*claim_a.leases, *claim_b.leases]
+        request_ids = sorted(lease["item"]["request_id"] for lease in leases)
+
+        assert assigned.assigned == 2
+        assert len(claim_a.leases) == 1
+        assert len(claim_b.leases) == 1
+        assert request_ids == [
+            "component-concurrent-claim-a",
+            "component-concurrent-claim-b",
+        ]
+        assert len({lease["lease_id"] for lease in leases}) == 2
+        for lease in leases:
+            record = await world.observe_task(lease["item"]["request_id"])
+            assert record["status"] == "leased"
+            assert record["lease_id"] == lease["lease_id"]
+            assert record["attempt_id"] == lease["attempt_id"]
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
         await assert_no_orphan_assigned(world)
     finally:
         world.close()
