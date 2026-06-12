@@ -106,9 +106,11 @@ def test_model_engine_host_terminal_commit_goes_through_scheduler_finish_surface
 def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
     runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     contracts_path = REPO_ROOT / "mint_server" / "backend" / "control_plane_contracts.py"
+    scheduler_path = REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py"
     runtime_tree = ast.parse(runtime_path.read_text(), filename=str(runtime_path))
     contracts_source = contracts_path.read_text()
     protocols = _class_methods(contracts_path)
+    scheduler_methods = _class_methods(scheduler_path)
 
     scheduler_calls: list[str] = []
     for node in ast.walk(runtime_tree):
@@ -126,6 +128,9 @@ def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
     assert "complete" not in scheduler_calls
     assert "complete" not in protocols["AsyncSchedulerQueue"]
     assert "COMPLETE = \"complete\"" not in contracts_source
+    assert "complete_lease" not in scheduler_methods["_ModelWorkSchedulerActor"]
+    assert "complete_lease" not in scheduler_methods["ModelWorkSchedulerClient"]
+    assert "complete" not in scheduler_methods["ModelWorkSchedulerClient"]
 
 
 def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor() -> None:

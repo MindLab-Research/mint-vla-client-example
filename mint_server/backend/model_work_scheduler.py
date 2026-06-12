@@ -2630,48 +2630,6 @@ class _ModelWorkSchedulerActor:
             and self._lease_id_by_request_id.get(request_id) == str(lease_id)
         )
 
-    async def complete_lease(
-        self,
-        *,
-        lease_id: str,
-        consumer_id: str,
-        consumer_generation: int,
-    ) -> FinishResult:
-        async with self._cv:
-            lease = self._leases_by_id.get(str(lease_id))
-            if lease is None:
-                return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
-            if lease.consumer_id != consumer_id or int(lease.consumer_generation) != int(
-                consumer_generation
-            ):
-                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-            if self._request_locations.get(lease.item.request_id) == "finalizing":
-                return FinishResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
-            request_id = lease.item.request_id
-        terminal = await self._terminal_task_state_for_lease(lease)
-        if not terminal.ok:
-            return FinishResult(ok=False, reason=terminal.reason or ConflictReason.NOT_TERMINAL)
-        async with self._cv:
-            current = self._leases_by_id.get(str(lease_id))
-            if current is None:
-                if self._request_locations.get(request_id) is not None:
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                return FinishResult(ok=False, reason=ConflictReason.UNKNOWN_LEASE)
-            if not self._current_lease_matches_locked(
-                current,
-                expected=lease,
-                lease_id=str(lease_id),
-                consumer_id=consumer_id,
-                consumer_generation=consumer_generation,
-            ):
-                return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-            if self._request_locations.get(request_id) == "finalizing":
-                return FinishResult(ok=False, reason=ConflictReason.FINALIZE_INFLIGHT)
-            self._leases_by_id.pop(lease.lease_id, None)
-            self._remove_request_location(request_id)
-            self._completed += 1
-            return FinishResult(ok=True, request_id=request_id)
-
     async def _finish_lease_terminal(
         self,
         *,
@@ -3345,20 +3303,6 @@ def _create_ray_actor_handle():
             )
             return out.to_wire()
 
-        async def complete_lease(
-            self,
-            *,
-            lease_id: str,
-            consumer_id: str,
-            consumer_generation: int,
-        ) -> dict[str, Any]:
-            out = await super().complete_lease(
-                lease_id=lease_id,
-                consumer_id=consumer_id,
-                consumer_generation=consumer_generation,
-            )
-            return out.to_wire()
-
         async def finish_lease_success(
             self,
             *,
@@ -3795,33 +3739,6 @@ class ModelWorkSchedulerClient:
             lease_ttl_s=lease_ttl_s,
             timeout_s=timeout_s,
         )
-
-    async def complete_lease(
-        self,
-        *,
-        lease: LeaseToken,
-        timeout_s: float = 10.0,
-    ) -> FinishResult:
-        actor = await self._get_ray_actor_async(create_if_missing=False)
-        out = await self._await_ray_ref(
-            actor.complete_lease.remote(
-                lease_id=str(lease.lease_id),
-                consumer_id=str(lease.consumer_id),
-                consumer_generation=int(lease.consumer_generation),
-            ),
-            timeout_s=timeout_s,
-        )
-        if not isinstance(out, dict):
-            raise TypeError(f"ModelWorkScheduler.complete_lease returned non-dict: {type(out)}")
-        return FinishResult.from_wire(out)
-
-    async def complete(
-        self,
-        *,
-        lease: LeaseToken,
-        timeout_s: float = 10.0,
-    ) -> FinishResult:
-        return await self.complete_lease(lease=lease, timeout_s=timeout_s)
 
     async def finish_lease_success(
         self,

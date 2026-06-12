@@ -1,5 +1,6 @@
 import asyncio
 import time
+from typing import Any
 
 import pytest
 
@@ -709,7 +710,7 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
     import mint_server.backend.model_work_scheduler as module
     import ray
 
-    captured: dict[str, object] = {"methods": {}}
+    captured: dict[str, Any] = {"methods": {}}
 
     class _OptionsProxy:
         def __init__(self, cls):
@@ -799,6 +800,7 @@ def test_scheduler_append_can_assign_immediately() -> None:
         assert contains.present is True
         assert contains.location == "assigned"
         assert contains.scheduler_instance_id == out.scheduler_instance_id
+        assert out.assigned is not None
         assert out.assigned["assigned"] == 1
         assert actor.stats()["backlog_depth"] == 0
         assert actor.stats()["replica_queues"][
@@ -991,10 +993,23 @@ def test_sampling_inflight_admission_releases_count_after_completion(
             lease_ttl_s=30.0,
         )
         lease_id = str(claimed.leases[0]["lease_id"])
-        completed = await actor.complete_lease(
+        lease = claimed.leases[0]
+        finalizing = await actor.begin_finalize_lease(
             lease_id=lease_id,
             consumer_id="consumer-replica-0",
             consumer_generation=10,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/result-req-1.json",
+        )
+        assert finalizing.ok is True
+        completed = await actor.finish_lease_success(
+            request_id=str(lease["item"]["request_id"]),
+            lease_id=lease_id,
+            attempt_id=str(lease["attempt_id"]),
+            scheduler_epoch=int(lease["scheduler_epoch"] or 0),
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            result_path="/tmp/result-req-1.json",
         )
         assert completed.ok is True
         assert (await actor.append(_work("req-2"), assign=True)).ok is True
@@ -1192,10 +1207,10 @@ def test_unhealthy_replica_requeues_assigned_and_leased_work() -> None:
     asyncio.run(_run())
 
 
-def test_lease_complete_fail_and_expiry() -> None:
+def test_lease_finish_fail_and_expiry() -> None:
     actor = _ModelWorkSchedulerActor()
 
-    async def _claim_one(request_id: str) -> str:
+    async def _claim_one(request_id: str) -> dict[str, Any]:
         await actor.append(_work(request_id))
         await actor.assign_pending()
         claimed = await actor.claim_from_replica_queue(
@@ -1206,23 +1221,36 @@ def test_lease_complete_fail_and_expiry() -> None:
             max_items=1,
             lease_ttl_s=1.0,
         )
-        return str(claimed.leases[0]["lease_id"])
+        return claimed.leases[0]
 
     async def _run() -> None:
         await actor.sync_replicas([_replica("replica-0")])
 
-        complete_lease = await _claim_one("req-complete")
-        complete = await actor.complete_lease(
-            lease_id=complete_lease,
+        success_lease = await _claim_one("req-complete")
+        lease_id = success_lease["lease_id"]
+        finalizing = await actor.begin_finalize_lease(
+            lease_id=str(lease_id),
             consumer_id="consumer-replica-0",
             consumer_generation=10,
+            finalize_ttl_s=30.0,
+            staged_payload_path="/tmp/result-req-complete.json",
+        )
+        assert finalizing.ok is True
+        complete = await actor.finish_lease_success(
+            request_id=str(success_lease["item"]["request_id"]),
+            lease_id=str(lease_id),
+            attempt_id=str(success_lease["attempt_id"]),
+            scheduler_epoch=int(success_lease["scheduler_epoch"] or 0),
+            consumer_id="consumer-replica-0",
+            consumer_generation=10,
+            result_path="/tmp/result-req-complete.json",
         )
         assert complete.ok is True
         assert actor.stats()["counters"]["completed"] == 1
 
         fail_lease = await _claim_one("req-fail")
         failed = await actor.fail_lease(
-            lease_id=fail_lease,
+            lease_id=str(fail_lease["lease_id"]),
             consumer_id="consumer-replica-0",
             consumer_generation=10,
             requeue=False,
@@ -1234,7 +1262,9 @@ def test_lease_complete_fail_and_expiry() -> None:
         expire_lease = await _claim_one("req-expire")
         assert (await actor.expire_leases(now=time.time() + 999.0)).expired == 1
         assert actor.stats()["backlog_depth"] == 1
-        assert expire_lease not in {lease["lease_id"] for lease in actor.stats()["leases"]}
+        assert str(expire_lease["lease_id"]) not in {
+            str(lease["lease_id"]) for lease in actor.stats()["leases"]
+        }
 
     asyncio.run(_run())
 
@@ -1360,6 +1390,7 @@ def test_scheduler_persists_append_assign_claim_and_begin_finalize_to_task_state
         record = store.get_task("req-persisted")
         assert record["status"] == "leased"
         assert float(record["lease_expires_at"]) > claimed_expires_at
+        assert renewed.lease is not None
         assert renewed.lease["lease_expires_at"] == record["lease_expires_at"]
 
         finalizing = await actor.begin_finalize_lease(
@@ -1756,6 +1787,7 @@ def test_issue_645_scheduler_drops_terminal_stale_backlog_head_and_assigns_next(
 
         synced = await actor.sync_replicas([_replica("replica-0")])
 
+        assert synced.assigned is not None
         assert synced.assigned["assigned"] == 1
         assert store.get_task("req-stale")["status"] == "retrieved"
         assert store.get_task("req-valid")["status"] == "assigned"
