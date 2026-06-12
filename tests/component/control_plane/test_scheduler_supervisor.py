@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import time
 from typing import Any, cast
 
 import pytest
 
 from mint_server.backend.cluster_placement_controller import ClusterPlacementController
+from mint_server.backend.engine_adapter import EngineHealth, EngineHealthStatus
+from mint_server.backend.engine_liveness import EngineLivenessPush
 
 from .harness import SchedulerComponentWorld
 
@@ -189,5 +192,86 @@ async def test_scheduler_component_placement_pg_blocked_registers_unclaimable_re
         assert observed.location == "backlog"
         assert len(replica_stats) == 1
         assert replica_stats[0]["status"] == "blocked"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_liveness_unhealthy_push_registers_unclaimable_replica(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        supervisor = world.supervisor()
+        first = await supervisor.reconcile_once()
+        replica_key = f"{world.domain_key}::{world.replica_id}"
+        healthy_replica = first["snapshot"]["replicas"][replica_key]
+        generation = int(healthy_replica["generation"])
+        consumer_id = str(healthy_replica["consumer_id"])
+
+        await world.enqueue_sampling("component-liveness-before-unhealthy")
+        healthy_claim = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            consumer_id=consumer_id,
+            consumer_generation=generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        assert [lease["item"]["request_id"] for lease in healthy_claim.leases] == [
+            "component-liveness-before-unhealthy"
+        ]
+        active_lease = healthy_claim.leases[0]
+
+        pushed = await supervisor.push_liveness(
+            EngineLivenessPush(
+                actor_name=str(healthy_replica["actor_name"]),
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=consumer_id,
+                actor_generation=generation,
+                running=True,
+                engine_ready=False,
+                engine_health=EngineHealth(
+                    status=EngineHealthStatus.UNHEALTHY,
+                    reason="synthetic engine unhealthy",
+                ),
+                active_request_id=str(active_lease["item"]["request_id"]),
+                active_lease_id=str(active_lease["lease_id"]),
+                active_lease_count=1,
+                pushed_at=time.time(),
+                last_error="synthetic engine unhealthy",
+            )
+        )
+        after_push = await supervisor.reconcile_once()
+        await world.enqueue_sampling("component-liveness-after-unhealthy", assign=False)
+
+        with pytest.raises(Exception, match="not claimable|unknown replica"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=consumer_id,
+                consumer_generation=generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+
+        unhealthy_replica = after_push["snapshot"]["replicas"][replica_key]
+        observed = cast(Any, await world.observe_scheduler("component-liveness-after-unhealthy"))
+        stats = await world.scheduler.stats()
+        replica_stats = [
+            replica
+            for replica in stats["replicas"]
+            if replica["domain_key"] == world.domain_key and replica["replica_id"] == world.replica_id
+        ]
+
+        assert pushed["ok"] is True
+        assert after_push["ok"] is True
+        assert unhealthy_replica["state"] == "unhealthy"
+        assert unhealthy_replica["scheduler_status"] == "unhealthy"
+        assert unhealthy_replica["last_error"] == "synthetic engine unhealthy"
+        assert observed.location == "backlog"
+        assert len(replica_stats) == 1
+        assert replica_stats[0]["status"] == "unhealthy"
     finally:
         world.close()
