@@ -4,6 +4,8 @@ from typing import Any, cast
 
 import pytest
 
+from mint_server.backend.cluster_placement_controller import ClusterPlacementController
+
 from .harness import SchedulerComponentWorld
 
 
@@ -136,5 +138,56 @@ async def test_scheduler_component_supervisor_generation_restart_allows_only_new
         assert [lease["item"]["request_id"] for lease in claimed.leases] == [
             "component-supervisor-generation"
         ]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_placement_pg_blocked_registers_unclaimable_replica(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        async def _factory(spec: Any, generation: int) -> Any:
+            raise AssertionError("runtime factory must not run while placement PG is blocked")
+
+        placement = ClusterPlacementController(
+            observed_free_gpus_by_node=lambda: {},
+            initial_backoff_s=0.1,
+            max_backoff_s=0.1,
+        )
+        supervisor = world.supervisor_with_factory(_factory)
+        supervisor._placement_controller = placement
+
+        out = await supervisor.reconcile_once()
+        await world.enqueue_sampling("component-placement-pg-blocked", assign=False)
+
+        with pytest.raises(Exception, match="not claimable|unknown replica"):
+            await world.scheduler.claim(
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=world.consumer_id,
+                consumer_generation=world.generation,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+
+        replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
+        observed = cast(Any, await world.observe_scheduler("component-placement-pg-blocked"))
+        stats = await world.scheduler.stats()
+
+        assert out["ok"] is True
+        assert replica["state"] == "blocked"
+        assert replica["scheduler_status"] == "blocked"
+        assert "placement group blocked" in replica["last_error"]
+        replica_stats = [
+            replica
+            for replica in stats["replicas"]
+            if replica["domain_key"] == world.domain_key and replica["replica_id"] == world.replica_id
+        ]
+
+        assert observed.location == "backlog"
+        assert len(replica_stats) == 1
+        assert replica_stats[0]["status"] == "blocked"
     finally:
         world.close()
