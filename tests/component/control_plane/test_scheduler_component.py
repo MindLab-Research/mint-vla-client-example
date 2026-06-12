@@ -727,7 +727,7 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
         stale_complete = await complete_task
 
         assert begin.ok is True
-        assert committed["ok"] is True
+        assert committed.ok is True
         assert expired.ok is True and expired.expired == 0
         assert new_lease["item"]["request_id"] == request_id
         assert new_lease["lease_id"] != old_lease["lease_id"]
@@ -1052,8 +1052,8 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         assigned = await world.scheduler.assign_pending(max_items=1)
         new_lease = await world.claim_one()
 
-        assert takeover["ok"] is True
-        assert takeover["epoch"] == 2
+        assert takeover.ok is True
+        assert takeover.epoch == 2
         assert synced.assigned["assigned"] == 1 or assigned.assigned == 1
         assert new_lease["item"]["request_id"] == "component-owner-fencing"
         assert new_lease["scheduler_epoch"] == 2
@@ -1092,7 +1092,7 @@ async def test_scheduler_component_reaper_recovers_lost_pending_after_hydration(
         assigned = await world.scheduler.assign_pending(max_items=1)
         await world.runtime_once()
 
-        assert created["created"] is True
+        assert created.created is True
         assert before.present is False
         assert reaped["ok"] is True
         assert reaped["recovered"] == 1
@@ -2870,7 +2870,7 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
             lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
-        assert committed["ok"] is True
+        assert committed.ok is True
         assert completed.ok is True and completed.request_id == request_id
         assert (await world.observe_scheduler(request_id)).present is False
     finally:

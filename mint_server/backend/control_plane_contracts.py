@@ -96,12 +96,6 @@ class WireCompatibleResult:
     def to_wire(self) -> dict[str, Any]:
         raise NotImplementedError
 
-    def __getitem__(self, key: str) -> Any:
-        return self.to_wire()[key]
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self.to_wire().get(key, default)
-
 
 def _extra_wire_fields(data: dict[str, Any], known: set[str]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if key not in known}

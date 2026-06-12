@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from mint_server.backend.control_plane_contracts import ConflictReason
 from mint_server.backend.task_payload_store import TaskPayloadStore
 from mint_server.backend.task_state_store import (
     TaskStateConflictError,
@@ -30,8 +31,8 @@ def _create_task(store: TaskStateStore, request_id: str = "req-1") -> None:
         metadata={"queue_kind": "model_work_scheduler"},
         now=100.0,
     )
-    assert created["ok"] is True
-    assert created["created"] is True
+    assert created.ok is True
+    assert created.created is True
 
 
 def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> None:
@@ -58,11 +59,11 @@ def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> Non
             },
         )
 
-        assert first["created"] is True
-        assert second["created"] is False
-        assert second["record"]["request_json"] == b'{"prompt":"first"}'
-        assert second["record"]["metadata"]["model_work_scheduler_append_attempt_id"] == "attempt-a"
-        assert second["record"]["metadata"]["stage"] == "first"
+        assert first.created is True
+        assert second.created is False
+        assert second.record["request_json"] == b'{"prompt":"first"}'
+        assert second.record["metadata"]["model_work_scheduler_append_attempt_id"] == "attempt-a"
+        assert second.record["metadata"]["stage"] == "first"
     finally:
         store.close()
 
@@ -668,8 +669,8 @@ def test_task_state_store_actor_wait_terminal_only_ignores_active_progress(tmp_p
 
 def _own_scheduler(store: TaskStateStore, owner_id: str = "scheduler-a") -> int:
     owner = store.acquire_scheduler_owner(owner_id=owner_id, ttl_s=30.0, now=101.0)
-    assert owner["ok"] is True
-    return int(owner["epoch"])
+    assert owner.ok is True
+    return int(owner.epoch)
 
 
 def _leased_task(store: TaskStateStore) -> tuple[int, str, str]:
@@ -694,7 +695,7 @@ def _leased_task(store: TaskStateStore) -> tuple[int, str, str]:
         lease_ttl_s=30.0,
         now=103.0,
     )
-    assert claimed["record"]["status"] == "leased"
+    assert claimed.record["status"] == "leased"
     return epoch, lease_id, attempt_id
 
 
@@ -702,17 +703,17 @@ def test_owner_epoch_fences_stale_scheduler() -> None:
     store = TaskStateStore.in_memory()
     try:
         owner_a = store.acquire_scheduler_owner(owner_id="scheduler-a", ttl_s=30.0, now=100.0)
-        assert owner_a["ok"] is True
-        assert owner_a["epoch"] == 1
+        assert owner_a.ok is True
+        assert owner_a.epoch == 1
 
         blocked = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=110.0)
-        assert blocked["ok"] is False
-        assert blocked["reason"] == "owner_active"
-        assert blocked["epoch"] == 1
+        assert blocked.ok is False
+        assert blocked.reason == ConflictReason.OWNER_ACTIVE
+        assert blocked.epoch == 1
 
         owner_b = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=131.0)
-        assert owner_b["ok"] is True
-        assert owner_b["epoch"] == 2
+        assert owner_b.ok is True
+        assert owner_b.epoch == 2
         stale_renew = store.renew_scheduler_owner(
             owner_id="scheduler-a",
             epoch=1,
@@ -787,8 +788,8 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             scheduler_epoch=epoch,
             now=102.0,
         )
-        assert assigned["record"]["status"] == "assigned"
-        assert assigned["record"]["subqueue_id"] == "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0"
+        assert assigned.record["status"] == "assigned"
+        assert assigned.record["subqueue_id"] == "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0"
 
         claimed = store.claim_task(
             request_id="req-1",
@@ -801,9 +802,9 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             lease_ttl_s=30.0,
             now=103.0,
         )
-        assert claimed["record"]["status"] == "leased"
-        assert claimed["record"]["lease_id"] == "lease-1"
-        assert claimed["record"]["attempt_id"] == "attempt-1"
+        assert claimed.record["status"] == "leased"
+        assert claimed.record["lease_id"] == "lease-1"
+        assert claimed.record["attempt_id"] == "attempt-1"
 
         renewed = store.renew_lease(
             request_id="req-1",
@@ -814,8 +815,8 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             lease_ttl_s=60.0,
             now=104.0,
         )
-        assert renewed["record"]["status"] == "leased"
-        assert renewed["record"]["lease_expires_at"] == 164.0
+        assert renewed.record["status"] == "leased"
+        assert renewed.record["lease_expires_at"] == 164.0
 
         with pytest.raises(TaskStateConflictError):
             store.renew_lease(
@@ -861,9 +862,9 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
             staged_payload_path="/vePFS-Mindverse/share/mint-results/req-1.json",
             now=104.0,
         )
-        assert finalizing["record"]["status"] == "finalizing"
-        assert finalizing["record"]["staged_payload_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
-        assert finalizing["record"]["result_path"] is None
+        assert finalizing.record["status"] == "finalizing"
+        assert finalizing.record["staged_payload_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert finalizing.record["result_path"] is None
 
         committed = store.commit_finalize_success(
             request_id="req-1",
@@ -876,11 +877,11 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
             result_size_bytes=123,
             now=105.0,
         )
-        assert committed["ok"] is True
-        assert committed["idempotent"] is False
-        assert committed["record"]["status"] == "done"
-        assert committed["record"]["result_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
-        assert committed["record"]["staged_payload_path"] is None
+        assert committed.ok is True
+        assert committed.idempotent is False
+        assert committed.record["status"] == "done"
+        assert committed.record["result_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert committed.record["staged_payload_path"] is None
         assert store.list_active_tasks() == []
 
         repeated = store.commit_finalize_success(
@@ -894,7 +895,7 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
             result_size_bytes=123,
             now=106.0,
         )
-        assert repeated["idempotent"] is True
+        assert repeated.idempotent is True
 
         with pytest.raises(TaskStateConflictError):
             store.commit_finalize_success(
@@ -970,9 +971,9 @@ def test_failure_commit_after_stage_preserves_abandoned_staged_payload() -> None
             now=3.0,
         )
 
-        assert failed["record"]["status"] == "failed"
-        assert failed["record"]["staged_payload_path"] is None
-        assert failed["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+        assert failed.record["status"] == "failed"
+        assert failed.record["staged_payload_path"] is None
+        assert failed.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-direct-fail/future__stage-a.json"
         ]
     finally:
@@ -1004,9 +1005,9 @@ def test_finalize_failure_after_stage_preserves_abandoned_staged_payload() -> No
             now=105.0,
         )
 
-        assert failed["record"]["status"] == "failed"
-        assert failed["record"]["staged_payload_path"] is None
-        assert failed["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+        assert failed.record["status"] == "failed"
+        assert failed.record["staged_payload_path"] is None
+        assert failed.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
         ]
     finally:
@@ -1045,7 +1046,7 @@ def test_staged_payload_path_is_not_terminal_payload_until_commit() -> None:
             result_size_bytes=123,
             now=105.0,
         )
-        assert committed["record"]["staged_payload_path"] is None
+        assert committed.record["staged_payload_path"] is None
 
         payloads = store.list_terminal_payloads_for_eviction(
             older_than_s=1.0,
@@ -1073,8 +1074,8 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
             now=104.0,
         )
         owner_b = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=132.0)
-        assert owner_b["ok"] is True
-        assert owner_b["epoch"] == 2
+        assert owner_b.ok is True
+        assert owner_b.epoch == 2
 
         committed = store.commit_finalize_success(
             request_id="req-1",
@@ -1088,8 +1089,8 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
             now=133.0,
         )
 
-        assert committed["record"]["status"] == "done"
-        assert committed["record"]["staged_payload_path"] is None
+        assert committed.record["status"] == "done"
+        assert committed.record["staged_payload_path"] is None
     finally:
         store.close()
 
@@ -1115,9 +1116,9 @@ def test_scheduler_leased_task_can_finalize_after_runtime_marks_running() -> Non
             now=105.0,
         )
 
-        assert finalizing["record"]["status"] == "finalizing"
-        assert finalizing["record"]["lease_id"] == lease_id
-        assert finalizing["record"]["metadata"]["stage"] == "prefill"
+        assert finalizing.record["status"] == "finalizing"
+        assert finalizing.record["lease_id"] == lease_id
+        assert finalizing.record["metadata"]["stage"] == "prefill"
     finally:
         store.close()
 
@@ -1142,11 +1143,11 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
             reason="lease_expired",
             now=104.0,
         )
-        assert requeued["record"]["status"] == "pending"
-        assert requeued["record"]["lease_id"] is None
-        assert requeued["record"]["attempt_id"] is None
-        assert requeued["record"]["staged_payload_path"] is None
-        assert requeued["record"]["metadata"]["abandoned_staged_payload_paths"] == [
+        assert requeued.record["status"] == "pending"
+        assert requeued.record["lease_id"] is None
+        assert requeued.record["attempt_id"] is None
+        assert requeued.record["staged_payload_path"] is None
+        assert requeued.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
         ]
 
@@ -1167,8 +1168,8 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
             lease_ttl_s=30.0,
             now=106.0,
         )
-        assert claimed["record"]["status"] == "leased"
-        assert claimed["record"]["lease_id"] == "lease-1-retry"
+        assert claimed.record["status"] == "leased"
+        assert claimed.record["lease_id"] == "lease-1-retry"
     finally:
         store.close()
 
@@ -1239,7 +1240,7 @@ def test_stale_finalizer_uses_distinct_payload_path_and_cannot_overwrite_retry(t
             result_size_bytes=int(retry_meta["size_bytes"]),
             now=109.0,
         )
-        assert committed["record"]["status"] == "done"
+        assert committed.record["status"] == "done"
 
         payloads.write_json_payload(
             request_id="req-1",
@@ -1287,8 +1288,8 @@ def test_future_style_task_lifecycle_and_metadata_lookup() -> None:
             status="running",
             now=101.0,
         )
-        assert running["record"]["metadata"]["model_id"] == "model-a"
-        assert running["record"]["metadata"]["stage"] == "running"
+        assert running.record["metadata"]["model_id"] == "model-a"
+        assert running.record["metadata"]["stage"] == "running"
 
         completed = store.complete_task_success(
             request_id="future-1",
@@ -1821,13 +1822,13 @@ def test_create_task_is_idempotent_for_precreated_scheduler_task() -> None:
             now=101.0,
         )
 
-        assert created["ok"] is True
-        assert created["created"] is False
-        assert created["record"]["status"] == "queued"
-        assert created["record"]["payload_hash"] == "hash-1"
-        assert created["record"]["request_json"] == b'{"prompt":"b"}'
-        assert created["record"]["metadata"]["stage"] == "queued"
-        assert created["record"]["metadata"]["model_work_scheduler"] is True
+        assert created.ok is True
+        assert created.created is False
+        assert created.record["status"] == "queued"
+        assert created.record["payload_hash"] == "hash-1"
+        assert created.record["request_json"] == b'{"prompt":"b"}'
+        assert created.record["metadata"]["stage"] == "queued"
+        assert created.record["metadata"]["model_work_scheduler"] is True
 
         with pytest.raises(TaskStateConflictError):
             store.create_task(
@@ -1864,8 +1865,8 @@ def test_finalize_failure_records_terminal_error() -> None:
             now=105.0,
         )
 
-        assert failed["record"]["status"] == "failed"
-        assert failed["record"]["error"] == "executor failed"
+        assert failed.record["status"] == "failed"
+        assert failed.record["error"] == "executor failed"
         assert store.get_task("req-1")["status"] == "failed"
     finally:
         store.close()
