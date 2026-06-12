@@ -467,7 +467,16 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
 
     monkeypatch.setattr(ray, "remote", _fake_remote)
     monkeypatch.setattr(ray, "method", _fake_method)
-    monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {})
+    def _fake_actor_runtime_env(**kwargs):
+        captured["runtime_env_kwargs"] = kwargs
+        return {
+            "env_vars": {
+                "PYTHONPATH": kwargs["pythonpath"],
+                **dict(kwargs.get("extra") or {}),
+            }
+        }
+
+    monkeypatch.setattr(module, "actor_runtime_env", _fake_actor_runtime_env)
     monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(module, "_model_work_scheduler_actor_resources", lambda: None)
     monkeypatch.setattr(module, "_await_ray_ref_sync", lambda ref, *, timeout_s=None: ref)
@@ -475,6 +484,13 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
     module._create_ray_actor(require_ready=True)
 
     assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
+    assert captured["runtime_env_kwargs"]["extra"]["MINT_GIT_SHA"] == CURRENT_CODE_IDENTITY
+    assert captured["options"]["runtime_env"] == {
+        "env_vars": {
+            "PYTHONPATH": module.PFS_PYTHONPATH,
+            "MINT_GIT_SHA": CURRENT_CODE_IDENTITY,
+        }
+    }
     assert captured["methods"]["ping"] == {"concurrency_group": "health"}
     assert captured["methods"]["contains_request"] == {"concurrency_group": "lookup"}
 

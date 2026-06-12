@@ -1827,12 +1827,15 @@ def _create_ray_actor(*, require_ready: bool = True):
 
     actor_name = _ray_model_work_scheduler_actor_name()
     max_concurrency = int(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ACTOR_MAX_CONCURRENCY", "64"))
+    extra_env = otel_env_vars()
+    if CURRENT_CODE_IDENTITY:
+        extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
     options: dict[str, Any] = {
         "name": actor_name,
         "namespace": _ray_namespace(),
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
+        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=extra_env),
     }
     resources = _model_work_scheduler_actor_resources()
     if resources:
