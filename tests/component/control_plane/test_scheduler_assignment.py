@@ -13,7 +13,7 @@ from .helpers import (
     token,
 )
 from .harness import SchedulerComponentWorld
-from .invariants import assert_terminal_not_scheduled
+from .invariants import assert_no_orphan_assigned, assert_terminal_not_scheduled
 
 
 pytestmark = pytest.mark.component
@@ -331,6 +331,57 @@ async def test_scheduler_component_assignment_counts_active_leases_surface(tmp_p
 
         assert claimed_b["item"]["request_id"] == "component-after-active"
         assert empty_a.leases == []
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_replica_capacity_exhaustion_leaves_extra_work_in_backlog(tmp_path) -> None:
+    world = cast(Any, SchedulerComponentWorld(tmp_path))
+    try:
+        await world.scheduler.sync_replicas(
+            [
+                world.replica(replica_id="replica-a", status="healthy", capacity=1),
+                world.replica(replica_id="replica-b", status="healthy", capacity=1),
+            ]
+        )
+        await world.enqueue_sampling("component-capacity-a", assign=False, affinity_group="lora:a")
+        await world.enqueue_sampling("component-capacity-b", assign=False, affinity_group="lora:b")
+        await world.enqueue_sampling("component-capacity-c", assign=False, affinity_group="lora:c")
+
+        assigned = await world.scheduler.assign_pending(max_items=3)
+        lease_a = await world.claim_one(replica_id="replica-a")
+        lease_b = await world.claim_one(replica_id="replica-b")
+        empty_a = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id="replica-a",
+            consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        empty_b = await world.scheduler.claim(
+            domain_key=world.domain_key,
+            replica_id="replica-b",
+            consumer_id=world.replica(replica_id="replica-b")["consumer_id"],
+            consumer_generation=world.generation,
+            max_items=1,
+            lease_ttl_s=30.0,
+        )
+        remaining = cast(Any, await world.observe_scheduler("component-capacity-c"))
+
+        assert assigned.assigned == 2
+        assert sorted(
+            [
+                lease_a["item"]["request_id"],
+                lease_b["item"]["request_id"],
+            ]
+        ) == ["component-capacity-a", "component-capacity-b"]
+        assert empty_a.leases == []
+        assert empty_b.leases == []
+        assert remaining.present is True
+        assert remaining.location == "backlog"
+        await assert_no_orphan_assigned(world)
     finally:
         world.close()
 

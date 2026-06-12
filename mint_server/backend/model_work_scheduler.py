@@ -1479,7 +1479,7 @@ class _ModelWorkSchedulerActor:
         return removed
 
     def _claimable_replicas(self, domain_key: str) -> list[ModelReplicaRegistration]:
-        replicas = [
+        candidates = [
             replica
             for (replica_domain, _), replica in self._replicas.items()
             if replica_domain == domain_key and replica.claimable
@@ -1489,6 +1489,13 @@ class _ModelWorkSchedulerActor:
             if lease.domain_key != domain_key:
                 continue
             active_by_replica[lease.replica_id] = active_by_replica.get(lease.replica_id, 0) + 1
+        replicas = [
+            replica
+            for replica in candidates
+            if active_by_replica.get(replica.replica_id, 0)
+            + len(self._queue(replica.domain_key, replica.replica_id))
+            < max(1, int(replica.capacity))
+        ]
         replicas.sort(
             key=lambda r: (
                 active_by_replica.get(r.replica_id, 0) + len(self._queue(r.domain_key, r.replica_id)),
