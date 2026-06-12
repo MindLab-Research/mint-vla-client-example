@@ -1326,7 +1326,8 @@ class ModelEngineHost:
                     )
                 wait_s = min(wait_s, remaining_s)
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=wait_s)
+                async with asyncio.timeout(wait_s):
+                    await asyncio.shield(task)
                 return
             except asyncio.TimeoutError:
                 if (

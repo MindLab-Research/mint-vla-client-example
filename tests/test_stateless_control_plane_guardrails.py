@@ -108,6 +108,16 @@ def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor
     assert 'ExecutorOutcome(kind="user_error"' not in source
 
 
+def test_model_engine_host_renew_wait_uses_asyncio_timeout_scope() -> None:
+    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    methods = _class_methods(runtime_path)["ModelEngineHost"]
+    renew_until_done = methods["_renew_until_done"]
+    source = ast.get_source_segment(runtime_path.read_text(), renew_until_done) or ""
+
+    assert "asyncio.timeout(" in source
+    assert "asyncio.wait_for(asyncio.shield(" not in source
+
+
 def test_backend_placement_group_creation_is_controller_owned() -> None:
     backend_paths = [
         REPO_ROOT / "mint_server" / "backend" / "dense_trainer.py",
