@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import LeaseToken, as_task_ledger
+from typing import Any
+
+from mint_server.backend.control_plane_contracts import (
+    FinishResult,
+    LeaseToken,
+    as_task_ledger,
+)
 from mint_server.backend.model_work_scheduler import ModelWorkSchedulerClient
 from mint_server.backend.task_state_store import TaskStateStore, TaskStateStoreClient
 
@@ -163,7 +169,9 @@ def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -
     }
     for name, expected in expected_returns.items():
         fn = functions[name]
-        assert ast.unparse(fn.returns) == expected
+        returns = fn.returns
+        assert returns is not None
+        assert ast.unparse(returns) == expected
         source = ast.get_source_segment(task_state_path.read_text(), fn) or ""
         assert 'return {"ok"' not in source
         assert '"reason": "terminal"' not in source
@@ -349,13 +357,13 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
 def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> None:
     import mint_server.backend.model_work_scheduler as scheduler_module
 
-    calls: list[tuple[str, dict]] = []
+    calls: list[tuple[str, dict[str, Any]]] = []
 
     class _RemoteMethod:
         def __init__(self, name: str) -> None:
             self.name = name
 
-        def remote(self, **kwargs):
+        def remote(self, **kwargs: Any) -> dict[str, Any]:
             calls.append((self.name, kwargs))
             return {"ok": True, "method": self.name}
 
@@ -363,14 +371,19 @@ def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> Non
         finish_lease_success = _RemoteMethod("finish_lease_success")
         finish_lease_failure = _RemoteMethod("finish_lease_failure")
 
-    async def _get_actor(self, **_kwargs):
+    async def _get_actor(self: object, **_kwargs: Any) -> _Actor:
         return _Actor()
 
-    async def _await_ref(self, ref, *, timeout_s=None):
+    async def _await_ref(
+        self: object,
+        ref: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]:
         assert timeout_s == 3.0
         return ref
 
-    async def _run() -> tuple[dict, dict]:
+    async def _run() -> tuple[FinishResult, FinishResult]:
         client = ModelWorkSchedulerClient()
         success = await client.finish_success(
             lease=LeaseToken(
