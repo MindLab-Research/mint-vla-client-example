@@ -2495,156 +2495,44 @@ class ModelActorSupervisorCore:
                 results[label] = self._states[key]
                 continue
 
-            try:
-                health = await self._actor_health(actor)
-                if not self._actor_generation_matches_current(key, actor, health):
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    results[label] = self._states.get(key, {})
-                    continue
-                runtime_last_error = str(health.get("last_error") or "").strip()
-                runtime_failed_total = int(health.get("failed_total") or 0)
-                runtime_completed_total = int(health.get("completed_total") or 0)
-                runtime_processed_total = int(health.get("processed_total") or 0)
-                health_error_unrecovered = bool(
-                    _runtime_error_requires_recreate(runtime_last_error)
-                    and runtime_failed_total > 0
-                    and runtime_completed_total <= 0
-                    and runtime_processed_total <= runtime_failed_total
-                )
-                state = (
-                    "healthy"
-                    if bool(health.get("running", True)) and not health_error_unrecovered
-                    else "unhealthy"
-                )
-                if state == "unhealthy":
-                    previous = self._states.get(key, {})
-                    crash_count = int(previous.get("crash_count", 0)) + 1
-                    last_error = (
-                        runtime_last_error
-                        if health_error_unrecovered
-                        else "runtime actor not running"
-                    )
-                    self._states[key] = {
-                        **previous,
-                        "domain_key": spec.domain_key,
-                        "replica_id": spec.replica_id,
-                        "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-                        "state": "unhealthy",
-                        "actor_name": spec.normalized_actor_name(),
-                        "launcher_key": spec.launcher_key,
-                        "generation": int(self._generations.get(key, 0)),
-                        "consumer_id": consumer_id_for_replica(
-                            spec.domain_key,
-                            spec.replica_id,
-                            int(self._generations.get(key, 0)),
-                        ),
-                        "health": health,
-                        "crash_count": crash_count,
-                        "last_error": last_error,
-                        "last_action": "health_unhealthy",
-                        "last_action_at": time.time(),
-                        "node_pins": resolved_node_pins,
-                        "worker_aliases": original_spec.normalized_worker_aliases(),
-                        "gpu_count": spec.gpu_count,
-                    }
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    try:
-                        pg_result = await self._ensure_runtime_placement_group(spec)
-                        if pg_result is not None and not bool(pg_result.get("ok")):
-                            self._blocked_total += 1
-                            self._states[key] = self._runtime_placement_blocked_state(
-                                spec,
-                                original_spec=original_spec,
-                                resolved_node_pins=resolved_node_pins,
-                                pg_result=pg_result,
-                            )
-                            results[label] = self._states[key]
-                            continue
-                        await self._create_runtime(spec, reason="unhealthy")
-                        self._states[key]["crash_count"] = crash_count
-                    except Exception as e:
-                        self._states[key] = {
-                            **self._states.get(key, {}),
-                            "domain_key": spec.domain_key,
-                            "replica_id": spec.replica_id,
-                            "state": "dead",
-                            "actor_name": spec.normalized_actor_name(),
-                            "crash_count": crash_count,
-                            "last_error": f"{type(e).__name__}: {e}",
-                            "last_action": "create_failed:unhealthy",
-                            "last_action_at": time.time(),
-                            "node_pins": resolved_node_pins,
-                            "worker_aliases": original_spec.normalized_worker_aliases(),
-                            "gpu_count": spec.gpu_count,
-                        }
-                    results[label] = self._states[key]
-                    continue
-                self._states[key] = {
-                    **self._states.get(key, {}),
-                    "domain_key": spec.domain_key,
-                    "replica_id": spec.replica_id,
-                    "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-                    "state": state,
-                    "actor_name": spec.normalized_actor_name(),
-                    "launcher_key": spec.launcher_key,
-                    "generation": int(self._generations.get(key, 0)),
-                    "consumer_id": consumer_id_for_replica(
-                        spec.domain_key,
-                        spec.replica_id,
-                        int(self._generations.get(key, 0)),
-                    ),
-                    "health": health,
-                    "last_error": None if state == "healthy" else "runtime actor not running",
-                    "last_action": "health_check",
-                    "last_action_at": time.time(),
-                    "node_pins": resolved_node_pins,
-                    "worker_aliases": original_spec.normalized_worker_aliases(),
-                    "gpu_count": spec.gpu_count,
-                }
-                results[label] = self._states[key]
-            except Exception as e:
-                if not self._actor_generation_matches_current(key, actor):
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    results[label] = self._states.get(key, {})
-                    continue
-                if _is_ray_get_timeout_error(e):
-                    # A health-probe timeout means the actor is still alive but
-                    # busy (e.g. executing a long save_weights_for_sampler that
-                    # starves the snapshot call). Killing/recreating it here would
-                    # abort an in-flight lease, flip the scheduler registration to
-                    # unclaimable, and re-queue the same request onto a fresh actor
-                    # that promptly times out again. Preserve the prior healthy
-                    # registration and wait for the next reconcile instead.
-                    self._health_timeout_preserved_total += 1
-                    previous = self._states.get(key, {})
-                    self._states[key] = {
-                        **previous,
-                        "domain_key": spec.domain_key,
-                        "replica_id": spec.replica_id,
-                        "actor_name": spec.normalized_actor_name(),
-                        "last_action": "health_timeout_preserved",
-                        "last_action_at": time.time(),
-                        "node_pins": resolved_node_pins,
-                        "worker_aliases": original_spec.normalized_worker_aliases(),
-                        "gpu_count": spec.gpu_count,
-                    }
-                    logger.warning(
-                        "[model_actor_supervisor] health probe timed out; runtime "
-                        "assumed busy, not recreating domain=%s replica=%s actor=%s "
-                        "error_type=%s error=%s",
-                        spec.domain_key,
-                        spec.replica_id,
-                        spec.normalized_actor_name(),
-                        type(e).__name__,
-                        e,
-                    )
-                    results[label] = self._states[key]
-                    continue
+            now = time.time()
+            latest_push = self._latest_push.get(key)
+            if latest_push is not None and not self._actor_generation_matches_current(
+                key,
+                actor,
+                latest_push.to_wire(),
+            ):
+                self._actors.pop(key, None)
+                self._actor_generations.pop(key, None)
+                results[label] = self._states.get(key, {})
+                continue
+
+            stale_after_s = _liveness_stale_after_s(self._reconcile_interval_s)
+            push_stale = _liveness_push_is_stale(
+                latest_push,
+                now=now,
+                stale_after_s=stale_after_s,
+            )
+            gpu_busy = _liveness_push_gpu_busy(
+                latest_push,
+                threshold_percent=_liveness_gpu_busy_threshold_percent(),
+            )
+            health = latest_push.to_wire() if latest_push is not None else {}
+            generation = int(
+                getattr(latest_push, "actor_generation", None)
+                or self._generations.get(key, 0)
+                or 0
+            )
+            consumer_id = str(
+                getattr(latest_push, "consumer_id", None)
+                or consumer_id_for_replica(spec.domain_key, spec.replica_id, generation)
+            )
+            if push_stale and not gpu_busy:
                 previous = self._states.get(key, {})
                 crash_count = int(previous.get("crash_count", 0)) + 1
+                stale_age_s = None
+                if latest_push is not None and latest_push.pushed_at is not None:
+                    stale_age_s = max(0.0, now - float(latest_push.pushed_at))
                 self._states[key] = {
                     **previous,
                     "domain_key": spec.domain_key,
@@ -2652,9 +2540,15 @@ class ModelActorSupervisorCore:
                     "state": "dead",
                     "actor_name": spec.normalized_actor_name(),
                     "crash_count": crash_count,
-                    "last_error": f"{type(e).__name__}: {e}",
-                    "last_action": "health_failed",
-                    "last_action_at": time.time(),
+                    "last_error": (
+                        "runtime liveness push missing"
+                        if latest_push is None
+                        else f"runtime liveness push stale age_s={stale_age_s:.1f}"
+                    ),
+                    "last_action": "liveness_stale_dead",
+                    "last_action_at": now,
+                    "liveness_stale_after_s": stale_after_s,
+                    "liveness_stale_age_s": stale_age_s,
                     "node_pins": resolved_node_pins,
                     "worker_aliases": original_spec.normalized_worker_aliases(),
                     "gpu_count": spec.gpu_count,
@@ -2691,6 +2585,53 @@ class ModelActorSupervisorCore:
                         "gpu_count": spec.gpu_count,
                     }
                 results[label] = self._states[key]
+                continue
+
+            if push_stale and gpu_busy:
+                state = "healthy"
+                last_action = "liveness_stale_gpu_busy"
+                last_error = None
+            elif latest_push is not None and bool(latest_push.running) and bool(latest_push.engine_ready):
+                state = "healthy"
+                last_action = "liveness_push"
+                last_error = None
+            else:
+                state = "unhealthy"
+                last_action = "liveness_unhealthy"
+                last_error = (
+                    "runtime actor not running"
+                    if latest_push is None or not bool(latest_push.running)
+                    else (latest_push.last_error or latest_push.engine_health.reason or "engine not ready")
+                )
+
+            previous = self._states.get(key, {})
+            crash_count = int(previous.get("crash_count", 0))
+            if state == "unhealthy":
+                crash_count += 1
+            self._states[key] = {
+                **previous,
+                "domain_key": spec.domain_key,
+                "replica_id": spec.replica_id,
+                "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+                "state": state,
+                "actor_name": spec.normalized_actor_name(),
+                "launcher_key": spec.launcher_key,
+                "generation": generation,
+                "consumer_id": consumer_id,
+                "health": health,
+                "crash_count": crash_count,
+                "last_error": last_error,
+                "last_action": last_action,
+                "last_action_at": now,
+                "liveness_stale": bool(push_stale),
+                "liveness_gpu_busy": bool(gpu_busy),
+                "liveness_stale_after_s": stale_after_s,
+                "node_pins": resolved_node_pins,
+                "worker_aliases": original_spec.normalized_worker_aliases(),
+                "gpu_count": spec.gpu_count,
+                "scheduler_status": state,
+            }
+            results[label] = self._states[key]
 
         await self._sync_scheduler()
         return {"ok": True, "replicas": results, "snapshot": self.snapshot()}
@@ -3027,6 +2968,56 @@ def _runtime_error_requires_recreate(error: str) -> bool:
             "consumer_id mismatch",
         )
     )
+
+
+def _liveness_stale_after_s(reconcile_interval_s: float) -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_LIVENESS_STALE_AFTER_S") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_LIVENESS_STALE_AFTER_S=%r; using default",
+                raw,
+            )
+    return max(30.0, float(reconcile_interval_s) * 3.0)
+
+
+def _liveness_gpu_busy_threshold_percent() -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_LIVENESS_GPU_BUSY_THRESHOLD_PERCENT") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_LIVENESS_GPU_BUSY_THRESHOLD_PERCENT=%r; using default",
+                raw,
+            )
+    return 5.0
+
+
+def _liveness_push_is_stale(
+    push: EngineLivenessPush | None,
+    *,
+    now: float,
+    stale_after_s: float,
+) -> bool:
+    if push is None:
+        return True
+    if push.pushed_at is None:
+        return True
+    return now - float(push.pushed_at) > float(stale_after_s)
+
+
+def _liveness_push_gpu_busy(push: EngineLivenessPush | None, *, threshold_percent: float) -> bool:
+    if push is None:
+        return False
+    samples = push.observability.gpu_performance
+    for sample in samples:
+        util = sample.utilization_percent
+        if util is not None and float(util) >= float(threshold_percent):
+            return True
+    return False
 
 
 def queue_id_for_replica(domain_key: str, replica_id: str) -> str:

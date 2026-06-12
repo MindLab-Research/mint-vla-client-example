@@ -84,12 +84,14 @@ class _FakeRuntimeActor:
         self.start_calls = 0
         self.shutdown_calls = 0
         self.health_errors: list[BaseException] = []
+        self.health_snapshot_calls = 0
         self.last_error: str | None = None
         self.failed_total = 0
         self.completed_total = 0
         self.processed_total = 0
 
     def health_snapshot(self) -> dict:
+        self.health_snapshot_calls += 1
         if self.health_errors:
             raise self.health_errors.pop(0)
         return {
@@ -386,6 +388,48 @@ async def test_model_actor_supervisor_records_typed_liveness_push() -> None:
     assert latest["engine_health"]["status"] == "ready"
     assert latest["observability"]["gpu_performance"][0]["utilization_percent"] == 73.0
     assert latest["active_request_id"] == "req-1"
+
+
+def _liveness_push(
+    *,
+    domain_key: str = "vllm:model-a",
+    replica_id: str = "replica-0",
+    generation: int,
+    running: bool = True,
+    engine_ready: bool = True,
+    utilization_percent: float | None = 0.0,
+    pushed_at: float | None = None,
+    last_error: str | None = None,
+) -> EngineLivenessPush:
+    status = EngineHealthStatus.READY if running and engine_ready else EngineHealthStatus.UNHEALTHY
+    return EngineLivenessPush(
+        actor_name="mint_model_runtime_vllm-model-a_replica-0",
+        domain_key=domain_key,
+        replica_id=replica_id,
+        consumer_id=f"{domain_key}::{replica_id}::generation::{generation}",
+        actor_generation=generation,
+        running=running,
+        engine_ready=engine_ready,
+        engine_health=EngineHealth(
+            status=status,
+            reason=None if status is EngineHealthStatus.READY else "not_ready",
+            last_error=last_error,
+        ),
+        observability=EngineObservability(
+            gpu_performance=(
+                GpuPerformanceSample(
+                    device_index=0,
+                    utilization_percent=utilization_percent,
+                    memory_used_bytes=4096,
+                    memory_total_bytes=8192,
+                    power_watts=222.0,
+                    temperature_c=68.0,
+                ),
+            )
+        ),
+        pushed_at=time.time() if pushed_at is None else pushed_at,
+        last_error=last_error,
+    )
 
 
 def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
@@ -1700,6 +1744,139 @@ async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() 
 
 
 @pytest.mark.anyio
+async def test_model_actor_supervisor_reconcile_uses_fresh_liveness_push_without_pull() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    actor = created[0]
+    actor.health_snapshot_calls = 0
+    actor.health_errors.append(AssertionError("supervisor must not pull health_snapshot"))
+    await supervisor.push_liveness(_liveness_push(generation=actor.generation).to_wire())
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert len(created) == 1
+    assert actor.health_snapshot_calls == 0
+    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["last_action"] == "liveness_push"
+    assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_model_actor_supervisor_keeps_stale_gpu_busy_runtime_without_pull() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        reconcile_interval_s=1.0,
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    actor = created[0]
+    actor.health_snapshot_calls = 0
+    actor.health_errors.append(AssertionError("supervisor must not pull health_snapshot"))
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=actor.generation,
+            utilization_percent=91.0,
+            pushed_at=time.time() - 120.0,
+        ).to_wire()
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert len(created) == 1
+    assert actor.health_snapshot_calls == 0
+    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["last_action"] == "liveness_stale_gpu_busy"
+    assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
+async def test_model_actor_supervisor_restarts_stale_gpu_idle_runtime_without_pull() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        reconcile_interval_s=1.0,
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    actor = created[0]
+    first_generation = actor.generation
+    actor.health_snapshot_calls = 0
+    actor.health_errors.append(AssertionError("supervisor must not pull health_snapshot"))
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=first_generation,
+            utilization_percent=0.0,
+            pushed_at=time.time() - 120.0,
+        ).to_wire()
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert len(created) == 2
+    assert created[1].generation > first_generation
+    assert actor.health_snapshot_calls == 0
+    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["generation"] == created[1].generation
+    assert synced[-1][0]["status"] == "healthy"
+
+
+@pytest.mark.anyio
 async def test_issue_593_supervisor_ignores_stale_generation_health_failure() -> None:
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
@@ -1735,16 +1912,20 @@ async def test_issue_593_supervisor_ignores_stale_generation_health_failure() ->
         "scheduler_status": "healthy",
         "last_action": "reserve:dead",
     }
-    stale_actor.health_errors.append(TimeoutError("metadata timeout"))
     supervisor._actors[stale_actor.domain_key, stale_actor.replica_id] = _OpaqueRuntimeHandle(stale_actor)
+    push_result = await supervisor.push_liveness(
+        _liveness_push(generation=stale_generation).to_wire()
+    )
+    await supervisor.push_liveness(_liveness_push(generation=next_generation).to_wire())
 
     out = await supervisor.reconcile_once()
 
     label = "vllm:model-a::replica-0"
     assert len(created) == 1
-    assert out["snapshot"]["replicas"][label]["state"] == "starting"
+    assert push_result["reason"] == "stale_generation"
+    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
     assert out["snapshot"]["replicas"][label]["generation"] == next_generation
-    assert out["snapshot"]["replicas"][label]["last_action"] == "reserve:dead"
+    assert out["snapshot"]["replicas"][label]["last_action"] == "liveness_push"
     assert synced[-1][0]["status"] == "healthy"
     assert synced[-1][0]["generation"] == next_generation
 
@@ -1812,14 +1993,22 @@ async def test_issue_593_supervisor_keeps_runtime_with_recovered_execution_error
         **_disabled_control_plane_kwargs(),
     )
     await supervisor.reconcile_once()
-    created[0].last_error = "future failed: transient"
-    created[0].failed_total = 1
-    created[0].processed_total = 2
-    created[0].completed_total = 1
+    actor = created[0]
+    actor.health_errors.append(AssertionError("supervisor must not pull health_snapshot"))
+    actor.health_snapshot_calls = 0
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=actor.generation,
+            running=True,
+            engine_ready=True,
+            last_error=None,
+        ).to_wire()
+    )
 
     out = await supervisor.reconcile_once()
 
     assert len(created) == 1
+    assert actor.health_snapshot_calls == 0
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
     assert replica["state"] == "healthy"
     assert replica["last_error"] is None
