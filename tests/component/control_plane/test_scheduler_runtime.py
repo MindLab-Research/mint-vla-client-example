@@ -5,6 +5,7 @@ from typing import Any, cast
 import pytest
 
 from mint_server.backend.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.engine_liveness import EngineLivenessPush
 from mint_server.backend.model_engine_host import ModelEngineHost
 from mint_server.backend.task_state_store import FutureStatus
 
@@ -32,6 +33,20 @@ class _ComponentEngineLifecycle:
     async def restart(self) -> None:
         self.restart_calls += 1
         self.ready = True
+
+
+class _FlakyComponentLivenessPush:
+    def __init__(self) -> None:
+        self.payloads: list[EngineLivenessPush] = []
+        self.failures = 0
+        self.successes = 0
+
+    async def __call__(self, payload: EngineLivenessPush) -> None:
+        self.payloads.append(payload)
+        if len(self.payloads) == 1:
+            self.failures += 1
+            raise RuntimeError("synthetic liveness push failure")
+        self.successes += 1
 
 
 @pytest.mark.anyio
@@ -216,6 +231,62 @@ async def test_scheduler_component_runtime_resumes_durable_finalize_after_engine
         assert record["result_path"] == staged_payload_path
         assert contains.present is False
         assert stats["leases"] == []
+        await assert_terminal_not_scheduled(world, request_id)
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_liveness_push_failure_does_not_interrupt_runtime(
+    tmp_path,
+) -> None:
+    world = cast(Any, SchedulerComponentWorld(tmp_path))
+    try:
+        await world.start()
+        request_id = "component-liveness-push-failure"
+        await world.enqueue_sampling(request_id)
+        engine = _ComponentEngineLifecycle()
+        push = _FlakyComponentLivenessPush()
+
+        async def _executor(lease: dict[str, Any]) -> ExecutorOutcome:
+            lease_request_id = str(lease["item"]["request_id"])
+            return ExecutorOutcome(
+                kind="success",
+                payload={"ok": True, "request_id": lease_request_id},
+            )
+
+        actor = ModelEngineHost(
+            domain_key=world.domain_key,
+            replica_id=world.replica_id,
+            actor_name=f"component-runtime-{world.replica_id}",
+            actor_generation=world.generation,
+            poll_interval_s=0.01,
+            lease_ttl_s=1.0,
+            max_claim=1,
+            scheduler_client=world.scheduler,
+            task_futures_client=world.future_service,
+            task_state_store_client=world.task_state,
+            payload_store=world.payload_store,
+            engine_lifecycle=engine,
+            liveness_push=push,
+            executor=_executor,
+        )
+
+        assert await actor.run_once() == {"claimed": 1, "executed": 1}
+        assert await actor.run_once() == {"claimed": 0, "executed": 0}
+
+        record = await world.observe_task(request_id)
+        snapshot = actor.health_snapshot()
+
+        assert push.failures == 1
+        assert push.successes == 1
+        assert len(push.payloads) == 2
+        assert push.payloads[0].active_request_id is None
+        assert push.payloads[1].last_error == "RuntimeError: synthetic liveness push failure"
+        assert record["status"] == "done"
+        assert snapshot["completed_total"] == 1
+        assert snapshot["failed_total"] == 0
+        assert snapshot["last_error"] == "RuntimeError: synthetic liveness push failure"
         await assert_terminal_not_scheduled(world, request_id)
     finally:
         world.close()
