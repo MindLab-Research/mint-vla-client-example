@@ -1850,6 +1850,47 @@ async def test_scheduler_component_sync_requeue_failure_preserves_replica_regist
 
 
 @pytest.mark.anyio
+async def test_scheduler_component_generation_bump_drains_assigned_unleased_work(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-generation-bump-assigned-drain"
+        await world.enqueue_sampling(request_id, assign=False)
+        assigned = await world.scheduler.assign_pending(max_items=1)
+
+        old_record = await world.observe_task(request_id)
+        next_generation = world.generation + 1
+        next_consumer_id = world.replica(generation=next_generation)["consumer_id"]
+        synced = await world.scheduler.sync_replicas(
+            [world.replica(status="healthy", generation=next_generation)]
+        )
+        lease = await world.claim_one(
+            consumer_id=next_consumer_id,
+            consumer_generation=next_generation,
+        )
+        begin = await world.scheduler.begin_finalize(
+            lease=_token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation)
+        )
+        finished = await world.scheduler.finish_success(
+            lease=_token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation),
+            result_path=str(world.tmp_path / "generation-bump-result.json"),
+        )
+        record = await world.observe_task(request_id)
+
+        assert assigned.assigned == 1
+        assert old_record["status"] == "assigned"
+        assert synced.requeued == 1
+        assert synced.assigned["assigned"] == 1
+        assert lease["item"]["request_id"] == request_id
+        assert lease["consumer_id"] == next_consumer_id
+        assert begin.ok is True
+        assert finished.ok is True
+        assert record["status"] == "done"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
 async def test_scheduler_component_assign_cancellation_restores_backlog(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
