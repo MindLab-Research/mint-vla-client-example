@@ -22,7 +22,8 @@ async def assert_no_double_lease(world: Any) -> None:
     for lease in leases:
         assert isinstance(lease, dict)
         lease_id = str(lease.get("lease_id") or "")
-        item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+        raw_item = lease.get("item")
+        item = raw_item if isinstance(raw_item, dict) else {}
         request_id = str(item.get("request_id") or lease.get("request_id") or "")
         assert lease_id
         assert request_id
@@ -39,7 +40,8 @@ async def assert_lease_consistency(world: Any) -> None:
 
     for lease in leases:
         assert isinstance(lease, dict)
-        item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+        raw_item = lease.get("item")
+        item = raw_item if isinstance(raw_item, dict) else {}
         request_id = str(item.get("request_id") or lease.get("request_id") or "")
         assert request_id
         record = await world.observe_task(request_id)

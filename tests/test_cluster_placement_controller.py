@@ -31,6 +31,32 @@ class _FakePlacementGroup:
         return self
 
 
+async def assert_reservation_account_consistent(
+    controller: ClusterPlacementController,
+    *,
+    expected_active_reservations: int | None = None,
+    expected_in_flight_gpus_by_node: tuple[tuple[str, int], ...] | None = None,
+) -> None:
+    snapshot = await controller.snapshot()
+    if expected_active_reservations is not None:
+        assert snapshot.active_reservation_count == expected_active_reservations
+    if expected_in_flight_gpus_by_node is not None:
+        assert snapshot.in_flight_gpus_by_node == expected_in_flight_gpus_by_node
+    if snapshot.active_reservation_count == 0:
+        assert snapshot.in_flight_gpus_by_node == ()
+    if snapshot.in_flight_gpus_by_node:
+        assert snapshot.active_reservation_count > 0
+    for _node_ip, gpu_count in snapshot.in_flight_gpus_by_node:
+        assert gpu_count > 0
+    for _node_ip, gpu_count in snapshot.available_gpus_by_node:
+        assert gpu_count >= 0
+    for _node_ip, gpu_count in snapshot.rebuilt_gpus_by_node:
+        assert gpu_count > 0
+    for _replica_key, reason, retry_at in snapshot.blocked_replicas:
+        assert isinstance(reason, PlacementBlockReason)
+        assert retry_at > 0
+
+
 @pytest.mark.anyio
 async def test_cluster_placement_controller_reserves_capacity_atomically() -> None:
     controller = ClusterPlacementController(
@@ -55,10 +81,12 @@ async def test_cluster_placement_controller_reserves_capacity_atomically() -> No
     blocked = first if first.status == PlacementReservationStatus.BLOCKED else second
     assert blocked.reason is PlacementBlockReason.INSUFFICIENT_GPU
 
-    snapshot = await controller.snapshot()
-    assert snapshot.active_reservation_count == 1
-    assert snapshot.in_flight_gpus_by_node == (("10.0.0.7", 4),)
-    assert snapshot.available_gpus_by_node == (("10.0.0.7", 0),)
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=1,
+        expected_in_flight_gpus_by_node=(("10.0.0.7", 4),),
+    )
+    assert (await controller.snapshot()).available_gpus_by_node == (("10.0.0.7", 0),)
 
 
 @pytest.mark.anyio
@@ -92,9 +120,12 @@ async def test_cluster_placement_controller_releases_capacity_for_followup_reser
         )
     )
     assert third.status is PlacementReservationStatus.RESERVED
-    snapshot = await controller.snapshot()
-    assert snapshot.in_flight_gpus_by_node == (("10.0.0.7", 1),)
-    assert snapshot.available_gpus_by_node == (("10.0.0.7", 3),)
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=1,
+        expected_in_flight_gpus_by_node=(("10.0.0.7", 1),),
+    )
+    assert (await controller.snapshot()).available_gpus_by_node == (("10.0.0.7", 3),)
 
 
 @pytest.mark.anyio
@@ -117,9 +148,15 @@ async def test_cluster_placement_controller_reserves_unpinned_cluster_capacity()
         PlacementReservationStatus.RESERVED,
         PlacementReservationStatus.BLOCKED,
     }
-    snapshot = await controller.snapshot()
-    assert snapshot.in_flight_gpus_by_node == (("__cluster__", 3),)
-    assert snapshot.available_gpus_by_node == (("10.0.0.7", 0), ("10.0.0.8", 1))
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=1,
+        expected_in_flight_gpus_by_node=(("__cluster__", 3),),
+    )
+    assert (await controller.snapshot()).available_gpus_by_node == (
+        ("10.0.0.7", 0),
+        ("10.0.0.8", 1),
+    )
 
 
 def test_cluster_placement_controller_builds_backend_attach_compatible_pg_requests() -> None:
@@ -289,10 +326,12 @@ async def test_cluster_placement_controller_times_out_pending_pg_and_blocks_with
     assert result.placement_group_name == "mint_model_runtime_vllm-a_replica-0_pg"
     assert len(created) == 1
     assert len(removed) == 1
-    snapshot = await controller.snapshot()
-    assert snapshot.active_reservation_count == 0
-    assert snapshot.in_flight_gpus_by_node == ()
-    assert snapshot.blocked_replicas == (
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=0,
+        expected_in_flight_gpus_by_node=(),
+    )
+    assert (await controller.snapshot()).blocked_replicas == (
         ("vllm:model-a::replica-0", PlacementBlockReason.PG_PENDING_TIMEOUT, 105.0),
     )
 
@@ -341,9 +380,12 @@ async def test_cluster_placement_controller_recovers_blocked_replica_after_backo
     assert recovered.placement_group_name == "mint_dense_a_pg"
     assert len(created) == 2
     assert len(removed) == 1
-    snapshot = await controller.snapshot()
-    assert snapshot.blocked_replicas == ()
-    assert snapshot.active_reservation_count == 0
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=0,
+        expected_in_flight_gpus_by_node=(),
+    )
+    assert (await controller.snapshot()).blocked_replicas == ()
 
 
 def test_cluster_placement_controller_computes_backend_bundle_requests() -> None:

@@ -5,16 +5,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, cast
 
+from fastapi import Request, Response
 from mint_server.backend.control_plane_contracts import (
     AsyncSchedulerQueue,
     AsyncTaskLedger,
     CancelTaskResult,
+    ClaimResult,
+    ContainsResult,
     ExecutorOutcome,
     InProcessSchedulerQueueAdapter,
     ModelWorkTaskGateway,
+    SyncReplicasResult,
 )
+from mint_server.backend.model_work_admission import ModelWorkAdmissionResult
 from mint_server.backend.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisorCore,
@@ -209,8 +214,8 @@ class SchedulerComponentWorld:
             faults=self.faults,
         )
         self.future_service = TaskFutureService(
-            task_state_client=self.task_state,
-            future_state_client=self.task_state,
+            task_state_client=cast(Any, self.task_state),
+            future_state_client=cast(Any, self.task_state),
             payload_store=self.payload_store,
         )
         self.scheduler_actor = _ModelWorkSchedulerActor(
@@ -220,7 +225,9 @@ class SchedulerComponentWorld:
         )
         self.runtime_queue: AsyncSchedulerQueue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
         self.scheduler = self.runtime_queue
-        self.task_ledger: AsyncTaskLedger = self.scheduler_actor._task_state_store
+        task_ledger = self.scheduler_actor._task_state_store
+        assert task_ledger is not None
+        self.task_ledger: AsyncTaskLedger = task_ledger
         self.task_gateway: ModelWorkTaskGateway = SchedulerModelWorkTaskGateway(
             scheduler_client=self.runtime_queue,
             task_ledger_client=self.task_ledger,
@@ -235,7 +242,9 @@ class SchedulerComponentWorld:
         )
         self.runtime_queue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
         self.scheduler = self.runtime_queue
-        self.task_ledger = self.scheduler_actor._task_state_store
+        task_ledger = self.scheduler_actor._task_state_store
+        assert task_ledger is not None
+        self.task_ledger = task_ledger
         self.task_gateway = SchedulerModelWorkTaskGateway(
             scheduler_client=self.runtime_queue,
             task_ledger_client=self.task_ledger,
@@ -280,7 +289,7 @@ class SchedulerComponentWorld:
         ordering_key: str | None = None,
         token_cost: int = 1,
         request_json: bytes = b'{"prompt":"hello"}',
-    ) -> dict[str, Any]:
+    ) -> ModelWorkAdmissionResult:
         return await enqueue_model_work(
             request_id=request_id,
             op="sampling.asample",
@@ -329,7 +338,7 @@ class SchedulerComponentWorld:
         assert len(leases) == 1
         return leases[0]
 
-    async def claim_none(self, *, lease_ttl_s: float = 30.0) -> dict[str, Any]:
+    async def claim_none(self, *, lease_ttl_s: float = 30.0) -> ClaimResult:
         claimed = await self.scheduler.claim(
             domain_key=self.domain_key,
             replica_id=self.replica_id,
@@ -373,7 +382,7 @@ class SchedulerComponentWorld:
             poll_interval_s=0.01,
             lease_ttl_s=lease_ttl_s,
             max_claim=1,
-            scheduler_client=self.scheduler,
+            scheduler_client=cast(Any, self.scheduler),
             task_futures_client=self.future_service,
             task_state_store_client=self.task_state,
             payload_store=self.payload_store,
@@ -385,7 +394,7 @@ class SchedulerComponentWorld:
     async def observe_task(self, request_id: str) -> dict[str, Any]:
         return await self.task_state.async_get_task(request_id=str(request_id))
 
-    async def observe_scheduler(self, request_id: str) -> dict[str, Any]:
+    async def observe_scheduler(self, request_id: str) -> ContainsResult:
         return await self.scheduler.contains(request_id=str(request_id))
 
     async def observe_future_status(self, request_id: str) -> FutureStatus:
@@ -424,8 +433,8 @@ class SchedulerComponentWorld:
         request = SimpleNamespace(state=SimpleNamespace(user_data={"user_id": user_id}), headers={})
         payload = await futures_route.retrieve_future(
             FutureRetrieveRequest(request_id=request_id),
-            request,
-            response,
+            cast(Request, request),
+            cast(Response, response),
         )
         return int(response.status_code), payload
 
@@ -469,7 +478,7 @@ class SchedulerComponentWorld:
                 shutdown=lambda: {"ok": True},
             )
 
-        async def _sync(registrations: list[Any]) -> dict[str, Any]:
+        async def _sync(registrations: list[Any]) -> SyncReplicasResult:
             return await self.scheduler.sync_replicas([registration.to_dict() for registration in registrations])
 
         return ModelActorSupervisorCore(
@@ -492,7 +501,7 @@ class SchedulerComponentWorld:
         self,
         runtime_factory: Callable[[ModelActorSpec, int], Awaitable[Any]],
     ) -> ModelActorSupervisorCore:
-        async def _sync(registrations: list[Any]) -> dict[str, Any]:
+        async def _sync(registrations: list[Any]) -> SyncReplicasResult:
             return await self.scheduler.sync_replicas([registration.to_dict() for registration in registrations])
 
         return ModelActorSupervisorCore(
@@ -515,4 +524,6 @@ class SchedulerComponentWorld:
         manager_task = getattr(self.scheduler_actor, "_background_loop_manager_task", None)
         if manager_task is not None and not manager_task.done():
             manager_task.cancel()
-        self.task_store.close()
+        task_store = self.task_store
+        assert task_store is not None
+        task_store.close()
