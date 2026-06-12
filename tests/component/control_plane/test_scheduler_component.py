@@ -217,11 +217,11 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_gpu_actor_died_fences_consumer_until_generation_bump(tmp_path) -> None:
+async def test_scheduler_component_gpu_actor_died_does_not_scheduler_fence_consumer(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
         await world.start()
-        await world.enqueue_sampling("component-gpu-died-fence-a")
+        await world.enqueue_sampling("component-gpu-died-no-fence-a")
         lease = await world.claim_one()
 
         failed = await world.scheduler.fail(
@@ -229,8 +229,8 @@ async def test_scheduler_component_gpu_actor_died_fences_consumer_until_generati
             requeue=True,
             reason="gpu_actor_died",
         )
-        await world.enqueue_sampling("component-gpu-died-fence-b")
-        fenced_claim = await world.scheduler.claim(
+        await world.enqueue_sampling("component-gpu-died-no-fence-b")
+        claim = await world.scheduler.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -238,26 +238,14 @@ async def test_scheduler_component_gpu_actor_died_fences_consumer_until_generati
             max_items=1,
             lease_ttl_s=30.0,
         )
-
-        next_generation = world.generation + 1
-        next_consumer_id = world.replica(generation=next_generation)["consumer_id"]
-        await world.scheduler.sync_replicas([world.replica(generation=next_generation, status="healthy")])
-        recovered_claim = await world.scheduler.claim(
-            domain_key=world.domain_key,
-            replica_id=world.replica_id,
-            consumer_id=next_consumer_id,
-            consumer_generation=next_generation,
-            max_items=1,
-            lease_ttl_s=30.0,
-        )
         stats = await world.scheduler.stats()
 
         assert failed.ok is True and failed.requeued is True
-        assert fenced_claim.ok is False
-        assert fenced_claim.reason == "stale_consumer"
-        assert len(recovered_claim.leases) == 1
-        assert recovered_claim.leases[0]["consumer_id"] == next_consumer_id
-        assert stats["self_failed_consumers"] == []
+        assert claim.ok is True
+        assert len(claim.leases) == 1
+        assert claim.leases[0]["consumer_id"] == world.consumer_id
+        assert "self_failed_consumers" not in stats
+        assert "self_failed_consumer_count" not in stats
     finally:
         world.close()
 
