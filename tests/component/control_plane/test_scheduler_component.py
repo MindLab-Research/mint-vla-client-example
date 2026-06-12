@@ -100,6 +100,23 @@ async def _assert_scheduler_surfaces_progress_while_blocked(
     return result
 
 
+async def _wait_for_task_state_call_count(
+    world: SchedulerComponentWorld,
+    method: str,
+    *,
+    count: int,
+    timeout_s: float = 0.5,
+) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        observed = sum(1 for call_method, _ in world.task_state.calls if call_method == method)
+        if observed >= count:
+            return
+        await asyncio.sleep(0.005)
+    observed = sum(1 for call_method, _ in world.task_state.calls if call_method == method)
+    raise AssertionError(f"timed out waiting for {method} call count {count}; observed {observed}")
+
+
 @pytest.mark.anyio
 async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, monkeypatch) -> None:
     world = SchedulerComponentWorld(tmp_path)
@@ -114,6 +131,38 @@ async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, 
         assert status_code == 200
         assert payload == {"ok": True, "request_id": "component-happy"}
         await assert_terminal_not_scheduled(world, "component-happy")
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_owner_renew_rpc_does_not_hold_owner_lock(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        baseline_renew_calls = sum(
+            1 for method, _ in world.task_state.calls if method == "renew_scheduler_owner"
+        )
+        block = world.faults.block("task_state.renew_scheduler_owner")
+
+        first = asyncio.create_task(world.scheduler_actor._ensure_task_state_owner())
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+        await _wait_for_task_state_call_count(
+            world,
+            "renew_scheduler_owner",
+            count=baseline_renew_calls + 1,
+        )
+
+        second = asyncio.create_task(world.scheduler_actor._ensure_task_state_owner())
+        await _wait_for_task_state_call_count(
+            world,
+            "renew_scheduler_owner",
+            count=baseline_renew_calls + 2,
+        )
+
+        block.release.set()
+        first_epoch, second_epoch = await asyncio.gather(first, second)
+        assert first_epoch == second_epoch == 1
     finally:
         world.close()
 

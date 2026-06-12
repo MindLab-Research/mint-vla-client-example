@@ -690,26 +690,42 @@ class _ModelWorkSchedulerActor:
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:
             return None
-        async with self._task_state_owner_lock:
-            if self._scheduler_epoch is not None:
+        ttl_s = float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0))
+        while True:
+            async with self._task_state_owner_lock:
+                current_epoch = self._scheduler_epoch
+
+            if current_epoch is not None:
                 renewed = await self._task_state_call(
                     "renew_owner",
                     owner_id=self._owner_id,
-                    epoch=int(self._scheduler_epoch),
-                    ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
+                    epoch=int(current_epoch),
+                    ttl_s=ttl_s,
                 )
                 if isinstance(renewed, OwnerLeaseResult) and renewed.ok:
-                    return int(self._scheduler_epoch)
-                self._scheduler_epoch = None
+                    async with self._task_state_owner_lock:
+                        if self._scheduler_epoch in {None, int(current_epoch)}:
+                            self._scheduler_epoch = int(current_epoch)
+                            return int(current_epoch)
+                    continue
+
+                async with self._task_state_owner_lock:
+                    if self._scheduler_epoch == int(current_epoch):
+                        self._scheduler_epoch = None
+                    if self._scheduler_epoch is not None:
+                        continue
+
             acquired = await self._task_state_call(
                 "acquire_owner",
                 owner_id=self._owner_id,
-                ttl_s=float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0)),
+                ttl_s=ttl_s,
             )
             if not isinstance(acquired, OwnerLeaseResult) or not acquired.ok:
                 raise ModelWorkSchedulerConflictError(f"failed to acquire scheduler owner: {acquired}")
-            self._scheduler_epoch = int(acquired.epoch or 0)
-            return int(self._scheduler_epoch)
+            acquired_epoch = int(acquired.epoch or 0)
+            async with self._task_state_owner_lock:
+                self._scheduler_epoch = acquired_epoch
+            return acquired_epoch
 
     async def _owner_heartbeat_loop(self) -> None:
         while True:
