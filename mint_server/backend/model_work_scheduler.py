@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import time
@@ -407,6 +408,10 @@ class _ModelWorkSchedulerActor:
         self._sampling_token_cost_by_request_id: dict[str, int] = {}
         self._sampling_admission_would_reject: dict[tuple[str, str], int] = {}
         self._sampling_admission_reject: dict[tuple[str, str], int] = {}
+        self._background_loop_manager_task: asyncio.Task | None = None
+        self._background_loop_tasks: dict[str, asyncio.Task] = {}
+        self._background_loop_start_deferred: set[str] = set()
+        self._background_loops_shutdown = False
         self._assignment_loop_task: asyncio.Task | None = None
         self._assignment_loop_interval_s = float(
             os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
@@ -429,9 +434,7 @@ class _ModelWorkSchedulerActor:
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
-        self._ensure_assignment_loop_started()
-        self._ensure_owner_heartbeat_started()
-        self._ensure_reaper_loop_started()
+        self._ensure_background_loops_started()
 
     def _init_otel_metrics(self) -> None:
         endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
@@ -741,16 +744,95 @@ class _ModelWorkSchedulerActor:
                     e,
                 )
 
-    def _ensure_owner_heartbeat_started(self) -> None:
-        if not self._use_task_state_store or self._owner_heartbeat_interval_s <= 0:
+    def _desired_background_loop_names(self) -> list[str]:
+        names: list[str] = []
+        if self._assignment_loop_interval_s > 0:
+            names.append("assignment")
+        if self._use_task_state_store and self._owner_heartbeat_interval_s > 0:
+            names.append("owner_heartbeat")
+        if self._use_task_state_store and self._reaper_loop_interval_s > 0:
+            names.append("reaper")
+        return names
+
+    def _background_loop_running(self, name: str) -> bool:
+        task = self._background_loop_tasks.get(name)
+        if task is not None:
+            return not task.done()
+        manager = self._background_loop_manager_task
+        return (
+            manager is not None
+            and not manager.done()
+            and name in self._desired_background_loop_names()
+            and name not in self._background_loop_start_deferred
+        )
+
+    async def _background_loop_manager(self) -> None:
+        try:
+            async with asyncio.TaskGroup() as task_group:
+                if "assignment" in self._desired_background_loop_names():
+                    self._assignment_loop_task = task_group.create_task(
+                        self._assignment_loop(),
+                        name="model-work-scheduler-assignment-loop",
+                    )
+                    self._background_loop_tasks["assignment"] = self._assignment_loop_task
+                if "owner_heartbeat" in self._desired_background_loop_names():
+                    self._owner_heartbeat_task = task_group.create_task(
+                        self._owner_heartbeat_loop(),
+                        name="model-work-scheduler-owner-heartbeat-loop",
+                    )
+                    self._background_loop_tasks["owner_heartbeat"] = self._owner_heartbeat_task
+                if "reaper" in self._desired_background_loop_names():
+                    self._reaper_loop_task = task_group.create_task(
+                        self._reaper_loop(),
+                        name="model-work-scheduler-reaper-loop",
+                    )
+                    self._background_loop_tasks["reaper"] = self._reaper_loop_task
+        finally:
+            self._background_loop_tasks.clear()
+            self._assignment_loop_task = None
+            self._owner_heartbeat_task = None
+            self._reaper_loop_task = None
+
+    def _ensure_background_loops_started(self) -> None:
+        if self._background_loops_shutdown:
             return
-        if self._owner_heartbeat_task is not None and not self._owner_heartbeat_task.done():
+        desired = self._desired_background_loop_names()
+        if not desired:
+            self._background_loop_start_deferred.clear()
+            return
+        if self._background_loop_manager_task is not None and not self._background_loop_manager_task.done():
             return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            self._background_loop_start_deferred = set(desired)
+            logger.debug(
+                "[model_work_scheduler] background loop start deferred; no running event loop names=%s",
+                sorted(desired),
+            )
             return
-        self._owner_heartbeat_task = loop.create_task(self._owner_heartbeat_loop())
+        self._background_loop_start_deferred.clear()
+        self._background_loop_manager_task = loop.create_task(
+            self._background_loop_manager(),
+            name="model-work-scheduler-background-loop-manager",
+        )
+
+    async def shutdown_background_loops(self) -> dict[str, Any]:
+        self._background_loops_shutdown = True
+        task = self._background_loop_manager_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        self._background_loop_manager_task = None
+        self._background_loop_tasks.clear()
+        self._assignment_loop_task = None
+        self._owner_heartbeat_task = None
+        self._reaper_loop_task = None
+        return {"ok": True}
+
+    def _ensure_owner_heartbeat_started(self) -> None:
+        self._ensure_background_loops_started()
 
     async def _assignment_loop(self) -> None:
         while True:
@@ -767,15 +849,7 @@ class _ModelWorkSchedulerActor:
                 )
 
     def _ensure_assignment_loop_started(self) -> None:
-        if self._assignment_loop_interval_s <= 0:
-            return
-        if self._assignment_loop_task is not None and not self._assignment_loop_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._assignment_loop_task = loop.create_task(self._assignment_loop())
+        self._ensure_background_loops_started()
 
     async def _reaper_loop(self) -> None:
         while True:
@@ -792,15 +866,7 @@ class _ModelWorkSchedulerActor:
                 )
 
     def _ensure_reaper_loop_started(self) -> None:
-        if not self._use_task_state_store or self._reaper_loop_interval_s <= 0:
-            return
-        if self._reaper_loop_task is not None and not self._reaper_loop_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        self._reaper_loop_task = loop.create_task(self._reaper_loop())
+        self._ensure_background_loops_started()
 
     def _work_item_from_task_record(self, record: dict[str, Any]) -> ModelWorkItem:
         metadata = dict(record.get("metadata") or {})
@@ -2993,12 +3059,20 @@ class _ModelWorkSchedulerActor:
             "scheduler_instance_id": self._instance_id,
             "scheduler_epoch": self._scheduler_epoch,
             "task_state_store_enabled": self._use_task_state_store,
+            "background_loop_manager_running": self._background_loop_manager_task is not None
+            and not self._background_loop_manager_task.done(),
+            "background_loop_names": [
+                name
+                for name in ("assignment", "owner_heartbeat", "reaper")
+                if self._background_loop_running(name)
+            ],
+            "background_loop_start_deferred": sorted(self._background_loop_start_deferred),
             "assignment_loop_interval_s": self._assignment_loop_interval_s,
-            "assignment_loop_running": self._assignment_loop_task is not None and not self._assignment_loop_task.done(),
+            "assignment_loop_running": self._background_loop_running("assignment"),
             "owner_heartbeat_interval_s": self._owner_heartbeat_interval_s,
-            "owner_heartbeat_running": self._owner_heartbeat_task is not None and not self._owner_heartbeat_task.done(),
+            "owner_heartbeat_running": self._background_loop_running("owner_heartbeat"),
             "reaper_loop_interval_s": self._reaper_loop_interval_s,
-            "reaper_loop_running": self._reaper_loop_task is not None and not self._reaper_loop_task.done(),
+            "reaper_loop_running": self._background_loop_running("reaper"),
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -3056,8 +3130,6 @@ class _ModelWorkSchedulerActor:
         }
 
     def stats(self) -> dict[str, Any]:
-        self._ensure_assignment_loop_started()
-        self._ensure_owner_heartbeat_started()
         return self._stats_snapshot()
 
     def ping(self) -> dict[str, Any]:
@@ -3331,6 +3403,9 @@ def _create_ray_actor_handle():
         async def expire_leases(self, *, now: float | None = None) -> dict[str, Any]:
             out = await super().expire_leases(now=now)
             return out.to_wire()
+
+        async def shutdown_background_loops(self) -> dict[str, Any]:
+            return await super().shutdown_background_loops()
 
     actor = _RayModelWorkSchedulerActor.options(**options).remote(
         use_task_state_store=_model_work_scheduler_use_task_state_store_from_env(),

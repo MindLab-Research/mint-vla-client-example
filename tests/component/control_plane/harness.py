@@ -509,4 +509,7 @@ class SchedulerComponentWorld:
         )
 
     def close(self) -> None:
+        manager_task = getattr(self.scheduler_actor, "_background_loop_manager_task", None)
+        if manager_task is not None and not manager_task.done():
+            manager_task.cancel()
         self.task_store.close()

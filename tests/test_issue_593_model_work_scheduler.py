@@ -211,9 +211,76 @@ def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: py
             assert store.count("renew_owner") >= 1
             assert actor.stats()["owner_heartbeat_running"] is True
         finally:
+            await actor.shutdown_background_loops()
             store.close()
 
     asyncio.run(_run())
+
+
+def test_scheduler_background_loops_are_taskgroup_managed_and_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "0.01")
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_REAPER_INTERVAL_S", "0.01")
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S", "0.01")
+
+    async def _run() -> None:
+        store = _MockTaskStateStoreClient()
+        actor = _ModelWorkSchedulerActor(
+            use_task_state_store=True,
+            task_state_store=store,
+            owner_id="scheduler-background-taskgroup",
+        )
+        try:
+            stats = actor.stats()
+            assert stats["background_loop_manager_running"] is True
+            assert stats["assignment_loop_running"] is True
+            assert stats["owner_heartbeat_running"] is True
+            assert stats["reaper_loop_running"] is True
+            assert stats["background_loop_names"] == [
+                "assignment",
+                "owner_heartbeat",
+                "reaper",
+            ]
+
+            await actor.shutdown_background_loops()
+
+            stopped = actor.stats()
+            assert stopped["background_loop_manager_running"] is False
+            assert stopped["assignment_loop_running"] is False
+            assert stopped["owner_heartbeat_running"] is False
+            assert stopped["reaper_loop_running"] is False
+            assert stopped["background_loop_names"] == []
+        finally:
+            await actor.shutdown_background_loops()
+            store.close()
+
+    asyncio.run(_run())
+
+
+def test_scheduler_background_loops_defer_without_running_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "0.01")
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_REAPER_INTERVAL_S", "0.01")
+    monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S", "0.01")
+
+    store = _MockTaskStateStoreClient()
+    actor = _ModelWorkSchedulerActor(
+        use_task_state_store=True,
+        task_state_store=store,
+        owner_id="scheduler-background-deferred",
+    )
+    try:
+        stats = actor.stats()
+        assert stats["background_loop_manager_running"] is False
+        assert set(stats["background_loop_start_deferred"]) == {
+            "assignment",
+            "owner_heartbeat",
+            "reaper",
+        }
+    finally:
+        store.close()
 
 
 def test_scheduler_assigns_to_registered_replica_queue() -> None:
