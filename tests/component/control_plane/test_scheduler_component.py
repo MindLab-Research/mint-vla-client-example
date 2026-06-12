@@ -560,6 +560,8 @@ async def test_scheduler_component_finish_success_commits_terminal_and_releases_
         assert record["result_path"].endswith("component-finish-success.json")
         assert record["result_checksum"] == "sha256:abc"
         assert record["result_size_bytes"] == 123
+        await assert_every_terminal_has_payload_ref(world)
+        await assert_no_double_lease(world)
         await assert_terminal_not_scheduled(world, request_id)
     finally:
         world.close()
@@ -1036,6 +1038,9 @@ async def test_scheduler_component_lease_expiry_requeues_for_retry(tmp_path) -> 
         assert second_lease["lease_id"] != first_lease["lease_id"]
         record = await world.observe_task("component-expired-lease")
         assert record["status"] == "leased"
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
+        await assert_no_orphan_assigned(world)
     finally:
         world.close()
 
@@ -2749,6 +2754,8 @@ async def test_scheduler_component_cancel_assigned_work_removes_scheduler_projec
         assert failed_status == FutureStatus.FAILED
         assert status_code == 200
         assert "cancelled" in payload["error"]
+        await assert_no_double_lease(world)
+        await assert_no_orphan_assigned(world)
     finally:
         world.close()
 
