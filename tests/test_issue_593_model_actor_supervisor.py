@@ -14,7 +14,7 @@ from mint_server.backend.model_actor_launchers import (
     ModelActorLauncherRegistry,
     _model_runtime_max_claim_for_spec,
     _model_runtime_token_budget_for_spec,
-    launch_model_runtime_actor,
+    launch_model_engine_host,
     placement_env_for_spec,
 )
 from mint_server.backend.model_actor_supervisor import (
@@ -1127,22 +1127,22 @@ def test_issue_648_training_runtime_token_budget_uses_backend_then_training_then
 
 
 @pytest.mark.anyio
-async def test_issue_648_launch_model_runtime_actor_passes_training_token_budget(
+async def test_issue_648_launch_model_engine_host_passes_training_token_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
 
-    def _fake_get_or_create_model_runtime_actor(**kwargs):
+    def _fake_get_or_create_model_engine_host(**kwargs):
         captured.update(kwargs)
         return SimpleNamespace(ok=True)
 
-    runtime_module = types.ModuleType("mint_server.backend.model_runtime_actor")
-    runtime_module.get_or_create_model_runtime_actor = _fake_get_or_create_model_runtime_actor
-    monkeypatch.setitem(sys.modules, "mint_server.backend.model_runtime_actor", runtime_module)
+    runtime_module = types.ModuleType("mint_server.backend.model_engine_host")
+    runtime_module.get_or_create_model_engine_host = _fake_get_or_create_model_engine_host
+    monkeypatch.setitem(sys.modules, "mint_server.backend.model_engine_host", runtime_module)
     monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET", "262144")
     monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "16")
 
-    actor = await launch_model_runtime_actor(
+    actor = await launch_model_engine_host(
         ModelActorSpec(
             domain_key="bumblebee:Qwen/Qwen3-30B-A3B-Instruct-2507",
             replica_id="replica-0",

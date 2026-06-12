@@ -194,10 +194,10 @@ def _model_runtime_token_budget_for_spec(spec: ModelActorSpecLike) -> int | None
     return _positive_env_int("MINT_MODEL_RUNTIME_TOKEN_BUDGET")
 
 
-async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) -> Any:
-    from .model_runtime_actor import get_or_create_model_runtime_actor
+async def launch_model_engine_host(spec: ModelActorSpecLike, generation: int) -> Any:
+    from .model_engine_host import get_or_create_model_engine_host
 
-    return get_or_create_model_runtime_actor(
+    return get_or_create_model_engine_host(
         domain_key=spec.domain_key,
         replica_id=spec.replica_id,
         actor_name=spec.normalized_actor_name(),
@@ -212,11 +212,14 @@ async def launch_model_runtime_actor(spec: ModelActorSpecLike, generation: int) 
     )
 
 
+launch_model_runtime_actor = launch_model_engine_host
+
+
 def default_model_actor_launcher_registry() -> ModelActorLauncherRegistry:
     launchers = {
-        "cpu_runtime": launch_model_runtime_actor,
-        "training": launch_model_runtime_actor,
-        "vllm": launch_model_runtime_actor,
-        "model_runtime": launch_model_runtime_actor,
+        "cpu_runtime": launch_model_engine_host,
+        "training": launch_model_engine_host,
+        "vllm": launch_model_engine_host,
+        "model_runtime": launch_model_engine_host,
     }
     return ModelActorLauncherRegistry(launchers)

@@ -42,7 +42,7 @@ def test_issue_290_all_actor_runtime_env_call_otel_env_vars():
         "mint_server/backend/megatron_distributed.py": 2,
         "mint_server/backend/dense_trainer.py": 1,
         "mint_server/backend/verl_inference.py": 1,
-        "mint_server/backend/model_runtime_actor.py": 1,
+        "mint_server/backend/model_engine_host.py": 1,
         "mint_server/backend/model_work_scheduler.py": 1,
         "mint_server/backend/node_metrics_daemon.py": 1,
         "mint_server/backend/task_state_store.py": 1,

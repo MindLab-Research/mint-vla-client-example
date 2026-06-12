@@ -21,7 +21,7 @@ from mint_server.backend.model_actor_supervisor import (
     consumer_id_for_replica,
     queue_id_for_replica,
 )
-from mint_server.backend.model_runtime_actor import ModelRuntimeActor
+from mint_server.backend.model_engine_host import ModelEngineHost
 from mint_server.backend.model_work_admission import enqueue_model_work
 from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
 from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
@@ -356,13 +356,13 @@ class SchedulerComponentWorld:
         *,
         executor: Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None]] | None = None,
         lease_ttl_s: float = 1.0,
-    ) -> ModelRuntimeActor:
+    ) -> ModelEngineHost:
         async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
             request_id = str(lease["item"]["request_id"])
             await self.future_service.async_resolve(request_id, {"ok": True, "request_id": request_id})
             return ExecutorOutcome(kind="success")
 
-        actor = ModelRuntimeActor(
+        actor = ModelEngineHost(
             domain_key=self.domain_key,
             replica_id=self.replica_id,
             actor_name=f"component-runtime-{self.replica_id}",

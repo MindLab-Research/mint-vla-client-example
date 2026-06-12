@@ -38,7 +38,7 @@ def test_initialize_execution_bindings_is_runtime_actor_only() -> None:
                 ):
                     callers.append(str(path.relative_to(REPO_ROOT)))
 
-    assert callers == ["mint_server/backend/model_runtime_actor.py"]
+    assert callers == ["mint_server/backend/model_engine_host.py"]
 
 
 def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
@@ -71,9 +71,9 @@ def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
         assert assignment not in source
 
 
-def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
+def test_model_engine_host_does_not_bind_legacy_route_globals() -> None:
     runtime_source = (
-        REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+        REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     ).read_text()
     context_source = (
         REPO_ROOT / "mint_server" / "backend" / "execution_context.py"
@@ -84,9 +84,9 @@ def test_model_runtime_does_not_bind_legacy_route_globals() -> None:
     assert "from ..routes" not in context_source
 
 
-def test_model_runtime_terminal_commit_goes_through_scheduler_finish_surface() -> None:
+def test_model_engine_host_terminal_commit_goes_through_scheduler_finish_surface() -> None:
     runtime_source = (
-        REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+        REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     ).read_text()
 
     assert "_commit_task_state_success" not in runtime_source
@@ -97,8 +97,8 @@ def test_model_runtime_terminal_commit_goes_through_scheduler_finish_surface() -
     assert "finish_failure(" in runtime_source
 
 
-def test_model_runtime_does_not_classify_executor_exceptions_in_run_executor() -> None:
-    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor() -> None:
+    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(runtime_path)
     run_executor = functions["_run_executor"]
     source = ast.get_source_segment(runtime_path.read_text(), run_executor) or ""

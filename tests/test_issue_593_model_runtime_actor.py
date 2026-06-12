@@ -7,11 +7,11 @@ import pytest
 
 from mint_server.backend.control_plane_contracts import ExecutorOutcome, LeaseToken
 from mint_server.backend.task_state_store import FutureStatus
-from mint_server.backend.model_runtime_actor import (
-    ModelRuntimeActor,
+from mint_server.backend.model_engine_host import (
+    ModelEngineHost,
     _default_executor,
-    default_model_runtime_actor_name,
-    get_or_create_model_runtime_actor,
+    default_model_engine_host_name,
+    get_or_create_model_engine_host,
 )
 from mint_server.backend.model_work_execution_context import (
     get_current_model_work_consumer_generation,
@@ -309,7 +309,7 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
         await asyncio.sleep(0.16)
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -401,7 +401,7 @@ async def test_issue_616_model_runtime_finishes_success_via_scheduler(tmp_path) 
             billing_observations=billing_observations,
         )
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -446,7 +446,7 @@ async def test_issue_593_model_runtime_accepts_executor_outcome_success(tmp_path
             billing_observations=[{"tokens": 11}],
         )
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -478,7 +478,7 @@ async def test_issue_593_model_runtime_offloads_sync_executor_and_renews(tmp_pat
         time.sleep(0.35)
         return ExecutorOutcome(kind="success", payload={"ok": True, "source": "sync_executor"})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -524,7 +524,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -561,7 +561,7 @@ async def test_issue_616_model_runtime_finishes_executor_user_error_via_schedule
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="user_error", error="boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -606,7 +606,7 @@ async def test_issue_616_model_runtime_does_not_requeue_after_task_state_user_er
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="user_error", error="boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -637,7 +637,7 @@ async def test_issue_593_model_runtime_executor_exception_requeues_lease() -> No
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -682,7 +682,7 @@ async def test_issue_593_model_runtime_dispatch_dead_actor_outcome_requeues_gpu_
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="fatal_backend_death", error="backend actor died")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -731,7 +731,7 @@ async def test_issue_653_model_runtime_executor_timeout_fails_future_and_lease()
             cancelled = True
             raise
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="training:Qwen/Qwen3-0.6B",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -776,7 +776,7 @@ def test_issue_656_save_weights_runtime_timeout_uses_model_cap(monkeypatch) -> N
     monkeypatch.delenv("MINT_MODEL_RUNTIME_SAVE_WEIGHTS_TIMEOUT_S", raising=False)
     monkeypatch.delenv("MINT_MODEL_RUNTIME_EXECUTION_TIMEOUT_GRACE_S", raising=False)
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="training:Qwen/Qwen3-0.6B",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -793,7 +793,7 @@ def test_issue_656_save_weights_runtime_timeout_explicit_env_override(monkeypatc
     monkeypatch.setenv("MINT_SAVE_LORA_TIMEOUT_S", "1800")
     monkeypatch.setenv("MINT_MODEL_RUNTIME_SAVE_WEIGHTS_TIMEOUT_S", "42")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="training:Qwen/Qwen3-0.6B",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -821,7 +821,7 @@ async def test_issue_656_stale_recovered_generation_fails_without_executor() -> 
         nonlocal called
         called = True
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -870,7 +870,7 @@ async def test_issue_648_vllm_runtime_uses_dynamic_token_budget_for_claim() -> N
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
         replica_id="replica-0",
         actor_generation=3,
@@ -896,7 +896,7 @@ async def test_issue_648_vllm_runtime_falls_back_to_single_claim_without_budget(
     async def _token_budget_provider() -> None:
         return None
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -945,11 +945,11 @@ async def test_issue_648_default_token_budget_provider_uses_kv_debug_fallback(mo
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.async_get_ray_ref",
+        "mint_server.backend.model_engine_host.async_get_ray_ref",
         _async_get_ray_ref,
     )
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -986,7 +986,7 @@ async def test_issue_648_model_runtime_executes_claimed_vllm_leases_concurrently
         await asyncio.wait_for(release.wait(), timeout=1)
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1026,7 +1026,7 @@ async def test_model_runtime_renews_pending_sequential_leases() -> None:
         await asyncio.sleep(0.16)
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="bumblebee:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1058,7 +1058,7 @@ async def test_issue_593_model_runtime_future_fail_finalization_fails_lease() ->
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="user_error", error="engine startup failed")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="runtime-a",
@@ -1101,7 +1101,7 @@ async def test_issue_593_model_runtime_requeues_if_task_futures_finalize_fails()
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1138,7 +1138,7 @@ async def test_issue_593_model_runtime_completes_without_task_state_finalize_met
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1173,7 +1173,7 @@ async def test_issue_593_model_runtime_fails_future_if_lease_missing_before_fina
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1205,7 +1205,7 @@ async def test_issue_593_model_runtime_releases_capacity_if_lost_lease_fail_writ
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1230,7 +1230,7 @@ async def test_issue_593_model_runtime_does_not_recreate_forgotten_future_on_los
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1255,7 +1255,7 @@ async def test_issue_593_model_runtime_does_not_fail_new_retry_on_lost_old_lease
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1280,7 +1280,7 @@ async def test_issue_593_model_runtime_requeues_if_executor_failure_skips_finali
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1320,7 +1320,7 @@ async def test_issue_593_model_runtime_requeues_if_executor_failure_and_future_f
     async def _executor(_lease: dict) -> None:
         raise RuntimeError("boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1360,7 +1360,7 @@ async def test_issue_593_model_runtime_requeues_if_task_state_user_error_finish_
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="user_error", error="boom")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1397,7 +1397,7 @@ async def test_issue_593_model_runtime_requeues_if_mark_running_fails() -> None:
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1437,7 +1437,7 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
         nonlocal executed
         executed = True
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -1463,7 +1463,7 @@ async def test_issue_593_model_runtime_skips_non_pending_future_without_executio
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_empty_poll_and_drain() -> None:
     scheduler = _FakeScheduler()
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         scheduler_client=scheduler,
@@ -1491,7 +1491,7 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
     async def _executor(_lease: dict) -> ExecutorOutcome:
         return ExecutorOutcome(kind="user_error", error="engine startup failed")
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         scheduler_client=scheduler,
@@ -1512,7 +1512,7 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_empty_poll_clears_transient_scheduler_mismatch() -> None:
     scheduler = _FakeScheduler()
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         scheduler_client=scheduler,
@@ -1551,7 +1551,7 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
             return ExecutorOutcome(kind="user_error", error="engine startup failed")
         return ExecutorOutcome(kind="success", payload={"ok": True})
 
-    actor = ModelRuntimeActor(
+    actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         scheduler_client=scheduler,
@@ -1573,14 +1573,14 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
 
 def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
     assert (
-        default_model_runtime_actor_name("vllm:Qwen/Qwen3-30B-A3B-Instruct-2507", "replica-0")
+        default_model_engine_host_name("vllm:Qwen/Qwen3-30B-A3B-Instruct-2507", "replica-0")
         == "mint_model_runtime_vllm-qwen-qwen3-30b-a3b-instruct-2507_replica-0"
     )
 
 
 @pytest.mark.anyio
 async def test_issue_593_default_executor_initializes_execution_bindings(monkeypatch) -> None:
-    import mint_server.backend.model_runtime_actor as runtime_module
+    import mint_server.backend.model_engine_host as runtime_module
     import mint_server.backend.model_work_dispatch as dispatch_module
     from mint_server.backend.execution_context import current_execution_context
     from mint_server.routes import sampling
@@ -1621,7 +1621,7 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 
 @pytest.mark.anyio
 async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) -> None:
-    import mint_server.backend.model_runtime_actor as runtime_module
+    import mint_server.backend.model_engine_host as runtime_module
     import mint_server.backend.model_work_dispatch as dispatch_module
     from mint_server.backend.execution_context import current_execution_context
     from mint_server.routes import training
@@ -1708,20 +1708,20 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
+        "mint_server.backend.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.setenv("RAY_ADDRESS", "local")
 
-    out = get_or_create_model_runtime_actor(
+    out = get_or_create_model_engine_host(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="actor-a",
@@ -1782,20 +1782,20 @@ def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> No
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
+        "mint_server.backend.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.setenv("RAY_ADDRESS", "local")
 
-    out = get_or_create_model_runtime_actor(
+    out = get_or_create_model_engine_host(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_name="actor-a",
@@ -1858,20 +1858,20 @@ def test_issue_679_get_or_create_recreates_stale_runtime_env(monkeypatch) -> Non
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.sync_get_ray_ref",
+        "mint_server.backend.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.apply_detached_actor_resources",
+        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_runtime_actor.actor_runtime_env_vars",
+        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.setenv("RAY_ADDRESS", "local")
 
-    out = get_or_create_model_runtime_actor(
+    out = get_or_create_model_engine_host(
         domain_key="bumblebee:model-a",
         replica_id="replica-0",
         actor_name="actor-a",
