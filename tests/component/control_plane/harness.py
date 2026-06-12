@@ -327,7 +327,7 @@ class SchedulerComponentWorld:
             if consumer_id is not None
             else consumer_id_for_replica(self.domain_key, replica_id, consumer_generation)
         )
-        claimed = await self.scheduler.claim(
+        claimed = await self.runtime_queue.claim(
             domain_key=self.domain_key,
             replica_id=replica_id,
             consumer_id=consumer_id,
@@ -342,7 +342,7 @@ class SchedulerComponentWorld:
         return leases[0]
 
     async def claim_none(self, *, lease_ttl_s: float = 30.0) -> ClaimResult:
-        claimed = await self.scheduler.claim(
+        claimed = await self.runtime_queue.claim(
             domain_key=self.domain_key,
             replica_id=self.replica_id,
             consumer_id=self.consumer_id,
