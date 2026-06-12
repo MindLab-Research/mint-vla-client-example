@@ -212,6 +212,33 @@ class _FakeEngineLifecycle:
         self.ready = self.ready_after_restart
 
 
+class _FakeBindingEngine:
+    def __init__(self, *, ready: bool = True) -> None:
+        self.ready = bool(ready)
+        self.restart_calls = 0
+        self.shutdown_calls = 0
+        self.unhealthy_reasons: list[str] = []
+        self.observability = {"kv_cache_capacity_tokens": 128}
+
+    async def is_ready(self) -> bool:
+        return self.ready
+
+    async def get_observability_binding(self) -> dict:
+        return dict(self.observability)
+
+    async def restart(self) -> None:
+        self.restart_calls += 1
+        self.ready = True
+
+    async def shutdown_all(self) -> None:
+        self.shutdown_calls += 1
+        self.ready = False
+
+    async def mark_unhealthy(self, reason: str) -> None:
+        self.ready = False
+        self.unhealthy_reasons.append(str(reason))
+
+
 class _FakeTaskFutureService:
     def __init__(
         self,
@@ -771,6 +798,104 @@ async def test_model_engine_host_skips_claim_when_engine_not_ready() -> None:
     assert await actor.run_once() == {"claimed": 0, "executed": 0, "engine_ready": False}
     assert scheduler.claim_calls == []
     assert actor.health_snapshot()["engine_ready"] is False
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_engine_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_engine_host as runtime_module
+    import mint_server.backend.model_work_dispatch as dispatch_module
+    from mint_server.backend.execution_context import ExecutionContext
+
+    lease = _lease("runtime-req-default-lifecycle-ready")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    binding_engine = _FakeBindingEngine(ready=False)
+    init_calls = 0
+
+    async def _initialize_execution_bindings() -> dict:
+        nonlocal init_calls
+        init_calls += 1
+        return {
+            "inference_manager": binding_engine,
+            "train_manager": object(),
+            "train_engine": object(),
+            "action_manager": object(),
+        }
+
+    async def _execute_work_item(_item, **_kwargs) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
+
+    monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
+    monkeypatch.setattr(
+        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        _initialize_execution_bindings,
+    )
+    monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,  # type: ignore[arg-type]
+        task_futures_client=task_futures,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0, "engine_ready": False}
+    assert scheduler.claim_calls == []
+    assert init_calls == 1
+    assert isinstance(runtime_module._EXECUTION_BINDINGS, ExecutionContext)
+
+    binding_engine.ready = True
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert len(scheduler.claim_calls) == 1
+    assert init_calls == 1
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_default_lifecycle_restarts_binding_engine_on_backend_death(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_engine_host as runtime_module
+    import mint_server.backend.model_work_dispatch as dispatch_module
+
+    lease = _lease("runtime-req-default-lifecycle-restart")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    binding_engine = _FakeBindingEngine(ready=True)
+
+    async def _initialize_execution_bindings() -> dict:
+        return {
+            "inference_manager": binding_engine,
+            "train_manager": object(),
+            "train_engine": object(),
+            "action_manager": object(),
+        }
+
+    async def _execute_work_item(_item, **_kwargs) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="fatal_backend_death", error="binding engine died")
+
+    monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
+    monkeypatch.setattr(
+        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        _initialize_execution_bindings,
+    )
+    monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,  # type: ignore[arg-type]
+        task_futures_client=task_futures,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert binding_engine.unhealthy_reasons == ["binding engine died"]
+    assert binding_engine.restart_calls == 1
+    assert binding_engine.ready is True
+    assert len(scheduler.finished_failure) == 1
 
 
 @pytest.mark.anyio

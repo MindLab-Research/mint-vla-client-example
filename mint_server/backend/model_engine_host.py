@@ -334,14 +334,18 @@ async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
     return outcome
 
 
-async def _ensure_execution_bindings() -> ExecutionContext:
+async def _ensure_execution_bindings(*, force_refresh: bool = False) -> ExecutionContext:
     global _EXECUTION_BINDINGS
-    if _EXECUTION_BINDINGS is not None:
+    if _EXECUTION_BINDINGS is not None and not force_refresh:
         return _EXECUTION_BINDINGS
     from .execution_bindings import initialize_execution_bindings
 
     _EXECUTION_BINDINGS = ExecutionContext(**await initialize_execution_bindings())
     return _EXECUTION_BINDINGS
+
+
+async def _refresh_execution_bindings() -> ExecutionContext:
+    return await _ensure_execution_bindings(force_refresh=True)
 
 
 class ModelEngineHost:
@@ -433,6 +437,13 @@ class ModelEngineHost:
         self._token_budget_provider = (
             token_budget_provider if token_budget_provider is not None else self._default_token_budget_provider
         )
+        if engine_lifecycle is None and executor is None:
+            from .engine_lifecycle import ExecutionContextEngineLifecycle
+
+            engine_lifecycle = ExecutionContextEngineLifecycle(
+                _ensure_execution_bindings,
+                refresh_context_factory=_refresh_execution_bindings,
+            )
         self._engine_lifecycle = engine_lifecycle
         self._self_exit = self_exit if self_exit is not None else self._ray_actor_self_exit
 
