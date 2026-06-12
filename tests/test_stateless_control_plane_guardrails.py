@@ -108,6 +108,25 @@ def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor
     assert 'ExecutorOutcome(kind="user_error"' not in source
 
 
+def test_backend_placement_group_creation_is_controller_owned() -> None:
+    backend_paths = [
+        REPO_ROOT / "mint_server" / "backend" / "dense_trainer.py",
+        REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
+        REPO_ROOT / "mint_server" / "backend" / "megatron_distributed.py",
+        REPO_ROOT / "mint_server" / "backend" / "bumblebee_distributed.py",
+    ]
+    for path in backend_paths:
+        source = path.read_text()
+        assert "ray.util.placement_group(" not in source
+        assert "ray.util.remove_placement_group(e.pg)" not in source
+
+
+def test_vllm_backend_attach_preserves_child_task_capture() -> None:
+    source = (REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py").read_text()
+    assert "get_named_placement_group(" in source
+    assert "placement_group_capture_child_tasks=True" in source
+
+
 def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -> None:
     task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
     functions = _class_methods(task_state_path)["TaskStateStore"]

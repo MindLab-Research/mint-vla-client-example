@@ -11,6 +11,7 @@ For K2 (1T params, 384 experts):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -39,7 +40,7 @@ from . import ray_kill
 from .async_ray_control import async_get_ray_ref
 from .gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from .multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
-from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
+from .ray_placement_groups import get_named_placement_group
 from .ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from .runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
 from .vllm_scheduler_observability import (
@@ -2515,26 +2516,6 @@ class MultiNodeInferenceEngine:
                         return
             except (ValueError, ray.exceptions.RayActorError):
                 logger.info(f"No existing actor found, creating new: {self.actor_name}")
-                try:
-                    stale_pg = get_named_placement_group(
-                        f"{self.actor_name}_pg",
-                        namespace=PERSISTENT_NAMESPACE,
-                    )
-                except Exception:
-                    stale_pg = None
-                if stale_pg is not None:
-                    logger.warning(
-                        "Removing stale placement group for actor_name=%s before recreation",
-                        self.actor_name,
-                    )
-                    try:
-                        ray.util.remove_placement_group(stale_pg)
-                    except Exception as e:
-                        logger.warning(
-                            "Failed removing stale placement group for actor_name=%s: %s",
-                            self.actor_name,
-                            e,
-                        )
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -2546,11 +2527,6 @@ class MultiNodeInferenceEngine:
                         namespace=PERSISTENT_NAMESPACE,
                         no_restart=True,
                     )
-                    try:
-                        pg = ray.util.get_placement_group(f"{self.actor_name}_pg")
-                        ray.util.remove_placement_group(pg)
-                    except Exception:
-                        pass
                     # Wait for Ray to clean up the actor name
                     for _ in range(10):
                         await asyncio.sleep(1)
@@ -2640,49 +2616,11 @@ class MultiNodeInferenceEngine:
             if distributed_executor_backend == "ray":
                 pg_name = f"{self.actor_name}_pg"
                 pg_bundles = resources.pg_bundles
-                try:
-                    pg = get_named_placement_group(
-                        pg_name,
-                        namespace=PERSISTENT_NAMESPACE,
-                        expected_bundles=pg_bundles,
-                    )
-                except PlacementGroupMismatchError as e:
-                    logger.warning(
-                        "Removing incompatible placement group for actor_name=%s: %s",
-                        self.actor_name,
-                        e,
-                    )
-                    ray.util.remove_placement_group(e.pg)
-                    pg = ray.util.placement_group(
-                        pg_bundles,
-                        # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
-                        # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
-                        # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
-                        strategy="PACK",
-                        name=pg_name,
-                        lifetime="detached",
-                    )
-                except Exception:
-                    pg = ray.util.placement_group(
-                        pg_bundles,
-                        # PACK to minimize fragmentation: multi-node vLLM uses many 1-GPU workers.
-                        # SPREAD can occupy 1-3 GPUs on every node, preventing later 4-GPU actors
-                        # (e.g., Qwen3-30B) from finding a node with 4 free GPUs.
-                        strategy="PACK",
-                        name=pg_name,
-                        lifetime="detached",
-                    )
-                try:
-                    await async_get_ray_ref(pg.ready())
-                except SystemExit as e:
-                    if getattr(e, "code", None) == 15:
-                        raise
-                    try:
-                        if pg is not None:
-                            ray.util.remove_placement_group(pg)
-                    except Exception:
-                        pass
-                    raise RuntimeError(f"ray.get(pg.ready()) triggered SystemExit for {pg_name}: {e}") from e
+                pg = get_named_placement_group(
+                    pg_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    expected_bundles=pg_bundles,
+                )
 
             # Create new engine actor
             MultiNodeVLLMEngine = _create_mint_vllm_multinode_actor(
@@ -2898,11 +2836,6 @@ class MultiNodeInferenceEngine:
                     )
                 except Exception:
                     pass
-                try:
-                    if pg is not None:
-                        ray.util.remove_placement_group(pg)
-                except Exception:
-                    pass
                 self.engine = None
                 raise RuntimeError(f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
@@ -2915,11 +2848,6 @@ class MultiNodeInferenceEngine:
                     no_restart=True,
                     timeout_s=init_timeout,
                 )
-                try:
-                    if pg is not None:
-                        ray.util.remove_placement_group(pg)
-                except Exception:
-                    pass
                 self.engine = None
                 raise RuntimeError("MultiNodeVLLMEngine init timed out")
             except Exception:
@@ -2932,11 +2860,6 @@ class MultiNodeInferenceEngine:
                         no_restart=True,
                         timeout_s=init_timeout,
                     )
-                except Exception:
-                    pass
-                try:
-                    if pg is not None:
-                        ray.util.remove_placement_group(pg)
                 except Exception:
                     pass
                 self.engine = None

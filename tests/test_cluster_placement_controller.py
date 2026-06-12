@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 
 import pytest
 
 from mint_server.backend.cluster_placement_controller import (
     ClusterPlacementController,
     PlacementBlockReason,
+    PlacementGroupBundleRequest,
     PlacementGroupCreateRequest,
     PlacementGroupCreateStatus,
     PlacementReservationRequest,
     PlacementReservationStatus,
 )
+from mint_server.backend.model_placement_topology import ParallelTopology
 
 
 class _FakePlacementGroup:
@@ -92,6 +95,31 @@ async def test_cluster_placement_controller_releases_capacity_for_followup_reser
 
 
 @pytest.mark.anyio
+async def test_cluster_placement_controller_reserves_unpinned_cluster_capacity() -> None:
+    controller = ClusterPlacementController(
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 2, "10.0.0.8": 2},
+    )
+    request_a = PlacementReservationRequest.from_mapping(
+        replica_key="vllm:model-a::replica-0",
+        required_gpus_by_node={"__cluster__": 3},
+    )
+    request_b = PlacementReservationRequest.from_mapping(
+        replica_key="vllm:model-b::replica-0",
+        required_gpus_by_node={"__cluster__": 2},
+    )
+
+    first, second = await asyncio.gather(controller.reserve(request_a), controller.reserve(request_b))
+
+    assert {first.status, second.status} == {
+        PlacementReservationStatus.RESERVED,
+        PlacementReservationStatus.BLOCKED,
+    }
+    snapshot = await controller.snapshot()
+    assert snapshot.in_flight_gpus_by_node == (("__cluster__", 3),)
+    assert snapshot.available_gpus_by_node == (("10.0.0.7", 0), ("10.0.0.8", 1))
+
+
+@pytest.mark.anyio
 async def test_cluster_placement_controller_rebuilds_existing_pg_occupancy_from_table() -> None:
     controller = ClusterPlacementController(
         namespace="mint",
@@ -105,6 +133,12 @@ async def test_cluster_placement_controller_rebuilds_existing_pg_occupancy_from_
                     "0": {"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001},
                     "1": {"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001},
                 },
+            },
+            "alive_unpinned": {
+                "name": "mint_model_runtime_vllm-b_replica-0_pg",
+                "namespace": "mint",
+                "state": "CREATED",
+                "bundles": {"0": {"GPU": 1, "CPU": 1}},
             },
             "foreign": {
                 "name": "other_pg",
@@ -123,8 +157,8 @@ async def test_cluster_placement_controller_rebuilds_existing_pg_occupancy_from_
 
     snapshot = await controller.rebuild_from_placement_group_table()
 
-    assert snapshot.rebuilt_gpus_by_node == (("10.0.0.7", 2),)
-    assert snapshot.available_gpus_by_node == (("10.0.0.7", 2), ("10.0.0.8", 2))
+    assert snapshot.rebuilt_gpus_by_node == (("10.0.0.7", 2), ("__cluster__", 1))
+    assert snapshot.available_gpus_by_node == (("10.0.0.7", 1), ("10.0.0.8", 2))
 
     reserved = await controller.reserve(
         PlacementReservationRequest.from_mapping(
@@ -141,7 +175,7 @@ async def test_cluster_placement_controller_rebuilds_existing_pg_occupancy_from_
             required_gpus_by_node={"10.0.0.7": 2},
         )
     )
-    assert accepted.status is PlacementReservationStatus.RESERVED
+    assert accepted.status is PlacementReservationStatus.BLOCKED
 
 
 @pytest.mark.anyio
@@ -233,3 +267,79 @@ async def test_cluster_placement_controller_recovers_blocked_replica_after_backo
     snapshot = await controller.snapshot()
     assert snapshot.blocked_replicas == ()
     assert snapshot.active_reservation_count == 0
+
+
+def test_cluster_placement_controller_computes_backend_bundle_requests() -> None:
+    dense = PlacementGroupBundleRequest.for_dense(
+        replica_key="dense:model-a::replica-0",
+        placement_group_name="mint_dense_a_mint_pg",
+        node_ip="10.0.0.7",
+        namespace="mint",
+    )
+    assert dense.required_gpus_by_node == (("10.0.0.7", 1),)
+    assert dense.bundles == ((("CPU", 1), ("GPU", 1), ("node:10.0.0.7", 0.001)),)
+
+    vllm = PlacementGroupBundleRequest.for_vllm(
+        replica_key="vllm:model-a::replica-0",
+        placement_group_name="mint_vllm_a_pg",
+        worker_gpus=3,
+        node_ips=("10.0.0.7", "10.0.0.7", "10.0.0.8"),
+        namespace="mint",
+    )
+    assert vllm.required_gpus_by_node == (("10.0.0.7", 2), ("10.0.0.8", 1))
+    assert vllm.controller_bundle_index == 3
+    assert vllm.bundles[-1] == (("CPU", 1),)
+
+    megatron = PlacementGroupBundleRequest.for_distributed_training(
+        replica_key="megatron:model-a::replica-0",
+        placement_group_name="mint_megatron_a_mint_pg",
+        parallel=ParallelTopology(tensor_parallel_size=2, pipeline_parallel_size=2),
+        placement_slices=(("replica-0", "10.0.0.9", 4),),
+        namespace="mint",
+    )
+    assert megatron.required_gpus_by_node == (("10.0.0.9", 4),)
+    assert len(megatron.bundles) == 4
+
+
+@pytest.mark.anyio
+async def test_cluster_placement_controller_default_ray_ready_wait_uses_ray_get(monkeypatch) -> None:
+    ready_refs: list[object] = []
+
+    class _RayUtil:
+        @staticmethod
+        def placement_group(**kwargs):
+            assert kwargs["name"] == "mint_dense_a_pg"
+            return _SyncReadyPlacementGroup()
+
+        @staticmethod
+        def remove_placement_group(pg):
+            raise AssertionError(f"unexpected remove placement group {pg!r}")
+
+    class _RayModule:
+        util = _RayUtil()
+
+        @staticmethod
+        def get(ref):
+            ready_refs.append(ref)
+            return "ready"
+
+    class _SyncReadyPlacementGroup:
+        def ready(self):
+            return "ready-ref"
+
+    monkeypatch.setitem(sys.modules, "ray", _RayModule())
+
+    controller = ClusterPlacementController(
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 1},
+    )
+    result = await controller.create_pg(
+        PlacementGroupCreateRequest.from_mapping(
+            replica_key="dense:model-a::replica-0",
+            placement_group_name="mint_dense_a_pg",
+            required_gpus_by_node={"10.0.0.7": 1},
+            bundles=({"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001},),
+        )
+    )
+
+    assert result.status is PlacementGroupCreateStatus.READY
+    assert ready_refs == ["ready-ref"]

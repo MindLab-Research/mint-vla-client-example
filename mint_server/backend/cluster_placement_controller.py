@@ -9,6 +9,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from .model_placement_topology import (
+    EnginePlacementTopology,
+    ParallelTopology,
+    PlacementBundle,
+)
+
+CLUSTER_GPU_KEY = "__cluster__"
+
 
 class PlacementReservationStatus(StrEnum):
     RESERVED = "reserved"
@@ -109,6 +117,135 @@ class PlacementGroupCreateRequest:
     @property
     def bundle_dicts(self) -> tuple[dict[str, int | float], ...]:
         return tuple(dict(bundle) for bundle in self.bundles)
+
+
+@dataclass(frozen=True)
+class PlacementGroupBundleRequest:
+    replica_key: str
+    placement_group_name: str
+    required_gpus_by_node: GpuByNode
+    bundles: tuple[BUNDLE, ...]
+    controller_bundle_index: int | None = None
+    namespace: str | None = None
+
+    @classmethod
+    def for_dense(
+        cls,
+        *,
+        replica_key: str,
+        placement_group_name: str,
+        node_ip: str | None = None,
+        namespace: str | None = None,
+    ) -> PlacementGroupBundleRequest:
+        topology = EnginePlacementTopology(
+            gpu_count=1,
+            placement_slices=() if node_ip is None else ((replica_key, node_ip, 1),),
+        )
+        return cls.from_topology(
+            replica_key=replica_key,
+            placement_group_name=placement_group_name,
+            topology=topology,
+            namespace=namespace,
+        )
+
+    @classmethod
+    def for_vllm(
+        cls,
+        *,
+        replica_key: str,
+        placement_group_name: str,
+        worker_gpus: int,
+        node_ips: Iterable[str] = (),
+        namespace: str | None = None,
+    ) -> PlacementGroupBundleRequest:
+        placement_slices: list[tuple[str, str, int]] = []
+        node_counts: dict[str, int] = {}
+        for raw_node_ip in node_ips:
+            node_ip = str(raw_node_ip).strip()
+            if not node_ip:
+                continue
+            node_counts[node_ip] = node_counts.get(node_ip, 0) + 1
+        for node_ip, gpu_count in node_counts.items():
+            placement_slices.append((replica_key, node_ip, gpu_count))
+        topology = EnginePlacementTopology(
+            gpu_count=int(worker_gpus),
+            placement_slices=tuple(placement_slices),
+        )
+        layout = topology.with_controller_bundle(cpu=1, cpu_per_gpu=1)
+        return cls.from_layout(
+            replica_key=replica_key,
+            placement_group_name=placement_group_name,
+            bundles=layout.bundles,
+            controller_bundle_index=layout.controller_bundle_index,
+            namespace=namespace,
+        )
+
+    @classmethod
+    def for_distributed_training(
+        cls,
+        *,
+        replica_key: str,
+        placement_group_name: str,
+        parallel: ParallelTopology,
+        placement_slices: Iterable[tuple[str, str, int]] = (),
+        namespace: str | None = None,
+    ) -> PlacementGroupBundleRequest:
+        topology = EnginePlacementTopology(
+            parallel=parallel,
+            placement_slices=tuple(placement_slices),
+        )
+        return cls.from_topology(
+            replica_key=replica_key,
+            placement_group_name=placement_group_name,
+            topology=topology,
+            namespace=namespace,
+        )
+
+    @classmethod
+    def from_topology(
+        cls,
+        *,
+        replica_key: str,
+        placement_group_name: str,
+        topology: EnginePlacementTopology,
+        namespace: str | None = None,
+    ) -> PlacementGroupBundleRequest:
+        return cls.from_layout(
+            replica_key=replica_key,
+            placement_group_name=placement_group_name,
+            bundles=topology.gpu_bundles(cpu_per_gpu=1),
+            namespace=namespace,
+        )
+
+    @classmethod
+    def from_layout(
+        cls,
+        *,
+        replica_key: str,
+        placement_group_name: str,
+        bundles: Iterable[PlacementBundle],
+        controller_bundle_index: int | None = None,
+        namespace: str | None = None,
+    ) -> PlacementGroupBundleRequest:
+        normalized_bundles = _normalize_bundles(bundles)
+        return cls(
+            replica_key=str(replica_key),
+            placement_group_name=str(placement_group_name),
+            required_gpus_by_node=_required_gpus_by_node_from_bundles(normalized_bundles),
+            bundles=normalized_bundles,
+            controller_bundle_index=controller_bundle_index,
+            namespace=namespace,
+        )
+
+    def to_create_request(self, *, ready_timeout_s: float = 60.0) -> PlacementGroupCreateRequest:
+        return PlacementGroupCreateRequest(
+            replica_key=self.replica_key,
+            placement_group_name=self.placement_group_name,
+            required_gpus_by_node=self.required_gpus_by_node,
+            bundles=self.bundles,
+            namespace=self.namespace,
+            ready_timeout_s=float(ready_timeout_s),
+        )
 
 
 @dataclass(frozen=True)
@@ -256,7 +393,7 @@ class ClusterPlacementController:
             blockers = {
                 node_ip: required_gpus
                 for node_ip, required_gpus in required.items()
-                if int(available.get(node_ip, 0)) < int(required_gpus)
+                if not _has_available_gpus(available, node_ip=node_ip, required_gpus=int(required_gpus))
             }
             if blockers:
                 return PlacementReservationResult(
@@ -340,9 +477,17 @@ class ClusterPlacementController:
         observed = await raw if inspect.isawaitable(raw) else raw
         available = dict(_normalize_gpu_by_node(observed))
         for node_ip, gpu_count in self._rebuilt_gpus_by_node.items():
-            available[node_ip] = max(0, int(available.get(node_ip, 0)) - int(gpu_count))
+            available = _subtract_available_gpus(
+                available,
+                node_ip=node_ip,
+                gpu_count=int(gpu_count),
+            )
         for node_ip, gpu_count in self._in_flight_gpus_by_node_unlocked():
-            available[node_ip] = max(0, int(available.get(node_ip, 0)) - int(gpu_count))
+            available = _subtract_available_gpus(
+                available,
+                node_ip=node_ip,
+                gpu_count=int(gpu_count),
+            )
         return available
 
     def _in_flight_gpus_by_node_unlocked(self) -> GpuByNode:
@@ -353,9 +498,8 @@ class ClusterPlacementController:
         return _gpu_by_node_tuple(totals)
 
     async def _create_placement_group(self, request: PlacementGroupCreateRequest) -> Any:
-        if self._placement_group_factory is None:
-            raise RuntimeError("placement_group_factory is not configured")
-        out = self._placement_group_factory(
+        factory = self._placement_group_factory or _ray_placement_group_factory
+        out = factory(
             bundles=request.bundle_dicts,
             strategy=request.strategy,
             name=request.placement_group_name,
@@ -372,12 +516,16 @@ class ClusterPlacementController:
         if inspect.isawaitable(out):
             await asyncio.wait_for(out, timeout=max(0.001, float(timeout_s)))
             return
-        await asyncio.wait_for(asyncio.to_thread(lambda: out), timeout=max(0.001, float(timeout_s)))
+        await asyncio.wait_for(
+            asyncio.to_thread(_ray_get, out),
+            timeout=max(0.001, float(timeout_s)),
+        )
 
     async def _remove_placement_group(self, pg: Any | None) -> None:
-        if pg is None or self._placement_group_remover is None:
+        if pg is None:
             return
-        out = self._placement_group_remover(pg)
+        remover = self._placement_group_remover or _ray_placement_group_remover
+        out = remover(pg)
         if inspect.isawaitable(out):
             await out
 
@@ -426,6 +574,75 @@ def _normalize_bundles(values: Iterable[Mapping[str, int | float]]) -> tuple[BUN
 
 def _gpu_by_node_tuple(values: Mapping[str, int]) -> GpuByNode:
     return tuple(sorted((str(node_ip), int(gpu_count)) for node_ip, gpu_count in values.items()))
+
+
+def _required_gpus_by_node_from_bundles(bundles: Iterable[BUNDLE]) -> GpuByNode:
+    required: dict[str, int] = {}
+    unpinned_gpus = 0
+    for bundle in bundles:
+        bundle_dict = dict(bundle)
+        gpu_count = int(float(bundle_dict.get("GPU", 0) or 0))
+        if gpu_count <= 0:
+            continue
+        pinned_nodes = [
+            str(key).split("node:", 1)[1]
+            for key, value in bundle_dict.items()
+            if isinstance(key, str) and key.startswith("node:") and float(value or 0) > 0
+        ]
+        if pinned_nodes:
+            for node_ip in pinned_nodes:
+                required[node_ip] = required.get(node_ip, 0) + gpu_count
+        else:
+            unpinned_gpus += gpu_count
+    if unpinned_gpus > 0:
+        required[CLUSTER_GPU_KEY] = required.get(CLUSTER_GPU_KEY, 0) + unpinned_gpus
+    return _gpu_by_node_tuple(required)
+
+
+def _has_available_gpus(available: Mapping[str, int], *, node_ip: str, required_gpus: int) -> bool:
+    if node_ip == CLUSTER_GPU_KEY:
+        return sum(int(value) for value in available.values()) >= int(required_gpus)
+    return int(available.get(node_ip, 0)) >= int(required_gpus)
+
+
+def _subtract_available_gpus(available: Mapping[str, int], *, node_ip: str, gpu_count: int) -> dict[str, int]:
+    out = dict(available)
+    remaining = int(gpu_count)
+    if remaining <= 0:
+        return out
+    if node_ip != CLUSTER_GPU_KEY:
+        out[node_ip] = max(0, int(out.get(node_ip, 0)) - remaining)
+        return out
+    for current_node_ip in sorted(out):
+        if remaining <= 0:
+            break
+        current = int(out.get(current_node_ip, 0))
+        consumed = min(current, remaining)
+        out[current_node_ip] = current - consumed
+        remaining -= consumed
+    return out
+
+
+def _ray_placement_group_factory(**kwargs: Any) -> Any:
+    import ray
+
+    try:
+        return ray.util.placement_group(**kwargs)
+    except TypeError:
+        kwargs.pop("namespace", None)
+        return ray.util.placement_group(**kwargs)
+
+
+def _ray_placement_group_remover(pg: Any) -> None:
+    import ray
+
+    ray.util.remove_placement_group(pg)
+
+
+def _ray_get(ref: Any) -> Any:
+    import ray
+
+    return ray.get(ref)
 
 
 def _placement_group_rows(table: Mapping[str, Any] | Iterable[Any]) -> tuple[dict[str, Any], ...]:
@@ -478,13 +695,17 @@ def _gpu_by_pinned_node_from_pg(row: Mapping[str, Any]) -> dict[str, int]:
             for key, value in bundle.items()
             if isinstance(key, str) and key.startswith("node:") and float(value or 0) > 0
         ]
-        for node_ip in pinned_nodes:
-            out[node_ip] = out.get(node_ip, 0) + gpu_count
+        if pinned_nodes:
+            for node_ip in pinned_nodes:
+                out[node_ip] = out.get(node_ip, 0) + gpu_count
+        else:
+            out[CLUSTER_GPU_KEY] = out.get(CLUSTER_GPU_KEY, 0) + gpu_count
     return out
 
 
 __all__ = [
     "ClusterPlacementController",
+    "PlacementGroupBundleRequest",
     "PlacementBlockReason",
     "PlacementGroupCreateRequest",
     "PlacementGroupCreateResult",
