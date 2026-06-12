@@ -7,9 +7,22 @@ import pytest
 from mint_server.backend.cluster_placement_controller import (
     ClusterPlacementController,
     PlacementBlockReason,
+    PlacementGroupCreateRequest,
+    PlacementGroupCreateStatus,
     PlacementReservationRequest,
     PlacementReservationStatus,
 )
+
+
+class _FakePlacementGroup:
+    def __init__(self, *, ready_delay_s: float = 0.0) -> None:
+        self.ready_delay_s = float(ready_delay_s)
+        self.ready_calls = 0
+
+    async def ready(self) -> object:
+        self.ready_calls += 1
+        await asyncio.sleep(self.ready_delay_s)
+        return self
 
 
 @pytest.mark.anyio
@@ -129,3 +142,94 @@ async def test_cluster_placement_controller_rebuilds_existing_pg_occupancy_from_
         )
     )
     assert accepted.status is PlacementReservationStatus.RESERVED
+
+
+@pytest.mark.anyio
+async def test_cluster_placement_controller_times_out_pending_pg_and_blocks_with_backoff() -> None:
+    created: list[dict[str, object]] = []
+    removed: list[_FakePlacementGroup] = []
+
+    async def _create_pg(**kwargs) -> _FakePlacementGroup:
+        created.append(dict(kwargs))
+        return _FakePlacementGroup(ready_delay_s=1.0)
+
+    controller = ClusterPlacementController(
+        namespace="mint",
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 4},
+        placement_group_factory=_create_pg,
+        placement_group_remover=lambda pg: removed.append(pg),
+        monotonic=lambda: 100.0,
+        initial_backoff_s=5.0,
+        max_backoff_s=60.0,
+    )
+
+    result = await controller.create_pg(
+        PlacementGroupCreateRequest.from_mapping(
+            replica_key="vllm:model-a::replica-0",
+            placement_group_name="mint_model_runtime_vllm-a_replica-0_pg",
+            required_gpus_by_node={"10.0.0.7": 4},
+            bundles=({"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001},) * 4,
+            ready_timeout_s=0.01,
+        )
+    )
+
+    assert result.status is PlacementGroupCreateStatus.BLOCKED
+    assert result.reason is PlacementBlockReason.PG_PENDING_TIMEOUT
+    assert result.placement_group_name == "mint_model_runtime_vllm-a_replica-0_pg"
+    assert len(created) == 1
+    assert len(removed) == 1
+    snapshot = await controller.snapshot()
+    assert snapshot.active_reservation_count == 0
+    assert snapshot.in_flight_gpus_by_node == ()
+    assert snapshot.blocked_replicas == (
+        ("vllm:model-a::replica-0", PlacementBlockReason.PG_PENDING_TIMEOUT, 105.0),
+    )
+
+
+@pytest.mark.anyio
+async def test_cluster_placement_controller_recovers_blocked_replica_after_backoff() -> None:
+    now = 200.0
+    created: list[dict[str, object]] = []
+    removed: list[_FakePlacementGroup] = []
+    delays = [1.0, 0.0]
+
+    async def _create_pg(**kwargs) -> _FakePlacementGroup:
+        created.append(dict(kwargs))
+        return _FakePlacementGroup(ready_delay_s=delays.pop(0))
+
+    controller = ClusterPlacementController(
+        namespace="mint",
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 2},
+        placement_group_factory=_create_pg,
+        placement_group_remover=lambda pg: removed.append(pg),
+        monotonic=lambda: now,
+        initial_backoff_s=5.0,
+        max_backoff_s=60.0,
+    )
+    request = PlacementGroupCreateRequest.from_mapping(
+        replica_key="dense:model-a::replica-0",
+        placement_group_name="mint_dense_a_pg",
+        required_gpus_by_node={"10.0.0.7": 1},
+        bundles=({"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001},),
+        ready_timeout_s=0.01,
+    )
+
+    blocked = await controller.create_pg(request)
+    assert blocked.status is PlacementGroupCreateStatus.BLOCKED
+
+    still_blocked = await controller.create_pg(request)
+    assert still_blocked.status is PlacementGroupCreateStatus.BLOCKED
+    assert still_blocked.reason is PlacementBlockReason.BACKOFF_ACTIVE
+    assert len(created) == 1
+
+    now = 205.0
+    recovered = await controller.create_pg(request)
+
+    assert recovered.status is PlacementGroupCreateStatus.READY
+    assert recovered.placement_group is not None
+    assert recovered.placement_group_name == "mint_dense_a_pg"
+    assert len(created) == 2
+    assert len(removed) == 1
+    snapshot = await controller.snapshot()
+    assert snapshot.blocked_replicas == ()
+    assert snapshot.active_reservation_count == 0
