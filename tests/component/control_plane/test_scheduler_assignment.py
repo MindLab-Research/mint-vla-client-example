@@ -35,7 +35,7 @@ async def test_scheduler_component_blocked_claim_task_does_not_block_stats(tmp_p
 
         claimed = await assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.claim(
+            lambda: world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.consumer_id,
@@ -99,7 +99,7 @@ async def test_scheduler_component_blocked_assign_task_keeps_claim_nonblocking_a
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
 
         claimed = await asyncio.wait_for(
-            world.scheduler.claim(
+            world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.consumer_id,
@@ -260,10 +260,10 @@ async def test_scheduler_component_generation_bump_drains_assigned_unleased_work
             consumer_id=next_consumer_id,
             consumer_generation=next_generation,
         )
-        begin = await world.scheduler.begin_finalize(
+        begin = await world.runtime_queue.begin_finalize(
             lease=token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation)
         )
-        finished = await world.scheduler.finish_success(
+        finished = await world.runtime_queue.finish_success(
             lease=token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation),
             result_path=str(world.tmp_path / "generation-bump-result.json"),
         )
@@ -326,7 +326,7 @@ async def test_scheduler_component_assignment_counts_active_leases_surface(tmp_p
 
         assert active["item"]["request_id"] == "component-active-lease"
         claimed_b = await world.claim_one(replica_id="replica-b")
-        empty_a = await world.scheduler.claim(
+        empty_a = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id="replica-a",
             consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
@@ -358,7 +358,7 @@ async def test_scheduler_component_replica_capacity_exhaustion_leaves_extra_work
         assigned = await world.scheduler.assign_pending(max_items=3)
         lease_a = await world.claim_one(replica_id="replica-a")
         lease_b = await world.claim_one(replica_id="replica-b")
-        empty_a = await world.scheduler.claim(
+        empty_a = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id="replica-a",
             consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
@@ -366,7 +366,7 @@ async def test_scheduler_component_replica_capacity_exhaustion_leaves_extra_work
             max_items=1,
             lease_ttl_s=30.0,
         )
-        empty_b = await world.scheduler.claim(
+        empty_b = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id="replica-b",
             consumer_id=world.replica(replica_id="replica-b")["consumer_id"],
@@ -407,7 +407,7 @@ async def test_scheduler_component_concurrent_multi_replica_claims_do_not_duplic
         assigned = await world.scheduler.assign_pending(max_items=2)
 
         claim_a, claim_b = await asyncio.gather(
-            world.scheduler.claim(
+            world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id="replica-a",
                 consumer_id=world.replica(replica_id="replica-a")["consumer_id"],
@@ -415,7 +415,7 @@ async def test_scheduler_component_concurrent_multi_replica_claims_do_not_duplic
                 max_items=1,
                 lease_ttl_s=30.0,
             ),
-            world.scheduler.claim(
+            world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id="replica-b",
                 consumer_id=world.replica(replica_id="replica-b")["consumer_id"],
@@ -457,7 +457,7 @@ async def test_scheduler_component_claims_first_item_when_it_exceeds_token_budge
         await world.enqueue_sampling("component-cheap-next", assign=False, token_cost=1)
         assigned = await world.scheduler.assign_pending(max_items=2)
 
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -494,7 +494,7 @@ async def test_scheduler_component_same_session_sampling_is_serialized_by_orderi
         )
 
         first = await world.claim_one()
-        blocked = await world.scheduler.claim(
+        blocked = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -506,7 +506,7 @@ async def test_scheduler_component_same_session_sampling_is_serialized_by_orderi
         assert first["item"]["request_id"] == "component-session-serial-a"
         assert blocked.leases == []
 
-        begin = await world.scheduler.begin_finalize(
+        begin = await world.runtime_queue.begin_finalize(
             lease=token(first, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
@@ -564,7 +564,7 @@ async def test_scheduler_component_megatron_training_session_is_serialized_by_or
         )
 
         first = await world.claim_one()
-        blocked = await world.scheduler.claim(
+        blocked = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,

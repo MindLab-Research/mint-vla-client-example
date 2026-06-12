@@ -29,10 +29,10 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         await world.enqueue_sampling("component-stale-consumer")
         lease = await world.claim_one()
 
-        stale_finalize = await world.scheduler.begin_finalize(
+        stale_finalize = await world.runtime_queue.begin_finalize(
             lease=token(lease, consumer_id="stale-consumer", consumer_generation=world.generation),
         )
-        stale_fail = await world.scheduler.fail(
+        stale_fail = await world.runtime_queue.fail(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation + 1),
             requeue=False,
             reason="stale",
@@ -41,7 +41,7 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         assert stale_finalize.ok is False and stale_finalize.reason == "stale_consumer"
         assert stale_fail.ok is False and stale_fail.reason == "stale_consumer"
         assert (
-            await world.scheduler.validate(
+            await world.runtime_queue.validate(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
@@ -59,13 +59,13 @@ async def test_scheduler_component_gpu_actor_died_does_not_scheduler_fence_consu
         await world.enqueue_sampling("component-gpu-died-no-fence-a")
         lease = await world.claim_one()
 
-        failed = await world.scheduler.fail(
+        failed = await world.runtime_queue.fail(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="gpu_actor_died",
         )
         await world.enqueue_sampling("component-gpu-died-no-fence-b")
-        claim = await world.scheduler.claim(
+        claim = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -117,7 +117,7 @@ async def test_scheduler_component_finalizing_expiry_requeues_for_retry(tmp_path
         await world.start()
         await world.enqueue_sampling("component-expired-finalize")
         first_lease = await world.claim_one(lease_ttl_s=1.0)
-        begin = await world.scheduler.begin_finalize(
+        begin = await world.runtime_queue.begin_finalize(
             lease=token(first_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=1.0,
             staged_payload_path=str(world.tmp_path / "staged.json"),
@@ -150,12 +150,12 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
         assigned = await world.scheduler.assign_pending(max_items=1)
         new_lease = await world.claim_one()
 
-        stale_finalize = await world.scheduler.begin_finalize(
+        stale_finalize = await world.runtime_queue.begin_finalize(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
         stale_finish = await finish_success_for_test(world, old_lease)
-        valid_new = await world.scheduler.validate(
+        valid_new = await world.runtime_queue.validate(
             lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
@@ -180,7 +180,7 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         await world.start()
         await world.enqueue_sampling("component-owner-fencing")
         old_lease = await world.claim_one()
-        old_scheduler = world.scheduler
+        old_runtime_queue = world.runtime_queue
 
         takeover = cast(
             Any,
@@ -194,7 +194,7 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
         synced = await world.scheduler.sync_replicas([world.replica(status="healthy")])
 
         with pytest.raises(Exception, match="owner_active"):
-            await old_scheduler.renew(
+            await old_runtime_queue.renew(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 lease_ttl_s=30.0,
             )
@@ -309,7 +309,7 @@ async def test_scheduler_component_concurrent_reapers_recover_lost_pending_once(
 
         stats = await world.scheduler.stats()
         assigned = await world.scheduler.assign_pending(max_items=2)
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -343,18 +343,18 @@ async def test_scheduler_component_old_generation_cannot_renew_finish_or_fail_af
 
         await world.scheduler.sync_replicas([world.replica(status="healthy", generation=old_generation + 1)])
 
-        renewed = await world.scheduler.renew(
+        renewed = await world.runtime_queue.renew(
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             lease_ttl_s=30.0,
         )
-        finished = await world.scheduler.finish_success(
+        finished = await world.runtime_queue.finish_success(
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             result_path=str(world.tmp_path / "result.json"),
             result_checksum=None,
             result_size_bytes=None,
             billing_observations=None,
         )
-        failed = await world.scheduler.fail(
+        failed = await world.runtime_queue.fail(
             lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             requeue=False,
             reason="stale-runtime",
@@ -368,7 +368,7 @@ async def test_scheduler_component_old_generation_cannot_renew_finish_or_fail_af
         assert assigned.assigned == 0
         new_generation = old_generation + 1
         new_consumer_id = world.replica(generation=new_generation)["consumer_id"]
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=new_consumer_id,
@@ -393,7 +393,7 @@ async def test_scheduler_component_old_generation_cannot_claim_after_replica_syn
         await world.enqueue_sampling("component-old-generation")
 
         with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=old_consumer_id,
@@ -403,7 +403,7 @@ async def test_scheduler_component_old_generation_cannot_claim_after_replica_syn
             )
 
         new_consumer_id = world.replica(generation=old_generation + 1)["consumer_id"]
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=new_consumer_id,
@@ -455,14 +455,14 @@ async def test_scheduler_component_renew_missing_task_cleans_orphan_lease(tmp_pa
         lease = await world.claim_one()
         await world.task_state.async_forget_task(request_id=request_id)
 
-        renewed = await world.scheduler.renew(
+        renewed = await world.runtime_queue.renew(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             lease_ttl_s=30.0,
         )
 
         assert renewed.ok is False and renewed.reason == "unknown_lease"
         assert cast(Any, await world.observe_scheduler(request_id)).present is False
-        validate = await world.scheduler.validate(
+        validate = await world.runtime_queue.validate(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
@@ -485,14 +485,14 @@ async def test_scheduler_component_orphan_lease_cannot_clear_recreated_same_requ
         recreated = cast(Any, await world.enqueue_sampling(request_id))
         new_lease = await world.claim_one()
 
-        stale_renew = await world.scheduler.renew(
+        stale_renew = await world.runtime_queue.renew(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             lease_ttl_s=30.0,
         )
-        stale_validate = await world.scheduler.validate(
+        stale_validate = await world.runtime_queue.validate(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
-        valid_new = await world.scheduler.validate(
+        valid_new = await world.runtime_queue.validate(
             lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         observed = cast(Any, await world.observe_scheduler(request_id))

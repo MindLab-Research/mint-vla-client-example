@@ -62,7 +62,7 @@ async def test_scheduler_component_retrieve_pending_during_blocked_finalize_does
 
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
-            world.scheduler.begin_finalize(
+            world.runtime_queue.begin_finalize(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
@@ -96,7 +96,7 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_stats(t
 
         finalized = await assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.begin_finalize(
+            lambda: world.runtime_queue.begin_finalize(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             ),
@@ -120,7 +120,7 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_schedul
 
         finalized = await assert_scheduler_surfaces_progress_while_blocked(
             world,
-            lambda: world.scheduler.begin_finalize(
+            lambda: world.runtime_queue.begin_finalize(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             ),
@@ -142,7 +142,7 @@ async def test_scheduler_component_sync_defers_while_begin_finalize_is_inflight(
 
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
-            world.scheduler.begin_finalize(
+            world.runtime_queue.begin_finalize(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
@@ -160,7 +160,7 @@ async def test_scheduler_component_sync_defers_while_begin_finalize_is_inflight(
         assert synced.extra["deferred"] == "inflight_scheduler_transition"
         assert finalized.ok is True
         assert (
-            await world.scheduler.validate(
+            await world.runtime_queue.validate(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True

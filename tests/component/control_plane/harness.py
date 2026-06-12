@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, cast
 
 from fastapi import Request, Response
 from mint_server.backend.control_plane_contracts import (
+    AsyncSchedulerControlPlane,
     AsyncSchedulerQueue,
     AsyncTaskLedger,
     CancelTaskResult,
@@ -223,8 +224,9 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id="component-scheduler",
         )
-        self.runtime_queue: AsyncSchedulerQueue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
-        self.scheduler = self.runtime_queue
+        scheduler_adapter = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.runtime_queue: AsyncSchedulerQueue = scheduler_adapter
+        self.scheduler: AsyncSchedulerControlPlane = scheduler_adapter
         task_ledger = self.scheduler_actor._task_state_store
         assert task_ledger is not None
         self.task_ledger: AsyncTaskLedger = task_ledger
@@ -240,8 +242,9 @@ class SchedulerComponentWorld:
             task_state_store=self.task_state,
             owner_id=owner_id,
         )
-        self.runtime_queue = InProcessSchedulerQueueAdapter(self.scheduler_actor)
-        self.scheduler = self.runtime_queue
+        scheduler_adapter = InProcessSchedulerQueueAdapter(self.scheduler_actor)
+        self.runtime_queue = scheduler_adapter
+        self.scheduler = scheduler_adapter
         task_ledger = self.scheduler_actor._task_state_store
         assert task_ledger is not None
         self.task_ledger = task_ledger

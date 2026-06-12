@@ -4,6 +4,7 @@ import pytest
 from typing import Any, cast
 
 from mint_server.backend.control_plane_contracts import (
+    AsyncSchedulerControlPlane,
     AsyncSchedulerQueue,
     AsyncTaskLedger,
     ModelWorkTaskGateway,
@@ -28,6 +29,7 @@ def test_scheduler_component_world_exposes_typed_contracts(tmp_path) -> None:
         assert isinstance(world.task_gateway, ModelWorkTaskGateway)
         assert isinstance(world.task_ledger, AsyncTaskLedger)
         assert isinstance(world.runtime_queue, AsyncSchedulerQueue)
+        assert isinstance(world.scheduler, AsyncSchedulerControlPlane)
         assert world.scheduler is world.runtime_queue
     finally:
         world.close()
@@ -119,7 +121,7 @@ async def test_scheduler_component_supervisor_syncs_real_scheduler(tmp_path) -> 
         replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
         generation = int(replica["generation"])
         await world.enqueue_sampling("component-supervisor")
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=replica["consumer_id"],

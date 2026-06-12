@@ -25,17 +25,14 @@ class TaskLedgerOp(StrEnum):
 
 
 class SchedulerQueueOp(StrEnum):
-    APPEND = "append"
     SYNC_REPLICAS = "sync_replicas"
-    ASSIGN_PENDING = "assign_pending"
     CLAIM = "claim"
     RENEW = "renew"
     BEGIN_FINALIZE = "begin_finalize"
+    FINISH_SUCCESS = "finish_success"
+    FINISH_FAILURE = "finish_failure"
     FAIL = "fail"
     VALIDATE = "validate"
-    EXPIRE = "expire"
-    CONTAINS = "contains"
-    STATS = "stats"
 
 
 class ConflictReason(StrEnum):
@@ -964,35 +961,7 @@ class AsyncTaskLedger(Protocol):
 
 @runtime_checkable
 class AsyncSchedulerQueue(Protocol):
-    async def append_work(
-        self,
-        *,
-        request_id: str,
-        op: str,
-        request_json: bytes,
-        domain_key: str,
-        user_id: str | None = None,
-        apikey_id: str | None = None,
-        throttle_principal: str | None = None,
-        webhook_url: str | None = None,
-        extra: dict[str, Any] | None = None,
-        created_at: float | None = None,
-        affinity_group: str | None = None,
-        ordering_key: str | None = None,
-        token_cost: int = 1,
-        assign: bool = False,
-        assign_max_items: int | None = None,
-        timeout_s: float | None = None,
-    ) -> AppendWorkResult: ...
-
     async def sync_replicas(self, replicas: list[dict[str, Any]], **kwargs: Any) -> SyncReplicasResult: ...
-
-    async def assign_pending(
-        self,
-        *,
-        max_items: int | None = None,
-        timeout_s: float | None = None,
-    ) -> AssignPendingResult: ...
 
     async def claim(
         self,
@@ -1063,6 +1032,59 @@ class AsyncSchedulerQueue(Protocol):
         timeout_s: float | None = None,
     ) -> ValidateLeaseResult: ...
 
+
+@runtime_checkable
+class AsyncSchedulerControlPlane(Protocol):
+    async def append_work(
+        self,
+        *,
+        request_id: str,
+        op: str,
+        request_json: bytes,
+        domain_key: str,
+        user_id: str | None = None,
+        apikey_id: str | None = None,
+        throttle_principal: str | None = None,
+        webhook_url: str | None = None,
+        extra: dict[str, Any] | None = None,
+        created_at: float | None = None,
+        affinity_group: str | None = None,
+        ordering_key: str | None = None,
+        token_cost: int = 1,
+        assign: bool = False,
+        assign_max_items: int | None = None,
+        timeout_s: float | None = None,
+    ) -> AppendWorkResult: ...
+
+    async def sync_replicas(self, replicas: list[dict[str, Any]], **kwargs: Any) -> SyncReplicasResult: ...
+
+    async def assign_pending(
+        self,
+        *,
+        max_items: int | None = None,
+        timeout_s: float | None = None,
+    ) -> AssignPendingResult: ...
+
+    async def reap_lost_pending_tasks(
+        self,
+        *,
+        reason: str = "scheduler_reaper_requeue",
+        timeout_s: float | None = None,
+    ) -> dict[str, Any]: ...
+
+    async def claim(
+        self,
+        *,
+        domain_key: str,
+        replica_id: str,
+        consumer_id: str,
+        consumer_generation: int,
+        max_items: int = 1,
+        token_budget: int | None = None,
+        lease_ttl_s: float = 30.0,
+        timeout_s: float | None = None,
+    ) -> ClaimResult: ...
+
     async def expire(
         self,
         *,
@@ -1071,6 +1093,16 @@ class AsyncSchedulerQueue(Protocol):
     ) -> ExpireResult: ...
 
     async def contains(self, *, request_id: str, timeout_s: float | None = None) -> ContainsResult: ...
+
+    async def contains_request(self, *, request_id: str, timeout_s: float | None = None) -> ContainsResult: ...
+
+    async def cancel_request(
+        self,
+        *,
+        request_id: str,
+        reason: str,
+        timeout_s: float | None = None,
+    ) -> CancelTaskResult: ...
 
     async def stats(self, **kwargs: Any) -> dict[str, Any]: ...
 

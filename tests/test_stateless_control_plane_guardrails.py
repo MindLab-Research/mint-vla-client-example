@@ -133,6 +133,28 @@ def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
     assert "complete" not in scheduler_methods["ModelWorkSchedulerClient"]
 
 
+def test_runtime_queue_contract_is_lease_only_surface() -> None:
+    contracts_path = REPO_ROOT / "mint_server" / "backend" / "control_plane_contracts.py"
+    contracts_source = contracts_path.read_text()
+    protocols = _class_methods(contracts_path)
+
+    assert set(protocols["AsyncSchedulerQueue"]) == {
+        "sync_replicas",
+        "claim",
+        "renew",
+        "begin_finalize",
+        "finish_success",
+        "finish_failure",
+        "fail",
+        "validate",
+    }
+    assert "APPEND =" not in contracts_source
+    assert "ASSIGN_PENDING =" not in contracts_source
+    assert "EXPIRE =" not in contracts_source
+    assert "CONTAINS =" not in contracts_source
+    assert "STATS =" not in contracts_source
+
+
 def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor() -> None:
     runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(runtime_path)

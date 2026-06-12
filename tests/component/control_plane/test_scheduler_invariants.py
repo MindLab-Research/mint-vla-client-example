@@ -31,13 +31,13 @@ async def test_scheduler_component_invariant_helpers_cover_happy_path(
         await assert_lease_consistency(world)
         await assert_no_orphan_assigned(world)
 
-        begin = await world.scheduler.begin_finalize(
+        begin = await world.runtime_queue.begin_finalize(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             staged_payload_path=str(world.tmp_path / "component-invariants.json"),
             finalize_ttl_s=30.0,
         )
         assert begin.ok is True
-        finished = await world.scheduler.finish_success(
+        finished = await world.runtime_queue.finish_success(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             result_path=str(world.tmp_path / "component-invariants.json"),
             result_checksum="checksum",

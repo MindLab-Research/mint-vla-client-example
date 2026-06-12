@@ -27,7 +27,7 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_stats(tmp
 
         failed = await assert_stats_progress_while_blocked(
             world,
-            lambda: world.scheduler.fail(
+            lambda: world.runtime_queue.fail(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="component-test",
@@ -51,7 +51,7 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_scheduler
 
         failed = await assert_scheduler_surfaces_progress_while_blocked(
             world,
-            lambda: world.scheduler.fail(
+            lambda: world.runtime_queue.fail(
                 lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="component-test",
@@ -80,21 +80,21 @@ async def test_scheduler_component_direct_fail_requeue_failure_preserves_retryab
             RuntimeError("synthetic direct requeue failure"),
         )
         with pytest.raises(RuntimeError, match="synthetic direct requeue failure"):
-            await world.scheduler.fail(
+            await world.runtime_queue.fail(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-error",
             )
 
         assert (
-            await world.scheduler.validate(
+            await world.runtime_queue.validate(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
         assert (await world.observe_task(request_id))["status"] == "leased"
 
-        retried = await world.scheduler.fail(
+        retried = await world.runtime_queue.fail(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-retry",
@@ -121,14 +121,14 @@ async def test_scheduler_component_direct_fail_requeue_drops_missing_task_projec
         old_lease = await world.claim_one()
         await world.task_state.async_forget_task(request_id=request_id)
 
-        failed = await world.scheduler.fail(
+        failed = await world.runtime_queue.fail(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-missing",
         )
 
         assert failed.ok is True and failed.request_id == request_id and failed.requeued is False
-        validate = await world.scheduler.validate(
+        validate = await world.runtime_queue.validate(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
@@ -148,7 +148,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_re
 
         block = world.faults.block("task_state.requeue_task")
         fail_task = asyncio.create_task(
-            world.scheduler.fail(
+            world.runtime_queue.fail(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-cancel",
@@ -161,14 +161,14 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_re
             await fail_task
 
         assert (
-            await world.scheduler.validate(
+            await world.runtime_queue.validate(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
         assert (await world.observe_task(request_id))["status"] == "leased"
 
-        retried = await world.scheduler.fail(
+        retried = await world.runtime_queue.fail(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-retry-after-cancel",
@@ -197,7 +197,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_after_commit
 
         block = world.faults.block("task_state.requeue_task.after")
         fail_task = asyncio.create_task(
-            world.scheduler.fail(
+            world.runtime_queue.fail(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-cancel-after",
@@ -209,7 +209,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_after_commit
         with pytest.raises(asyncio.CancelledError):
             await fail_task
 
-        validate = await world.scheduler.validate(
+        validate = await world.runtime_queue.validate(
             lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
@@ -366,13 +366,13 @@ async def test_scheduler_component_sync_requeue_failure_preserves_replica_regist
             )
 
         assert (
-            await world.scheduler.validate(
+            await world.runtime_queue.validate(
                 lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             )
         ).ok is True
         await world.enqueue_sampling("component-sync-requeue-registry-after", assign=False)
         with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.replica(generation=old_generation + 1)["consumer_id"],

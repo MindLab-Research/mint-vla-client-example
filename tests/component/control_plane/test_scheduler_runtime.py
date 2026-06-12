@@ -59,7 +59,7 @@ async def test_scheduler_component_fail_cleans_scheduler_lease_for_missing_task(
         lease = await world.claim_one()
         await world.task_state.async_forget_task(request_id=request_id)
 
-        failed = await world.scheduler.fail(
+        failed = await world.runtime_queue.fail(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=False,
             reason="missing-task",
@@ -102,7 +102,7 @@ async def test_scheduler_component_claim_skips_missing_stale_head_and_claims_nex
         await world.enqueue_sampling(valid_request_id)
         await world.task_state.async_forget_task(request_id=stale_request_id)
 
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=world.consumer_id,
@@ -187,7 +187,7 @@ async def test_scheduler_component_runtime_resumes_durable_finalize_after_engine
         engine = _ComponentEngineLifecycle()
 
         async def _executor(lease: dict[str, Any]) -> ExecutorOutcome:
-            begin = await world.scheduler.begin_finalize(
+            begin = await world.runtime_queue.begin_finalize(
                 lease=token(
                     lease,
                     consumer_id=world.consumer_id,

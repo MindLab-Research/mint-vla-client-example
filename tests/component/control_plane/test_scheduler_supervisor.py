@@ -48,7 +48,7 @@ async def test_scheduler_component_supervisor_start_failure_removes_claimable_re
         await world.enqueue_sampling("component-supervisor-start-failure", assign=False)
 
         with pytest.raises(Exception, match="not claimable|unknown replica"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.consumer_id,
@@ -117,7 +117,7 @@ async def test_scheduler_component_supervisor_generation_restart_allows_only_new
         new_consumer_id = str(new_replica["consumer_id"])
 
         with pytest.raises(Exception, match="consumer_id mismatch|generation mismatch"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=old_consumer_id,
@@ -125,7 +125,7 @@ async def test_scheduler_component_supervisor_generation_restart_allows_only_new
                 max_items=1,
                 lease_ttl_s=30.0,
             )
-        claimed = await world.scheduler.claim(
+        claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=new_consumer_id,
@@ -166,7 +166,7 @@ async def test_scheduler_component_placement_pg_blocked_registers_unclaimable_re
         await world.enqueue_sampling("component-placement-pg-blocked", assign=False)
 
         with pytest.raises(Exception, match="not claimable|unknown replica"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=world.consumer_id,
@@ -210,7 +210,7 @@ async def test_scheduler_component_liveness_unhealthy_push_registers_unclaimable
         consumer_id = str(healthy_replica["consumer_id"])
 
         await world.enqueue_sampling("component-liveness-before-unhealthy")
-        healthy_claim = await world.scheduler.claim(
+        healthy_claim = await world.runtime_queue.claim(
             domain_key=world.domain_key,
             replica_id=world.replica_id,
             consumer_id=consumer_id,
@@ -247,7 +247,7 @@ async def test_scheduler_component_liveness_unhealthy_push_registers_unclaimable
         await world.enqueue_sampling("component-liveness-after-unhealthy", assign=False)
 
         with pytest.raises(Exception, match="not claimable|unknown replica"):
-            await world.scheduler.claim(
+            await world.runtime_queue.claim(
                 domain_key=world.domain_key,
                 replica_id=world.replica_id,
                 consumer_id=consumer_id,

@@ -40,7 +40,7 @@ async def finish_success_for_test(
     *,
     result_path: str | None = None,
 ) -> Any:
-    return await world.scheduler.finish_success(
+    return await world.runtime_queue.finish_success(
         lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         result_path=result_path or str(world.tmp_path / "result.json"),
         result_checksum=None,
