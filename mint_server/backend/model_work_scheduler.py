@@ -687,8 +687,12 @@ class _ModelWorkSchedulerActor:
         async_method = getattr(self._task_state_store, method)
         return await async_method(**kwargs)
 
-    def _task_record_data(self, record: TaskRecord) -> dict[str, Any]:
-        return dict(record.data)
+    def _task_record_data(self, record: TaskRecord | dict[str, Any]) -> dict[str, Any]:
+        if isinstance(record, TaskRecord):
+            return dict(record.data)
+        if isinstance(record, dict):
+            return dict(record)
+        raise TypeError(f"task ledger returned non-TaskRecord: {type(record)}")
 
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:
@@ -1207,6 +1211,22 @@ class _ModelWorkSchedulerActor:
             return False
         return True
 
+    def _hot_projection_matches_work_item_locked(self, item: ModelWorkItem) -> bool:
+        lease_id = self._lease_id_by_request_id.get(item.request_id)
+        if lease_id is not None:
+            lease = self._leases_by_id.get(lease_id)
+            if lease is not None:
+                return self._task_record_matches_work_item(lease.item.to_dict(), item)
+        for queue in self._replica_queues.values():
+            for assigned in queue:
+                if assigned.item.request_id == item.request_id:
+                    return self._task_record_matches_work_item(assigned.item.to_dict(), item)
+        for backlog in self._domain_backlog.values():
+            for current in backlog:
+                if current.request_id == item.request_id:
+                    return self._task_record_matches_work_item(current.to_dict(), item)
+        return False
+
     async def _duplicate_append_matches_hydrated_pending_task(self, item: ModelWorkItem) -> bool:
         if not self._use_task_state_store:
             return False
@@ -1216,12 +1236,37 @@ class _ModelWorkSchedulerActor:
             task_record = await self._task_state_call("get_task", request_id=item.request_id)
         except Exception:
             return False
-        if not isinstance(task_record, TaskRecord):
+        if not isinstance(task_record, (TaskRecord, dict)):
             return False
         record = self._task_record_data(task_record)
         if not self._task_record_matches_work_item(record, item):
             return False
         return str(record.get("status") or "") in {"pending", "queued", "assigned"}
+
+    async def _drop_recreated_orphan_projection_before_append(self, item: ModelWorkItem) -> bool:
+        if not self._use_task_state_store:
+            return False
+        durable_missing = False
+        try:
+            task_record = await self._task_state_call("get_task", request_id=item.request_id)
+        except Exception as exc:
+            if self._task_not_found_cause(exc) is None:
+                return False
+            durable_missing = True
+        if not durable_missing:
+            if not isinstance(task_record, (TaskRecord, dict)):
+                return False
+            record = self._task_record_data(task_record)
+            if not self._task_record_matches_work_item(record, item):
+                return False
+            if str(record.get("status") or "") not in {"pending", "queued"}:
+                return False
+        async with self._cv:
+            if self._request_locations.get(item.request_id) not in {"leased", "finalizing"}:
+                return False
+            if not self._hot_projection_matches_work_item_locked(item):
+                return False
+            return self._remove_request_from_memory_locked(item.request_id)
 
     async def _forget_created_task_after_append_cancel(
         self,
@@ -1243,7 +1288,7 @@ class _ModelWorkSchedulerActor:
                 item.request_id,
             )
             return
-        if not isinstance(task_record, TaskRecord):
+        if not isinstance(task_record, (TaskRecord, dict)):
             return
         record = self._task_record_data(task_record)
         if not self._task_record_matches_work_item(record, item):
@@ -1854,6 +1899,8 @@ class _ModelWorkSchedulerActor:
         work = ModelWorkItem.from_dict(item)
         async with self._cv:
             duplicate_in_memory = work.request_id in self._all_request_ids()
+        if duplicate_in_memory and await self._drop_recreated_orphan_projection_before_append(work):
+            duplicate_in_memory = False
         if duplicate_in_memory:
             if not await self._duplicate_append_matches_hydrated_pending_task(work):
                 return AppendWorkResult(

@@ -466,3 +466,50 @@ async def test_scheduler_component_renew_missing_task_cleans_orphan_lease(tmp_pa
         assert validate.ok is False and validate.reason == "unknown_lease"
     finally:
         world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_orphan_lease_cannot_clear_recreated_same_request_id(
+    tmp_path,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-orphan-lease-recreated"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one()
+        await world.task_state.async_forget_task(request_id=request_id)
+
+        recreated = cast(Any, await world.enqueue_sampling(request_id))
+        new_lease = await world.claim_one()
+
+        stale_renew = await world.scheduler.renew(
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease_ttl_s=30.0,
+        )
+        stale_validate = await world.scheduler.validate(
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+        )
+        valid_new = await world.scheduler.validate(
+            lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+        )
+        observed = cast(Any, await world.observe_scheduler(request_id))
+        record = await world.observe_task(request_id)
+
+        assert recreated.scheduler_result.ok is True
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+        assert new_lease["attempt_id"] != old_lease["attempt_id"]
+        assert stale_renew.ok is False and stale_renew.reason == "unknown_lease"
+        assert stale_validate.ok is False and stale_validate.reason == "unknown_lease"
+        assert valid_new.ok is True
+        assert observed.present is True
+        assert observed.location == "leased"
+        assert observed.lease_id == new_lease["lease_id"]
+        assert record["status"] == "leased"
+        assert record["lease_id"] == new_lease["lease_id"]
+        assert record["attempt_id"] == new_lease["attempt_id"]
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
+    finally:
+        world.close()
