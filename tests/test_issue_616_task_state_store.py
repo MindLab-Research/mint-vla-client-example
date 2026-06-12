@@ -713,12 +713,14 @@ def test_owner_epoch_fences_stale_scheduler() -> None:
         owner_b = store.acquire_scheduler_owner(owner_id="scheduler-b", ttl_s=30.0, now=131.0)
         assert owner_b["ok"] is True
         assert owner_b["epoch"] == 2
-        assert store.renew_scheduler_owner(
+        stale_renew = store.renew_scheduler_owner(
             owner_id="scheduler-a",
             epoch=1,
             ttl_s=30.0,
             now=132.0,
-        ) == {"ok": False, "reason": "stale_owner"}
+        )
+        assert stale_renew.ok is False
+        assert stale_renew.reason == "stale_owner"
     finally:
         store.close()
 

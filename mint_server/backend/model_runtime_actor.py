@@ -1047,20 +1047,12 @@ class ModelRuntimeActor:
         item = lease.get("item") if isinstance(lease, dict) else {}
         tracer = get_otel_tracer()
         if tracer is None:
-            try:
-                out = await self._call_executor(lease)
-            except Exception as e:
-                return ExecutorOutcome(kind="retryable_failure", error=str(e))
-            return out or ExecutorOutcome(kind="success")
+            return await self._call_executor(lease) or ExecutorOutcome(kind="success")
         try:
             from opentelemetry.propagate import extract
             from opentelemetry.trace import SpanKind, Status, StatusCode
         except Exception:
-            try:
-                out = await self._call_executor(lease)
-            except Exception as e:
-                return ExecutorOutcome(kind="retryable_failure", error=str(e))
-            return out or ExecutorOutcome(kind="success")
+            return await self._call_executor(lease) or ExecutorOutcome(kind="success")
 
         span_context = None
         extra = item.get("extra") if isinstance(item, dict) else {}
@@ -1086,7 +1078,7 @@ class ModelRuntimeActor:
             except Exception as e:
                 span.record_exception(e)
                 span.set_status(Status(StatusCode.ERROR, str(e)))
-                return ExecutorOutcome(kind="retryable_failure", error=str(e))
+                raise
             return out or ExecutorOutcome(kind="success")
 
     async def _execute_lease(self, lease: dict[str, Any]) -> None:
@@ -1389,69 +1381,68 @@ class ModelRuntimeActor:
                 classify_failure_reason(e),
             )
             try:
-                if not self._task_state_finalize_enabled(lease):
-                    await self._task_futures.async_fail(request_id, f"executor failed: {e}")
-                    failed = await self._scheduler.fail(
-                        lease=legacy_token,
-                        reason="future_failed",
-                        requeue=False,
+                if isinstance(e, TimeoutError):
+                    token = _lease_token(lease)
+                    begin_finalize = await self._scheduler.begin_finalize(
+                        lease=token,
+                        finalize_ttl_s=self._config.lease_ttl_s,
                     )
-                    if not _scheduler_result_ok(failed):
+                    if not _scheduler_result_ok(begin_finalize):
                         logger.warning(
-                            "[model_runtime] legacy failure lease fail rejected actor=%s request_id=%s result=%s",
+                            "[model_runtime] timeout lease finalize rejected actor=%s request_id=%s result=%s",
                             self._config.actor_name,
                             request_id,
-                            failed,
+                            begin_finalize,
                         )
+                        failed = await self._scheduler.fail(
+                            lease=legacy_token,
+                            reason="executor_retryable_failure",
+                            requeue=True,
+                            abort_finalize=True,
+                        )
+                        if not _scheduler_result_ok(failed):
+                            logger.warning(
+                                "[model_runtime] timeout fallback requeue rejected actor=%s request_id=%s result=%s",
+                                self._config.actor_name,
+                                request_id,
+                                failed,
+                            )
+                        self._requeued_total += 1
+                        return
+                    finished = await self._scheduler.finish_failure(
+                        lease=token,
+                        error=f"executor failed: {e}",
+                    )
+                    if not _scheduler_result_ok(finished):
+                        logger.warning(
+                            "[model_runtime] timeout lease finish rejected actor=%s request_id=%s result=%s",
+                            self._config.actor_name,
+                            request_id,
+                            finished,
+                        )
+                        self._requeued_total += 1
+                        return
                     self._processed_total += 1
                     self._failed_total += 1
                     return
-                token = _lease_token(lease)
-                begin_finalize = await self._scheduler.begin_finalize(
-                    lease=token,
-                    finalize_ttl_s=self._config.lease_ttl_s,
+                failed = await self._scheduler.fail(
+                    lease=legacy_token,
+                    reason="executor_retryable_failure",
+                    requeue=True,
+                    abort_finalize=True,
                 )
-                if not _scheduler_result_ok(begin_finalize):
+                if not _scheduler_result_ok(failed):
                     logger.warning(
-                        "[model_runtime] failure lease finalize rejected actor=%s request_id=%s result=%s",
+                        "[model_runtime] executor exception requeue rejected actor=%s request_id=%s result=%s",
                         self._config.actor_name,
                         request_id,
-                        begin_finalize,
+                        failed,
                     )
-                    try:
-                        failed = await self._fail_lost_lease_if_still_pending(
-                            request_id,
-                            "model work scheduler lost active lease after executor failure; request must be retried",
-                            attempt_id=attempt_id,
-                        )
-                        if failed:
-                            self._failed_total += 1
-                    except Exception as e2:
-                        logger.error(
-                            "[model_runtime] lost-failure-lease task_futures.fail failed actor=%s request_id=%s error_type=%s error=%s",
-                            self._config.actor_name,
-                            request_id,
-                            type(e2).__name__,
-                            e2,
-                        )
-                    self._requeued_total += 1
-                    return
-                finished = await self._scheduler.finish_failure(
-                    lease=token,
-                    error=f"executor failed: {e}",
-                )
-                if not _scheduler_result_ok(finished):
-                    logger.warning(
-                        "[model_runtime] failure lease finish rejected actor=%s request_id=%s result=%s",
-                        self._config.actor_name,
-                        request_id,
-                        finished,
-                    )
-                    self._requeued_total += 1
-                    return
+                self._requeued_total += 1
+                return
             except Exception as e2:
                 logger.error(
-                    "[model_runtime] task_state failure finalize failed actor=%s request_id=%s error_type=%s error=%s",
+                    "[model_runtime] executor exception requeue failed actor=%s request_id=%s error_type=%s error=%s",
                     self._config.actor_name,
                     request_id,
                     type(e2).__name__,

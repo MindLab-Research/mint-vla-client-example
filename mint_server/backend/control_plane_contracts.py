@@ -94,6 +94,12 @@ class WireCompatibleResult:
     def to_wire(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def __getitem__(self, key: str) -> Any:
+        return self.to_wire()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.to_wire().get(key, default)
+
 
 def _extra_wire_fields(data: dict[str, Any], known: set[str]) -> dict[str, Any]:
     return {key: value for key, value in data.items() if key not in known}
@@ -1089,6 +1095,8 @@ class TaskStateStoreLedgerAdapter:
 
     async def _call_dict(self, method: str, **kwargs: Any) -> dict[str, Any]:
         out = await self._call(method, **kwargs)
+        if isinstance(out, WireCompatibleResult):
+            return out.to_wire()
         if not isinstance(out, dict):
             raise TypeError(f"TaskLedger.{method} returned non-dict: {type(out)}")
         return out
@@ -1097,7 +1105,7 @@ class TaskStateStoreLedgerAdapter:
         out = await self._call(method, **kwargs)
         if not isinstance(out, list):
             raise TypeError(f"TaskLedger.{method} returned non-list: {type(out)}")
-        return out
+        return [item.to_wire() if isinstance(item, WireCompatibleResult) else item for item in out]
 
     async def _call(self, method: str, **kwargs: Any) -> Any:
         async_method = getattr(self._client, f"async_{method}", None)

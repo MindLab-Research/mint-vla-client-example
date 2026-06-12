@@ -15,6 +15,17 @@ from typing import Any, Iterator
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .control_plane_contracts import (
+    BeginFinalizeResult,
+    ClaimTaskResult,
+    CommitFinalizeResult,
+    ConflictReason,
+    CreateTaskResult,
+    OwnerLeaseResult,
+    RequeueTaskResult,
+    TaskMutationResult,
+    WireCompatibleResult,
+)
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
 from .task_hot_kv_store import TaskHotKVStore
 
@@ -78,6 +89,12 @@ class TaskStateNotFoundError(TaskStateStoreError, KeyError):
 
 class TaskStateStoreUnavailableError(TaskStateStoreError):
     pass
+
+
+def _wire_result(value: Any) -> Any:
+    if isinstance(value, WireCompatibleResult):
+        return value.to_wire()
+    return value
 
 
 def _task_state_cause_from_ray_error(exc: BaseException) -> TaskStateStoreError | None:
@@ -1244,7 +1261,7 @@ class TaskStateStore:
         ttl_s: float,
         name: str = "model_work_scheduler",
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> OwnerLeaseResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(ttl_s))
         owner_id = str(owner_id)
@@ -1255,13 +1272,13 @@ class TaskStateStore:
                 (name,),
             ).fetchone()
             if row is not None and str(row["owner_id"]) != owner_id and float(row["expires_at"]) > ts:
-                return {
-                    "ok": False,
-                    "reason": "owner_active",
-                    "owner_id": str(row["owner_id"]),
-                    "epoch": int(row["epoch"]),
-                    "expires_at": float(row["expires_at"]),
-                }
+                return OwnerLeaseResult(
+                    ok=False,
+                    reason=ConflictReason.OWNER_ACTIVE,
+                    owner_id=str(row["owner_id"]),
+                    epoch=int(row["epoch"]),
+                    expires_at=float(row["expires_at"]),
+                )
             epoch = 1 if row is None else int(row["epoch"]) + (0 if str(row["owner_id"]) == owner_id else 1)
             fencing_token = f"{name}:{epoch}:{owner_id}"
             conn.execute(
@@ -1277,13 +1294,13 @@ class TaskStateStore:
                 """,
                 (name, owner_id, epoch, ts, expires_at, fencing_token),
             )
-            return {
-                "ok": True,
-                "owner_id": owner_id,
-                "epoch": epoch,
-                "expires_at": expires_at,
-                "fencing_token": fencing_token,
-            }
+            return OwnerLeaseResult(
+                ok=True,
+                owner_id=owner_id,
+                epoch=epoch,
+                expires_at=expires_at,
+                fencing_token=fencing_token,
+            )
 
     def renew_scheduler_owner(
         self,
@@ -1293,7 +1310,7 @@ class TaskStateStore:
         ttl_s: float,
         name: str = "model_work_scheduler",
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> OwnerLeaseResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(ttl_s))
         with self._transaction() as conn:
@@ -1306,8 +1323,8 @@ class TaskStateStore:
                 (ts, expires_at, str(name), str(owner_id), int(epoch)),
             )
             if cur.rowcount != 1:
-                return {"ok": False, "reason": "stale_owner"}
-            return {"ok": True, "owner_id": str(owner_id), "epoch": int(epoch), "expires_at": expires_at}
+                return OwnerLeaseResult(ok=False, reason=ConflictReason.STALE_OWNER)
+            return OwnerLeaseResult(ok=True, owner_id=str(owner_id), epoch=int(epoch), expires_at=expires_at)
 
     def assert_scheduler_owner(
         self,
@@ -1335,7 +1352,7 @@ class TaskStateStore:
         payload_hash: str | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> CreateTaskResult:
         ts = _now(now)
         with self._transaction() as conn:
             existing = conn.execute(
@@ -1351,11 +1368,7 @@ class TaskStateStore:
                 existing_metadata = _json_loads(existing["metadata_json"])
                 append_attempt_key = "model_work_scheduler_append_attempt_id"
                 if append_attempt_key in existing_metadata:
-                    return {
-                        "ok": True,
-                        "created": False,
-                        "record": self._row_to_record(existing),
-                    }
+                    return CreateTaskResult(ok=True, created=False, record=self._row_to_record(existing))
                 merged = {**existing_metadata, **dict(metadata or {})}
                 if existing_hash is None and payload_hash is not None:
                     conn.execute(
@@ -1375,7 +1388,11 @@ class TaskStateStore:
                         """,
                         (bytes(request_json), _json_dumps(merged), ts, str(request_id)),
                     )
-                return {"ok": True, "created": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                return CreateTaskResult(
+                    ok=True,
+                    created=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
             conn.execute(
                 """
                 INSERT INTO tasks(
@@ -1402,7 +1419,11 @@ class TaskStateStore:
                 payload={"status": "pending"},
                 now=ts,
             )
-            return {"ok": True, "created": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return CreateTaskResult(
+                ok=True,
+                created=True,
+                record=self._row_to_record(self._get_row(conn, request_id)),
+            )
 
     def ensure_task(
         self,
@@ -1469,7 +1490,7 @@ class TaskStateStore:
         metadata: dict[str, Any] | None = None,
         status: str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
@@ -1499,7 +1520,7 @@ class TaskStateStore:
                 payload={"status": status, "metadata": dict(metadata or {})},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def complete_task_success(
         self,
@@ -1622,11 +1643,11 @@ class TaskStateStore:
             self._record_event(conn, request_id=str(request_id), event_type="task_retrieved", payload={}, now=ts)
             return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
 
-    def forget_task(self, *, request_id: str) -> dict[str, Any]:
+    def forget_task(self, *, request_id: str) -> TaskMutationResult:
         with self._transaction() as conn:
             conn.execute("DELETE FROM task_events WHERE request_id = ?", (str(request_id),))
             cur = conn.execute("DELETE FROM tasks WHERE request_id = ?", (str(request_id),))
-            return {"ok": True, "deleted": cur.rowcount > 0}
+            return TaskMutationResult(ok=True, deleted=cur.rowcount > 0)
 
     def expire_active_tasks(
         self,
@@ -1999,6 +2020,8 @@ class TaskStateStore:
             return fallback
         try:
             updated = self.update_task_metadata(request_id=request_id, metadata=metadata, now=now)
+            if isinstance(updated, TaskMutationResult) and isinstance(updated.record, dict):
+                return updated.record
             if isinstance(updated, dict) and isinstance(updated.get("record"), dict):
                 return updated["record"]
         except Exception:
@@ -2194,7 +2217,7 @@ class TaskStateStore:
         subqueue_id: str,
         scheduler_epoch: int,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
@@ -2219,7 +2242,7 @@ class TaskStateStore:
                 payload={"subqueue_id": str(subqueue_id), "scheduler_epoch": int(scheduler_epoch)},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def claim_task(
         self,
@@ -2233,7 +2256,7 @@ class TaskStateStore:
         runtime_generation: int,
         lease_ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(lease_ttl_s))
         with self._transaction() as conn:
@@ -2285,7 +2308,7 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return ClaimTaskResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def renew_lease(
         self,
@@ -2297,7 +2320,7 @@ class TaskStateStore:
         runtime_generation: int,
         lease_ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(lease_ttl_s))
         with self._transaction() as conn:
@@ -2305,7 +2328,11 @@ class TaskStateStore:
             row = self._get_row(conn, request_id)
             status = str(row["status"])
             if status in TERMINAL_TASK_STATUSES:
-                return {"ok": False, "reason": "terminal", "record": self._row_to_record(row)}
+                return TaskMutationResult(
+                    ok=False,
+                    reason=ConflictReason.TERMINAL,
+                    record=self._row_to_record(row),
+                )
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -2330,7 +2357,7 @@ class TaskStateStore:
             )
             if cur.rowcount != 1:
                 self._raise_task_transition_error(conn, request_id, "renew lease")
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def begin_finalize(
         self,
@@ -2343,7 +2370,7 @@ class TaskStateStore:
         finalize_ttl_s: float,
         staged_payload_path: str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         finalizing_until = ts + max(1.0, float(finalize_ttl_s))
         with self._transaction() as conn:
@@ -2396,7 +2423,7 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return BeginFinalizeResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def commit_finalize_success(
         self,
@@ -2411,7 +2438,7 @@ class TaskStateStore:
         result_size_bytes: int,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._commit_finalize(
             request_id=request_id,
             lease_id=lease_id,
@@ -2440,7 +2467,7 @@ class TaskStateStore:
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._commit_finalize(
             request_id=request_id,
             lease_id=lease_id,
@@ -2462,13 +2489,17 @@ class TaskStateStore:
         scheduler_epoch: int,
         reason: str,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
-                return {"ok": False, "reason": "terminal", "record": self._row_to_record(row)}
+                return RequeueTaskResult(
+                    ok=False,
+                    reason=ConflictReason.TERMINAL,
+                    record=self._row_to_record(row),
+                )
             merged = _merge_metadata_with_abandoned_staged_payload(row)
             cur = conn.execute(
                 """
@@ -2503,7 +2534,7 @@ class TaskStateStore:
                 payload={"reason": str(reason), "scheduler_epoch": int(scheduler_epoch)},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return RequeueTaskResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def _commit_finalize(
         self,
@@ -2520,9 +2551,9 @@ class TaskStateStore:
         error: str | None,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
-        out: dict[str, Any]
+        out: TaskMutationResult
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -2535,7 +2566,7 @@ class TaskStateStore:
                     and (row["result_size_bytes"] == result_size_bytes)
                     and (row["error"] == error)
                 ):
-                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                    out = CommitFinalizeResult(ok=True, idempotent=True, record=self._row_to_record(row))
                 else:
                     raise TaskStateConflictError("terminal task commit payload mismatch")
             else:
@@ -2595,18 +2626,29 @@ class TaskStateStore:
                     },
                     now=ts,
                 )
-                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                out = CommitFinalizeResult(
+                    ok=True,
+                    idempotent=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
         if status == "done" and billing_observations:
             billing_metadata = self._append_billing_outbox_after_terminal_success(
                 observations=billing_observations,
                 source="model_work_terminal",
                 now=ts,
             )
-            out["record"] = self._best_effort_update_billing_metadata(
-                request_id=request_id,
-                metadata=billing_metadata,
-                now=ts,
-                fallback=dict(out["record"]),
+            out = CommitFinalizeResult(
+                ok=out.ok,
+                record=self._best_effort_update_billing_metadata(
+                    request_id=request_id,
+                    metadata=billing_metadata,
+                    now=ts,
+                    fallback=dict(out.record or {}),
+                ),
+                reason=out.reason,
+                idempotent=out.idempotent,
+                retry_required=out.retry_required,
+                deleted=out.deleted,
             )
         return out
 
@@ -3590,15 +3632,15 @@ class _TaskStateStoreActor:
         return self._store.integrity_check()
 
     def acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.acquire_scheduler_owner(**kwargs)
+        return _wire_result(self._store.acquire_scheduler_owner(**kwargs))
 
     def renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.renew_scheduler_owner(**kwargs)
+        return _wire_result(self._store.renew_scheduler_owner(**kwargs))
 
     def create_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.create_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def ensure_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.ensure_task(**kwargs)
@@ -3608,7 +3650,7 @@ class _TaskStateStoreActor:
     def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.update_task_metadata(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.complete_task_success(**kwargs)
@@ -3628,7 +3670,7 @@ class _TaskStateStoreActor:
     def forget_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.forget_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def expire_active_tasks(self, **kwargs: Any) -> list[str]:
         out = self._store.expire_active_tasks(**kwargs)
@@ -3697,22 +3739,22 @@ class _TaskStateStoreActor:
     def assign_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.assign_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def claim_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.claim_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.renew_lease(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.begin_finalize(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def stage_payload(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.stage_payload(**kwargs)
@@ -3722,17 +3764,17 @@ class _TaskStateStoreActor:
     def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_success(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_failure(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.requeue_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_active_tasks(**kwargs)
@@ -4758,6 +4800,7 @@ class TaskStateStoreClient:
 
     async def _dict_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
         out = await self._call(method, **kwargs)
+        out = _wire_result(out)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.{method} returned non-dict: {type(out)}")
         return out

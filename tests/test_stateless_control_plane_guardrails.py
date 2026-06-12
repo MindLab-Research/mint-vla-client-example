@@ -97,6 +97,61 @@ def test_model_runtime_terminal_commit_goes_through_scheduler_finish_surface() -
     assert "finish_failure(" in runtime_source
 
 
+def test_model_runtime_does_not_classify_executor_exceptions_in_run_executor() -> None:
+    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_runtime_actor.py"
+    functions = _module_functions(runtime_path)
+    run_executor = functions["_run_executor"]
+    source = ast.get_source_segment(runtime_path.read_text(), run_executor) or ""
+
+    assert 'ExecutorOutcome(kind="retryable_failure"' not in source
+    assert 'ExecutorOutcome(kind="fatal_backend_death"' not in source
+    assert 'ExecutorOutcome(kind="user_error"' not in source
+
+
+def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -> None:
+    task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
+    functions = _class_methods(task_state_path)["TaskStateStore"]
+    expected_returns = {
+        "acquire_scheduler_owner": "OwnerLeaseResult",
+        "renew_scheduler_owner": "OwnerLeaseResult",
+        "create_task": "CreateTaskResult",
+        "assign_task": "TaskMutationResult",
+        "claim_task": "TaskMutationResult",
+        "renew_lease": "TaskMutationResult",
+        "begin_finalize": "TaskMutationResult",
+        "commit_finalize_success": "TaskMutationResult",
+        "commit_finalize_failure": "TaskMutationResult",
+        "requeue_task": "TaskMutationResult",
+    }
+    for name, expected in expected_returns.items():
+        fn = functions[name]
+        assert ast.unparse(fn.returns) == expected
+        source = ast.get_source_segment(task_state_path.read_text(), fn) or ""
+        assert 'return {"ok"' not in source
+        assert '"reason": "terminal"' not in source
+        assert '"reason": "owner_active"' not in source
+
+
+def test_task_state_store_actor_ledger_methods_wire_typed_results() -> None:
+    task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
+    source = task_state_path.read_text()
+    functions = _class_methods(task_state_path)["_TaskStateStoreActor"]
+    for name in (
+        "acquire_scheduler_owner",
+        "renew_scheduler_owner",
+        "create_task",
+        "assign_task",
+        "claim_task",
+        "renew_lease",
+        "begin_finalize",
+        "commit_finalize_success",
+        "commit_finalize_failure",
+        "requeue_task",
+    ):
+        fn_source = ast.get_source_segment(source, functions[name]) or ""
+        assert "_wire_result(" in fn_source
+
+
 def test_task_ledger_contract_rejects_sync_task_state_store_surface() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -540,6 +595,20 @@ def _module_functions(path: Path) -> dict[str, ast.FunctionDef | ast.AsyncFuncti
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
+
+
+def _class_methods(path: Path) -> dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    tree = ast.parse(path.read_text(), filename=str(path))
+    out: dict[str, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.ClassDef):
+            continue
+        out[node.name] = {
+            child.name: child
+            for child in node.body
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+    return out
 
 
 def _called_local_functions(
