@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from typing import Any, cast
 
 import pytest
 
@@ -14,6 +16,140 @@ from .invariants import (
 
 
 pytestmark = pytest.mark.component
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_complete_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-complete-during-finalize")
+        lease = await world.claim_one()
+
+        block = world.faults.block("task_state.begin_finalize")
+        finalize_task = asyncio.create_task(
+            world.scheduler.begin_finalize(
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                finalize_ttl_s=30.0,
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+        completed = await world.scheduler.complete(
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+        )
+
+        block.release.set()
+        finalized = await finalize_task
+
+        assert completed.ok is False and completed.reason == "finalize_inflight"
+        assert finalized.ok is True
+        assert (
+            await world.scheduler.validate(
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            )
+        ).ok is True
+        assert (await world.observe_task("component-complete-during-finalize"))["status"] == "finalizing"
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_projection(tmp_path) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        request_id = "component-stale-complete-new-attempt"
+        await world.enqueue_sampling(request_id)
+        old_lease = await world.claim_one(lease_ttl_s=1.0)
+        begin = await world.scheduler.begin_finalize(
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            finalize_ttl_s=30.0,
+        )
+        committed = cast(
+            Any,
+            await world.task_state.async_commit_finalize_failure(
+                request_id=request_id,
+                lease_id=old_lease["lease_id"],
+                attempt_id=old_lease["attempt_id"],
+                scheduler_epoch=old_lease["scheduler_epoch"],
+                runtime_generation=world.generation,
+                error="old attempt failed",
+            ),
+        )
+
+        block = world.faults.block("task_state.get_task.after")
+        complete_task = asyncio.create_task(
+            world.scheduler.complete(
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            )
+        )
+        await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+        expired = await world.scheduler.expire(now=time.time() + 31.0)
+        await world.task_state.async_forget_task(request_id=request_id)
+        await world.enqueue_sampling(request_id)
+        new_lease = await world.claim_one()
+
+        block.release.set()
+        stale_complete = await complete_task
+
+        assert begin.ok is True
+        assert committed.ok is True
+        assert expired.ok is True and expired.expired == 0
+        assert new_lease["item"]["request_id"] == request_id
+        assert new_lease["lease_id"] != old_lease["lease_id"]
+        assert stale_complete.ok is False and stale_complete.reason == "stale_consumer"
+        assert (
+            await world.scheduler.validate(
+                lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            )
+        ).ok is True
+        observed = cast(Any, await world.observe_scheduler(request_id))
+        assert observed.location == "leased"
+        assert (await world.observe_task(request_id))["lease_id"] == new_lease["lease_id"]
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(tmp_path) -> None:
+    for requeue in (True, False):
+        world = SchedulerComponentWorld(tmp_path / str(requeue))
+        try:
+            await world.start()
+            request_id = f"component-fail-during-finalize-{requeue}"
+            await world.enqueue_sampling(request_id)
+            lease = await world.claim_one()
+
+            block = world.faults.block("task_state.begin_finalize")
+            finalize_task = asyncio.create_task(
+                world.scheduler.begin_finalize(
+                    lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                    finalize_ttl_s=30.0,
+                )
+            )
+            await asyncio.wait_for(block.entered.wait(), timeout=1.0)
+
+            failed = await world.scheduler.fail(
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                requeue=requeue,
+                reason="fail-during-finalize",
+            )
+
+            block.release.set()
+            finalized = await finalize_task
+
+            assert failed.ok is False and failed.reason == "finalize_inflight"
+            assert finalized.ok is True
+            assert (
+                await world.scheduler.validate(
+                    lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                )
+            ).ok is True
+            assert (await world.observe_task(request_id))["status"] == "finalizing"
+        finally:
+            world.close()
 
 
 @pytest.mark.anyio
