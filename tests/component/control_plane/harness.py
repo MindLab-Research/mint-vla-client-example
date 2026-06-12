@@ -231,7 +231,7 @@ class SchedulerComponentWorld:
         assert task_ledger is not None
         self.task_ledger: AsyncTaskLedger = task_ledger
         self.task_gateway: ModelWorkTaskGateway = SchedulerModelWorkTaskGateway(
-            scheduler_client=self.runtime_queue,
+            scheduler_client=self.scheduler,
             task_ledger_client=self.task_ledger,
         )
         self.event_log: list[tuple[str, dict[str, Any]]] = []
@@ -249,7 +249,7 @@ class SchedulerComponentWorld:
         assert task_ledger is not None
         self.task_ledger = task_ledger
         self.task_gateway = SchedulerModelWorkTaskGateway(
-            scheduler_client=self.runtime_queue,
+            scheduler_client=self.scheduler,
             task_ledger_client=self.task_ledger,
         )
 
@@ -385,7 +385,7 @@ class SchedulerComponentWorld:
             poll_interval_s=0.01,
             lease_ttl_s=lease_ttl_s,
             max_claim=1,
-            scheduler_client=cast(Any, self.scheduler),
+            scheduler_client=cast(Any, self.runtime_queue),
             task_futures_client=self.future_service,
             task_state_store_client=self.task_state,
             payload_store=self.payload_store,

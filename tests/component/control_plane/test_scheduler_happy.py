@@ -9,6 +9,7 @@ from mint_server.backend.control_plane_contracts import (
     AsyncTaskLedger,
     ModelWorkTaskGateway,
 )
+from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
 from mint_server.backend.task_state_store import FutureStatus
 
 from .harness import SchedulerComponentWorld
@@ -31,6 +32,7 @@ def test_scheduler_component_world_exposes_typed_contracts(tmp_path) -> None:
         assert isinstance(world.runtime_queue, AsyncSchedulerQueue)
         assert isinstance(world.scheduler, AsyncSchedulerControlPlane)
         assert world.scheduler is world.runtime_queue
+        assert cast(SchedulerModelWorkTaskGateway, world.task_gateway).scheduler is world.scheduler
     finally:
         world.close()
 
