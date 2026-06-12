@@ -308,9 +308,7 @@ def get_or_create_model_runtime_actor(
 
 async def _default_executor(lease: dict[str, Any]) -> ExecutorOutcome:
     context = await _ensure_execution_bindings()
-    item = lease.get("item")
-    if not isinstance(item, dict):
-        raise RuntimeError(f"model work lease missing item: {lease!r}")
+    item = _lease_item_wire(lease)
     op = str(item.get("op") or "")
     from .model_work_dispatch import execute_model_work_item
 
@@ -703,7 +701,7 @@ class ModelRuntimeActor:
         return out if out > 0 else None
 
     def _restore_item_context(self, lease: dict[str, Any]) -> None:
-        item = lease.get("item") if isinstance(lease, dict) else {}
+        item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) else {}
         extra = extra if isinstance(extra, dict) else {}
         trace_id = extra.get("_trace_id")
@@ -762,7 +760,7 @@ class ModelRuntimeActor:
         return 300.0
 
     def _recovered_stale_generation_error(self, lease: dict[str, Any]) -> RuntimeError | None:
-        item = lease.get("item") if isinstance(lease, dict) else {}
+        item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
         raw = extra.get("actor_generation")
         if raw is None:
@@ -783,7 +781,7 @@ class ModelRuntimeActor:
     def _execution_timeout_s_for_lease(self, lease: dict[str, Any]) -> float | None:
         if self._config.execution_timeout_s is not None:
             return self._config.execution_timeout_s
-        item = lease.get("item") if isinstance(lease, dict) else {}
+        item = _lease_item_wire(lease)
         op = str(item.get("op") if isinstance(item, dict) else "")
         if op != "training.save_weights_for_sampler":
             return None
@@ -957,7 +955,7 @@ class ModelRuntimeActor:
                 elapsed_s = time.monotonic() - started
                 remaining_s = float(execution_timeout_s) - elapsed_s
                 if remaining_s <= 0:
-                    item = lease.get("item") if isinstance(lease, dict) else {}
+                    item = _lease_item_wire(lease)
                     op = str(item.get("op") if isinstance(item, dict) else "unknown")
                     raise TimeoutError(
                         f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
@@ -972,7 +970,7 @@ class ModelRuntimeActor:
                     and time.monotonic() - started >= float(execution_timeout_s)
                     and not task.done()
                 ):
-                    item = lease.get("item") if isinstance(lease, dict) else {}
+                    item = _lease_item_wire(lease)
                     op = str(item.get("op") if isinstance(item, dict) else "unknown")
                     raise TimeoutError(
                         f"model work executor timed out after {execution_timeout_s:.1f}s op={op}"
