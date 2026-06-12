@@ -5,17 +5,17 @@ import time
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import (
-    AsyncSchedulerQueue,
-    AsyncTaskLedger,
-    ExecutorOutcome,
-    LeaseToken,
-    ModelWorkTaskGateway,
-)
+from mint_server.backend.control_plane_contracts import ExecutorOutcome
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
 from mint_server.backend.task_state_store import TaskStateStore
 
+from .helpers import (
+    assert_scheduler_surfaces_progress_while_blocked,
+    assert_stats_progress_while_blocked,
+    token,
+    wait_for_task_state_call_count,
+)
 from .harness import SchedulerComponentWorld
 from .invariants import (
     assert_every_terminal_has_payload_ref,
@@ -28,117 +28,6 @@ from .scenarios import sampling_meta
 
 
 pytestmark = pytest.mark.component
-
-
-def _token(
-    lease: dict,
-    *,
-    consumer_id: str | None = None,
-    consumer_generation: int | None = None,
-) -> LeaseToken:
-    item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
-    return LeaseToken(
-        request_id=str(item.get("request_id") or lease.get("request_id", "")),
-        lease_id=str(lease["lease_id"]),
-        attempt_id=str(lease.get("attempt_id", "")),
-        scheduler_epoch=int(lease.get("scheduler_epoch", 0)),
-        consumer_id=str(
-            consumer_id if consumer_id is not None else lease.get("consumer_id", "")
-        ),
-        consumer_generation=int(
-            consumer_generation
-            if consumer_generation is not None
-            else lease.get("consumer_generation", 0)
-        ),
-    )
-
-
-def test_scheduler_component_world_exposes_typed_contracts(tmp_path) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        assert isinstance(world.task_gateway, ModelWorkTaskGateway)
-        assert isinstance(world.task_ledger, AsyncTaskLedger)
-        assert isinstance(world.runtime_queue, AsyncSchedulerQueue)
-        assert world.scheduler is world.runtime_queue
-    finally:
-        world.close()
-
-
-async def _assert_stats_progress_while_blocked(world: SchedulerComponentWorld, call, block_name: str):
-    block = world.faults.block(block_name)
-    task = asyncio.create_task(call())
-    await asyncio.wait_for(block.entered.wait(), timeout=1.0)
-
-    stats = await asyncio.wait_for(world.scheduler.stats(), timeout=0.5)
-
-    block.release.set()
-    result = await task
-    assert stats["scheduler_instance_id"]
-    return result
-
-
-async def _assert_scheduler_surfaces_progress_while_blocked(
-    world: SchedulerComponentWorld,
-    call,
-    block_name: str,
-):
-    block = world.faults.block(block_name)
-    task = asyncio.create_task(call())
-    await asyncio.wait_for(block.entered.wait(), timeout=1.0)
-
-    contains = await asyncio.wait_for(world.observe_scheduler("component-progress-probe"), timeout=0.5)
-    stats = await asyncio.wait_for(world.scheduler.stats(), timeout=0.5)
-    appended = await asyncio.wait_for(
-        world.enqueue_sampling(f"component-progress-{block_name}", assign=False),
-        timeout=0.5,
-    )
-    synced = await asyncio.wait_for(
-        world.scheduler.sync_replicas([world.replica(status="healthy")]),
-        timeout=0.5,
-    )
-
-    block.release.set()
-    result = await task
-    assert contains.ok is True
-    assert stats["scheduler_instance_id"]
-    assert appended.scheduler_result.ok is True
-    assert synced.ok is True
-    return result
-
-
-async def _wait_for_task_state_call_count(
-    world: SchedulerComponentWorld,
-    method: str,
-    *,
-    count: int,
-    timeout_s: float = 0.5,
-) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        observed = sum(1 for call_method, _ in world.task_state.calls if call_method == method)
-        if observed >= count:
-            return
-        await asyncio.sleep(0.005)
-    observed = sum(1 for call_method, _ in world.task_state.calls if call_method == method)
-    raise AssertionError(f"timed out waiting for {method} call count {count}; observed {observed}")
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, monkeypatch) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        await world.enqueue_sampling("component-happy")
-
-        await world.runtime_once()
-
-        assert await world.observe_future_status("component-happy") == FutureStatus.DONE
-        status_code, payload = await world.retrieve("component-happy", monkeypatch)
-        assert status_code == 200
-        assert payload == {"ok": True, "request_id": "component-happy"}
-        await assert_terminal_not_scheduled(world, "component-happy")
-    finally:
-        world.close()
 
 
 @pytest.mark.anyio
@@ -157,13 +46,13 @@ async def test_scheduler_component_invariant_helpers_cover_happy_path(
         await assert_no_orphan_assigned(world)
 
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             staged_payload_path=str(world.tmp_path / "component-invariants.json"),
             finalize_ttl_s=30.0,
         )
         assert begin.ok is True
         finished = await world.scheduler.finish_success(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             result_path=str(world.tmp_path / "component-invariants.json"),
             result_checksum="checksum",
             result_size_bytes=17,
@@ -188,14 +77,14 @@ async def test_scheduler_owner_renew_rpc_does_not_hold_owner_lock(tmp_path) -> N
 
         first = asyncio.create_task(world.scheduler_actor._ensure_task_state_owner())
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
-        await _wait_for_task_state_call_count(
+        await wait_for_task_state_call_count(
             world,
             "renew_scheduler_owner",
             count=baseline_renew_calls + 1,
         )
 
         second = asyncio.create_task(world.scheduler_actor._ensure_task_state_owner())
-        await _wait_for_task_state_call_count(
+        await wait_for_task_state_call_count(
             world,
             "renew_scheduler_owner",
             count=baseline_renew_calls + 2,
@@ -209,74 +98,6 @@ async def test_scheduler_owner_renew_rpc_does_not_hold_owner_lock(tmp_path) -> N
 
 
 @pytest.mark.anyio
-async def test_scheduler_component_retrieve_pending_uses_real_future_service(
-    tmp_path,
-    monkeypatch,
-) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        await world.enqueue_sampling("component-pending")
-
-        status_code, payload = await world.retrieve("component-pending", monkeypatch)
-
-        assert status_code == 408
-        assert payload["request_id"] == "component-pending"
-        assert payload["type"] == "try_again"
-        assert payload["status"] == "queued"
-        assert payload["queue_kind"] == "model_work_scheduler"
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_supervisor_syncs_real_scheduler(tmp_path) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        supervisor = world.supervisor()
-
-        out = await supervisor.reconcile_once()
-        replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
-        generation = int(replica["generation"])
-        await world.enqueue_sampling("component-supervisor")
-        claimed = await world.scheduler.claim(
-            domain_key=world.domain_key,
-            replica_id=world.replica_id,
-            consumer_id=replica["consumer_id"],
-            consumer_generation=generation,
-            max_items=1,
-            lease_ttl_s=30.0,
-        )
-
-        assert out["ok"] is True
-        assert len(claimed.leases) == 1
-        assert claimed.leases[0]["item"]["request_id"] == "component-supervisor"
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_duplicate_append_is_idempotent_while_pending(tmp_path) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-
-        first = await world.enqueue_sampling("component-duplicate")
-        second = await world.enqueue_sampling("component-duplicate")
-
-        assert first.scheduler_result.ok is True
-        assert not first.scheduler_result.idempotent
-        assert second.scheduler_result.ok is True
-        assert second.scheduler_result.idempotent is True
-
-        lease = await world.claim_one()
-        assert lease["item"]["request_id"] == "component-duplicate"
-        await world.claim_none()
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
 async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active_lease(tmp_path) -> None:
     world = SchedulerComponentWorld(tmp_path)
     try:
@@ -285,10 +106,10 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         lease = await world.claim_one()
 
         stale_finalize = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id="stale-consumer", consumer_generation=world.generation),
+            lease=token(lease, consumer_id="stale-consumer", consumer_generation=world.generation),
         )
         stale_fail = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation + 1),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation + 1),
             requeue=False,
             reason="stale",
         )
@@ -297,7 +118,7 @@ async def test_scheduler_component_stale_consumer_cannot_finalize_or_fail_active
         assert stale_fail.ok is False and stale_fail.reason == "stale_consumer"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         record = await world.observe_task("component-stale-consumer")
@@ -315,7 +136,7 @@ async def test_scheduler_component_gpu_actor_died_does_not_scheduler_fence_consu
         lease = await world.claim_one()
 
         failed = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="gpu_actor_died",
         )
@@ -348,20 +169,20 @@ async def test_scheduler_component_complete_requires_durable_terminal_commit(tmp
         await world.enqueue_sampling("component-complete-before-commit")
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
             staged_payload_path=str(world.tmp_path / "staged.json"),
         )
 
         premature_complete = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
         assert begin.ok is True
         assert premature_complete.ok is False and premature_complete.reason == "not_terminal"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_task("component-complete-before-commit"))["status"] == "finalizing"
@@ -377,12 +198,12 @@ async def test_scheduler_component_fail_terminal_requires_durable_terminal_commi
         await world.enqueue_sampling("component-fail-before-commit")
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
 
         premature_fail = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=False,
             reason="premature-terminal-fail",
         )
@@ -391,7 +212,7 @@ async def test_scheduler_component_fail_terminal_requires_durable_terminal_commi
         assert premature_fail.ok is False and premature_fail.reason == "not_terminal"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_task("component-fail-before-commit"))["status"] == "finalizing"
@@ -408,12 +229,12 @@ async def test_scheduler_component_fail_requeue_rejects_durable_finalizing_lease
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
 
         failed = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="ordinary-fail-after-finalize",
         )
@@ -423,7 +244,7 @@ async def test_scheduler_component_fail_requeue_rejects_durable_finalizing_lease
         assert (await world.observe_task(request_id))["status"] == "finalizing"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
     finally:
@@ -443,7 +264,7 @@ async def test_scheduler_component_fail_requeue_rejects_finalizing_after_local_t
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=1.0,
             )
         )
@@ -453,7 +274,7 @@ async def test_scheduler_component_fail_requeue_rejects_finalizing_after_local_t
         begin = await finalize_task
 
         failed = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="ordinary-fail-after-local-ttl-drift",
         )
@@ -463,7 +284,7 @@ async def test_scheduler_component_fail_requeue_rejects_finalizing_after_local_t
         assert (await world.observe_task(request_id))["status"] == "finalizing"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
     finally:
@@ -481,13 +302,13 @@ async def test_scheduler_component_fail_requeue_recovers_after_durable_finalize_
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=1.0,
         )
 
         await asyncio.sleep(1.05)
         failed = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="recover-expired-finalize",
         )
@@ -514,7 +335,7 @@ async def test_scheduler_component_finish_success_requires_begin_finalize(tmp_pa
         lease = await world.claim_one()
 
         finished = await world.scheduler.finish_success(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             result_path=str(world.tmp_path / "result.json"),
         )
 
@@ -522,7 +343,7 @@ async def test_scheduler_component_finish_success_requires_begin_finalize(tmp_pa
         assert (await world.observe_task(request_id))["status"] == "leased"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
     finally:
@@ -540,13 +361,13 @@ async def test_scheduler_component_finish_success_commits_terminal_and_releases_
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
             staged_payload_path=str(world.tmp_path / "component-finish-success.json"),
         )
 
         finished = await world.scheduler.finish_success(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             result_path=str(world.tmp_path / "component-finish-success.json"),
             result_checksum="sha256:abc",
             result_size_bytes=123,
@@ -578,13 +399,13 @@ async def test_scheduler_component_finish_success_preserves_absent_result_metada
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
             staged_payload_path=str(world.tmp_path / "component-finish-success-no-meta.json"),
         )
 
         finished = await world.scheduler.finish_success(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             result_path=str(world.tmp_path / "component-finish-success-no-meta.json"),
         )
 
@@ -610,12 +431,12 @@ async def test_scheduler_component_finish_failure_commits_terminal_and_releases_
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
 
         finished = await world.scheduler.finish_failure(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             error="runtime failed",
         )
 
@@ -640,7 +461,7 @@ async def test_scheduler_component_finish_cancel_after_durable_commit_releases_p
         await world.enqueue_sampling(request_id)
         lease = await world.claim_one()
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
 
@@ -651,7 +472,7 @@ async def test_scheduler_component_finish_cancel_after_durable_commit_releases_p
 
         with pytest.raises(asyncio.CancelledError):
             await world.scheduler.finish_success(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 result_path=str(world.tmp_path / "component-finish-cancel.json"),
                 result_checksum="sha256:abc",
                 result_size_bytes=123,
@@ -744,14 +565,14 @@ async def test_scheduler_component_complete_defers_while_begin_finalize_is_infli
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
         )
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
 
         completed = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
         block.release.set()
@@ -761,7 +582,7 @@ async def test_scheduler_component_complete_defers_while_begin_finalize_is_infli
         assert finalized.ok is True
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_task("component-complete-during-finalize"))["status"] == "finalizing"
@@ -778,7 +599,7 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
         await world.enqueue_sampling(request_id)
         old_lease = await world.claim_one(lease_ttl_s=1.0)
         begin = await world.scheduler.begin_finalize(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
         committed = await world.task_state.async_commit_finalize_failure(
@@ -793,7 +614,7 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
         block = world.faults.block("task_state.get_task.after")
         complete_task = asyncio.create_task(
             world.scheduler.complete(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         )
         await asyncio.wait_for(block.entered.wait(), timeout=1.0)
@@ -814,7 +635,7 @@ async def test_scheduler_component_stale_complete_cannot_clear_new_attempt_proje
         assert stale_complete.ok is False and stale_complete.reason == "stale_consumer"
         assert (
             await world.scheduler.validate(
-                lease=_token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
@@ -834,7 +655,7 @@ async def test_scheduler_component_complete_cleans_scheduler_lease_for_missing_t
         await world.task_state.async_forget_task(request_id=request_id)
 
         completed = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
         assert completed.ok is True and completed.request_id == request_id
@@ -903,14 +724,14 @@ async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(
             block = world.faults.block("task_state.begin_finalize")
             finalize_task = asyncio.create_task(
                 world.scheduler.begin_finalize(
-                    lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                    lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                     finalize_ttl_s=30.0,
                 )
             )
             await asyncio.wait_for(block.entered.wait(), timeout=1.0)
 
             failed = await world.scheduler.fail(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=requeue,
                 reason="fail-during-finalize",
             )
@@ -922,7 +743,7 @@ async def test_scheduler_component_fail_defers_while_begin_finalize_is_inflight(
             assert finalized.ok is True
             assert (
                 await world.scheduler.validate(
-                    lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                    lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 )
             ).ok is True
             assert (await world.observe_task(request_id))["status"] == "finalizing"
@@ -1053,7 +874,7 @@ async def test_scheduler_component_finalizing_expiry_requeues_for_retry(tmp_path
         await world.enqueue_sampling("component-expired-finalize")
         first_lease = await world.claim_one(lease_ttl_s=1.0)
         begin = await world.scheduler.begin_finalize(
-            lease=_token(first_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(first_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=1.0,
             staged_payload_path=str(world.tmp_path / "staged.json"),
         )
@@ -1086,14 +907,14 @@ async def test_scheduler_component_expired_old_lease_cannot_finalize_new_attempt
         new_lease = await world.claim_one()
 
         stale_finalize = await world.scheduler.begin_finalize(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
         stale_complete = await world.scheduler.complete(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         valid_new = await world.scheduler.validate(
-            lease=_token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(new_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
         assert expired.ok is True and expired.expired == 1
@@ -1129,7 +950,7 @@ async def test_scheduler_component_new_owner_hydrates_and_fences_old_scheduler(t
 
         with pytest.raises(Exception, match="owner_active"):
             await old_scheduler.renew(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 lease_ttl_s=30.0,
             )
         assigned = await world.scheduler.assign_pending(max_items=1)
@@ -1202,14 +1023,14 @@ async def test_scheduler_component_old_generation_cannot_renew_complete_or_fail_
         await world.scheduler.sync_replicas([world.replica(status="healthy", generation=old_generation + 1)])
 
         renewed = await world.scheduler.renew(
-            lease=_token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+            lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             lease_ttl_s=30.0,
         )
         completed = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+            lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
         )
         failed = await world.scheduler.fail(
-            lease=_token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+            lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             requeue=False,
             reason="stale-runtime",
         )
@@ -1250,7 +1071,7 @@ async def test_scheduler_component_retrieve_pending_during_blocked_finalize_does
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
         )
@@ -1280,7 +1101,7 @@ async def test_scheduler_component_blocked_claim_task_does_not_block_stats(tmp_p
         await world.start()
         await world.enqueue_sampling("component-blocked-claim")
 
-        claimed = await _assert_stats_progress_while_blocked(
+        claimed = await assert_stats_progress_while_blocked(
             world,
             lambda: world.scheduler.claim(
                 domain_key=world.domain_key,
@@ -1305,7 +1126,7 @@ async def test_scheduler_component_blocked_assign_task_does_not_block_stats(tmp_
         await world.start()
         await world.enqueue_sampling("component-blocked-assign", assign=False)
 
-        assigned = await _assert_stats_progress_while_blocked(
+        assigned = await assert_stats_progress_while_blocked(
             world,
             lambda: world.scheduler.assign_pending(max_items=1),
             "task_state.assign_task",
@@ -1323,7 +1144,7 @@ async def test_scheduler_component_blocked_assign_task_does_not_block_scheduler_
         await world.start()
         await world.enqueue_sampling("component-progress-probe", assign=False)
 
-        assigned = await _assert_scheduler_surfaces_progress_while_blocked(
+        assigned = await assert_scheduler_surfaces_progress_while_blocked(
             world,
             lambda: world.scheduler.assign_pending(max_items=1),
             "task_state.assign_task",
@@ -1496,10 +1317,10 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_stats(t
         await world.enqueue_sampling("component-blocked-finalize")
         lease = await world.claim_one()
 
-        finalized = await _assert_stats_progress_while_blocked(
+        finalized = await assert_stats_progress_while_blocked(
             world,
             lambda: world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             ),
             "task_state.begin_finalize",
@@ -1520,10 +1341,10 @@ async def test_scheduler_component_blocked_begin_finalize_does_not_block_schedul
         await world.enqueue_sampling("component-progress-probe")
         lease = await world.claim_one()
 
-        finalized = await _assert_scheduler_surfaces_progress_while_blocked(
+        finalized = await assert_scheduler_surfaces_progress_while_blocked(
             world,
             lambda: world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             ),
             "task_state.begin_finalize",
@@ -1545,7 +1366,7 @@ async def test_scheduler_component_sync_defers_while_begin_finalize_is_inflight(
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
         )
@@ -1563,7 +1384,7 @@ async def test_scheduler_component_sync_defers_while_begin_finalize_is_inflight(
         assert finalized.ok is True
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         record = await world.observe_task("component-sync-during-finalize")
@@ -1580,10 +1401,10 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_stats(tmp
         await world.enqueue_sampling("component-blocked-requeue")
         lease = await world.claim_one()
 
-        failed = await _assert_stats_progress_while_blocked(
+        failed = await assert_stats_progress_while_blocked(
             world,
             lambda: world.scheduler.fail(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="component-test",
             ),
@@ -1604,10 +1425,10 @@ async def test_scheduler_component_blocked_requeue_task_does_not_block_scheduler
         await world.enqueue_sampling("component-progress-probe")
         lease = await world.claim_one()
 
-        failed = await _assert_scheduler_surfaces_progress_while_blocked(
+        failed = await assert_scheduler_surfaces_progress_while_blocked(
             world,
             lambda: world.scheduler.fail(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="component-test",
             ),
@@ -1636,21 +1457,21 @@ async def test_scheduler_component_direct_fail_requeue_failure_preserves_retryab
         )
         with pytest.raises(RuntimeError, match="synthetic direct requeue failure"):
             await world.scheduler.fail(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-error",
             )
 
         assert (
             await world.scheduler.validate(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
         assert (await world.observe_task(request_id))["status"] == "leased"
 
         retried = await world.scheduler.fail(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-retry",
         )
@@ -1677,14 +1498,14 @@ async def test_scheduler_component_direct_fail_requeue_drops_missing_task_projec
         await world.task_state.async_forget_task(request_id=request_id)
 
         failed = await world.scheduler.fail(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-missing",
         )
 
         assert failed.ok is True and failed.request_id == request_id and failed.requeued is False
         validate = await world.scheduler.validate(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
         assert (await world.observe_scheduler(request_id)).present is False
@@ -1704,7 +1525,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_re
         block = world.faults.block("task_state.requeue_task")
         fail_task = asyncio.create_task(
             world.scheduler.fail(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-cancel",
             )
@@ -1717,14 +1538,14 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_preserves_re
 
         assert (
             await world.scheduler.validate(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
         assert (await world.observe_task(request_id))["status"] == "leased"
 
         retried = await world.scheduler.fail(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             requeue=True,
             reason="direct-fail-requeue-retry-after-cancel",
         )
@@ -1753,7 +1574,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_after_commit
         block = world.faults.block("task_state.requeue_task.after")
         fail_task = asyncio.create_task(
             world.scheduler.fail(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 requeue=True,
                 reason="direct-fail-requeue-cancel-after",
             )
@@ -1765,7 +1586,7 @@ async def test_scheduler_component_direct_fail_requeue_cancellation_after_commit
             await fail_task
 
         validate = await world.scheduler.validate(
-            lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
         assert (await world.observe_scheduler(request_id)).location == "backlog"
@@ -1922,7 +1743,7 @@ async def test_scheduler_component_sync_requeue_failure_preserves_replica_regist
 
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+                lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             )
         ).ok is True
         await world.enqueue_sampling("component-sync-requeue-registry-after", assign=False)
@@ -1964,10 +1785,10 @@ async def test_scheduler_component_generation_bump_drains_assigned_unleased_work
             consumer_generation=next_generation,
         )
         begin = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation)
+            lease=token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation)
         )
         finished = await world.scheduler.finish_success(
-            lease=_token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation),
+            lease=token(lease, consumer_id=next_consumer_id, consumer_generation=next_generation),
             result_path=str(world.tmp_path / "generation-bump-result.json"),
         )
         record = await world.observe_task(request_id)
@@ -2058,7 +1879,7 @@ async def test_scheduler_component_begin_finalize_cancellation_restores_lease(tm
         block = world.faults.block("task_state.begin_finalize")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
         )
@@ -2071,12 +1892,12 @@ async def test_scheduler_component_begin_finalize_cancellation_restores_lease(tm
         assert (await world.observe_scheduler(request_id)).location == "leased"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
 
         retried = await world.scheduler.begin_finalize(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             finalize_ttl_s=30.0,
         )
         assert retried.ok is True
@@ -2110,7 +1931,7 @@ async def test_scheduler_component_sync_cancellation_preserves_replica_registry_
 
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+                lease=token(lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
@@ -2154,7 +1975,7 @@ async def test_scheduler_component_sync_cancellation_after_requeue_commit_preser
             await sync_task
 
         validate = await world.scheduler.validate(
-            lease=_token(old_lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
+            lease=token(old_lease, consumer_id=old_consumer_id, consumer_generation=old_generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
         assert (await world.observe_scheduler(request_id)).location == "backlog"
@@ -2201,7 +2022,7 @@ async def test_scheduler_component_expire_cancellation_preserves_retryable_lease
 
         assert (
             await world.scheduler.validate(
-                lease=_token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         assert (await world.observe_scheduler(request_id)).location == "leased"
@@ -2341,7 +2162,7 @@ async def test_scheduler_component_same_session_sampling_is_serialized_by_orderi
         )
         assert (
             await world.scheduler.complete(
-                lease=_token(first, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(first, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
 
@@ -2407,117 +2228,6 @@ async def test_scheduler_component_megatron_training_session_is_serialized_by_or
 
         assert first["item"]["request_id"] == "component-megatron-session-a"
         assert blocked.leases == []
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_retrieve_pending_survives_scheduler_restart(tmp_path, monkeypatch) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        request_id = "component-retrieve-orphan"
-        await world.enqueue_sampling(request_id, assign=False)
-        await world.acquire_owner(owner_id="component-scheduler-orphan-probe", now=time.time() + 31.0)
-        world.replace_scheduler(owner_id="component-scheduler-orphan-probe")
-
-        status_code, payload = await world.retrieve(request_id, monkeypatch)
-
-        assert status_code == 408
-        assert payload["request_id"] == request_id
-        assert payload["type"] == "try_again"
-        assert payload["status"] == "queued"
-        assert payload["queue_kind"] == "model_work_scheduler"
-        assert await world.observe_future_status(request_id) == FutureStatus.PENDING
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_retrieve_orphan_pending_waits_for_reaper(tmp_path, monkeypatch) -> None:
-    class AbsentScheduler:
-        async def contains_request(
-            self,
-            *,
-            request_id: str,
-            hydrate_task_state: bool = True,
-            timeout_s: float | None = None,
-        ) -> dict[str, object]:
-            _ = request_id, hydrate_task_state, timeout_s
-            return {"ok": True, "present": False}
-
-        async def contains(self, **kwargs) -> dict[str, object]:
-            return await self.contains_request(**kwargs)
-
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        request_id = "component-retrieve-orphan-pending"
-        await world.enqueue_sampling(request_id, assign=False)
-
-        status_code, payload = await world.retrieve(
-            request_id,
-            monkeypatch,
-            scheduler_override=AbsentScheduler(),
-        )
-
-        assert status_code == 408
-        assert payload["request_id"] == request_id
-        assert payload["type"] == "try_again"
-        assert payload["queue_kind"] == "model_work_scheduler"
-        assert await world.observe_future_status(request_id) == FutureStatus.PENDING
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_retrieve_wait_returns_terminal_result(tmp_path, monkeypatch) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        request_id = "component-retrieve-wait-terminal"
-        await world.enqueue_sampling(request_id)
-
-        async def _complete_later() -> None:
-            await asyncio.sleep(0.01)
-            await world.runtime_once()
-
-        completion = asyncio.create_task(_complete_later())
-        status_code, payload = await world.retrieve(
-            request_id,
-            monkeypatch,
-            wait_timeout_s=0.2,
-        )
-        await completion
-
-        assert status_code == 200
-        assert payload == {"ok": True, "request_id": request_id}
-        await assert_terminal_not_scheduled(world, request_id)
-    finally:
-        world.close()
-
-
-@pytest.mark.anyio
-async def test_scheduler_component_retrieve_masks_internal_error_for_non_admin(tmp_path, monkeypatch) -> None:
-    world = SchedulerComponentWorld(tmp_path)
-    try:
-        await world.start()
-        request_id = "component-retrieve-mask-error"
-        await world.enqueue_sampling(request_id)
-
-        async def _failing_executor(_lease: dict) -> ExecutorOutcome:
-            return ExecutorOutcome(kind="user_error", error="internal gpu traceback secret")
-
-        await world.runtime_once(executor=_failing_executor)
-
-        admin_status, admin_payload = await world.retrieve(request_id, monkeypatch, admin=True)
-        user_status, user_payload = await world.retrieve(request_id, monkeypatch, admin=False)
-
-        assert admin_status == 200
-        assert "internal gpu traceback secret" in admin_payload["error"]
-        assert user_status == 200
-        assert user_payload["error"] == "Operation failed. Contact administrator if issue persists."
-        assert user_payload["category"] == "system"
     finally:
         world.close()
 
@@ -2805,7 +2515,7 @@ async def test_scheduler_component_cancel_leased_work_removes_scheduler_projecti
 
         cancelled = await world.cancel(request_id, monkeypatch, reason="component-test")
         validate = await world.scheduler.validate(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         failed_status = await world.observe_future_status(request_id)
         status_code, payload = await world.retrieve(request_id, monkeypatch)
@@ -2846,9 +2556,9 @@ async def test_scheduler_component_cancel_leased_work_survives_scheduler_restart
         assert claimed.leases == []
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
-        ).ok is False and (await world.scheduler.validate(lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation))).reason == "unknown_lease"
+        ).ok is False and (await world.scheduler.validate(lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation))).reason == "unknown_lease"
         assert (await world.observe_scheduler(request_id)).present is False
         assert failed_status == FutureStatus.FAILED
         assert status_code == 200
@@ -2938,7 +2648,7 @@ async def test_scheduler_component_claim_cancellation_after_durable_commit_prese
         assert contains.lease_id == task["lease_id"]
         assert (
             await world.scheduler.validate(
-                lease=_token(task, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(task, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
     finally:
@@ -2959,7 +2669,7 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
         block = world.faults.block("task_state.begin_finalize.after")
         finalize_task = asyncio.create_task(
             world.scheduler.begin_finalize(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
                 finalize_ttl_s=30.0,
             )
         )
@@ -2973,11 +2683,11 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
         assert (await world.observe_task(request_id))["status"] == "finalizing"
         assert (
             await world.scheduler.validate(
-                lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+                lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             )
         ).ok is True
         complete = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert complete.ok is False and complete.reason == "not_terminal"
         expired = await world.scheduler.expire(now=time.time() + 29.0)
@@ -2993,7 +2703,7 @@ async def test_scheduler_component_begin_finalize_cancellation_after_durable_com
             result_size_bytes=None,
         )
         completed = await world.scheduler.complete(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
 
         assert committed.ok is True
@@ -3106,14 +2816,14 @@ async def test_scheduler_component_renew_missing_task_cleans_orphan_lease(tmp_pa
         await world.task_state.async_forget_task(request_id=request_id)
 
         renewed = await world.scheduler.renew(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
             lease_ttl_s=30.0,
         )
 
         assert renewed.ok is False and renewed.reason == "unknown_lease"
         assert (await world.observe_scheduler(request_id)).present is False
         validate = await world.scheduler.validate(
-            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
         )
         assert validate.ok is False and validate.reason == "unknown_lease"
     finally:
