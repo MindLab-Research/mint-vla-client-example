@@ -17,7 +17,13 @@ from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedE
 from mint_server.backend.task_state_store import TaskStateStore
 
 from .harness import SchedulerComponentWorld
-from .invariants import assert_terminal_not_scheduled
+from .invariants import (
+    assert_every_terminal_has_payload_ref,
+    assert_lease_consistency,
+    assert_no_double_lease,
+    assert_no_orphan_assigned,
+    assert_terminal_not_scheduled,
+)
 from .scenarios import sampling_meta
 
 
@@ -131,6 +137,41 @@ async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, 
         assert status_code == 200
         assert payload == {"ok": True, "request_id": "component-happy"}
         await assert_terminal_not_scheduled(world, "component-happy")
+    finally:
+        world.close()
+
+
+@pytest.mark.anyio
+async def test_scheduler_component_invariant_helpers_cover_happy_path(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    world = SchedulerComponentWorld(tmp_path)
+    try:
+        await world.start()
+        await world.enqueue_sampling("component-invariants")
+
+        lease = await world.claim_one()
+        await assert_no_double_lease(world)
+        await assert_lease_consistency(world)
+        await assert_no_orphan_assigned(world)
+
+        begin = await world.scheduler.begin_finalize(
+            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            staged_payload_path=str(world.tmp_path / "component-invariants.json"),
+            finalize_ttl_s=30.0,
+        )
+        assert begin.ok is True
+        finished = await world.scheduler.finish_success(
+            lease=_token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
+            result_path=str(world.tmp_path / "component-invariants.json"),
+            result_checksum="checksum",
+            result_size_bytes=17,
+        )
+        assert finished.ok is True
+
+        await assert_every_terminal_has_payload_ref(world)
+        await assert_terminal_not_scheduled(world, "component-invariants")
     finally:
         world.close()
 

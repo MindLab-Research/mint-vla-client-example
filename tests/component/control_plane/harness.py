@@ -114,6 +114,9 @@ class LocalAsyncTaskStateClient:
     async def async_list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
         return await self._call("list_active_tasks", **kwargs)
 
+    async def async_list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._call("list_tasks_by_metadata", **kwargs)
+
     async def async_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call("update_task_metadata", **kwargs)
 
