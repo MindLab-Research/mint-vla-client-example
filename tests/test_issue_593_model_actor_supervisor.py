@@ -14,6 +14,13 @@ from mint_server.backend.cluster_placement_controller import (
     ClusterPlacementController,
     PlacementGroupCreateStatus,
 )
+from mint_server.backend.engine_adapter import (
+    EngineHealth,
+    EngineHealthStatus,
+    EngineObservability,
+    GpuPerformanceSample,
+)
+from mint_server.backend.engine_liveness import EngineLivenessPush
 from mint_server.backend.model_actor_launchers import (
     ModelActorLauncherRegistry,
     _model_runtime_max_claim_for_spec,
@@ -328,6 +335,57 @@ def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.
     )
 
     assert calls["count"] == 1
+
+
+@pytest.mark.anyio
+async def test_model_actor_supervisor_records_typed_liveness_push() -> None:
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        state_store=SupervisorMemoryStateStore(),
+        node_metrics_enabled=False,
+        **_disabled_control_plane_kwargs(),
+    )
+    payload = EngineLivenessPush(
+        actor_name="runtime-a",
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        consumer_id="vllm:model-a::replica-0::generation::7",
+        actor_generation=7,
+        running=True,
+        engine_ready=True,
+        engine_health=EngineHealth(status=EngineHealthStatus.READY),
+        observability=EngineObservability(
+            gpu_performance=(
+                GpuPerformanceSample(
+                    device_index=0,
+                    utilization_percent=73.0,
+                    memory_used_bytes=4096,
+                    memory_total_bytes=8192,
+                    power_watts=222.0,
+                    temperature_c=68.0,
+                ),
+            )
+        ),
+        active_request_id="req-1",
+        active_lease_id="lease-1",
+        active_lease_count=1,
+        pushed_at=123.5,
+    )
+
+    result = await supervisor.push_liveness(payload.to_wire())
+
+    assert result == {
+        "ok": True,
+        "domain_key": "vllm:model-a",
+        "replica_id": "replica-0",
+        "actor_generation": 7,
+    }
+    snapshot = supervisor.snapshot()
+    latest = snapshot["liveness_pushes"]["vllm:model-a::replica-0"]
+    assert latest["engine_ready"] is True
+    assert latest["engine_health"]["status"] == "ready"
+    assert latest["observability"]["gpu_performance"][0]["utilization_percent"] == 73.0
+    assert latest["active_request_id"] == "req-1"
 
 
 def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(

@@ -27,6 +27,7 @@ from .cluster_placement_controller import (
     PlacementReconcileRequest,
     PlacementReconcileResult,
 )
+from .engine_liveness import EngineLivenessPush
 from .model_actor_inventory import (
     ActorEntry,
     ActorType,
@@ -1005,6 +1006,7 @@ class ModelActorSupervisorCore:
         self._actor_generations: dict[tuple[str, str], int] = {}
         self._generations: dict[tuple[str, str], int] = {}
         self._states: dict[tuple[str, str], dict[str, Any]] = {}
+        self._latest_push: dict[tuple[str, str], EngineLivenessPush] = {}
         self._reconcile_total = 0
         self._created_total = 0
         self._restarted_total = 0
@@ -1935,6 +1937,26 @@ class ModelActorSupervisorCore:
         if not isinstance(out, dict):
             raise TypeError(f"runtime actor health_snapshot returned non-dict: {type(out)}")
         return out
+
+    async def push_liveness(self, payload: EngineLivenessPush | dict[str, Any]) -> dict[str, Any]:
+        push = payload if isinstance(payload, EngineLivenessPush) else EngineLivenessPush.from_wire(dict(payload))
+        key = push.key
+        current_generation = int(self._generations.get(key, 0) or 0)
+        if current_generation > 0 and int(push.actor_generation) < current_generation:
+            return {
+                "ok": False,
+                "domain_key": push.domain_key,
+                "replica_id": push.replica_id,
+                "actor_generation": int(push.actor_generation),
+                "reason": "stale_generation",
+            }
+        self._latest_push[key] = push
+        return {
+            "ok": True,
+            "domain_key": push.domain_key,
+            "replica_id": push.replica_id,
+            "actor_generation": int(push.actor_generation),
+        }
 
     def _actor_generation_matches_current(
         self,
@@ -2949,6 +2971,10 @@ class ModelActorSupervisorCore:
             "last_scheduler_sync_at": self._last_scheduler_sync_at,
             "last_placement_reconcile": self._last_placement_reconcile,
             "last_topology_reconcile": self._last_topology_reconcile,
+            "liveness_pushes": {
+                _label(key): push.to_wire()
+                for key, push in sorted(self._latest_push.items())
+            },
             "topology": topology_snapshot,
             "state_store": {
                 "backend": self._state_store.backend,
@@ -3417,6 +3443,13 @@ class ModelActorSupervisorClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.recycle returned non-dict: {type(out)}")
+        return out
+
+    async def push_liveness(self, payload: EngineLivenessPush | dict[str, Any]) -> dict[str, Any]:
+        wire = payload.to_wire() if isinstance(payload, EngineLivenessPush) else dict(payload)
+        out = await self._call_async("push_liveness", wire)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.push_liveness returned non-dict: {type(out)}")
         return out
 
     def snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:

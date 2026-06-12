@@ -26,6 +26,8 @@ from ..logging_context import (
 )
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from .control_plane_contracts import ExecutorOutcome, LeaseToken, as_task_ledger
+from .engine_adapter import EngineHealth, EngineHealthStatus, EngineObservability
+from .engine_liveness import EngineLivenessPush
 from .execution_context import ExecutionContext, bind_execution_context
 from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
@@ -39,6 +41,7 @@ ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
 EngineLifecycleHook = Any
 SelfExitHook = Callable[[str], Awaitable[None] | None]
+LivenessPushHook = Callable[[EngineLivenessPush], Awaitable[None] | None]
 _EXECUTION_BINDINGS: ExecutionContext | None = None
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
@@ -348,6 +351,12 @@ async def _refresh_execution_bindings() -> ExecutionContext:
     return await _ensure_execution_bindings(force_refresh=True)
 
 
+async def _default_liveness_push(payload: EngineLivenessPush) -> None:
+    from .model_actor_supervisor import get_model_actor_supervisor
+
+    await get_model_actor_supervisor().push_liveness(payload)
+
+
 class ModelEngineHost:
     """Model-owned pull executor bound to one scheduler ReplicaQueue."""
 
@@ -373,6 +382,7 @@ class ModelEngineHost:
         token_budget_provider: TokenBudgetProvider | None = None,
         engine_lifecycle: EngineLifecycleHook | None = None,
         engine_restart_timeout_s: float | None = None,
+        liveness_push: LivenessPushHook | None = None,
         self_exit: SelfExitHook | None = None,
         ray_address: str | None = None,
     ) -> None:
@@ -437,7 +447,8 @@ class ModelEngineHost:
         self._token_budget_provider = (
             token_budget_provider if token_budget_provider is not None else self._default_token_budget_provider
         )
-        if engine_lifecycle is None and executor is None:
+        default_lifecycle = engine_lifecycle is None and executor is None
+        if default_lifecycle:
             from .engine_lifecycle import ExecutionContextEngineLifecycle
 
             engine_lifecycle = ExecutionContextEngineLifecycle(
@@ -445,6 +456,11 @@ class ModelEngineHost:
                 refresh_context_factory=_refresh_execution_bindings,
             )
         self._engine_lifecycle = engine_lifecycle
+        self._liveness_push = (
+            liveness_push
+            if liveness_push is not None
+            else (_default_liveness_push if default_lifecycle else None)
+        )
         self._self_exit = self_exit if self_exit is not None else self._ray_actor_self_exit
 
         self._running = False
@@ -605,14 +621,18 @@ class ModelEngineHost:
 
     async def run_once(self) -> dict[str, Any]:
         if self._draining:
+            await self._push_liveness()
             return {"claimed": 0, "executed": 0, "draining": True}
         if await self._engine_restart_deadline_expired():
+            await self._push_liveness()
             return {"claimed": 0, "executed": 0, "engine_ready": False, "self_exit": True}
         engine_ready = await self._engine_is_ready()
         if not engine_ready:
             if await self._engine_restart_deadline_expired():
+                await self._push_liveness()
                 return {"claimed": 0, "executed": 0, "engine_ready": False, "self_exit": True}
             self._empty_polls_total += 1
+            await self._push_liveness()
             return {"claimed": 0, "executed": 0, "engine_ready": False}
         max_items, token_budget = await self._claim_limits()
         claimed = await self._scheduler.claim(
@@ -628,6 +648,7 @@ class ModelEngineHost:
         if not leases:
             self._empty_polls_total += 1
             self._clear_transient_scheduler_error()
+            await self._push_liveness()
             return {"claimed": 0, "executed": 0}
 
         self._last_claimed_at = time.time()
@@ -638,6 +659,7 @@ class ModelEngineHost:
             await asyncio.gather(*(self._execute_lease(lease) for lease in valid_leases))
         else:
             await self._execute_leases_sequentially(valid_leases)
+        await self._push_liveness()
         return {"claimed": len(leases), "executed": len(valid_leases)}
 
     async def _claim_limits(self) -> tuple[int, int | None]:
@@ -965,6 +987,99 @@ class ModelEngineHost:
             self._record_error(exc)
             self._engine_ready = False
             return False
+
+    async def _engine_health(self) -> EngineHealth:
+        if self._engine_lifecycle is None:
+            return EngineHealth(status=EngineHealthStatus.READY)
+        getter = getattr(self._engine_lifecycle, "health", None)
+        if callable(getter):
+            try:
+                health = getter()
+                if inspect.isawaitable(health):
+                    health = await health
+                if isinstance(health, EngineHealth):
+                    return health
+                if isinstance(health, dict):
+                    return EngineHealth.from_wire(health)
+            except Exception as exc:
+                self._record_error(exc)
+                return EngineHealth(
+                    status=EngineHealthStatus.UNHEALTHY,
+                    reason="health_error",
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+        if self._engine_ready is False:
+            return EngineHealth(
+                status=EngineHealthStatus.UNHEALTHY,
+                reason="not_ready",
+                last_error=self._last_error,
+            )
+        if self._engine_restarting:
+            return EngineHealth(
+                status=EngineHealthStatus.RESTARTING,
+                restart_count=int(self._engine_restart_count),
+                last_error=self._last_error,
+            )
+        return EngineHealth(status=EngineHealthStatus.READY, last_error=self._last_error)
+
+    async def _engine_observability(self) -> EngineObservability:
+        if self._engine_lifecycle is None:
+            return EngineObservability()
+        getter = getattr(self._engine_lifecycle, "get_observability_binding", None)
+        if not callable(getter):
+            return EngineObservability()
+        try:
+            observability = getter()
+            if inspect.isawaitable(observability):
+                observability = await observability
+            if isinstance(observability, EngineObservability):
+                return observability
+            if isinstance(observability, dict):
+                return EngineObservability.from_wire(observability)
+        except Exception as exc:
+            self._record_error(exc)
+            logger.debug(
+                "[model_runtime] engine observability lookup failed actor=%s domain=%s error_type=%s error=%s",
+                self._config.actor_name,
+                self._config.domain_key,
+                type(exc).__name__,
+                exc,
+            )
+        return EngineObservability()
+
+    async def _push_liveness(self) -> None:
+        if self._liveness_push is None:
+            return
+        payload = EngineLivenessPush(
+            actor_name=self._config.actor_name,
+            domain_key=self._config.domain_key,
+            replica_id=self._config.replica_id,
+            consumer_id=self._config.consumer_id,
+            actor_generation=int(self._config.actor_generation),
+            running=bool(self._running),
+            engine_ready=bool(self._engine_ready),
+            engine_health=await self._engine_health(),
+            observability=await self._engine_observability(),
+            active_request_id=self._active_request_id,
+            active_lease_id=self._active_lease_id,
+            active_lease_count=len(self._active_leases),
+            pushed_at=time.time(),
+            last_error=self._last_error,
+        )
+        try:
+            out = self._liveness_push(payload)
+            if inspect.isawaitable(out):
+                await out
+        except Exception as exc:
+            self._record_error(exc)
+            logger.warning(
+                "[model_runtime] liveness push failed actor=%s domain=%s replica=%s error_type=%s error=%s",
+                self._config.actor_name,
+                self._config.domain_key,
+                self._config.replica_id,
+                type(exc).__name__,
+                exc,
+            )
 
     async def _ray_actor_self_exit(self, reason: str) -> None:
         logger.error(

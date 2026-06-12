@@ -6,6 +6,13 @@ import time
 import pytest
 
 from mint_server.backend.control_plane_contracts import ExecutorOutcome, LeaseToken
+from mint_server.backend.engine_adapter import (
+    EngineHealth,
+    EngineHealthStatus,
+    EngineObservability,
+    GpuPerformanceSample,
+)
+from mint_server.backend.engine_liveness import EngineLivenessPush
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_engine_host import (
     ModelEngineHost,
@@ -197,9 +204,30 @@ class _FakeEngineLifecycle:
         self.restart_event = restart_event
         self.unhealthy_reasons: list[str] = []
         self.restart_calls = 0
+        self.health_value = EngineHealth(status=EngineHealthStatus.READY)
+        self.observability_value = EngineObservability(
+            gpu_performance=(
+                GpuPerformanceSample(
+                    device_index=0,
+                    utilization_percent=42.5,
+                    memory_used_bytes=1024,
+                    memory_total_bytes=2048,
+                    power_watts=111.0,
+                    temperature_c=61.0,
+                ),
+            )
+        )
 
     async def is_ready(self) -> bool:
         return self.ready
+
+    async def health(self) -> EngineHealth:
+        if not self.ready:
+            return EngineHealth(status=EngineHealthStatus.UNHEALTHY, reason="not_ready")
+        return self.health_value
+
+    async def get_observability_binding(self) -> EngineObservability:
+        return self.observability_value
 
     async def mark_unhealthy(self, reason: str) -> None:
         self.ready = False
@@ -210,6 +238,14 @@ class _FakeEngineLifecycle:
         if self.restart_event is not None:
             await self.restart_event.wait()
         self.ready = self.ready_after_restart
+
+
+class _FakeLivenessPush:
+    def __init__(self) -> None:
+        self.payloads: list[EngineLivenessPush] = []
+
+    async def __call__(self, payload: EngineLivenessPush) -> None:
+        self.payloads.append(payload)
 
 
 class _FakeBindingEngine:
@@ -801,6 +837,67 @@ async def test_model_engine_host_skips_claim_when_engine_not_ready() -> None:
 
 
 @pytest.mark.anyio
+async def test_model_engine_host_pushes_typed_liveness_with_gpu_performance() -> None:
+    scheduler = _FakeScheduler(claims=[])
+    engine = _FakeEngineLifecycle(ready=True)
+    push = _FakeLivenessPush()
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        engine_lifecycle=engine,
+        liveness_push=push,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+
+    assert len(push.payloads) == 1
+    payload = push.payloads[0]
+    assert payload.actor_name == "runtime-a"
+    assert payload.domain_key == "vllm:model-a"
+    assert payload.replica_id == "replica-0"
+    assert payload.consumer_id == "vllm:model-a::replica-0::generation::3"
+    assert payload.actor_generation == 3
+    assert payload.running is False
+    assert payload.engine_ready is True
+    assert payload.engine_health.status is EngineHealthStatus.READY
+    assert payload.observability.gpu_performance[0].utilization_percent == 42.5
+    assert payload.observability.gpu_performance[0].memory_used_bytes == 1024
+    assert payload.pushed_at is not None
+
+    wire = payload.to_wire()
+    assert EngineLivenessPush.from_wire(wire) == payload
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_pushes_unhealthy_liveness_before_skipping_claim() -> None:
+    scheduler = _FakeScheduler(claims=[[_lease("runtime-req-not-claimed")]])
+    engine = _FakeEngineLifecycle(ready=False)
+    push = _FakeLivenessPush()
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        engine_lifecycle=engine,
+        liveness_push=push,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0, "engine_ready": False}
+
+    assert scheduler.claim_calls == []
+    assert len(push.payloads) == 1
+    payload = push.payloads[0]
+    assert payload.engine_ready is False
+    assert payload.engine_health.status is EngineHealthStatus.UNHEALTHY
+    assert payload.engine_health.reason == "not_ready"
+
+
+@pytest.mark.anyio
 async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_engine_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -851,6 +948,53 @@ async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_en
     assert await actor.run_once() == {"claimed": 1, "executed": 1}
     assert len(scheduler.claim_calls) == 1
     assert init_calls == 1
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_default_lifecycle_pushes_to_supervisor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.model_engine_host as runtime_module
+    import mint_server.backend.model_work_dispatch as dispatch_module
+
+    pushes: list[EngineLivenessPush] = []
+    scheduler = _FakeScheduler(claims=[])
+    binding_engine = _FakeBindingEngine(ready=True)
+
+    async def _initialize_execution_bindings() -> dict:
+        return {
+            "inference_manager": binding_engine,
+            "train_manager": object(),
+            "train_engine": object(),
+            "action_manager": object(),
+        }
+
+    async def _execute_work_item(_item, **_kwargs) -> ExecutorOutcome:
+        return ExecutorOutcome(kind="success", payload={"ok": True})
+
+    async def _push(payload: EngineLivenessPush) -> None:
+        pushes.append(payload)
+
+    monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
+    monkeypatch.setattr(runtime_module, "_default_liveness_push", _push)
+    monkeypatch.setattr(
+        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        _initialize_execution_bindings,
+    )
+    monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,  # type: ignore[arg-type]
+        task_futures_client=_FakeTaskFutureService(),
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+    assert len(pushes) == 1
+    assert pushes[0].engine_ready is True
+    assert pushes[0].consumer_id == "vllm:model-a::replica-0::generation::3"
 
 
 @pytest.mark.anyio
