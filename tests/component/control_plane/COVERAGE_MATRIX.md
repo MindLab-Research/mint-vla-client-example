@@ -24,9 +24,10 @@ runs-on: [self-hosted, linux]
 
 The workflow installs a minimal scheduler-CI venv, then invokes the entrypoint
 with `MINT_CI_UV_NO_SYNC=1`.  The scheduler control-plane gate does not import
-or execute torch-backed model code; avoiding full project sync keeps this
-PR-blocking gate focused on typed control-plane behavior instead of full model
-runtime provisioning.
+or execute torch-backed model code.  It also relies on the test suite's fake Ray
+module for hermetic control-plane checks instead of downloading a full Ray
+runtime wheel.  Avoiding full project sync keeps this PR-blocking gate focused
+on typed control-plane behavior instead of full model runtime provisioning.
 
 ## CI Layers
 
@@ -37,7 +38,7 @@ runtime provisioning.
 | Static guardrails | `uv run pytest tests/test_stateless_control_plane_guardrails.py -q` | Prevent regression to private route/storage access, legacy completion surfaces, direct backend PG creation, and async footguns. |
 | Issue 593 scheduler/runtime/supervisor | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_runtime_actor.py tests/test_issue_593_model_actor_supervisor.py -q` | Narrow historical regressions around scheduler, runtime actor, and supervisor behavior. |
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
-| Static checks | scoped `ruff`, scoped typed-surface `pyright`, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
+| Static checks | scoped `ruff`, scheduler-CI `pyright` config, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
 
 ## Contract Coverage
 
@@ -62,7 +63,9 @@ runtime provisioning.
 
 ## Explicit Non-Coverage
 
-The PR-blocking gate does not start a real Ray cluster, allocate GPUs, or launch
-real vLLM/Megatron/Bumblebee backends.  Those belong in a separate smoke or
-nightly gate because they validate external runtime semantics rather than the
-typed control-plane contract.
+The PR-blocking gate does not install a real Ray runtime, start a Ray cluster,
+allocate GPUs, or launch real vLLM/Megatron/Bumblebee backends.  Pytest uses the
+fake Ray module installed by `tests/conftest.py`; pyright resolves the same
+boundary through `pyrightconfig.scheduler-ci.json` and `tests/typing_stubs/`.
+Real runtime semantics belong in a separate smoke or nightly gate rather than
+this typed control-plane contract gate.

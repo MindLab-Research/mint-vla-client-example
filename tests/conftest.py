@@ -72,6 +72,8 @@ def _install_fake_ray() -> None:
     ray_module.get = lambda *args, **kwargs: None
     ray_module.nodes = lambda: []
     ray_module.kill = lambda *args, **kwargs: None
+    ray_module.remote = lambda *args, **kwargs: (lambda cls: cls)
+    ray_module.method = lambda *args, **kwargs: (lambda fn: fn)
 
     sys.modules["ray"] = ray_module
     sys.modules["ray.exceptions"] = ray_exceptions

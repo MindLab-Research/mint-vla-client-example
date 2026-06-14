@@ -45,15 +45,8 @@ PYTHON_TARGETS=(
   tests/test_issue_593_model_runtime_actor.py
   tests/test_issue_593_model_actor_supervisor.py
   tests/test_model_work_task_gateway.py
+  tests/conftest.py
   scripts/tools/verify_scheduler_control_plane.py
-)
-
-PYRIGHT_TARGETS=(
-  tests/test_cluster_placement_controller.py
-  tests/component/control_plane
-  tests/test_stateless_control_plane_guardrails.py
-  tests/test_model_work_task_gateway.py
-  tests/test_issue_593_model_work_scheduler.py
 )
 
 mapfile -t COMPONENT_TESTS < <(find tests/component/control_plane -name '*.py' -type f | sort)
@@ -67,6 +60,6 @@ run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_ru
 run_step "issue 593 supervisor" "${UV_RUN[@]}" pytest tests/test_issue_593_model_actor_supervisor.py -q
 run_step "contract verifier" "${UV_RUN[@]}" python scripts/tools/verify_scheduler_control_plane.py
 run_step "scoped ruff" "${UV_RUN[@]}" ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane
-run_step "scoped pyright" "${UV_RUN[@]}" pyright "${PYRIGHT_TARGETS[@]}"
+run_step "scoped pyright" "${UV_RUN[@]}" pyright --project pyrightconfig.scheduler-ci.json
 run_step "py_compile" "${UV_RUN[@]}" python -m py_compile "${PY_COMPILE_TARGETS[@]}"
 run_step "diff whitespace" git diff --check
