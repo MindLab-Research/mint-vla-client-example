@@ -40,6 +40,8 @@ of full model runtime provisioning.
 | Issue 593 scheduler/runtime/supervisor | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_runtime_actor.py tests/test_issue_593_model_actor_supervisor.py -q` | Narrow historical regressions around scheduler, runtime actor, and supervisor behavior. |
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
 | Static checks | scoped `ruff`, scheduler-CI `pyright` config, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
+| Critical path soft gates | focused `pytest` nodeids for critical success and critical failure paths | Make the highest-value semantic paths visible as named 100%-pass gates instead of only incidental full-suite coverage. |
+| Coverage hard gate | `coverage run ...` then `coverage report --fail-under=$MINT_SCHEDULER_COVERAGE_MIN` | Enforce a minimum line-coverage floor for scheduler control-plane modules. The default floor is 75%. |
 
 ## Hermetic Invariant Defaults
 
@@ -48,6 +50,39 @@ directories.  Runtime harnesses that exercise durable finalize success use a
 temporary `MINT_TASK_PAYLOAD_ROOT_DIR` by default, so payload publication
 failures indicate contract behavior rather than filesystem permissions outside
 the test sandbox.
+
+Coverage instrumentation is treated as a valid execution mode for this gate. If
+instrumentation overhead exposes a timing-sensitive test, the test timeout or
+assertion should be fixed rather than excluding coverage.  The coverage data is
+stored outside the repository by default through `COVERAGE_FILE` under `/tmp`.
+
+## Critical Path Soft Gates
+
+The single-entry CI script runs two focused nodeid groups before the broad
+suite.  These are "soft" in the sense that they are semantic coverage checks,
+not numeric line-coverage checks, but CI still requires every selected test to
+pass.
+
+Critical success paths:
+
+- scheduler happy path submit -> claim -> execute -> retrieve
+- manual assignment happy path
+- durable finalize success releases scheduler projection
+- engine death during durable finalize resumes terminalization
+- typed gateway ready retrieve reads payload refs
+- placement reservation atomicity
+- backend bundle computation
+
+Critical failure paths:
+
+- executor failure commits terminal failure
+- payload write failure requeues without terminal commit
+- stale consumer cannot finalize/fail active lease
+- lease expiry requeues for retry
+- cancel leased work removes scheduler projection
+- placement PG blocked registers unclaimable replica
+- gateway admission reject does not create a task
+- pending PG timeout blocks with backoff
 
 ## Contract Coverage
 

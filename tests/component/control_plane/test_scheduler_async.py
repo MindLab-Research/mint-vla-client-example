@@ -71,9 +71,9 @@ async def test_scheduler_component_retrieve_pending_during_blocked_finalize_does
 
         status_code, payload = await asyncio.wait_for(
             world.retrieve("component-finalize-retrieve-race", monkeypatch),
-            timeout=0.5,
+            timeout=2.0,
         )
-        stats = await asyncio.wait_for(world.scheduler.stats(), timeout=0.5)
+        stats = await asyncio.wait_for(world.scheduler.stats(), timeout=2.0)
 
         block.release.set()
         finalized = await finalize_task

@@ -4,7 +4,8 @@
     "tests/component/control_plane",
     "tests/test_stateless_control_plane_guardrails.py",
     "tests/test_model_work_task_gateway.py",
-    "tests/test_issue_593_model_work_scheduler.py"
+    "tests/test_issue_593_model_work_scheduler.py",
+    "tests/test_model_engine_host_rename.py"
   ],
   "stubPath": "tests/typing_stubs",
   "reportMissingModuleSource": "none",

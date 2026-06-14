@@ -24,6 +24,7 @@ on:
       - "tests/test_issue_593_model_work_scheduler.py"
       - "tests/test_issue_593_model_runtime_actor.py"
       - "tests/test_issue_593_model_actor_supervisor.py"
+      - "tests/test_model_engine_host_rename.py"
       - "tests/test_model_work_task_gateway.py"
       - "pyproject.toml"
       - "pyrightconfig.scheduler-ci.json"
@@ -53,6 +54,7 @@ on:
       - "tests/test_issue_593_model_work_scheduler.py"
       - "tests/test_issue_593_model_runtime_actor.py"
       - "tests/test_issue_593_model_actor_supervisor.py"
+      - "tests/test_model_engine_host_rename.py"
       - "tests/test_model_work_task_gateway.py"
       - "pyproject.toml"
       - "pyrightconfig.scheduler-ci.json"
@@ -77,6 +79,7 @@ jobs:
         run: |
           uv venv --python 3.12
           uv pip install --python .venv/bin/python --index-url "$UV_INDEX_URL" \
+            coverage==7.14.1 \
             fastapi==0.121.2 \
             httpx==0.27.2 \
             opentelemetry-api==1.38.0 \
