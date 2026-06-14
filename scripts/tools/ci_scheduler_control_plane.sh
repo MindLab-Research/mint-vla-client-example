@@ -6,7 +6,9 @@ cd "$ROOT_DIR"
 
 export PYRIGHT_PYTHON_FORCE_VERSION="${PYRIGHT_PYTHON_FORCE_VERSION:-1.1.409}"
 export MINT_SCHEDULER_COVERAGE_MIN="${MINT_SCHEDULER_COVERAGE_MIN:-75}"
+export MINT_SCHEDULER_COVERAGE_FILE_MIN="${MINT_SCHEDULER_COVERAGE_FILE_MIN:-70}"
 COVERAGE_FILE="${COVERAGE_FILE:-${TMPDIR:-/tmp}/mint_scheduler_control_plane.coverage}"
+COVERAGE_JSON="${COVERAGE_JSON:-${TMPDIR:-/tmp}/mint_scheduler_control_plane.coverage.json}"
 
 UV_RUN=(uv run)
 if [[ "${MINT_CI_UV_NO_SYNC:-}" == "1" ]]; then
@@ -67,6 +69,10 @@ COVERAGE_SOURCE_FILES=(
   mint_server/backend/model_placement_topology.py
 )
 
+COVERAGE_FILE_MIN_EXCEPTIONS=(
+  mint_server/backend/model_actor_supervisor.py=65
+)
+
 COVERAGE_TEST_TARGETS=(
   tests/component/control_plane
   tests/test_cluster_placement_controller.py
@@ -119,4 +125,37 @@ run_step "coverage collect" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" co
 run_step "coverage hard gate" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage report \
   --fail-under="$MINT_SCHEDULER_COVERAGE_MIN" \
   "${COVERAGE_SOURCE_FILES[@]}"
+run_step "coverage json" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage json \
+  -o "$COVERAGE_JSON" \
+  "${COVERAGE_SOURCE_FILES[@]}"
+run_step "coverage per-file gate" env COVERAGE_JSON="$COVERAGE_JSON" \
+  MINT_SCHEDULER_COVERAGE_FILE_MIN="$MINT_SCHEDULER_COVERAGE_FILE_MIN" \
+  "${UV_RUN[@]}" python - "${COVERAGE_SOURCE_FILES[@]}" -- "${COVERAGE_FILE_MIN_EXCEPTIONS[@]}" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+args = sys.argv[1:]
+separator = args.index("--")
+source_files = args[:separator]
+exceptions = dict(item.split("=", 1) for item in args[separator + 1 :])
+default_min = float(os.environ["MINT_SCHEDULER_COVERAGE_FILE_MIN"])
+
+with open(os.environ["COVERAGE_JSON"], encoding="utf-8") as handle:
+    coverage = json.load(handle)
+
+failures: list[str] = []
+for source_file in source_files:
+    summary = coverage["files"][source_file]["summary"]
+    percent = float(summary["percent_covered"])
+    minimum = float(exceptions.get(source_file, default_min))
+    print(f"{source_file}: {percent:.2f}% >= {minimum:.2f}%")
+    if percent < minimum:
+        failures.append(f"{source_file}: {percent:.2f}% < {minimum:.2f}%")
+
+if failures:
+    raise SystemExit("coverage per-file gate failed:\n" + "\n".join(failures))
+PY
 run_step "diff whitespace" git diff --check

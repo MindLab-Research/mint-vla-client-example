@@ -41,7 +41,7 @@ of full model runtime provisioning.
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
 | Static checks | scoped `ruff`, scheduler-CI `pyright` config, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
 | Critical path soft gates | focused `pytest` nodeids for critical success and critical failure paths | Make the highest-value semantic paths visible as named 100%-pass gates instead of only incidental full-suite coverage. |
-| Coverage hard gate | `coverage run ...` then `coverage report --fail-under=$MINT_SCHEDULER_COVERAGE_MIN` | Enforce a minimum line-coverage floor for scheduler control-plane modules. The default floor is 75%. |
+| Coverage hard gate | `coverage run ...`, `coverage report --fail-under=$MINT_SCHEDULER_COVERAGE_MIN`, then per-file JSON validation | Enforce a minimum aggregate line-coverage floor plus a per-file floor for scheduler control-plane modules. The aggregate default is 75%; the per-file default is 70%. |
 
 ## Hermetic Invariant Defaults
 
@@ -56,12 +56,47 @@ instrumentation overhead exposes a timing-sensitive test, the test timeout or
 assertion should be fixed rather than excluding coverage.  The coverage data is
 stored outside the repository by default through `COVERAGE_FILE` under `/tmp`.
 
+Coverage has two numeric gates:
+
+- aggregate hard gate: `MINT_SCHEDULER_COVERAGE_MIN`, default 75%
+- per-file hard gate: `MINT_SCHEDULER_COVERAGE_FILE_MIN`, default 70%
+
+Per-file exceptions must be explicit in `ci_scheduler_control_plane.sh` and
+kept narrow.  They are only for files whose remaining branches are
+runtime-adjacent or hard to exercise under the fake-Ray CI harness without
+turning the PR-blocking gate into a real runtime/e2e job.
+
+Current exception:
+
+- `mint_server/backend/model_actor_supervisor.py`: 65% floor. The CI harness
+  covers scheduler-visible supervisor semantics such as blocked/unhealthy
+  claimability and liveness push consumption, while some process/Ray lifecycle
+  branches remain outside the fake-Ray PR gate.
+
 ## Critical Path Soft Gates
 
 The single-entry CI script runs two focused nodeid groups before the broad
 suite.  These are "soft" in the sense that they are semantic coverage checks,
 not numeric line-coverage checks, but CI still requires every selected test to
 pass.
+
+A test is selected as a critical path when it satisfies at least one of these
+criteria:
+
+- it proves a user-visible model-work lifecycle outcome, such as submit ->
+  execute -> retrieve or terminal failure
+- it crosses a typed contract boundary between API gateway, scheduler runtime
+  queue, task ledger, supervisor, or placement controller
+- it protects a high-risk invariant: no duplicate lease, identity fencing,
+  terminal projection cleanup, no silent requeue after durable finalize, or
+  claimability under placement/liveness state
+- it covers a previously observed or high-probability regression class,
+  especially races, stale writers, payload publication failures, admission
+  rejects, and placement timeout/backoff
+
+The soft gate intentionally names specific nodeids instead of relying on total
+test counts, so CI shows whether those semantic paths are still present and
+green.
 
 Critical success paths:
 
