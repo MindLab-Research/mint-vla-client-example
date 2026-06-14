@@ -682,6 +682,9 @@ def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRe
     namespace = _ray_namespace()
     actor_name = str(_call_spec_method(spec, "normalized_actor_name") or _default_model_actor_name(domain_key, replica_id))
 
+    if launcher_key == "cpu_runtime" or int(getattr(spec, "gpu_count", 1) or 0) <= 0:
+        raise ValueError(f"spec does not require GPU placement: {replica_key}")
+
     if launcher_key == "dense" or domain_key.startswith("dense:"):
         dense_actor_name = _dense_actor_name(base_model or domain_key)
         return PlacementGroupBundleRequest.for_dense(

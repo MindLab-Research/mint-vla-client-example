@@ -160,6 +160,16 @@ async def test_cluster_placement_controller_reserves_unpinned_cluster_capacity()
 
 
 def test_cluster_placement_controller_builds_backend_attach_compatible_pg_requests() -> None:
+    with pytest.raises(ValueError, match="does not require GPU placement"):
+        placement_group_bundle_request_for_spec(
+            ModelActorSpec(
+                domain_key="internal:runtime",
+                replica_id="replica-0",
+                launcher_key="cpu_runtime",
+                gpu_count=0,
+            )
+        )
+
     dense = placement_group_bundle_request_for_spec(
         ModelActorSpec(
             domain_key="dense:Qwen/Test",
@@ -224,6 +234,12 @@ async def test_cluster_placement_controller_reconcile_returns_node_pins_blocked_
         observed_free_gpus_by_node=lambda: {"10.0.0.7": 1},
     )
     desired = {
+        ("internal:runtime", "replica-0"): ModelActorSpec(
+            domain_key="internal:runtime",
+            replica_id="replica-0",
+            launcher_key="cpu_runtime",
+            gpu_count=0,
+        ),
         ("vllm:Qwen/Test", "replica-0"): ModelActorSpec(
             domain_key="vllm:Qwen/Test",
             replica_id="replica-0",
