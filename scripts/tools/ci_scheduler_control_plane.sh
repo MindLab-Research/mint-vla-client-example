@@ -6,6 +6,11 @@ cd "$ROOT_DIR"
 
 export PYRIGHT_PYTHON_FORCE_VERSION="${PYRIGHT_PYTHON_FORCE_VERSION:-1.1.409}"
 
+UV_RUN=(uv run)
+if [[ "${MINT_CI_UV_NO_SYNC:-}" == "1" ]]; then
+  UV_RUN=(uv run --no-sync)
+fi
+
 run_step() {
   local name="$1"
   shift
@@ -54,14 +59,14 @@ PYRIGHT_TARGETS=(
 mapfile -t COMPONENT_TESTS < <(find tests/component/control_plane -name '*.py' -type f | sort)
 PY_COMPILE_TARGETS=("${PYTHON_TARGETS[@]}" "${COMPONENT_TESTS[@]}")
 
-run_step "component harness" uv run pytest tests/component/control_plane -q
-run_step "placement controller" uv run pytest tests/test_cluster_placement_controller.py -q
-run_step "stateless guardrails" uv run pytest tests/test_stateless_control_plane_guardrails.py -q
-run_step "issue 593 scheduler" uv run pytest tests/test_issue_593_model_work_scheduler.py -q
-run_step "issue 593 runtime" uv run pytest tests/test_issue_593_model_runtime_actor.py -q
-run_step "issue 593 supervisor" uv run pytest tests/test_issue_593_model_actor_supervisor.py -q
-run_step "contract verifier" uv run python scripts/tools/verify_scheduler_control_plane.py
-run_step "scoped ruff" uv run ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane
-run_step "scoped pyright" uv run pyright "${PYRIGHT_TARGETS[@]}"
-run_step "py_compile" uv run python -m py_compile "${PY_COMPILE_TARGETS[@]}"
+run_step "component harness" "${UV_RUN[@]}" pytest tests/component/control_plane -q
+run_step "placement controller" "${UV_RUN[@]}" pytest tests/test_cluster_placement_controller.py -q
+run_step "stateless guardrails" "${UV_RUN[@]}" pytest tests/test_stateless_control_plane_guardrails.py -q
+run_step "issue 593 scheduler" "${UV_RUN[@]}" pytest tests/test_issue_593_model_work_scheduler.py -q
+run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_runtime_actor.py -q
+run_step "issue 593 supervisor" "${UV_RUN[@]}" pytest tests/test_issue_593_model_actor_supervisor.py -q
+run_step "contract verifier" "${UV_RUN[@]}" python scripts/tools/verify_scheduler_control_plane.py
+run_step "scoped ruff" "${UV_RUN[@]}" ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane
+run_step "scoped pyright" "${UV_RUN[@]}" pyright "${PYRIGHT_TARGETS[@]}"
+run_step "py_compile" "${UV_RUN[@]}" python -m py_compile "${PY_COMPILE_TARGETS[@]}"
 run_step "diff whitespace" git diff --check

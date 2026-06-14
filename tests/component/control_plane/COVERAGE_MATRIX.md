@@ -11,6 +11,23 @@ Run the complete gate with:
 scripts/tools/ci_scheduler_control_plane.sh
 ```
 
+## CI Wiring
+
+The GitHub Actions workflow `.github/workflows/scheduler-control-plane.yml`
+runs this same entrypoint on `pull_request` to `develop`, pushes to `develop`
+and `nolan/scheduler-contract`, and manual dispatch.  It uses the ops-defined
+self-hosted Linux runner label:
+
+```yaml
+runs-on: [self-hosted, linux]
+```
+
+The workflow syncs the project dev environment with `torch` intentionally
+omitted, then invokes the entrypoint with `MINT_CI_UV_NO_SYNC=1`.  The scheduler
+control-plane gate does not import or execute torch-backed model code; skipping
+the large CPU torch wheel keeps this PR-blocking gate focused on typed
+control-plane behavior instead of full model runtime provisioning.
+
 ## CI Layers
 
 | Layer | Command | Purpose |

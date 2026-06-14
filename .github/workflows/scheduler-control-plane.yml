@@ -22,6 +22,7 @@ on:
       - "tests/test_stateless_control_plane_guardrails.py"
       - "tests/test_issue_593_model_work_scheduler.py"
       - "tests/test_issue_593_model_runtime_actor.py"
+      - "tests/test_issue_593_model_actor_supervisor.py"
       - "tests/test_model_work_task_gateway.py"
       - "pyproject.toml"
       - "uv.lock"
@@ -47,6 +48,7 @@ on:
       - "tests/test_stateless_control_plane_guardrails.py"
       - "tests/test_issue_593_model_work_scheduler.py"
       - "tests/test_issue_593_model_runtime_actor.py"
+      - "tests/test_issue_593_model_actor_supervisor.py"
       - "tests/test_model_work_task_gateway.py"
       - "pyproject.toml"
       - "uv.lock"
@@ -62,8 +64,10 @@ jobs:
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
 
-      - name: Sync dev tools
-        run: uv sync --frozen --extra dev --group dev
+      - name: Sync scheduler CI environment
+        run: uv sync --frozen --extra dev --group dev --no-install-package torch
 
       - name: Run scheduler control-plane CI gate
+        env:
+          MINT_CI_UV_NO_SYNC: "1"
         run: scripts/tools/ci_scheduler_control_plane.sh
