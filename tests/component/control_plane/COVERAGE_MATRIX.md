@@ -22,11 +22,11 @@ self-hosted Linux runner label:
 runs-on: [self-hosted, linux]
 ```
 
-The workflow syncs the project dev environment with `torch` intentionally
-omitted, then invokes the entrypoint with `MINT_CI_UV_NO_SYNC=1`.  The scheduler
-control-plane gate does not import or execute torch-backed model code; skipping
-the large CPU torch wheel keeps this PR-blocking gate focused on typed
-control-plane behavior instead of full model runtime provisioning.
+The workflow installs a minimal scheduler-CI venv, then invokes the entrypoint
+with `MINT_CI_UV_NO_SYNC=1`.  The scheduler control-plane gate does not import
+or execute torch-backed model code; avoiding full project sync keeps this
+PR-blocking gate focused on typed control-plane behavior instead of full model
+runtime provisioning.
 
 ## CI Layers
 
