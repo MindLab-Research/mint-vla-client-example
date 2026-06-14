@@ -22,12 +22,13 @@ self-hosted Linux runner label:
 runs-on: [self-hosted, linux]
 ```
 
-The workflow installs a minimal scheduler-CI venv, then invokes the entrypoint
-with `MINT_CI_UV_NO_SYNC=1`.  The scheduler control-plane gate does not import
-or execute torch-backed model code.  It also relies on the test suite's fake Ray
-module for hermetic control-plane checks instead of downloading a full Ray
-runtime wheel.  Avoiding full project sync keeps this PR-blocking gate focused
-on typed control-plane behavior instead of full model runtime provisioning.
+The workflow installs a minimal scheduler-CI venv from the configured domestic
+PyPI mirror, then invokes the entrypoint with `MINT_CI_UV_NO_SYNC=1`.  The
+scheduler control-plane gate does not import or execute torch-backed model code.
+It also relies on the test suite's fake Ray module for hermetic control-plane
+checks instead of downloading a full Ray runtime wheel.  Avoiding full project
+sync keeps this PR-blocking gate focused on typed control-plane behavior instead
+of full model runtime provisioning.
 
 ## CI Layers
 

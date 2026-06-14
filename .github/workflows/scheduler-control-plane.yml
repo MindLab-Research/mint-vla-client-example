@@ -64,6 +64,9 @@ jobs:
   scheduler-control-plane:
     runs-on: [self-hosted, linux]
     timeout-minutes: 30
+    env:
+      UV_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
     steps:
       - uses: actions/checkout@v4
 
@@ -73,7 +76,7 @@ jobs:
       - name: Install scheduler CI dependencies
         run: |
           uv venv --python 3.12
-          uv pip install --python .venv/bin/python \
+          uv pip install --python .venv/bin/python --index-url "$UV_INDEX_URL" \
             fastapi==0.121.2 \
             httpx==0.27.2 \
             opentelemetry-api==1.38.0 \
