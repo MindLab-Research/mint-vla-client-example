@@ -38,6 +38,7 @@ PYTHON_TARGETS=(
   tests/test_stateless_control_plane_guardrails.py
   tests/test_issue_593_model_work_scheduler.py
   tests/test_issue_593_model_runtime_actor.py
+  tests/test_issue_593_model_actor_supervisor.py
   tests/test_model_work_task_gateway.py
   scripts/tools/verify_scheduler_control_plane.py
 )
@@ -58,6 +59,7 @@ run_step "placement controller" uv run pytest tests/test_cluster_placement_contr
 run_step "stateless guardrails" uv run pytest tests/test_stateless_control_plane_guardrails.py -q
 run_step "issue 593 scheduler" uv run pytest tests/test_issue_593_model_work_scheduler.py -q
 run_step "issue 593 runtime" uv run pytest tests/test_issue_593_model_runtime_actor.py -q
+run_step "issue 593 supervisor" uv run pytest tests/test_issue_593_model_actor_supervisor.py -q
 run_step "contract verifier" uv run python scripts/tools/verify_scheduler_control_plane.py
 run_step "scoped ruff" uv run ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane
 run_step "scoped pyright" uv run pyright "${PYRIGHT_TARGETS[@]}"

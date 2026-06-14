@@ -546,9 +546,53 @@ class SchedulerComponentWorld:
         )
 
     def close(self) -> None:
+        self.assert_basic_invariants_sync()
         manager_task = getattr(self.scheduler_actor, "_background_loop_manager_task", None)
         if manager_task is not None and not manager_task.done():
             manager_task.cancel()
         task_store = self.task_store
         assert task_store is not None
         task_store.close()
+
+    def assert_basic_invariants_sync(self) -> None:
+        """Run global scheduler invariants at component-world teardown."""
+        stats = self.scheduler_actor.stats()
+        leases = stats.get("leases") or []
+        assert isinstance(leases, list)
+
+        lease_ids: set[str] = set()
+        request_ids: set[str] = set()
+        for lease in leases:
+            assert isinstance(lease, dict)
+            lease_id = str(lease.get("lease_id") or "")
+            raw_item = lease.get("item")
+            item = raw_item if isinstance(raw_item, dict) else {}
+            request_id = str(item.get("request_id") or lease.get("request_id") or "")
+            assert lease_id
+            assert request_id
+            assert lease_id not in lease_ids
+            assert request_id not in request_ids
+            lease_ids.add(lease_id)
+            request_ids.add(request_id)
+
+            assert self.task_store is not None
+            record = self.task_store.get_task(request_id)
+            assert record["status"] in {"leased", "finalizing"}
+            assert str(record.get("lease_id") or "") == lease_id
+            assert str(record.get("attempt_id") or "") == str(lease.get("attempt_id") or "")
+            assert int(record.get("scheduler_epoch") or 0) == int(lease.get("scheduler_epoch") or 0)
+
+        active_records = self.task_store.list_active_tasks(limit=1000) if self.task_store is not None else []
+        assigned_count_by_queue: dict[str, int] = {}
+        for record in active_records:
+            if str(record.get("status") or "") != "assigned":
+                continue
+            queue_id = str(record.get("subqueue_id") or "")
+            assigned_count_by_queue[queue_id] = assigned_count_by_queue.get(queue_id, 0) + 1
+
+        replica_queues = stats.get("replica_queues") or {}
+        assert isinstance(replica_queues, dict)
+        for queue_id, queue in replica_queues.items():
+            assert isinstance(queue, dict)
+            depth = int(queue.get("depth") or 0)
+            assert assigned_count_by_queue.get(str(queue_id), 0) == depth

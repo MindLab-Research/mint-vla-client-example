@@ -18,9 +18,9 @@ scripts/tools/ci_scheduler_control_plane.sh
 | Component harness | `uv run pytest tests/component/control_plane -q` | Contract-level scheduler/gateway/runtime/supervisor integration through public surfaces. |
 | Placement controller | `uv run pytest tests/test_cluster_placement_controller.py -q` | PG reservation, pending timeout, blocked retry, attach request shape, and rebuild semantics. |
 | Static guardrails | `uv run pytest tests/test_stateless_control_plane_guardrails.py -q` | Prevent regression to private route/storage access, legacy completion surfaces, direct backend PG creation, and async footguns. |
-| Issue 593 scheduler/runtime | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_runtime_actor.py -q` | Narrow historical regressions around scheduler and runtime actor behavior. |
+| Issue 593 scheduler/runtime/supervisor | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_runtime_actor.py tests/test_issue_593_model_actor_supervisor.py -q` | Narrow historical regressions around scheduler, runtime actor, and supervisor behavior. |
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
-| Static checks | scoped `ruff`, scoped `pyright`, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
+| Static checks | scoped `ruff`, scoped typed-surface `pyright`, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
 
 ## Contract Coverage
 
@@ -41,7 +41,7 @@ scripts/tools/ci_scheduler_control_plane.sh
 | Placement controller owns PG create/reserve/ready/remove/blocked/backoff | `test_cluster_placement_controller.py`; backend PG guardrails |
 | Backend engines attach controller-created named PGs | `test_cluster_placement_controller.py`; `test_backend_placement_group_creation_is_controller_owned` |
 | Async scheduler surfaces do not block while ledger/Ray calls are pending | `test_scheduler_async.py`; async guardrails |
-| Reusable invariants cover no double lease, lease consistency, terminal projection cleanup, and no orphan assigned | `invariants.py`; `SchedulerComponentWorld.assert_consistent()`; component tests |
+| Reusable invariants cover no double lease, lease consistency, terminal projection cleanup, and no orphan assigned | `invariants.py`; `SchedulerComponentWorld.assert_consistent()`; `SchedulerComponentWorld.close()` basic invariant defaults; component tests |
 
 ## Explicit Non-Coverage
 

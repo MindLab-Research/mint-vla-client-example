@@ -61,8 +61,15 @@ jobs:
 
       - name: Ensure uv
         run: |
-          if ! command -v uv >/dev/null 2>&1; then
+          if command -v uv >/dev/null 2>&1; then
+            echo "uv already available"
+          elif command -v python3 >/dev/null 2>&1; then
+            python3 -m pip install uv
+          elif command -v python >/dev/null 2>&1; then
             python -m pip install uv
+          else
+            echo "uv and Python are unavailable on this runner" >&2
+            exit 1
           fi
 
       - name: Sync dev tools
