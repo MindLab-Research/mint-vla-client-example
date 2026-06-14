@@ -67,7 +67,9 @@ def _read_process_env_var(name: str) -> str:
 
 
 def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
-    # Ray worker bootstrap must use node-local Ray state, not driver/API host hints.
+    # Ray worker bootstrap must use node-local Ray state, not driver/API host
+    # hints. Ray runtime_env overlays but does not reliably delete inherited
+    # job env, so blank these keys instead of popping them.
     for key in (
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_NODE_IP_ADDRESS",
@@ -79,7 +81,7 @@ def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     ):
-        env_vars.pop(key, None)
+        env_vars[key] = ""
 
 
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
@@ -480,6 +482,7 @@ class MultiLoRAInferenceEngine:
                     "HF_HUB_OFFLINE": "1",
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
             env_vars.setdefault("VLLM_ATTENTION_BACKEND", server_config.vllm_attention_backend)
             if total_gpus >= 16:

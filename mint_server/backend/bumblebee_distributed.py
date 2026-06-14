@@ -2038,6 +2038,7 @@ class BumblebeeWorkerGroup:
                     "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
         runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(self.base_model))
@@ -2611,6 +2612,7 @@ def get_or_create_bumblebee_worker_group(
                     "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
         runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(base_model))

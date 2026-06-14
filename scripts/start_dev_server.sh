@@ -36,9 +36,10 @@ set -eu
 
 reject_per_launch_keys() {
   env_file="$1"
-  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH)=' "${env_file}"; then
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE)=' "${env_file}"; then
     echo "error: ${env_file} must not set MINT_CODE_ROOT, the Ray namespace," >&2
-    echo "       or MINT_RAY_HEAD_ADDRESS_PATH (those are per-launch inputs)." >&2
+    echo "       MINT_RAY_HEAD_ADDRESS_PATH, or MINT_VLLM_CHILD_PYTHON_EXECUTABLE" >&2
+    echo "       (those are per-launch inputs derived by the launcher)." >&2
     exit 1
   fi
 }
@@ -91,12 +92,14 @@ export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggin
 # upload the directory (~100-240 MB) over the Ray Client connection.
 # Workers find mint_server via PFS_PYTHONPATH (built from MINT_CODE_ROOT) which
 # is passed as env_vars to every actor's runtime_env.
-# Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH. The driver must attach as
-# a Ray client (ray://...:10001); the file holds a bare IP that the server would
-# normalize to the GCS port (...:6379) and try to direct-attach, which hangs on a
-# driver-only API host. We read the IP here and set the client/direct addresses.
+# Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH or RAY_ADDRESS. The driver
+# must attach as a Ray client (ray://...:10001), and Ray worker bootstrap treats
+# inherited RAY_ADDRESS as an instruction to nested direct-attach before user
+# runtime_env can blank it. Mint code that needs the direct GCS address reads the
+# explicit MINT_RAY_GCS_ADDRESS value instead.
 ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt}"
 unset MINT_RAY_HEAD_ADDRESS_PATH || true
+unset RAY_ADDRESS || true
 export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint/dev/tmp}"
 
 deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
@@ -123,15 +126,16 @@ ray_head_ip=""
 if [ -r "${ray_head_ip_path}" ]; then
   ray_head_ip=$(tr -d '[:space:]' < "${ray_head_ip_path}")
 fi
-# Driver attaches as a Ray client; actors get the direct GCS address as a hint.
+# Driver attaches as a Ray client; Mint control-plane code gets the direct GCS
+# address only through an explicit non-Ray bootstrap variable.
 if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
   export MINT_RAY_CLIENT_ADDRESS="ray://${ray_head_ip}:10001"
 fi
 if [ -z "${RAY_CLIENT_ADDRESS:-}" ] && [ -n "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
   export RAY_CLIENT_ADDRESS="${MINT_RAY_CLIENT_ADDRESS}"
 fi
-if [ -z "${RAY_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
-  export RAY_ADDRESS="${ray_head_ip}:6379"
+if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
+  export MINT_RAY_GCS_ADDRESS="${ray_head_ip}:6379"
 fi
 if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
   echo "error: no Ray head address. Expected an IP in ${ray_head_ip_path}" >&2
@@ -144,12 +148,22 @@ if [ ! -x "${py}" ]; then
   echo "error: runtime python not found: ${py}" >&2
   exit 1
 fi
+vllm_worker_python="${MINT_CODE_ROOT}/scripts/vllm_worker_python.py"
+if [ ! -r "${vllm_worker_python}" ]; then
+  echo "error: vLLM worker python wrapper not found: ${vllm_worker_python}" >&2
+  exit 1
+fi
+# Always derive this from MINT_CODE_ROOT. A stale shell or policy env pointing at
+# another checkout bypasses this repo's Ray bootstrap sanitization.
+export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"
 
 echo "=== mint-dev launch contract ===" >&2
 echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
 echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
 echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
+echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2
 echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS}" >&2
+echo "MINT_RAY_GCS_ADDRESS      ${MINT_RAY_GCS_ADDRESS:-<unset>}" >&2
 echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2
 echo "ray head ip source        ${ray_head_ip_path}" >&2
 echo "MINT_TMP_ROOT             ${MINT_TMP_ROOT}" >&2

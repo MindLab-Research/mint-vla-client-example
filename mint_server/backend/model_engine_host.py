@@ -33,7 +33,7 @@ from .model_actor_supervisor import consumer_id_for_replica, queue_id_for_replic
 from .model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from .model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from .task_payload_store import TaskPayloadStore
-from .task_state_store import FutureStatus, task_futures, task_state_store
+from .task_state_store import FutureStatus, TaskStateNotFoundError, task_futures, task_state_store
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,18 @@ VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
 VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
 ENGINE_RESTART_TIMEOUT_S = 30.0 * 60.0
+_RAY_ATTACH_ENV_KEYS = (
+    "RAY_ADDRESS",
+    "RAY_CLIENT_ADDRESS",
+    "MINT_RAY_CLIENT_ADDRESS",
+    "MINT_RAY_HEAD_ADDRESS_PATH",
+    "MINT_RAY_NODE_IP_ADDRESS",
+    "MINT_RAY_TEMP_DIR",
+    "RAY_TMPDIR",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+)
 
 
 class EngineDeathLeaseDisposition(StrEnum):
@@ -60,6 +72,11 @@ def _scheduler_result_ok(result: Any) -> bool:
         return bool(ok)
     get_result = getattr(result, "get", None)
     return bool(get_result("ok")) if callable(get_result) else False
+
+
+def _blank_process_ray_attach_hints() -> None:
+    for key in _RAY_ATTACH_ENV_KEYS:
+        os.environ[key] = ""
 
 
 def _scheduler_claim_leases(result: Any) -> list[dict[str, Any]] | None:
@@ -261,9 +278,11 @@ def get_or_create_model_engine_host(
         except Exception:
             pass
 
-    resolved_ray_address = str(ray_address or "").strip() or env_nonempty(os.environ, "RAY_ADDRESS")
+    from ..ray_utils import preferred_ray_gcs_address
+
+    resolved_ray_address = str(ray_address or "").strip() or preferred_ray_gcs_address()
     if resolved_ray_address is None:
-        raise RuntimeError("RAY_ADDRESS is required")
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
 
     remote_cls = ray.remote(num_cpus=0, max_concurrency=64, max_restarts=-1)(ModelEngineHost)
     options: dict[str, Any] = {
@@ -387,6 +406,8 @@ class ModelEngineHost:
         self_exit: SelfExitHook | None = None,
         ray_address: str | None = None,
     ) -> None:
+        self._ray_address = str(ray_address or "").strip() or None
+        _blank_process_ray_attach_hints()
         domain = str(domain_key).strip()
         replica = str(replica_id).strip()
         if not domain:
@@ -788,6 +809,16 @@ class ModelEngineHost:
     def _record_error(self, e: BaseException) -> None:
         self._last_error = f"{type(e).__name__}: {e}"
         self._last_error_traceback = traceback.format_exc()
+
+    @staticmethod
+    def _is_missing_future_state_error(exc: BaseException) -> bool:
+        if isinstance(exc, (KeyError, TaskStateNotFoundError)):
+            return True
+        cause = getattr(exc, "__cause__", None)
+        if isinstance(cause, (KeyError, TaskStateNotFoundError)):
+            return True
+        context = getattr(exc, "__context__", None)
+        return isinstance(context, (KeyError, TaskStateNotFoundError))
 
     def _clear_transient_scheduler_error(self) -> None:
         error = str(self._last_error or "").lower()
@@ -1506,6 +1537,21 @@ class ModelEngineHost:
         try:
             await self._mark_running(lease)
         except Exception as e:
+            if self._is_missing_future_state_error(e):
+                self._record_error(e)
+                await self._finish_non_pending_scheduler_lease(
+                    lease,
+                    status=FutureStatus.FAILED,
+                    error=(
+                        "external future state is missing; "
+                        "terminating scheduler lease instead of requeueing stale model work"
+                    ),
+                )
+                self._processed_total += 1
+                self._failed_total += 1
+                self._last_completed_at = time.time()
+                self._clear_active_lease(lease_id)
+                return
             self._record_error(e)
             try:
                 await self._scheduler.fail(

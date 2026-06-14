@@ -275,18 +275,14 @@ def test_model_work_admission_delegates_durable_create_to_scheduler_gateway(tmp_
             domain_key="megatron:Qwen/Test",
             queued_meta={"op": "training.create_model"},
             scheduler_client=scheduler,
+            future_service_client=service,
         )
     )
 
-    assert scheduler.seen_status is None
+    assert scheduler.seen_status == FutureStatus.PENDING
     assert scheduler.seen_metadata is not None
     assert scheduler.seen_metadata["op"] == "training.create_model"
-    try:
-        asyncio.run(service.async_get_status("req-admission"))
-    except KeyError:
-        pass
-    else:
-        raise AssertionError("enqueue_model_work should not create future rows before scheduler append")
+    assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
 
 
 def test_model_work_admission_does_not_cleanup_future_when_scheduler_append_fails(tmp_path) -> None:
@@ -314,6 +310,7 @@ def test_model_work_admission_does_not_cleanup_future_when_scheduler_append_fail
                 domain_key="megatron:Qwen/Test",
                 queued_meta={"op": "training.create_model"},
                 scheduler_client=_Scheduler(),
+                future_service_client=service,
             )
         except RuntimeError as e:
             assert str(e) == "scheduler append failed"

@@ -18,10 +18,10 @@ def _load_repo_sitecustomize() -> None:
     spec.loader.exec_module(module)
 
 
-def _sanitize_worker_temp_environment() -> None:
-    # Ray worker bootstrap must not inherit the driver's temp-dir hints.
-    # Those point at the API host's tmp tree and break node-local startup
-    # checks inside the worker process.
+def _sanitize_worker_bootstrap_environment() -> None:
+    # Ray worker bootstrap must not inherit the driver's temp-dir or attach
+    # hints. Those point at the API host or force a nested direct attach before
+    # the Ray worker has registered with its local raylet.
     for key in (
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_NODE_IP_ADDRESS",
@@ -29,11 +29,15 @@ def _sanitize_worker_temp_environment() -> None:
         "TMPDIR",
         "TMP",
         "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
     ):
         os.environ.pop(key, None)
 
 
 def _run_as_python(argv: list[str]) -> None:
+    _sanitize_worker_bootstrap_environment()
     if not argv:
         raise RuntimeError("vllm worker wrapper requires a target script/module")
 
@@ -70,7 +74,6 @@ def _run_as_python(argv: list[str]) -> None:
         return
 
     script_path = os.fspath(Path(head).resolve())
-    _sanitize_worker_temp_environment()
     sys.argv = [script_path, *tail]
     runpy.run_path(script_path, run_name="__main__")
 

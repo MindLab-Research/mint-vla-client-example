@@ -31,6 +31,7 @@ from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
 from ..backend.actor_admin import KillActorsRequest
+from ..backend.task_state_store import task_futures
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -459,6 +460,7 @@ async def model_work_scheduler_noop(http_request: Request) -> dict:
                     "stage": "queued",
                     "queued_at": time.time(),
                 },
+                future_service_client=task_futures,
             ),
         )
     except Exception as e:

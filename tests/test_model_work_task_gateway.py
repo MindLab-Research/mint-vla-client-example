@@ -59,6 +59,20 @@ class _CancelScheduler:
         return self.result
 
 
+class _FutureService:
+    def __init__(self, *, created: bool = True):
+        self.created = bool(created)
+        self.created_calls: list[dict] = []
+        self.cleaned: list[str] = []
+
+    async def async_create_model_work_with_id(self, request_id: str, **kwargs):
+        self.created_calls.append({"request_id": request_id, **dict(kwargs)})
+        return {"request_id": request_id, "created": self.created}
+
+    async def async_cleanup(self, request_id: str):
+        self.cleaned.append(str(request_id))
+
+
 def test_scheduler_gateway_submit_returns_typed_created_result() -> None:
     scheduler = _AppendWorkScheduler(
         AppendWorkResult(
@@ -69,7 +83,11 @@ def test_scheduler_gateway_submit_returns_typed_created_result() -> None:
             extra={"sampling_inflight_admission": {"ok": True}},
         )
     )
-    gateway = SchedulerModelWorkTaskGateway(scheduler_client=scheduler)
+    futures = _FutureService()
+    gateway = SchedulerModelWorkTaskGateway(
+        scheduler_client=scheduler,
+        future_service_client=futures,
+    )
 
     result = asyncio.run(gateway.submit_task(**_submit_kwargs()))
 
@@ -79,6 +97,17 @@ def test_scheduler_gateway_submit_returns_typed_created_result() -> None:
     assert result.assigned is True
     assert result.extra["sampling_inflight_admission"] == {"ok": True}
     assert result.extra["scheduler_result"]["ok"] is True
+    assert futures.created_calls == [
+        {
+            "request_id": "req-gateway",
+            "op": "sampling.asample",
+            "domain_key": "vllm:Qwen/Test",
+            "request_json": b'{"model":"Qwen/Test"}',
+            "meta": {"queue_kind": "model_work_scheduler", "payload_hash": "hash-1"},
+            "payload_hash": "hash-1",
+        }
+    ]
+    assert futures.cleaned == []
     assert scheduler.calls[0]["extra"]["payload_hash"] == "hash-1"
     assert scheduler.calls[0]["extra"]["queue_kind"] == "model_work_scheduler"
 
@@ -92,7 +121,11 @@ def test_scheduler_gateway_submit_preserves_idempotent_duplicate() -> None:
             "idempotent": True,
         }
     )
-    gateway = SchedulerModelWorkTaskGateway(scheduler_client=scheduler)
+    futures = _FutureService(created=False)
+    gateway = SchedulerModelWorkTaskGateway(
+        scheduler_client=scheduler,
+        future_service_client=futures,
+    )
 
     result = asyncio.run(gateway.submit_task(**_submit_kwargs()))
 
@@ -100,6 +133,8 @@ def test_scheduler_gateway_submit_preserves_idempotent_duplicate() -> None:
     assert result.created is False
     assert result.assigned is False
     assert result.extra["scheduler_result"]["idempotent"] is True
+    assert futures.created_calls[0]["request_id"] == "req-gateway"
+    assert futures.cleaned == []
 
 
 def test_scheduler_gateway_submit_admission_reject_is_not_created() -> None:
@@ -115,7 +150,11 @@ def test_scheduler_gateway_submit_admission_reject_is_not_created() -> None:
             },
         }
     )
-    gateway = SchedulerModelWorkTaskGateway(scheduler_client=scheduler)
+    futures = _FutureService()
+    gateway = SchedulerModelWorkTaskGateway(
+        scheduler_client=scheduler,
+        future_service_client=futures,
+    )
 
     result = asyncio.run(gateway.submit_task(**_submit_kwargs()))
 
@@ -124,6 +163,7 @@ def test_scheduler_gateway_submit_admission_reject_is_not_created() -> None:
     assert result.assigned is False
     assert str(result.reason) == "principal_domain_inflight_limit_exceeded"
     assert result.extra["sampling_inflight_admission"]["ok"] is False
+    assert futures.cleaned == ["req-gateway"]
 
 
 def test_scheduler_gateway_submit_falls_back_to_append() -> None:
@@ -135,7 +175,10 @@ def test_scheduler_gateway_submit_falls_back_to_append() -> None:
             idempotent=True,
         )
     )
-    gateway = SchedulerModelWorkTaskGateway(scheduler_client=scheduler)
+    gateway = SchedulerModelWorkTaskGateway(
+        scheduler_client=scheduler,
+        future_service_client=_FutureService(created=False),
+    )
 
     result = asyncio.run(gateway.submit_task(**_submit_kwargs("req-fallback")))
 
@@ -143,6 +186,27 @@ def test_scheduler_gateway_submit_falls_back_to_append() -> None:
     assert result.request_id == "req-fallback"
     assert result.created is False
     assert len(scheduler.calls) == 1
+
+
+def test_scheduler_gateway_submit_cleans_new_future_when_append_raises() -> None:
+    class _RaisingScheduler:
+        async def append_work(self, **_kwargs):
+            raise RuntimeError("append failed")
+
+    futures = _FutureService()
+    gateway = SchedulerModelWorkTaskGateway(
+        scheduler_client=_RaisingScheduler(),
+        future_service_client=futures,
+    )
+
+    try:
+        asyncio.run(gateway.submit_task(**_submit_kwargs()))
+    except RuntimeError as exc:
+        assert str(exc) == "append failed"
+    else:
+        raise AssertionError("expected append failure")
+
+    assert futures.cleaned == ["req-gateway"]
 
 
 def test_scheduler_gateway_cancel_returns_typed_result() -> None:

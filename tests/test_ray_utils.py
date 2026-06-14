@@ -96,6 +96,79 @@ def test_init_ray_resolves_auto_address(monkeypatch):
     assert calls[0]["log_to_driver"] is False
 
 
+def test_init_ray_prefers_ray_client_over_gcs_address(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "ray://192.168.38.184:10001"
+    assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
+
+
+def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "ray://192.168.38.184:10001"
+    env_vars = calls[0]["runtime_env"]["env_vars"]
+    assert env_vars["RAY_ADDRESS"] == ""
+    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
+
+
+def test_init_ray_blanks_attach_hints_without_dropping_existing_ray_client_runtime_env(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(
+        namespace="mint",
+        runtime_env={"env_vars": {"PYTHONPATH": "/shared/code"}, "py_modules": ["s3://bucket/mint.zip"]},
+    )
+
+    assert out == {"ok": True}
+    runtime_env = calls[0]["runtime_env"]
+    assert runtime_env["py_modules"] == ["s3://bucket/mint.zip"]
+    env_vars = runtime_env["env_vars"]
+    assert env_vars["PYTHONPATH"] == "/shared/code"
+    assert env_vars["RAY_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
+
+
 def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):
     calls: list[dict[str, object]] = []
 

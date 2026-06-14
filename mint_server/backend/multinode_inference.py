@@ -150,7 +150,9 @@ def _set_default_vllm_runtime_env(env_vars: dict[str, str]) -> None:
 def _prepare_mint_vllm_multinode_runtime_env(env_vars: dict[str, str]) -> None:
     _set_default_vllm_runtime_env(env_vars)
     # Driver/head temp-dir hints are not portable into Ray worker-hosted vLLM
-    # EngineCore subprocesses. Let each controller actor stamp its local node IP.
+    # EngineCore subprocesses. Ray runtime_env overlays but does not reliably
+    # delete inherited job env, so blank these keys instead of popping them.
+    # Let each controller actor stamp its local node IP.
     for key in (
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_NODE_IP_ADDRESS",
@@ -162,7 +164,7 @@ def _prepare_mint_vllm_multinode_runtime_env(env_vars: dict[str, str]) -> None:
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     ):
-        env_vars.pop(key, None)
+        env_vars[key] = ""
 
 
 def _prepend_env_path_entries(raw: str | None, entries: list[str], *, blocked: set[str] | None = None) -> str:
@@ -2691,6 +2693,7 @@ class MultiNodeInferenceEngine:
                 "VLLM_DISABLE_PYNCCL": "1",
                 **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
             if "CUDA_LAUNCH_BLOCKING" in os.environ:
                 env_vars["CUDA_LAUNCH_BLOCKING"] = os.environ["CUDA_LAUNCH_BLOCKING"]

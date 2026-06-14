@@ -1330,6 +1330,7 @@ async def _asample_impl(
             },
             queued_meta=queued_meta,
             payload_hash=payload_hash,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -2338,6 +2339,7 @@ async def compute_logprobs(
                 "affinity_group": affinity_group,
             },
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,

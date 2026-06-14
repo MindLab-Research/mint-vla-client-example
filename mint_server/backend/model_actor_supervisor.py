@@ -3099,9 +3099,11 @@ def _create_ray_actor(*, require_ready: bool = True):
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
     if "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" in os.environ:
         extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
-    ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
+    from ..ray_utils import preferred_ray_gcs_address
+
+    ray_address = preferred_ray_gcs_address()
     if ray_address is None:
-        raise RuntimeError("RAY_ADDRESS is required")
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
 
     options: dict[str, Any] = {
         "name": actor_name,

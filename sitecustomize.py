@@ -17,6 +17,11 @@ import multiprocessing.spawn as _mp_spawn
 import os
 import sys
 import sysconfig
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS = (
@@ -88,7 +93,7 @@ def _sanitize_vllm_ray_runtime_env_dict(payload: object) -> object:
     if isinstance(env_vars, dict):
         cleaned = dict(env_vars)
         for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
-            cleaned.pop(key, None)
+            cleaned[key] = ""
         out["env_vars"] = cleaned
     return out
 
@@ -440,7 +445,8 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     In our server, multinode vLLM actors already run inside a managed Ray
     cluster. If vLLM initializes its Ray executor with no address, Ray starts a
     standalone local head inside EngineCore, which hides the real failure behind
-    a nested cluster. Fail closed unless `RAY_ADDRESS` is explicitly available.
+    a nested cluster. Fail closed unless Mint's explicit GCS address is
+    available, with legacy `RAY_ADDRESS` accepted only as a fallback.
     """
 
     import vllm.v1.executor.ray_executor as ray_exec_mod
@@ -452,13 +458,26 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     if getattr(original, "_mint_patched_explicit_cluster_address", False):
         return
 
+    def is_ray_worker_bootstrap_process() -> bool:
+        for arg in sys.argv:
+            value = str(arg)
+            if value == "ray._private.workers.default_worker":
+                return True
+            if value.replace("\\", "/").endswith("/ray/_private/workers/default_worker.py"):
+                return True
+        return False
+
     def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
         addr = ray_address
         if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
-            env_addr = os.environ.get("RAY_ADDRESS", "").strip()
+            env_addr = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            if not env_addr:
+                ray_addr = os.environ.get("RAY_ADDRESS", "").strip()
+                if ray_addr and not ray_addr.startswith("ray://"):
+                    env_addr = ray_addr
             if not env_addr:
                 raise RuntimeError(
-                    "vLLM RayDistributedExecutor requires explicit RAY_ADDRESS; "
+                    "vLLM RayDistributedExecutor requires explicit MINT_RAY_GCS_ADDRESS; "
                     "refusing to start nested local Ray inside EngineCore"
                 )
             addr = env_addr
@@ -469,7 +488,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
         import ray
         from mint_server.ray_utils import init_ray as mint_init_ray
 
-        if not ray.is_initialized():
+        if not ray.is_initialized() and not is_ray_worker_bootstrap_process():
             mint_init_ray(
                 address=addr,
                 runtime_env=getattr(parallel_config, "ray_runtime_env", None),
@@ -1222,7 +1241,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 
         n_experts = len(loras) // 3
 
-        base_any = next((l for l in loras if l is not None), None)
+        base_any = next((lora for lora in loras if lora is not None), None)
         if base_any is None:
             raise RuntimeError(
                 f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
@@ -1313,7 +1332,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 scaling=[1.0, 1.0, 1.0],
             )
 
-        if all(l is not None for l in loras):
+        if all(lora is not None for lora in loras):
             # Dense checkpoints can still be block-shared across contiguous expert
             # ranges. If so, keep only one representative per contiguous block and
             # reuse the sparse-shard set_lora path to avoid materializing the full
@@ -1849,6 +1868,7 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
             "PYTHONPATH",
             "LD_LIBRARY_PATH",
             "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+            "MINT_RAY_GCS_ADDRESS",
             "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
             "VLLM_USE_V1",
             "MINT_VLLM_DISABLE_MOE_LORA_PACKING",

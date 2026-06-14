@@ -423,6 +423,7 @@ async def _enqueue_training_model_work_route(
         },
         queued_meta=queued_meta,
         scheduler_client=model_work_scheduler,
+        future_service_client=task_futures,
         trace_enqueue=_enqueue_training_request_with_trace,
         trace_kwargs={
             "route_start_s": route_start_s,
@@ -1976,6 +1977,7 @@ async def _enqueue_internal_serialized_model_op(
             extra=dict(extra),
             queued_meta=_build_training_queued_meta(op=op, model_id=model_id),
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
         )
     except Exception as e:
         if inflight_marked:
@@ -2120,6 +2122,7 @@ async def create_model(
                 op="create_model", model_id=model_id
             ),
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -2590,6 +2593,7 @@ async def create_model_from_state(
                 op="create_model_from_state", model_id=model_id
             ),
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,

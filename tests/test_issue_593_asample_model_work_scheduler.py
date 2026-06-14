@@ -13,6 +13,7 @@ from mint_server.routes import sampling as sampling_route
 class _StubTaskFutureService:
     def __init__(self, *, fail_update_meta: bool = False):
         self.created: list[str] = []
+        self.created_model_work: list[dict] = []
         self.queued: list[tuple[str, dict | None]] = []
         self.updated: list[tuple[str, dict | None]] = []
         self.cleaned: list[str] = []
@@ -21,6 +22,10 @@ class _StubTaskFutureService:
     async def async_create_with_id(self, request_id: str):
         self.created.append(request_id)
         return request_id
+
+    async def async_create_model_work_with_id(self, request_id: str, **kwargs):
+        self.created_model_work.append({"request_id": request_id, **dict(kwargs)})
+        return {"request_id": request_id, "created": True}
 
     async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
         self.queued.append((request_id, None if meta is None else dict(meta)))
@@ -83,6 +88,23 @@ class _StubSamplingSessionManager:
         return 7
 
 
+def _patch_sampling_snapshot(monkeypatch) -> None:
+    async def _snapshot(session_id: str):
+        return sampling_route.SamplingSessionSnapshot(
+            session_id=session_id,
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+            lora_rank=32,
+            adapter_path="/tmp/adapter",
+            lora_loaded=False,
+            lora_int_id=None,
+            uses_multi_lora=True,
+            uses_base_model=False,
+            metadata_version=7,
+        )
+
+    monkeypatch.setattr(sampling_route, "_async_get_http_sampling_snapshot", _snapshot)
+
+
 def _dummy_request(user_id: str | None = None):
     user_data = None if user_id is None else {"user_id": user_id, "apikey_id": "key-a"}
     return SimpleNamespace(state=SimpleNamespace(user_data=user_data), headers={})
@@ -94,6 +116,7 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    _patch_sampling_snapshot(monkeypatch)
 
     import mint_server.backend.model_work_scheduler as mws
     import mint_server.backend.result_size_estimator as rse
@@ -114,6 +137,13 @@ def test_issue_593_asample_routes_multi_lora_to_model_work_scheduler(monkeypatch
     assert stub_fs.created == []
     assert len(scheduler.calls) == 1
     call = scheduler.calls[0]
+    assert len(stub_fs.created_model_work) == 1
+    created = stub_fs.created_model_work[0]
+    assert created["request_id"] == out.request_id
+    assert created["op"] == "sampling.asample"
+    assert created["domain_key"] == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert created["meta"]["queue_state"] == "queued"
+    assert created["payload_hash"] == call["extra"]["payload_hash"]
     assert call["request_id"] == out.request_id
     assert call["op"] == "sampling.asample"
     assert json.loads(call["request_json"].decode("utf-8"))["sampling_session_id"] == "session-a"
@@ -145,6 +175,7 @@ def test_issue_593_asample_does_not_mutate_future_meta_after_scheduler_append(mo
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    _patch_sampling_snapshot(monkeypatch)
 
     import mint_server.backend.model_work_scheduler as mws
     import mint_server.backend.result_size_estimator as rse
@@ -164,6 +195,7 @@ def test_issue_593_asample_does_not_mutate_future_meta_after_scheduler_append(mo
     assert isinstance(out.request_id, str) and out.request_id
     assert len(scheduler.calls) == 1
     assert scheduler.cancelled == []
+    assert len(stub_fs.created_model_work) == 1
     assert stub_fs.updated == []
     assert stub_fs.cleaned == []
 
@@ -174,6 +206,7 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    _patch_sampling_snapshot(monkeypatch)
 
     import mint_server.backend.model_work_scheduler as mws
     import mint_server.backend.result_size_estimator as rse
@@ -197,7 +230,8 @@ def test_issue_593_asample_does_not_cancel_scheduler_item_when_append_rejects(mo
     assert scheduler.cancelled == []
     assert stub_fs.created == []
     assert stub_fs.queued == []
-    assert stub_fs.cleaned == []
+    assert len(stub_fs.created_model_work) == 1
+    assert stub_fs.cleaned == [stub_fs.created_model_work[0]["request_id"]]
 
 
 def test_asample_returns_429_for_durable_inflight_admission_rejection(monkeypatch):
@@ -206,6 +240,7 @@ def test_asample_returns_429_for_durable_inflight_admission_rejection(monkeypatc
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    _patch_sampling_snapshot(monkeypatch)
     monkeypatch.setattr(
         sampling_route,
         "record_sampling_admission_metric",
@@ -265,6 +300,7 @@ def test_issue_593_asample_ignores_legacy_flag_and_uses_model_work_scheduler(mon
 
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
+    _patch_sampling_snapshot(monkeypatch)
 
     import mint_server.backend.model_work_scheduler as mws
     import mint_server.backend.result_size_estimator as rse

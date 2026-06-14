@@ -2961,6 +2961,7 @@ class VerlInferenceEngine:
                     "MINT_VLLM_MODEL_PLACEMENT_JSON": os.environ.get("MINT_VLLM_MODEL_PLACEMENT_JSON", "").strip(),
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
         preferred_python = (preferred_vllm_python_executable() or "").strip()

@@ -85,8 +85,9 @@ def _finish_failure_kwargs(lease: dict, *, consumer_id: str, error: str) -> dict
 
 def test_issue_729_model_engine_host_does_not_export_nested_ray_address(monkeypatch) -> None:
     monkeypatch.setenv("RAY_ADDRESS", "driver-address:6379")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://driver-address:10001")
 
-    ModelEngineHost(
+    host = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
         actor_generation=3,
@@ -100,7 +101,10 @@ def test_issue_729_model_engine_host_does_not_export_nested_ray_address(monkeypa
         ray_address="192.168.40.99:6379",
     )
 
-    assert os.environ["RAY_ADDRESS"] == "driver-address:6379"
+    assert host._ray_address == "192.168.40.99:6379"
+    assert os.environ["RAY_ADDRESS"] == ""
+    assert os.environ["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert os.environ.get("MINT_RAY_GCS_ADDRESS") is None
 
 
 def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(monkeypatch) -> None:
@@ -143,7 +147,8 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
         "mint_server.config.PFS_HF_MODULES_PATH",
         "/hf",
     )
-    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
 
@@ -159,6 +164,7 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     assert env_vars["RAY_ADDRESS"] == ""
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
 
 
@@ -404,9 +410,11 @@ class _FakeTaskFutureService:
         self,
         statuses: dict[str, FutureStatus] | None = None,
         fail_terminal_write: bool = False,
+        missing_on_mark_running: bool = False,
     ) -> None:
         self.statuses = statuses or {}
         self.fail_terminal_write = bool(fail_terminal_write)
+        self.missing_on_mark_running = bool(missing_on_mark_running)
         self.running: list[tuple[str, dict]] = []
         self.resolved: list[tuple[str, object]] = []
         self.failed: list[tuple[str, str]] = []
@@ -417,6 +425,8 @@ class _FakeTaskFutureService:
         return self.statuses[request_id]
 
     async def async_mark_running(self, request_id: str, meta: dict):
+        if self.missing_on_mark_running:
+            raise KeyError(request_id)
         self.running.append((request_id, dict(meta)))
 
     async def async_get_meta(self, request_id: str) -> dict | None:
@@ -589,6 +599,41 @@ async def test_issue_593_model_runtime_claims_executes_renews_and_completes() ->
     assert snapshot["completed_total"] == 1
     assert snapshot["failed_total"] == 0
     assert snapshot["active_request_id"] is None
+
+
+@pytest.mark.anyio
+async def test_issue_593_model_runtime_terminal_fails_when_future_missing_on_mark_running() -> None:
+    lease = _lease("runtime-req-missing-future-mark-running")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(
+        statuses={lease["item"]["request_id"]: FutureStatus.PENDING},
+        missing_on_mark_running=True,
+    )
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        raise AssertionError("executor must not run when external future state is missing")
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+    assert task_futures.running == []
+    assert scheduler.failed == []
+    assert len(scheduler.finished_failure) == 1
+    failure = scheduler.finished_failure[0]
+    assert failure["lease_id"] == lease["lease_id"]
+    assert failure["consumer_id"] == "vllm:model-a::replica-0::generation::3"
+    assert failure["consumer_generation"] == 3
+    assert "external future state is missing" in failure["error"]
+    snapshot = actor.health_snapshot()
+    assert snapshot["failed_total"] == 1
+    assert snapshot["requeued_total"] == 0
 
 
 @pytest.mark.anyio

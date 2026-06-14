@@ -420,6 +420,57 @@ async def test_cluster_placement_controller_recovers_blocked_replica_after_backo
     assert (await controller.snapshot()).blocked_replicas == ()
 
 
+@pytest.mark.anyio
+async def test_cluster_placement_controller_reuses_existing_named_pg_when_create_races() -> None:
+    created: list[dict[str, object]] = []
+    removed: list[object] = []
+    existing_pg = _FakePlacementGroup()
+
+    async def _create_pg(**kwargs):
+        created.append(dict(kwargs))
+        raise RuntimeError(
+            "System error: Failed to create placement group "
+            "'existing_pg' because name 'mint_vllm_a_pg' already exists."
+        )
+
+    controller = ClusterPlacementController(
+        namespace="mint",
+        observed_free_gpus_by_node=lambda: {"10.0.0.7": 1},
+        placement_group_table=lambda: {
+            "existing_pg": {
+                "name": "mint_vllm_a_pg",
+                "namespace": "mint",
+                "state": "CREATED",
+                "placement_group": existing_pg,
+                "bundles": {"0": {"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001}},
+            }
+        },
+        placement_group_factory=_create_pg,
+        placement_group_remover=lambda pg: removed.append(pg),
+    )
+
+    result = await controller.create_pg(
+        PlacementGroupCreateRequest.from_mapping(
+            replica_key="vllm:model-a::replica-0",
+            placement_group_name="mint_vllm_a_pg",
+            required_gpus_by_node={"10.0.0.7": 1},
+            bundles=({"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1}),
+        )
+    )
+
+    assert result.status is PlacementGroupCreateStatus.READY
+    assert result.placement_group is existing_pg
+    assert result.placement_group_name == "mint_vllm_a_pg"
+    assert len(created) == 1
+    assert removed == []
+    await assert_reservation_account_consistent(
+        controller,
+        expected_active_reservations=0,
+        expected_in_flight_gpus_by_node=(),
+    )
+    assert (await controller.snapshot()).blocked_replicas == ()
+
+
 def test_cluster_placement_controller_computes_backend_bundle_requests() -> None:
     dense = PlacementGroupBundleRequest.for_dense(
         replica_key="dense:model-a::replica-0",

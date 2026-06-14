@@ -46,6 +46,7 @@ async def enqueue_model_work(
     payload_hash: str | None = None,
     scheduler_client: Any | None = None,
     gateway_client: Any | None = None,
+    future_service_client: Any | None = None,
     trace_enqueue: TraceEnqueue | None = None,
     trace_kwargs: dict[str, Any] | None = None,
 ) -> ModelWorkAdmissionResult:
@@ -69,7 +70,10 @@ async def enqueue_model_work(
     if payload_hash is not None:
         scheduler_extra["payload_hash"] = str(payload_hash)
     if gateway_client is None:
-        gateway = SchedulerModelWorkTaskGateway(scheduler_client=scheduler_client)
+        gateway = SchedulerModelWorkTaskGateway(
+            scheduler_client=scheduler_client,
+            future_service_client=future_service_client,
+        )
     else:
         gateway = gateway_client
     try:

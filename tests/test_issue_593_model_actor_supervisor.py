@@ -273,7 +273,8 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     runtime_env_kwargs = {}
     monkeypatch.setitem(sys.modules, "ray.util", fake_ray_util)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
-    monkeypatch.setenv("RAY_ADDRESS", "10.1.2.3:6379")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "10.1.2.3:6379")
     monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
     def _fake_actor_runtime_env(**kwargs):
         runtime_env_kwargs.update(kwargs)

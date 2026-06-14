@@ -17,9 +17,23 @@ _RAY_INIT_THREAD_LOCK = threading.Lock()
 _RAY_INIT_LOCK_PATH_ENV = "MINT_RAY_INIT_LOCK_PATH"
 _RAY_INIT_LOCK_TIMEOUT_ENV = "MINT_RAY_INIT_LOCK_TIMEOUT_S"
 _RAY_INIT_LOCK_POLL_ENV = "MINT_RAY_INIT_LOCK_POLL_S"
+_RAY_GCS_ADDRESS_ENV = "MINT_RAY_GCS_ADDRESS"
 _RAY_HEAD_ADDRESS_PATH_ENV = "MINT_RAY_HEAD_ADDRESS_PATH"
 _RAY_RECONNECT_POLL_ENV = "MINT_RAY_RECONNECT_POLL_S"
 _DEFAULT_RAY_GCS_PORT = 6379
+_RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS = frozenset(
+    {
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    }
+)
 _RAY_LAST_INIT_ADDRESS: str | None = None
 _RAY_CONNECTION_EPOCH = 0
 _RAY_RECONNECT_INVALIDATORS: list[Callable[[], None]] = []
@@ -62,7 +76,7 @@ def ray_address_source_configured() -> bool:
         return True
     return any(
         bool(os.environ.get(name, "").strip())
-        for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS")
+        for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", _RAY_GCS_ADDRESS_ENV, "RAY_ADDRESS")
     )
 
 
@@ -102,11 +116,28 @@ def require_ray_address() -> str:
     return _normalize_ray_address(addr)
 
 
-def preferred_driver_ray_address() -> str:
+def preferred_ray_gcs_address() -> str | None:
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
     configured_path = _configured_ray_head_address_path()
     if configured_path is not None:
         return _read_configured_ray_head_address(configured_path)
-    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+    addr = os.environ.get("RAY_ADDRESS", "").strip()
+    if addr and not addr.startswith("ray://"):
+        return _normalize_ray_address(addr)
+    return None
+
+
+def preferred_driver_ray_address() -> str:
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
+        addr = os.environ.get(name, "").strip()
+        if addr:
+            return _normalize_ray_address(addr)
+    configured_path = _configured_ray_head_address_path()
+    if configured_path is not None:
+        return _read_configured_ray_head_address(configured_path)
+    for name in (_RAY_GCS_ADDRESS_ENV, "RAY_ADDRESS"):
         addr = os.environ.get(name, "").strip()
         if addr:
             return _normalize_ray_address(addr)
@@ -221,6 +252,7 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
     if not addr or not addr.startswith("ray://"):
         return None
     runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
+    runtime_env = _blank_ray_worker_bootstrap_attach_env(addr, runtime_env)
     return runtime_env or None
 
 
@@ -314,6 +346,26 @@ def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
     return runtime_env or existing
 
 
+def _blank_ray_worker_bootstrap_attach_env(address: str, existing: Any) -> dict[str, Any] | Any:
+    if not isinstance(address, str) or not address.startswith("ray://"):
+        return existing
+    if existing is None:
+        runtime_env: dict[str, Any] = {}
+    elif isinstance(existing, dict):
+        runtime_env = dict(existing)
+    else:
+        return existing
+    env_vars_raw = runtime_env.get("env_vars")
+    env_vars = dict(env_vars_raw) if isinstance(env_vars_raw, dict) else {}
+    gcs_address = preferred_ray_gcs_address()
+    if gcs_address:
+        env_vars[_RAY_GCS_ADDRESS_ENV] = gcs_address
+    for key in _RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS:
+        env_vars[key] = ""
+    runtime_env["env_vars"] = env_vars
+    return runtime_env
+
+
 def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
@@ -352,6 +404,7 @@ def init_ray(**kwargs: Any) -> Any:
         runtime_env = client_job_runtime_env(address=desired_address)
     else:
         runtime_env = _job_level_runtime_env(desired_address, existing_runtime_env)
+        runtime_env = _blank_ray_worker_bootstrap_attach_env(desired_address, runtime_env)
     if runtime_env is not None:
         kwargs["runtime_env"] = runtime_env
 

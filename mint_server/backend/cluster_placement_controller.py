@@ -498,6 +498,15 @@ class ClusterPlacementController:
                 retry_at=retry_at,
             )
         except Exception as exc:
+            existing_pg = await self._existing_active_placement_group(request)
+            if existing_pg is not None and _is_placement_group_name_conflict(exc, request.placement_group_name):
+                await self.release(reservation.token)
+                self._blocked.pop(request.replica_key, None)
+                return PlacementGroupCreateResult(
+                    status=PlacementGroupCreateStatus.READY,
+                    placement_group_name=request.placement_group_name,
+                    placement_group=existing_pg,
+                )
             await self._remove_placement_group(pg)
             await self.release(reservation.token)
             retry_at = self._record_blocked(request.replica_key, PlacementBlockReason.PG_READY_FAILED)
@@ -569,6 +578,22 @@ class ClusterPlacementController:
                 available_gpus_by_node=_gpu_by_node_tuple(await self._available_gpus_by_node_unlocked()),
                 reserved_gpus_by_node=self._in_flight_gpus_by_node_unlocked(),
             )
+
+    async def _existing_active_placement_group(self, request: PlacementGroupCreateRequest) -> Any | None:
+        if self._placement_group_table is None:
+            return None
+        raw = self._placement_group_table()
+        table = await raw if inspect.isawaitable(raw) else raw
+        target_namespace = request.namespace or self._namespace
+        for row in _placement_group_rows(table):
+            if str(row.get("name") or "") != request.placement_group_name:
+                continue
+            if not _placement_group_is_active(row):
+                continue
+            if not _placement_group_namespace_matches(row, target_namespace):
+                continue
+            return row.get("placement_group") or row.get("pg") or row.get("handle") or row
+        return None
 
     async def rebuild_from_placement_group_table(self) -> PlacementReservationSnapshot:
         if self._placement_group_table is None:
@@ -1024,6 +1049,11 @@ def _placement_group_namespace_matches(row: Mapping[str, Any], namespace: str | 
         return True
     row_namespace = row.get("namespace") or row.get("ray_namespace") or row.get("rayNamespace")
     return row_namespace is None or str(row_namespace) == str(namespace)
+
+
+def _is_placement_group_name_conflict(exc: Exception, placement_group_name: str) -> bool:
+    message = str(exc)
+    return placement_group_name in message and "already exists" in message
 
 
 def _placement_group_bundles(row: Mapping[str, Any]) -> tuple[dict[str, Any], ...]:

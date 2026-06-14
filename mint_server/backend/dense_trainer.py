@@ -522,16 +522,17 @@ def get_or_create_dense_trainer(
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,
                         extra={
-                        "USE_TORCH": "1",
-                        "USE_TF": "0",
-                        "USE_FLAX": "0",
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
-                        "TRANSFORMERS_OFFLINE": "1",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                        **otel_env_vars(),
+                            "USE_TORCH": "1",
+                            "USE_TF": "0",
+                            "USE_FLAX": "0",
+                            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                            "HF_HUB_OFFLINE": "1",
+                            "TRANSFORMERS_OFFLINE": "1",
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                            **otel_env_vars(),
                         },
+                        include_ray_attach_hints=False,
                     )
                 }
                 pg = _get_or_create_pg(actor_name, model_key=name_key, base_model=base_model)

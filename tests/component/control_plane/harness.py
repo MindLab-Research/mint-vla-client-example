@@ -19,6 +19,7 @@ from mint_server.backend.control_plane_contracts import (
     InProcessSchedulerQueueAdapter,
     ModelWorkTaskGateway,
     SyncReplicasResult,
+    WireCompatibleResult,
 )
 from mint_server.backend.model_work_admission import ModelWorkAdmissionResult
 from mint_server.backend.model_actor_supervisor import (
@@ -80,11 +81,19 @@ class LocalAsyncTaskStateClient:
         return await self._call("create_task", **kwargs)
 
     async def async_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(("ensure_task", {"args": (), **dict(kwargs)}))
+        await self.faults.before_call("task_state.ensure_task", **kwargs)
         try:
             record = await self.async_get_task(request_id=str(kwargs["request_id"]))
-            return {"ok": True, "created": False, "record": record}
+            out = {"ok": True, "created": False, "record": record}
         except Exception:
-            return await self.async_create_task(**kwargs)
+            # TaskStateStore-backed test doubles only create pending rows; the
+            # Ray FutureStateStore client accepts the same default status.
+            kwargs.pop("status", None)
+            created = await asyncio.to_thread(self.store.create_task, **kwargs)
+            out = created.to_wire() if isinstance(created, WireCompatibleResult) else dict(created)
+        await self.faults.before_call("task_state.ensure_task.after", **kwargs)
+        return out
 
     async def async_assign_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._call("assign_task", **kwargs)
@@ -233,6 +242,7 @@ class SchedulerComponentWorld:
         self.task_gateway: ModelWorkTaskGateway = SchedulerModelWorkTaskGateway(
             scheduler_client=self.scheduler,
             task_ledger_client=self.task_ledger,
+            future_service_client=self.future_service,
         )
         self.event_log: list[tuple[str, dict[str, Any]]] = []
 
@@ -251,6 +261,7 @@ class SchedulerComponentWorld:
         self.task_gateway = SchedulerModelWorkTaskGateway(
             scheduler_client=self.scheduler,
             task_ledger_client=self.task_ledger,
+            future_service_client=self.future_service,
         )
 
     @property
@@ -448,6 +459,7 @@ class SchedulerComponentWorld:
             SchedulerModelWorkTaskGateway(
                 scheduler_client=scheduler_override or self.scheduler,
                 task_ledger_client=self.task_ledger if scheduler_override is None else self.task_state,
+                future_service_client=self.future_service,
             ),
         )
         monkeypatch.setattr(futures_route, "task_payload_store", self.payload_store)
@@ -482,6 +494,7 @@ class SchedulerComponentWorld:
             SchedulerModelWorkTaskGateway(
                 scheduler_client=scheduler_override or self.scheduler,
                 task_ledger_client=self.task_ledger if scheduler_override is None else self.task_state,
+                future_service_client=self.future_service,
             ),
         )
         payload = await futures_route.cancel_future(

@@ -4968,8 +4968,8 @@ class TaskFutureService:
         request_json: bytes,
         meta: dict[str, Any] | None = None,
         payload_hash: str | None = None,
-    ) -> str:
-        await self._future_state.async_ensure_task(
+    ) -> dict[str, Any]:
+        out = await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str(op),
             domain_key=str(domain_key),
@@ -4978,7 +4978,12 @@ class TaskFutureService:
             metadata=dict(meta or {}),
             status="pending",
         )
-        return str(request_id)
+        out = _wire_result(out)
+        return {
+            "request_id": str(request_id),
+            "created": bool(out.get("created")),
+            "record": out.get("record"),
+        }
 
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         out = await self._future_state.async_ensure_task(

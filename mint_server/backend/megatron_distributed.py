@@ -7541,6 +7541,7 @@ class MegatronWorkerGroup:
                 **otel_env_vars(),
                 **_explicit_megatron_attention_backend_env_vars(),
                 },
+                include_ray_attach_hints=False,
             ),
         }
 
@@ -11030,6 +11031,7 @@ def get_or_create_megatron_worker_group(
                     **otel_env_vars(),
                     **_explicit_megatron_attention_backend_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
 

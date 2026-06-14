@@ -24,11 +24,20 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     assert '""|mint|root|mint_root)' in text
     # Driver attaches as a Ray client; the file-path env is not exported to it.
     assert "unset MINT_RAY_HEAD_ADDRESS_PATH" in text
+    assert "unset RAY_ADDRESS" in text
     assert 'export MINT_RAY_CLIENT_ADDRESS="ray://${ray_head_ip}:10001"' in text
-    assert 'export RAY_ADDRESS="${ray_head_ip}:6379"' in text
+    assert 'export MINT_RAY_GCS_ADDRESS="${ray_head_ip}:6379"' in text
+    assert 'export RAY_ADDRESS="${ray_head_ip}:6379"' not in text
+    # vLLM worker bootstrap must always use the wrapper from this checkout.
+    assert 'vllm_worker_python="${MINT_CODE_ROOT}/scripts/vllm_worker_python.py"' in text
+    assert 'export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"' in text
+    assert "MINT_VLLM_CHILD_PYTHON_EXECUTABLE" in text
     # Optional deployment policy must not carry code root or namespace.
     assert "MINT_DEV_DEPLOYMENT_ENV" in text
-    assert "MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH" in text
+    assert (
+        "MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|"
+        "MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE"
+    ) in text
     assert LEGACY_DEV_SECRETS_ENV not in text
     assert LEGACY_DEV_SECRETS_PATH not in text
     # Runtime root and HF modules default to dev infra (not business code).

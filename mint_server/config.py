@@ -250,9 +250,13 @@ def actor_runtime_env_vars(
         raise RuntimeError("MINT_CODE_ROOT is required")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
+    ray_gcs_address = _env_nonempty(os.environ, "MINT_RAY_GCS_ADDRESS")
     ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if include_ray_attach_hints and ray_address is None:
-        raise RuntimeError("RAY_ADDRESS is required")
+    direct_ray_address = ray_gcs_address or (
+        ray_address if ray_address is not None and not ray_address.startswith("ray://") else None
+    )
+    if include_ray_attach_hints and direct_ray_address is None:
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
 
     out = {
         "MINT_RAY_NAMESPACE": RAY_NAMESPACE,
@@ -261,8 +265,8 @@ def actor_runtime_env_vars(
         "MINT_CODE_ROOT": MINT_CODE_ROOT,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
     }
-    if include_ray_attach_hints and ray_address is not None:
-        out["RAY_ADDRESS"] = ray_address
+    if direct_ray_address is not None:
+        out["MINT_RAY_GCS_ADDRESS"] = direct_ray_address
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
@@ -275,8 +279,6 @@ def actor_runtime_env_vars(
     for key in (
         "MINT_ACTOR_LD_LIBRARY_PATH",
         "MINT_RAY_HEAD_ADDRESS_PATH",
-        "MINT_RAY_CLIENT_ADDRESS",
-        "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_CONTROL_PLANE_NODE_IP",
         "MINT_RAY_TEMP_DIR",
@@ -289,6 +291,8 @@ def actor_runtime_env_vars(
         "MINT_FUTURE_STATE_STORE_DB_PATH",
     ):
         if not include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
+            continue
+        if include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
             continue
         value = _env_nonempty(os.environ, key)
         if value is not None:

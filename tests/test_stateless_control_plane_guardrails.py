@@ -203,6 +203,68 @@ def test_vllm_backend_attach_preserves_child_task_capture() -> None:
     assert "placement_group_capture_child_tasks=True" in source
 
 
+def test_backend_nested_actor_runtime_env_does_not_export_ray_attach_hints() -> None:
+    backend_paths = [
+        REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
+        REPO_ROOT / "mint_server" / "backend" / "multi_lora_engine.py",
+        REPO_ROOT / "mint_server" / "backend" / "verl_inference.py",
+        REPO_ROOT / "mint_server" / "backend" / "openpi_ray_runtime.py",
+        REPO_ROOT / "mint_server" / "backend" / "dense_trainer.py",
+        REPO_ROOT / "mint_server" / "backend" / "megatron_distributed.py",
+        REPO_ROOT / "mint_server" / "backend" / "bumblebee_distributed.py",
+    ]
+    missing: list[str] = []
+    for path in backend_paths:
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Name) or func.id != "actor_runtime_env_vars":
+                continue
+            keyword = next((kw for kw in node.keywords if kw.arg == "include_ray_attach_hints"), None)
+            if not (
+                keyword is not None
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value is False
+            ):
+                missing.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
+
+    assert missing == []
+
+
+def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
+    helper_specs = [
+        (
+            REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
+            "_prepare_mint_vllm_multinode_runtime_env",
+        ),
+        (
+            REPO_ROOT / "mint_server" / "backend" / "multi_lora_engine.py",
+            "_prepare_vllm_actor_runtime_env",
+        ),
+    ]
+    for path, helper_name in helper_specs:
+        functions = _module_functions(path)
+        helper = functions[helper_name]
+        source = ast.get_source_segment(path.read_text(), helper) or ""
+        for key in (
+            "MINT_RAY_TEMP_DIR",
+            "MINT_RAY_NODE_IP_ADDRESS",
+            "RAY_TMPDIR",
+            "TMPDIR",
+            "TMP",
+            "TEMP",
+            "RAY_ADDRESS",
+            "RAY_CLIENT_ADDRESS",
+            "MINT_RAY_CLIENT_ADDRESS",
+        ):
+            assert f'"{key}"' in source
+        assert '"MINT_RAY_GCS_ADDRESS"' not in source
+        assert ".pop(" not in source
+        assert 'env_vars[key] = ""' in source
+
+
 def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -> None:
     task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
     functions = _class_methods(task_state_path)["TaskStateStore"]
