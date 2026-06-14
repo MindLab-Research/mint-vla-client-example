@@ -2297,6 +2297,26 @@ def _apply_optional_vllm_patch(patch) -> None:  # type: ignore[no-untyped-def]
         return
 
 
+def _apply_qwen36_verl_fsdp2_lora_patches() -> None:
+    if not _env_flag("MINT_QWEN36_VERL_FSDP2_LORA_PATCHES", default=False):
+        return
+
+    try:
+        from mint_server.backend.qwen36_verl_fsdp2_lora import (
+            install_qwen36_verl_fsdp2_lora_patches,
+        )
+    except Exception as exc:
+        print(
+            "[sitecustomize:qwen36_verl_fsdp2_lora] failed to import patch module: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return
+
+    install_qwen36_verl_fsdp2_lora_patches()
+
+
 def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
@@ -2339,4 +2359,5 @@ _patch_multiprocessing_executable()
 _patch_cv2_typing_shadow()
 _patch_ray_placement_group_bundle_cache()
 _maybe_log_vllm_child_startup()
+_apply_qwen36_verl_fsdp2_lora_patches()
 _apply_vllm_worker_patches()

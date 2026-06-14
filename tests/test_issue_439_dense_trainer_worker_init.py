@@ -8,6 +8,14 @@ import pytest
 import mint_server.backend.observability.runtime_observability as runtime_obs_module
 
 
+def _patch_model_actor_supervisor(monkeypatch, supervisor_factory) -> None:
+    from mint_server.backend.actors import model_actor_supervisor as supervisor_mod
+    from mint_server.backend.training.dense import dense_trainer as dt
+
+    monkeypatch.setattr(dt, "get_model_actor_supervisor", supervisor_factory)
+    monkeypatch.setattr(supervisor_mod, "get_model_actor_supervisor", supervisor_factory)
+
+
 def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkeypatch) -> None:
     from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
@@ -47,7 +55,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
         def mark_ready(self, _actor_name: str) -> None:
             return None
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("missing")))
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
@@ -131,7 +139,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
         retire_calls.append(dict(kwargs))
         return "ok"
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt, "retire_dense_trainer", _fake_retire_dense_trainer)
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: _ExistingActor())
@@ -177,7 +185,7 @@ def test_issue_561_poisoned_dense_trainer_recreate_aborts_when_retire_fails(monk
             assert queried_actor_name == actor_name
             return poisoned_entry
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: object())
     monkeypatch.setattr(dt, "retire_dense_trainer", lambda **kwargs: "kill_failed")
 
@@ -245,7 +253,7 @@ def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
         return out
 
     monkeypatch.setattr(dt, "RayActorError", _DeadActorError)
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt.ray, "get_actor", _fake_get_actor)
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
     monkeypatch.setattr(dt, "_get_or_create_pg", lambda *_args, **_kwargs: object())
@@ -313,7 +321,7 @@ def test_issue_561_dense_trainer_recreates_on_max_rank_mismatch(monkeypatch) -> 
         retire_calls.append(dict(kwargs))
         return "ok"
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt, "retire_dense_trainer", _fake_retire_dense_trainer)
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: _ExistingActor())
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
@@ -350,7 +358,7 @@ def test_issue_561_dense_trainer_fails_closed_when_max_rank_unknown(monkeypatch)
             assert queried_actor_name == "mint_dense_qwen__qwen3_0_6b"
             return SimpleNamespace(metadata={})
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(dt.ray, "get_actor", lambda *args, **kwargs: _ExistingActor())
     monkeypatch.setattr(dt.ray, "get", lambda value, timeout=None: value)
 
@@ -442,7 +450,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
         def unregister(self, actor_name: str):
             unregisters.append(actor_name)
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
     monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)
@@ -505,7 +513,7 @@ def test_issue_561_retire_metadata_failure_does_not_block_recreate(monkeypatch) 
         def unregister(self, actor_name: str):
             unregisters.append(actor_name)
 
-    monkeypatch.setattr(dt, "get_model_actor_supervisor", lambda: _FakePool())
+    _patch_model_actor_supervisor(monkeypatch, lambda: _FakePool())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(dt.ray_kill, "kill", lambda *args, **kwargs: None)
     monkeypatch.setattr(dt, "_remove_pg", lambda actor_name: None)

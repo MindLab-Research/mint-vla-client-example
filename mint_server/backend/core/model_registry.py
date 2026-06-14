@@ -237,6 +237,26 @@ MODEL_CONFIGS = {
         vllm_distributed_executor_backend="mp",
         supported_modalities=("text",),
     ),
+    "Qwen/Qwen3.6-27B": ModelConfig(
+        num_parameters=27.0,
+        is_moe=False,
+        inference_tp=4,
+        inference_dp=1,
+        train_tp=1,
+        train_ep=1,
+        max_model_len=32768,
+        max_num_seqs=128,
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.90,
+        max_loras=4,
+        max_cpu_loras=16,
+        max_lora_rank=64,
+        gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
+        supported_modalities=("text",),
+        training_backend="verl_fsdp2_lora",
+    ),
     # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters

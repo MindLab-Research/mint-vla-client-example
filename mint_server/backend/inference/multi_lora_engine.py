@@ -1394,6 +1394,16 @@ def _resolve_model_path(model_name: str) -> str:
                 qwen35_path = None
             if qwen35_path:
                 return qwen35_path
+        if model_name == "Qwen/Qwen3.6-27B":
+            try:
+                from mint_server.backend.qwen36_verl_fsdp2_lora import qwen36_model_path_override
+
+                qwen36_path = qwen36_model_path_override(model_name)
+            except Exception:
+                logger.debug("Failed to resolve Qwen3.6 model path override", exc_info=True)
+                qwen36_path = None
+            if qwen36_path:
+                return qwen36_path
         return model_name
 
     resolved_path = Path(resolved)
