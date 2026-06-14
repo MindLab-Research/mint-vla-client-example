@@ -1,0 +1,72 @@
+name: Scheduler Control Plane
+
+on:
+  pull_request:
+    branches:
+      - develop
+    paths:
+      - ".github/workflows/scheduler-control-plane.yml"
+      - "mint_server/backend/control_plane_contracts.py"
+      - "mint_server/backend/model_work_scheduler.py"
+      - "mint_server/backend/model_engine_host.py"
+      - "mint_server/backend/model_runtime_actor.py"
+      - "mint_server/backend/model_work_task_gateway.py"
+      - "mint_server/backend/model_actor_supervisor.py"
+      - "mint_server/backend/engine_liveness.py"
+      - "mint_server/backend/cluster_placement_controller.py"
+      - "mint_server/backend/model_placement_topology.py"
+      - "scripts/tools/ci_scheduler_control_plane.sh"
+      - "scripts/tools/verify_scheduler_control_plane.py"
+      - "tests/component/control_plane/**"
+      - "tests/test_cluster_placement_controller.py"
+      - "tests/test_stateless_control_plane_guardrails.py"
+      - "tests/test_issue_593_model_work_scheduler.py"
+      - "tests/test_issue_593_model_runtime_actor.py"
+      - "tests/test_model_work_task_gateway.py"
+      - "pyproject.toml"
+      - "uv.lock"
+  push:
+    branches:
+      - develop
+      - nolan/scheduler-contract
+    paths:
+      - ".github/workflows/scheduler-control-plane.yml"
+      - "mint_server/backend/control_plane_contracts.py"
+      - "mint_server/backend/model_work_scheduler.py"
+      - "mint_server/backend/model_engine_host.py"
+      - "mint_server/backend/model_runtime_actor.py"
+      - "mint_server/backend/model_work_task_gateway.py"
+      - "mint_server/backend/model_actor_supervisor.py"
+      - "mint_server/backend/engine_liveness.py"
+      - "mint_server/backend/cluster_placement_controller.py"
+      - "mint_server/backend/model_placement_topology.py"
+      - "scripts/tools/ci_scheduler_control_plane.sh"
+      - "scripts/tools/verify_scheduler_control_plane.py"
+      - "tests/component/control_plane/**"
+      - "tests/test_cluster_placement_controller.py"
+      - "tests/test_stateless_control_plane_guardrails.py"
+      - "tests/test_issue_593_model_work_scheduler.py"
+      - "tests/test_issue_593_model_runtime_actor.py"
+      - "tests/test_model_work_task_gateway.py"
+      - "pyproject.toml"
+      - "uv.lock"
+  workflow_dispatch:
+
+jobs:
+  scheduler-control-plane:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure uv
+        run: |
+          if ! command -v uv >/dev/null 2>&1; then
+            python -m pip install uv
+          fi
+
+      - name: Sync dev tools
+        run: uv sync --frozen --extra dev --group dev
+
+      - name: Run scheduler control-plane CI gate
+        run: scripts/tools/ci_scheduler_control_plane.sh

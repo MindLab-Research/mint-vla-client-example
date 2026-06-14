@@ -13,13 +13,6 @@ from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGa
 from mint_server.backend.task_state_store import FutureStatus
 
 from .harness import SchedulerComponentWorld
-from .invariants import (
-    assert_lease_consistency,
-    assert_no_double_lease,
-    assert_no_orphan_assigned,
-    assert_terminal_not_scheduled,
-)
-
 
 pytestmark = pytest.mark.component
 
@@ -50,7 +43,7 @@ async def test_scheduler_component_happy_path_reaches_retrieve_future(tmp_path, 
         status_code, payload = await world.retrieve("component-happy", monkeypatch)
         assert status_code == 200
         assert payload == {"ok": True, "request_id": "component-happy"}
-        await assert_terminal_not_scheduled(world, "component-happy")
+        await world.assert_consistent(terminal_request_ids=["component-happy"])
     finally:
         world.close()
 
@@ -69,7 +62,7 @@ async def test_scheduler_component_manual_assign_happy_path_reaches_retrieve_fut
         contains_before = cast(Any, await world.observe_scheduler(request_id))
         assigned = await world.scheduler.assign_pending(max_items=1)
         contains_assigned = cast(Any, await world.observe_scheduler(request_id))
-        await assert_no_orphan_assigned(world)
+        await world.assert_consistent()
 
         await world.runtime_once()
 
@@ -84,10 +77,7 @@ async def test_scheduler_component_manual_assign_happy_path_reaches_retrieve_fut
         status_code, payload = await world.retrieve(request_id, monkeypatch)
         assert status_code == 200
         assert payload == {"ok": True, "request_id": request_id}
-        await assert_terminal_not_scheduled(world, request_id)
-        await assert_no_double_lease(world)
-        await assert_lease_consistency(world)
-        await assert_no_orphan_assigned(world)
+        await world.assert_consistent(terminal_request_ids=[request_id])
     finally:
         world.close()
 

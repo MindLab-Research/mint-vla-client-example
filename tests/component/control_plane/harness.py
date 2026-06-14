@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable, Iterable, cast
 
 from fastapi import Request, Response
 from mint_server.backend.control_plane_contracts import (
@@ -402,6 +402,28 @@ class SchedulerComponentWorld:
 
     async def observe_future_status(self, request_id: str) -> FutureStatus:
         return await self.future_service.async_get_status(str(request_id))
+
+    async def assert_consistent(
+        self,
+        *,
+        terminal_request_ids: Iterable[str] = (),
+        terminal_payloads: bool = False,
+    ) -> None:
+        from .invariants import (
+            assert_every_terminal_has_payload_ref,
+            assert_lease_consistency,
+            assert_no_double_lease,
+            assert_no_orphan_assigned,
+            assert_terminal_not_scheduled,
+        )
+
+        await assert_no_double_lease(self)
+        await assert_lease_consistency(self)
+        await assert_no_orphan_assigned(self)
+        if terminal_payloads:
+            await assert_every_terminal_has_payload_ref(self)
+        for request_id in terminal_request_ids:
+            await assert_terminal_not_scheduled(self, str(request_id))
 
     def inject_payload_write_failure(self, enabled: bool) -> None:
         self.payload_store.fail_writes = bool(enabled)

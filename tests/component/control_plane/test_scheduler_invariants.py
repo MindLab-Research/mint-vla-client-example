@@ -4,14 +4,6 @@ import pytest
 
 from .helpers import token
 from .harness import SchedulerComponentWorld
-from .invariants import (
-    assert_every_terminal_has_payload_ref,
-    assert_lease_consistency,
-    assert_no_double_lease,
-    assert_no_orphan_assigned,
-    assert_terminal_not_scheduled,
-)
-
 
 pytestmark = pytest.mark.component
 
@@ -27,9 +19,7 @@ async def test_scheduler_component_invariant_helpers_cover_happy_path(
         await world.enqueue_sampling("component-invariants")
 
         lease = await world.claim_one()
-        await assert_no_double_lease(world)
-        await assert_lease_consistency(world)
-        await assert_no_orphan_assigned(world)
+        await world.assert_consistent()
 
         begin = await world.runtime_queue.begin_finalize(
             lease=token(lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
@@ -45,7 +35,9 @@ async def test_scheduler_component_invariant_helpers_cover_happy_path(
         )
         assert finished.ok is True
 
-        await assert_every_terminal_has_payload_ref(world)
-        await assert_terminal_not_scheduled(world, "component-invariants")
+        await world.assert_consistent(
+            terminal_request_ids=["component-invariants"],
+            terminal_payloads=True,
+        )
     finally:
         world.close()
