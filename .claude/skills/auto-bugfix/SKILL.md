@@ -243,17 +243,13 @@ ssh mint-dev "cat > /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh <<
 #!/usr/bin/env bash
 set -euo pipefail
 cd '$MINT_CODE_ROOT'
-set -a
-. /vePFS-Mindverse/share/mint/dev/config/common.env
-if [ -f /vePFS-Mindverse/share/mint/dev/config/secrets.env ]; then
-  . /vePFS-Mindverse/share/mint/dev/config/secrets.env
-fi
-set +a
 export MINT_CODE_ROOT='$MINT_CODE_ROOT'
 export MINT_RAY_NAMESPACE='$MINT_RAY_NAMESPACE'
 export MINT_PORT='$MINT_PORT'
 export MINT_USAGE_LOG_DIR='/tmp/mint_usage_issue_$ISSUE'
-exec /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/run_server.py
+export MINT_AUTH_MODE=no-auth
+export MINT_DEV_DEPLOYMENT_ENV=/vePFS-Mindverse/share/mint/dev/config/common.env
+exec scripts/start_dev_server.sh
 SH
 chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh
 nohup /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/mint_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/mint_server_issue_$ISSUE.pid"

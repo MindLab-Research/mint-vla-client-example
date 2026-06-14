@@ -193,6 +193,45 @@ class _SchedulerMockHarness:
         self.task_state.close()
 
 
+def test_scheduler_append_assign_uses_typed_assignment_under_wire_wrapper() -> None:
+    class _WireAssignScheduler(_ModelWorkSchedulerActor):
+        async def assign_pending(self, **kwargs: Any) -> Any:
+            out = await super().assign_pending(**kwargs)
+            return out.to_wire()
+
+        async def _assign_pending_unlocked(self, **kwargs: Any) -> Any:
+            out = await super()._assign_pending_unlocked(**kwargs)
+            return out.to_wire()
+
+    async def _run() -> None:
+        actor = _WireAssignScheduler()
+        try:
+            await actor.sync_replicas([_replica("replica-0")])
+
+            appended = await actor.append(_work("req-wire-assign"), assign=True)
+
+            assert appended.ok is True
+            assert appended.assigned is not None
+            assert appended.assigned["ok"] is True
+            assert appended.assigned["assigned"] == 1
+            contains = await actor.contains_request(request_id="req-wire-assign")
+            assert contains.location == "assigned"
+            claimed = await actor.claim_from_replica_queue(
+                domain_key="vllm:Qwen/Qwen3-30B-A3B-Instruct-2507",
+                replica_id="replica-0",
+                consumer_id="consumer-replica-0",
+                consumer_generation=10,
+                max_items=1,
+                lease_ttl_s=30.0,
+            )
+            assert claimed.ok is True
+            assert len(claimed.leases) == 1
+        finally:
+            await actor.shutdown_background_loops()
+
+    asyncio.run(_run())
+
+
 def test_scheduler_owner_heartbeat_runs_without_request_hot_path(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S", "0.01")
 
@@ -775,6 +814,7 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
 
     assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
     assert captured["runtime_env_kwargs"]["extra"]["MINT_GIT_SHA"] == CURRENT_CODE_IDENTITY
+    assert captured["runtime_env_kwargs"]["include_ray_attach_hints"] is False
     assert captured["options"]["runtime_env"] == {
         "env_vars": {
             "PYTHONPATH": module.PFS_PYTHONPATH,

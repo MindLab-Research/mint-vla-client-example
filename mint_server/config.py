@@ -297,7 +297,12 @@ def actor_runtime_env_vars(
         out.update(extra)
     if not include_ray_attach_hints:
         for key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
-            out.pop(key, None)
+            # Ray runtime_env env_vars overlay the job/worker environment; they
+            # do not reliably delete inherited variables.  Empty values make
+            # env_nonempty()/Ray attach helpers treat these as absent inside
+            # detached actor workers, preventing nested ray.init/direct attach
+            # attempts from a Ray worker process.
+            out[key] = ""
     if include_config_snapshot:
         out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out

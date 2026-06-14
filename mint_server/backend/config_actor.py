@@ -39,6 +39,7 @@ def _actor_options(*, actor_name: str) -> dict[str, object]:
             pythonpath=PFS_PYTHONPATH,
             extra={**otel_env_vars(), CONFIG_ACTOR_SELF_ENV: "1"},
             include_config_snapshot=False,
+            include_ray_attach_hints=False,
         ),
     }
     apply_detached_actor_resources(options, ray)

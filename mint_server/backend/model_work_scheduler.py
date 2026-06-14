@@ -842,7 +842,7 @@ class _ModelWorkSchedulerActor:
         while True:
             await asyncio.sleep(self._assignment_loop_interval_s)
             try:
-                await self.assign_pending()
+                await self._assign_pending_typed()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -1449,7 +1449,7 @@ class _ModelWorkSchedulerActor:
             self._drop_empty_backlog(domain_key)
         return pending, skipped_domains
 
-    async def _assign_pending_unlocked(self, *, max_items: int | None = None) -> AssignPendingResult:
+    async def _assign_pending_core_unlocked(self, *, max_items: int | None = None) -> AssignPendingResult:
         async with self._cv:
             pending, skipped_domains = self._prepare_assignments_locked(max_items=max_items)
             if not pending:
@@ -1486,6 +1486,9 @@ class _ModelWorkSchedulerActor:
                     assigned_count += 1
         return AssignPendingResult(ok=True, assigned=assigned_count, skipped_domains=skipped_domains)
 
+    async def _assign_pending_unlocked(self, *, max_items: int | None = None) -> AssignPendingResult:
+        return await self._assign_pending_core_unlocked(max_items=max_items)
+
     async def _assign_pending_if_no_inflight_unlocked(
         self,
         *,
@@ -1499,7 +1502,7 @@ class _ModelWorkSchedulerActor:
                     skipped_domains=[],
                     extra={"deferred": "inflight_scheduler_transition"},
                 )
-        return await self.assign_pending(hydrate_task_state=hydrate_task_state)
+        return await self._assign_pending_typed(hydrate_task_state=hydrate_task_state)
 
     def _remove_request_from_memory_locked(self, request_id: str) -> bool:
         request_id = str(request_id)
@@ -1909,7 +1912,7 @@ class _ModelWorkSchedulerActor:
                     request_id=work.request_id,
                 )
             assigned = (
-                (await self.assign_pending(max_items=assign_max_items)).to_wire()
+                (await self._assign_pending_typed(max_items=assign_max_items)).to_wire()
                 if bool(assign)
                 else {"ok": True, "assigned": 0, "skipped_domains": []}
             )
@@ -1992,7 +1995,7 @@ class _ModelWorkSchedulerActor:
                 self._track_sampling_inflight_locked(work)
                 backlog_depth = len(self._backlog(work.domain_key))
             assigned = (
-                (await self.assign_pending(max_items=assign_max_items)).to_wire()
+                (await self._assign_pending_typed(max_items=assign_max_items)).to_wire()
                 if bool(assign)
                 else {"ok": True, "assigned": 0, "skipped_domains": []}
             )
@@ -2237,7 +2240,7 @@ class _ModelWorkSchedulerActor:
             assigned=assigned_pending.to_wire(),
         )
 
-    async def assign_pending(
+    async def _assign_pending_typed(
         self,
         *,
         max_items: int | None = None,
@@ -2250,13 +2253,24 @@ class _ModelWorkSchedulerActor:
             else:
                 await self._ensure_task_state_owner()
         expired = await self._expire_leases_unlocked(now=time.time())
-        out = await self._assign_pending_unlocked(max_items=max_items)
+        out = await self._assign_pending_core_unlocked(max_items=max_items)
         return AssignPendingResult(
             ok=out.ok,
             assigned=out.assigned,
             skipped_domains=list(out.skipped_domains),
             reason=out.reason,
             extra={**dict(out.extra), "expired": expired},
+        )
+
+    async def assign_pending(
+        self,
+        *,
+        max_items: int | None = None,
+        hydrate_task_state: bool = True,
+    ) -> AssignPendingResult:
+        return await self._assign_pending_typed(
+            max_items=max_items,
+            hydrate_task_state=hydrate_task_state,
         )
 
     def _validate_claimer(
@@ -3152,7 +3166,11 @@ def _create_ray_actor_handle():
         "namespace": _ray_namespace(),
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=extra_env),
+        "runtime_env": actor_runtime_env(
+            pythonpath=PFS_PYTHONPATH,
+            extra=extra_env,
+            include_ray_attach_hints=False,
+        ),
     }
     resources = _model_work_scheduler_actor_resources()
     if resources:

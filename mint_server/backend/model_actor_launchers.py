@@ -20,7 +20,7 @@ class ModelActorSpecLike(Protocol):
     def normalized_node_pins(self) -> list[str]: ...
 
 
-ModelActorLauncher = Callable[[ModelActorSpecLike, int], Any | Awaitable[Any]]
+ModelActorLauncher = Callable[..., Any | Awaitable[Any]]
 DEFAULT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET = 262144
 
 
@@ -37,8 +37,21 @@ class ModelActorLauncherRegistry:
         except KeyError as e:
             raise ValueError(f"unknown model actor launcher_key: {key!r}") from e
 
-    async def launch(self, spec: ModelActorSpecLike, generation: int, *, launcher_key: str) -> Any:
-        value = self.resolve(launcher_key)(spec, generation)
+    async def launch(
+        self,
+        spec: ModelActorSpecLike,
+        generation: int,
+        *,
+        launcher_key: str,
+        ray_address: str | None = None,
+    ) -> Any:
+        launcher = self.resolve(launcher_key)
+        try:
+            value = launcher(spec, generation, ray_address=ray_address)
+        except TypeError as exc:
+            if "ray_address" not in str(exc):
+                raise
+            value = launcher(spec, generation)
         if isawaitable(value):
             return await value
         return value
@@ -194,7 +207,12 @@ def _model_runtime_token_budget_for_spec(spec: ModelActorSpecLike) -> int | None
     return _positive_env_int("MINT_MODEL_RUNTIME_TOKEN_BUDGET")
 
 
-async def launch_model_engine_host(spec: ModelActorSpecLike, generation: int) -> Any:
+async def launch_model_engine_host(
+    spec: ModelActorSpecLike,
+    generation: int,
+    *,
+    ray_address: str | None = None,
+) -> Any:
     from .model_engine_host import get_or_create_model_engine_host
 
     return get_or_create_model_engine_host(
@@ -205,14 +223,12 @@ async def launch_model_engine_host(spec: ModelActorSpecLike, generation: int) ->
         base_model=_base_model_from_spec(spec),
         max_claim=_model_runtime_max_claim_for_spec(spec),
         token_budget=_model_runtime_token_budget_for_spec(spec),
+        ray_address=ray_address,
         runtime_env_extra={
             **placement_env_for_spec(spec),
             **megatron_env_for_spec(spec),
         },
     )
-
-
-launch_model_runtime_actor = launch_model_engine_host
 
 
 def default_model_actor_launcher_registry() -> ModelActorLauncherRegistry:

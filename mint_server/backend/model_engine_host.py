@@ -214,6 +214,7 @@ def get_or_create_model_engine_host(
     execution_timeout_s: float | None = None,
     engine_restart_timeout_s: float | None = None,
     runtime_env_extra: dict[str, str] | None = None,
+    ray_address: str | None = None,
 ) -> Any:
     import ray
 
@@ -260,8 +261,8 @@ def get_or_create_model_engine_host(
         except Exception:
             pass
 
-    ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
-    if ray_address is None:
+    resolved_ray_address = str(ray_address or "").strip() or env_nonempty(os.environ, "RAY_ADDRESS")
+    if resolved_ray_address is None:
         raise RuntimeError("RAY_ADDRESS is required")
 
     remote_cls = ray.remote(num_cpus=0, max_concurrency=64, max_restarts=-1)(ModelEngineHost)
@@ -296,7 +297,7 @@ def get_or_create_model_engine_host(
         execution_timeout_s=execution_timeout_s,
         engine_restart_timeout_s=engine_restart_timeout_s,
         runtime_env_fingerprint=expected_runtime_env_fingerprint,
-        ray_address=ray_address,
+        ray_address=resolved_ray_address,
     )
 
 
@@ -392,9 +393,6 @@ class ModelEngineHost:
             raise ValueError("domain_key is required")
         if not replica:
             raise ValueError("replica_id is required")
-        ray_address_value = str(ray_address or "").strip()
-        if ray_address_value:
-            os.environ["RAY_ADDRESS"] = ray_address_value
         self._config = ModelEngineHostConfig(
             domain_key=domain,
             replica_id=replica,

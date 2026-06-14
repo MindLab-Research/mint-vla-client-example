@@ -202,6 +202,22 @@ def test_cluster_placement_controller_builds_backend_attach_compatible_pg_reques
     assert megatron.required_gpus_by_node == (("10.0.0.10", 2),)
 
 
+def test_cluster_placement_create_request_uses_ray_compatible_list_bundles() -> None:
+    request = PlacementGroupCreateRequest.from_mapping(
+        replica_key="vllm:model-a::replica-0",
+        placement_group_name="mint_vllm_a_pg",
+        required_gpus_by_node={"10.0.0.7": 1},
+        bundles=({"GPU": 1, "CPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1}),
+    )
+
+    assert isinstance(request.bundles, tuple)
+    assert request.bundle_dicts == [
+        {"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001},
+        {"CPU": 1},
+    ]
+    assert isinstance(request.bundle_dicts, list)
+
+
 @pytest.mark.anyio
 async def test_cluster_placement_controller_reconcile_returns_node_pins_blocked_and_pg_requests() -> None:
     controller = ClusterPlacementController(
@@ -428,6 +444,8 @@ async def test_cluster_placement_controller_default_ray_ready_wait_uses_ray_get(
         @staticmethod
         def placement_group(**kwargs):
             assert kwargs["name"] == "mint_dense_a_pg"
+            assert kwargs["bundles"] == [{"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}]
+            assert isinstance(kwargs["bundles"], list)
             return _SyncReadyPlacementGroup()
 
         @staticmethod

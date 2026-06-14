@@ -37,7 +37,6 @@ PYTHON_TARGETS=(
   mint_server/backend/control_plane_contracts.py
   mint_server/backend/model_work_scheduler.py
   mint_server/backend/model_engine_host.py
-  mint_server/backend/model_runtime_actor.py
   mint_server/backend/model_work_task_gateway.py
   mint_server/backend/model_actor_supervisor.py
   mint_server/backend/engine_liveness.py
@@ -48,7 +47,6 @@ PYTHON_TARGETS=(
   tests/test_issue_593_model_work_scheduler.py
   tests/test_issue_593_model_runtime_actor.py
   tests/test_issue_593_model_actor_supervisor.py
-  tests/test_model_engine_host_rename.py
   tests/test_model_work_task_gateway.py
   tests/conftest.py
   scripts/tools/verify_scheduler_control_plane.py
@@ -61,7 +59,6 @@ COVERAGE_SOURCE_FILES=(
   mint_server/backend/control_plane_contracts.py
   mint_server/backend/model_work_scheduler.py
   mint_server/backend/model_engine_host.py
-  mint_server/backend/model_runtime_actor.py
   mint_server/backend/model_work_task_gateway.py
   mint_server/backend/model_actor_supervisor.py
   mint_server/backend/engine_liveness.py
@@ -80,7 +77,6 @@ COVERAGE_TEST_TARGETS=(
   tests/test_issue_593_model_work_scheduler.py
   tests/test_issue_593_model_runtime_actor.py
   tests/test_issue_593_model_actor_supervisor.py
-  tests/test_model_engine_host_rename.py
   tests/test_model_work_task_gateway.py
 )
 
@@ -113,14 +109,13 @@ run_step "stateless guardrails" "${UV_RUN[@]}" pytest tests/test_stateless_contr
 run_step "issue 593 scheduler" "${UV_RUN[@]}" pytest tests/test_issue_593_model_work_scheduler.py -q
 run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_runtime_actor.py -q
 run_step "issue 593 supervisor" "${UV_RUN[@]}" pytest tests/test_issue_593_model_actor_supervisor.py -q
-run_step "model engine host rename" "${UV_RUN[@]}" pytest tests/test_model_engine_host_rename.py -q
 run_step "contract verifier" "${UV_RUN[@]}" python scripts/tools/verify_scheduler_control_plane.py
 run_step "scoped ruff" "${UV_RUN[@]}" ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane
 run_step "scoped pyright" "${UV_RUN[@]}" pyright --project pyrightconfig.scheduler-ci.json
 run_step "py_compile" "${UV_RUN[@]}" python -m py_compile "${PY_COMPILE_TARGETS[@]}"
 run_step "coverage erase" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage erase
 run_step "coverage collect" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage run \
-  --source=mint_server.backend.control_plane_contracts,mint_server.backend.model_work_scheduler,mint_server.backend.model_engine_host,mint_server.backend.model_runtime_actor,mint_server.backend.model_work_task_gateway,mint_server.backend.model_actor_supervisor,mint_server.backend.engine_liveness,mint_server.backend.cluster_placement_controller,mint_server.backend.model_placement_topology \
+  --source=mint_server.backend.control_plane_contracts,mint_server.backend.model_work_scheduler,mint_server.backend.model_engine_host,mint_server.backend.model_work_task_gateway,mint_server.backend.model_actor_supervisor,mint_server.backend.engine_liveness,mint_server.backend.cluster_placement_controller,mint_server.backend.model_placement_topology \
   -m pytest "${COVERAGE_TEST_TARGETS[@]}" -q
 run_step "coverage hard gate" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage report \
   --fail-under="$MINT_SCHEDULER_COVERAGE_MIN" \

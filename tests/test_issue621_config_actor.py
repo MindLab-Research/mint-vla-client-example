@@ -8,7 +8,6 @@ import pytest
 from mint_server.config import ServerConfig
 from mint_server.runtime_config import (
     CONFIG_ACTOR_DEFAULT_NAME,
-    CONFIG_CLASS_ACTOR_CREATION_INPUT,
     CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV,
     CONFIG_CLASS_OBSERVABILITY,
     CONFIG_CLASS_SNAPSHOT_CONFIG,
@@ -294,19 +293,26 @@ def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
 def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
     from mint_server.backend import config_actor
 
+    captured: dict[str, object] = {}
     monkeypatch.setattr(config_actor, "RAY_NAMESPACE", "mint-ns")
     monkeypatch.setattr(config_actor, "PFS_PYTHONPATH", "/pythonpath")
-    monkeypatch.setattr(
-        config_actor,
-        "actor_runtime_env",
-        lambda *, pythonpath, extra=None, include_config_snapshot=True: {
+    def _fake_actor_runtime_env(
+        *,
+        pythonpath,
+        extra=None,
+        include_config_snapshot=True,
+        include_ray_attach_hints=True,
+    ):
+        captured["include_ray_attach_hints"] = include_ray_attach_hints
+        return {
             "env_vars": {
                 "PYTHONPATH": pythonpath,
                 **(extra or {}),
                 **({"MINT_CONFIG_ACTOR_HYDRATE": "1"} if include_config_snapshot else {}),
             }
-        },
-    )
+        }
+
+    monkeypatch.setattr(config_actor, "actor_runtime_env", _fake_actor_runtime_env)
     monkeypatch.setattr(config_actor, "apply_detached_actor_resources", lambda options, ray_module: None)
 
     options = config_actor._actor_options(actor_name="mint_config")
@@ -321,6 +327,7 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
             "MINT_CONFIG_ACTOR_SELF": "1",
         }
     }
+    assert captured["include_ray_attach_hints"] is False
 
 
 def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:

@@ -1191,7 +1191,6 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
-            "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
@@ -1264,6 +1263,47 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
     assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
     assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
     assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
+
+
+def test_actor_runtime_env_vars_blanks_ray_attach_hints_when_disabled(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars("
+                "pythonpath='X', include_ray_attach_hints=False)))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
+            "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
+        },
+    )
+    data = json.loads(out.stdout)
+
+    for key in (
+        "RAY_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "MINT_RAY_TEMP_DIR",
+    ):
+        assert data[key] == ""
 
 
 def test_actor_runtime_env_vars_forwards_state_store_paths(tmp_path):

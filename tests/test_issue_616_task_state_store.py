@@ -151,7 +151,11 @@ def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypat
 
     monkeypatch.setattr(ray, "remote", _fake_remote)
     monkeypatch.setattr(ray, "method", _fake_method)
-    monkeypatch.setattr(module, "actor_runtime_env", lambda **_kwargs: {})
+    def _fake_actor_runtime_env(**kwargs):
+        captured["runtime_env_kwargs"] = kwargs
+        return {}
+
+    monkeypatch.setattr(module, "actor_runtime_env", _fake_actor_runtime_env)
     monkeypatch.setattr(module, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(module, "sync_get_ray_ref", lambda ref, *, timeout_s=None: ref)
     monkeypatch.setattr(module, "_task_state_store_db_path", lambda: ":memory:")
@@ -159,6 +163,7 @@ def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypat
     module._create_ray_actor(require_ready=True)
 
     assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8}
+    assert captured["runtime_env_kwargs"]["include_ray_attach_hints"] is False
     assert captured["method_kwargs"] == {"concurrency_group": "health"}
     assert captured["method_name"] == "ping"
 
@@ -2227,6 +2232,58 @@ def test_task_future_service_stages_payload_metadata_before_direct_resolve(tmp_p
         claimed = store.claim_billing_outbox(claim_id="claim-direct", limit=10, lease_ttl_s=30.0)
         assert len(claimed) == 1
         assert claimed[0]["event"]["request_id"] == "req-direct"
+    finally:
+        store.close()
+
+
+def test_task_future_service_wait_status_falls_back_to_scheduler_task_state() -> None:
+    store = TaskStateStore.in_memory()
+    try:
+        store.ensure_task(
+            request_id="req-scheduler-pending",
+            op="sampling.asample",
+            domain_key="vllm:test",
+            request_json=b"{}",
+            metadata={"queue_kind": "model_work_scheduler"},
+            status="pending",
+            now=1.0,
+        )
+
+        class _MissingFutureStateClient:
+            async def async_wait_task_status_change(self, **_kwargs):
+                return {"changed": True, "missing": True, "request_id": "req-scheduler-pending"}
+
+            async def async_stats(self):
+                return {"store": "missing-future-state"}
+
+        class _LocalTaskStateClient:
+            async def async_get_task(self, request_id: str) -> dict:
+                return store.get_task(request_id)
+
+            async def async_wait_task_status_change(self, **kwargs):
+                record = store.get_task(str(kwargs["request_id"]))
+                return {"changed": False, "timeout": True, "record": record}
+
+            async def async_stats(self):
+                return {"pending": 1}
+
+        service = TaskFutureService(
+            task_state_client=_LocalTaskStateClient(),
+            future_state_client=_MissingFutureStateClient(),
+        )
+
+        status = asyncio.run(
+            service.async_wait_status_change(
+                "req-scheduler-pending",
+                timeout_s=0.0,
+                terminal_only=True,
+            )
+        )
+        debug = asyncio.run(service.async_debug_snapshot())
+
+        assert status is None
+        assert debug["future_state_store"] == {"store": "missing-future-state"}
+        assert debug["task_state_store"]["pending"] == 1
     finally:
         store.close()
 

@@ -24,10 +24,9 @@ def _repo_root() -> Path:
 
 def _load_env() -> None:
     load_dotenv()
-    for name in (".env", ".secrets.env"):
-        env_file = _repo_root() / name
-        if env_file.exists():
-            load_dotenv(env_file, override=False)
+    env_file = _repo_root() / ".env"
+    if env_file.exists():
+        load_dotenv(env_file, override=False)
 
 
 def _coalesce(*vals: str | None) -> str | None:

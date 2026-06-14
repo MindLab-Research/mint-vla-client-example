@@ -119,8 +119,10 @@ class PlacementGroupCreateRequest:
         )
 
     @property
-    def bundle_dicts(self) -> tuple[dict[str, int | float], ...]:
-        return tuple(dict(bundle) for bundle in self.bundles)
+    def bundle_dicts(self) -> list[dict[str, int | float]]:
+        # Ray's placement_group API requires a concrete list, while this module
+        # keeps immutable tuples internally for typed snapshots and equality.
+        return [dict(bundle) for bundle in self.bundles]
 
 
 @dataclass(frozen=True)

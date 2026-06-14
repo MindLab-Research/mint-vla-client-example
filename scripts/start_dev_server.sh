@@ -30,6 +30,35 @@ set -eu
 #   MINT_DEV_DEPLOYMENT_ENV   extra deployment policy (model list, placement,
 #                             prewarm, OTEL). Must NOT set MINT_CODE_ROOT or
 #                             MINT_RAY_NAMESPACE; those are rejected below.
+#   MINT_DEV_RUN_ENV          per-run overrides (port, run-local task DB,
+#                             placement, debug knobs). Same identity keys are
+#                             rejected; set them in the launching shell/script.
+
+reject_per_launch_keys() {
+  env_file="$1"
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH)=' "${env_file}"; then
+    echo "error: ${env_file} must not set MINT_CODE_ROOT, the Ray namespace," >&2
+    echo "       or MINT_RAY_HEAD_ADDRESS_PATH (those are per-launch inputs)." >&2
+    exit 1
+  fi
+}
+
+source_env_file() {
+  env_name="$1"
+  env_file="$2"
+  if [ -z "${env_file}" ]; then
+    return 0
+  fi
+  if [ ! -r "${env_file}" ]; then
+    echo "error: ${env_name} not readable: ${env_file}" >&2
+    exit 1
+  fi
+  reject_per_launch_keys "${env_file}"
+  set -a
+  . "${env_file}"
+  set +a
+  export MINT_CODE_ROOT MINT_RAY_NAMESPACE PFS_RUNTIME_ENV_ROOT
+}
 
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
   echo "error: MINT_CODE_ROOT is required (mint-server checkout to run)." >&2
@@ -71,28 +100,10 @@ unset MINT_RAY_HEAD_ADDRESS_PATH || true
 export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint/dev/tmp}"
 
 deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
-if [ -n "${deployment_env}" ]; then
-  if [ ! -r "${deployment_env}" ]; then
-    echo "error: MINT_DEV_DEPLOYMENT_ENV not readable: ${deployment_env}" >&2
-    exit 1
-  fi
-  if grep -Eq '^[[:space:]]*export[[:space:]]+(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH)=' "${deployment_env}"; then
-    echo "error: ${deployment_env} must not set MINT_CODE_ROOT, the Ray namespace," >&2
-    echo "       or MINT_RAY_HEAD_ADDRESS_PATH (those are per-launch inputs)." >&2
-    exit 1
-  fi
-  set -a
-  . "${deployment_env}"
-  set +a
-  export MINT_CODE_ROOT MINT_RAY_NAMESPACE PFS_RUNTIME_ENV_ROOT
-fi
+source_env_file "MINT_DEV_DEPLOYMENT_ENV" "${deployment_env}"
 
-secrets_env="${MINT_DEV_SECRETS_ENV:-/vePFS-Mindverse/share/mint/dev/config/secrets.env}"
-if [ -r "${secrets_env}" ]; then
-  set -a
-  . "${secrets_env}"
-  set +a
-fi
+run_env="${MINT_DEV_RUN_ENV:-}"
+source_env_file "MINT_DEV_RUN_ENV" "${run_env}"
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${mint_user}"
 api_tmp_link="/tmp/mda"
@@ -143,7 +154,44 @@ echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2
 echo "ray head ip source        ${ray_head_ip_path}" >&2
 echo "MINT_TMP_ROOT             ${MINT_TMP_ROOT}" >&2
 echo "MINT_DEV_DEPLOYMENT_ENV   ${deployment_env:-<none, code defaults>}" >&2
+echo "MINT_DEV_RUN_ENV          ${run_env:-<none>}" >&2
 echo "================================" >&2
+
+"${py}" - <<'PY' >&2
+import json
+import os
+import pathlib
+import sys
+
+repo = pathlib.Path(os.environ["MINT_CODE_ROOT"]).resolve()
+sys.path.insert(0, str(repo))
+
+from mint_server import ray_utils
+from mint_server.runtime_env import bootstrap_runtime_pythonpath
+
+pythonpath = bootstrap_runtime_pythonpath(os.environ, repo_root=str(repo))
+job_env = ray_utils.client_job_runtime_env()
+
+summary = {
+    "cwd": os.getcwd(),
+    "python": sys.executable,
+    "pythonpath_entries": len([part for part in pythonpath.split(":") if part]),
+    "pythonpath_has_code_root": str(repo) in pythonpath.split(":"),
+    "ray_client_job_runtime_env": {
+        "keys": sorted((job_env or {}).keys()) if isinstance(job_env, dict) else [],
+        "env_vars": sorted((job_env or {}).get("env_vars", {}).keys())
+        if isinstance(job_env, dict) and isinstance((job_env or {}).get("env_vars"), dict)
+        else [],
+        "working_dir": (job_env or {}).get("working_dir") if isinstance(job_env, dict) else None,
+        "py_modules_count": len((job_env or {}).get("py_modules", []))
+        if isinstance(job_env, dict) and isinstance((job_env or {}).get("py_modules"), list)
+        else 0,
+    },
+}
+print("=== mint-dev python/ray preflight ===")
+print(json.dumps(summary, sort_keys=True))
+print("=====================================")
+PY
 
 "${py}" scripts/bootstrap_control_plane.py
 exec "${py}" scripts/run_server.py

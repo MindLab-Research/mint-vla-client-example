@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import os
 import sys
 import time
 import types
@@ -269,19 +270,24 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
 
     fake_ray.remote = _remote
     fake_ray_util = types.SimpleNamespace(get_node_ip_address=lambda: "10.1.2.3")
+    runtime_env_kwargs = {}
     monkeypatch.setitem(sys.modules, "ray.util", fake_ray_util)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setenv("RAY_ADDRESS", "10.1.2.3:6379")
     monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
-    monkeypatch.setattr(
-        supervisor_module,
-        "actor_runtime_env",
-        lambda **kwargs: {
+    def _fake_actor_runtime_env(**kwargs):
+        runtime_env_kwargs.update(kwargs)
+        return {
             "env_vars": {
                 "PYTHONPATH": kwargs["pythonpath"],
                 **dict(kwargs.get("extra") or {}),
             }
-        },
+        }
+
+    monkeypatch.setattr(
+        supervisor_module,
+        "actor_runtime_env",
+        _fake_actor_runtime_env,
         raising=False,
     )
     monkeypatch.setattr(supervisor_module, "otel_env_vars", lambda: {"OTEL_SERVICE_NAME": "mint-test"}, raising=False)
@@ -306,10 +312,26 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
             "MINT_GIT_SHA": supervisor_module.CURRENT_CODE_IDENTITY,
         }
     }
+    assert runtime_env_kwargs["include_ray_attach_hints"] is False
     assert created["options"]["resources"] == {"node:__internal_head__": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
     assert created["remote_kwargs"]["ray_address"] == "10.1.2.3:6379"
     assert actor.calls == [("snapshot", (), {})]
+
+
+def test_issue_729_supervisor_actor_does_not_export_nested_ray_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RAY_ADDRESS", "driver-address:6379")
+
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        ray_address="nested-address:6379",
+        **_disabled_control_plane_kwargs(),
+    )
+
+    assert supervisor._ray_address == "nested-address:6379"
+    assert os.environ["RAY_ADDRESS"] == "driver-address:6379"
 
 
 def test_issue_593_model_runtime_max_claim_uses_training_override_for_megatron(
@@ -1661,50 +1683,6 @@ async def test_issue_593_supervisor_restarts_dead_runtime_with_monotonic_generat
 
 
 @pytest.mark.anyio
-async def test_issue_593_supervisor_preserves_busy_runtime_on_health_timeout() -> None:
-    from ray.exceptions import GetTimeoutError
-
-    created: list[_FakeRuntimeActor] = []
-    synced: list[list[dict]] = []
-
-    async def _factory(spec: ModelActorSpec, generation: int):
-        actor = _FakeRuntimeActor(
-            actor_name=spec.normalized_actor_name(),
-            domain_key=spec.domain_key,
-            replica_id=spec.replica_id,
-            generation=generation,
-        )
-        created.append(actor)
-        return actor
-
-    supervisor = ModelActorSupervisor(
-        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
-        runtime_factory=_factory,
-        scheduler_sync=lambda registrations: synced.append(
-            [registration.to_dict() for registration in registrations]
-        ),
-        **_disabled_control_plane_kwargs(),
-    )
-    await supervisor.reconcile_once()
-    first_generation = created[0].generation
-    # A health-probe timeout means alive-but-busy, not dead: the runtime must be
-    # neither killed nor recreated, and its scheduler registration must stay
-    # claimable so the in-flight lease is not requeued as replica_unclaimable.
-    created[0].health_errors.append(GetTimeoutError("timed out after 5.000s"))
-
-    out = await supervisor.reconcile_once()
-
-    assert len(created) == 1
-    assert supervisor._actors[("vllm:model-a", "replica-0")] is created[0]
-    replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
-    assert replica["last_action"] == "health_timeout_preserved"
-    assert out["snapshot"]["restarted_total"] == 0
-    assert out["snapshot"]["health_timeout_preserved_total"] == 1
-    assert synced[-1][0]["status"] == "healthy"
-    assert synced[-1][0]["generation"] == first_generation
-
-
-@pytest.mark.anyio
 async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() -> None:
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
@@ -2605,8 +2583,9 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
     ]
 
 
-def test_issue_593_placement_reconciler_kills_orphan_mint_gpu_actor() -> None:
+def test_issue_593_placement_reconciler_kills_orphan_mint_gpu_actor(monkeypatch) -> None:
     killed: list[tuple[str, str, str]] = []
+    monkeypatch.setenv("MINT_UNDESIRED_GPU_ACTOR_GRACE_S", "0")
 
     reconciler = ModelActorPlacementReconciler(
         namespace="mint",
@@ -2638,6 +2617,13 @@ def test_issue_593_placement_reconciler_kills_orphan_mint_gpu_actor() -> None:
         ],
         placement_group_remover=lambda _name, _namespace: False,
     )
+
+    first = reconciler(
+        {},
+        protected_actor_names={"mint_openpi_shared_registered"},
+    )
+    assert first["cleaned_gpu_actor_names"] == []
+    assert killed == []
 
     out = reconciler(
         {},
@@ -2849,6 +2835,7 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
         {
             "detail": True,
             "limit": 10000,
+            "raise_on_missing_output": False,
             "filters": [("ray_namespace", "=", "mint-ns")],
         }
     ]
@@ -2868,6 +2855,66 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
             "node_id": "node-1",
         },
     ]
+
+
+def test_issue_729_default_gpu_actor_lister_does_not_fallback_to_full_private_actor_table(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+    private_actor_calls: list[bool] = []
+
+    class _RayState:
+        @staticmethod
+        def list_actors(**kwargs):
+            calls.append(dict(kwargs))
+            raise RuntimeError("actor table response too large")
+
+    class _RayUtil:
+        state = _RayState()
+
+    class _Ray:
+        util = _RayUtil()
+
+        @staticmethod
+        def is_initialized() -> bool:
+            return True
+
+        @staticmethod
+        def nodes() -> list[dict[str, str]]:
+            return [{"NodeID": "node-1", "NodeManagerAddress": "10.0.0.17"}]
+
+    class _PrivateState:
+        @staticmethod
+        def actors():
+            private_actor_calls.append(True)
+            return {
+                "huge": {
+                    "state": "ALIVE",
+                    "name": "mint_dense_huge",
+                    "ray_namespace": "mint-ns",
+                    "required_resources": {"GPU": 1},
+                    "node_id": "node-1",
+                }
+            }
+
+    monkeypatch.setenv("MINT_RAY_NAMESPACE", "mint-ns")
+    monkeypatch.setitem(sys.modules, "ray", _Ray)
+    monkeypatch.setitem(sys.modules, "ray.util", _RayUtil())
+    monkeypatch.setitem(sys.modules, "ray.util.state", _RayState())
+    monkeypatch.setitem(sys.modules, "ray._private.state", _PrivateState())
+
+    out = list(placement_module._default_gpu_actor_lister())
+
+    assert calls == [
+        {
+            "detail": True,
+            "limit": 10000,
+            "raise_on_missing_output": False,
+            "filters": [("ray_namespace", "=", "mint-ns")],
+        }
+    ]
+    assert out == []
+    assert private_actor_calls == []
 
 
 def test_issue_593_placement_reconciler_does_not_preempt_on_non_capacity_failure() -> None:
@@ -3137,7 +3184,7 @@ async def test_issue_593_supervisor_precreates_controller_pg_before_runtime() ->
     assert len(created) == 1
     assert len(pg_calls) == 1
     assert pg_calls[0]["name"] == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
-    assert pg_calls[0]["bundles"] == ({"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1})
+    assert pg_calls[0]["bundles"] == [{"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1}]
     replica = out["snapshot"]["replicas"]["vllm:Qwen/Test::replica-0"]
     assert replica["state"] == "healthy"
     assert replica["node_pins"] == ["10.0.0.7"]

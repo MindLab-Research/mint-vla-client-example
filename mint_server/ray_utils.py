@@ -181,9 +181,17 @@ def _driver_runtime_env() -> dict[str, Any]:
     # fails with ModuleNotFoundError. Pass PFS_PYTHONPATH as env_vars so the
     # head node can resolve mint_server without an upload.
     if not working_dir:
-        from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
-        if PFS_PYTHONPATH:
-            runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = PFS_PYTHONPATH
+        pfs_pythonpath = ""
+        try:
+            from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
+
+            pfs_pythonpath = str(PFS_PYTHONPATH or "")
+        except Exception:
+            pfs_pythonpath = ""
+        if not pfs_pythonpath:
+            pfs_pythonpath = os.environ.get("MINT_CODE_ROOT", "").strip()
+        if pfs_pythonpath:
+            runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = pfs_pythonpath
 
     py_modules_csv = os.environ.get("MINT_RAY_PY_MODULES_CSV", "").strip()
     py_modules: list[str] = []

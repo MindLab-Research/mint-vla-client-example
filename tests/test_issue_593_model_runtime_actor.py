@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 
 import pytest
@@ -80,6 +81,132 @@ def _finish_failure_kwargs(lease: dict, *, consumer_id: str, error: str) -> dict
         "consumer_generation": 3,
         "error": error,
     }
+
+
+def test_issue_729_model_engine_host_does_not_export_nested_ray_address(monkeypatch) -> None:
+    monkeypatch.setenv("RAY_ADDRESS", "driver-address:6379")
+
+    ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=object(),  # type: ignore[arg-type]
+        task_state_store_client=_FakeTaskStateStore(),
+        task_futures_client=object(),
+        payload_store=object(),  # type: ignore[arg-type]
+        executor=lambda _lease: ExecutorOutcome.success(result={"ok": True}),
+        engine_lifecycle=None,
+        liveness_push=None,
+        ray_address="192.168.40.99:6379",
+    )
+
+    assert os.environ["RAY_ADDRESS"] == "driver-address:6379"
+
+
+def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(monkeypatch) -> None:
+    created: list[dict] = []
+
+    class _RemoteClass:
+        @staticmethod
+        def options(**options):
+            created.append({"options": options})
+            return _RemoteClass()
+
+        def remote(self, **kwargs):
+            created[-1]["kwargs"] = kwargs
+            return {"created": True}
+
+    class _Ray:
+        @staticmethod
+        def get_actor(_name, namespace=None):
+            _ = namespace
+            raise ValueError("missing")
+
+        @staticmethod
+        def remote(**_kwargs):
+            return lambda _cls: _RemoteClass()
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+    monkeypatch.setattr(
+        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "mint_server.config.PFS_RUNTIME_ENV_ROOT",
+        "/runtime",
+    )
+    monkeypatch.setattr(
+        "mint_server.config.MINT_CODE_ROOT",
+        "/repo",
+    )
+    monkeypatch.setattr(
+        "mint_server.config.PFS_HF_MODULES_PATH",
+        "/hf",
+    )
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+
+    out = get_or_create_model_engine_host(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="actor-a",
+        actor_generation=3,
+    )
+
+    assert out == {"created": True}
+    env_vars = created[-1]["options"]["runtime_env"]["env_vars"]
+    assert env_vars["RAY_ADDRESS"] == ""
+    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
+
+
+def test_issue_729_get_or_create_model_engine_host_uses_explicit_ray_address(monkeypatch) -> None:
+    created: list[dict] = []
+
+    class _RemoteClass:
+        @staticmethod
+        def options(**options):
+            created.append({"options": options})
+            return _RemoteClass()
+
+        def remote(self, **kwargs):
+            created[-1]["kwargs"] = kwargs
+            return {"created": True}
+
+    class _Ray:
+        @staticmethod
+        def get_actor(_name, namespace=None):
+            _ = namespace
+            raise ValueError("missing")
+
+        @staticmethod
+        def remote(**_kwargs):
+            return lambda _cls: _RemoteClass()
+
+    monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
+    monkeypatch.setattr(
+        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
+        lambda **_kwargs: {"RAY_ADDRESS": ""},
+    )
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+
+    out = get_or_create_model_engine_host(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="actor-a",
+        actor_generation=3,
+        ray_address="192.168.40.99:6379",
+    )
+
+    assert out == {"created": True}
+    assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
+    assert created[-1]["options"]["runtime_env"]["env_vars"]["RAY_ADDRESS"] == ""
 
 
 def _lease_with_attempt(request_id: str, attempt_id: str) -> dict:

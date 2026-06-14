@@ -30,7 +30,7 @@ update the skill instead of reviving old deployment paths.
 | API port | `8000` (code default) |
 | Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` (launcher default) |
 | Ray namespace | `mint_${USER}` with a non-root user name |
-| Private config | `/vePFS-Mindverse/share/mint/dev/config/secrets.env` |
+| Auth mode | `no-auth` by default; exceptional auth env must come from the explicit launch environment |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
 
 The dev Ray head is reachable only as a Ray Client endpoint. Do not use
@@ -88,8 +88,9 @@ the namespace cannot be derived (for example you run as root), ask the user**
 for `MINT_RAY_NAMESPACE` or `MINT_DEV_USER` instead of inventing one. Do not
 hard-code shared namespaces such as `tinker_leixiang`.
 
-`secrets.env` holds private values (API keys, credentials). Source it only when
-needed; never print it, commit it, or paste its contents into logs.
+Dev runs should not use a default `secrets.env`. Keep per-run values in the
+explicit launch environment or `MINT_DEV_DEPLOYMENT_ENV`, and never print,
+commit, or paste private values into logs.
 
 ## Code Versioning
 
@@ -234,16 +235,14 @@ ray.shutdown()
 PY
 ```
 
-For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured,
-`/internal/*` also requires platform-forwarded identity headers. A plain
-`X-API-Key` request can return `401 {"error":"Missing platform auth headers"}`.
-When auth is enabled, source the dev secrets without printing values and send
-the internal token plus a synthetic operator identity:
+For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured
+through an explicit launch environment, `/internal/*` also requires
+platform-forwarded identity headers. A plain `X-API-Key` request can return
+`401 {"error":"Missing platform auth headers"}`. When auth is enabled, pass the
+internal token through the process environment without printing values and send
+the token plus a synthetic operator identity:
 
 ```bash
-set -a
-. /vePFS-Mindverse/share/mint/dev/config/secrets.env
-set +a
 /usr/bin/curl -s \
   -H "X-Internal-Token: ${MINT_INTERNAL_API_TOKEN:-}" \
   -H "X-MinT-User-Id: 000000000000000000000001" \

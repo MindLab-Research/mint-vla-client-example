@@ -1995,6 +1995,49 @@ def test_issue_638_node_metrics_daemon_skips_ray_global_gauges_on_worker(
         actor.shutdown()
 
 
+def test_issue_729_node_metrics_daemon_actor_options_do_not_export_ray_attach_hints(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _RemoteClass:
+        def options(self, **options):
+            captured["options"] = dict(options)
+            return self
+
+        def remote(self, **kwargs):
+            captured["kwargs"] = dict(kwargs)
+            return {"ok": True}
+
+    class _Ray:
+        @staticmethod
+        def get_actor(_name, namespace=None):
+            _ = namespace
+            raise ValueError("missing")
+
+        @staticmethod
+        def remote(**_kwargs):
+            return lambda _cls: _RemoteClass()
+
+    def _fake_actor_runtime_env(**kwargs):
+        captured["runtime_env_kwargs"] = dict(kwargs)
+        return {"env_vars": {"PYTHONPATH": kwargs["pythonpath"]}}
+
+    monkeypatch.setattr(node_metrics_daemon_module, "ray", _Ray, raising=False)
+    monkeypatch.setitem(sys.modules, "ray", _Ray)
+    monkeypatch.setattr(node_metrics_daemon_module, "PFS_PYTHONPATH", "/pythonpath")
+    monkeypatch.setattr(node_metrics_daemon_module, "actor_runtime_env", _fake_actor_runtime_env)
+    monkeypatch.setattr(node_metrics_daemon_module, "otel_env_vars", lambda: {})
+
+    actor = node_metrics_daemon_module.get_or_create_node_metrics_collector_actor(
+        NodeMetricsDaemonSpec(worker_alias="worker-4", node_ip="192.168.42.7")
+    )
+
+    assert actor == {"ok": True}
+    assert captured["runtime_env_kwargs"]["include_ray_attach_hints"] is False
+    assert captured["options"]["runtime_env"] == {"env_vars": {"PYTHONPATH": "/pythonpath"}}
+
+
 def test_issue_638_ray_global_otel_callbacks_use_bounded_labels(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -126,6 +126,11 @@ def _reconcile_interval_s_from_env() -> float:
     return max(0.1, value)
 
 
+def _adopt_surviving_gpu_actors_enabled() -> bool:
+    raw = str(os.environ.get("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _otel_metric_attrs() -> dict[str, str]:
     attrs = {
         "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
@@ -954,9 +959,11 @@ class ModelActorSupervisorCore:
         state_event_limit: int | None = None,
         ray_address: str | None = None,
     ) -> None:
-        ray_address_value = str(ray_address or "").strip()
-        if ray_address_value:
-            os.environ["RAY_ADDRESS"] = ray_address_value
+        # Detached control-plane actors already run inside a Ray worker context.
+        # Do not write a driver/direct Ray address into the actor process env:
+        # downstream control-plane calls must reuse that worker context instead
+        # of attempting a nested ray.init()/direct attach from inside Ray.
+        self._ray_address = str(ray_address or "").strip() or None
         try:
             from ..logging_context import init_actor_observability
 
@@ -2023,7 +2030,12 @@ class ModelActorSupervisorCore:
         if self._runtime_factory is not None:
             actor = await _maybe_await(self._runtime_factory(spec, generation))
         else:
-            actor = await self._launcher_registry.launch(spec, generation, launcher_key=spec.launcher_key)
+            actor = await self._launcher_registry.launch(
+                spec,
+                generation,
+                launcher_key=spec.launcher_key,
+                ray_address=self._ray_address,
+            )
         try:
             start_result = await _invoke_actor(actor, "start")
         except Exception as e:
@@ -2648,9 +2660,12 @@ class ModelActorSupervisorCore:
         self._reconcile_loop_starting = True
         try:
             # Fix D (#727): re-adopt still-alive mint GPU workers into inventory
-            # BEFORE the first reconcile fires the reaper, so they appear in
-            # _reconcile_protected_actor_names and are never reaped on restart.
-            await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+            # BEFORE the first reconcile fires the reaper. The Ray state API can
+            # crash large shared clusters when actor history is huge, so keep
+            # startup adoption opt-in and leave the explicit method available
+            # for controlled restart flows.
+            if _adopt_surviving_gpu_actors_enabled():
+                await asyncio.to_thread(self._adopt_surviving_gpu_actors)
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         finally:
             self._reconcile_loop_starting = False

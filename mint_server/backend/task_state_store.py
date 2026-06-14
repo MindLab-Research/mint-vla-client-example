@@ -3935,7 +3935,11 @@ def _create_ray_actor_handle():
         "namespace": namespace,
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
+        "runtime_env": actor_runtime_env(
+            pythonpath=PFS_PYTHONPATH,
+            extra=otel_env_vars(),
+            include_ray_attach_hints=False,
+        ),
     }
     apply_detached_actor_resources(options, ray)
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
@@ -4888,6 +4892,9 @@ class _FutureStateAccess:
     async def async_wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("wait_task_status_change", **kwargs)
 
+    async def async_stats(self) -> dict[str, Any]:
+        return await self._dict_call("stats")
+
     async def async_expire_active_tasks(self, **kwargs: Any) -> list[str]:
         return [str(x) for x in await self._list_call("expire_active_tasks", **kwargs)]
 
@@ -5116,13 +5123,22 @@ class TaskFutureService:
         wait = getattr(self._future_state, "async_wait_task_status_change", None)
         if wait is None:
             return None
-        out = await wait(
-            request_id=str(request_id),
-            timeout_s=float(timeout_s),
-            terminal_only=bool(terminal_only),
-        )
+        try:
+            out = await wait(
+                request_id=str(request_id),
+                timeout_s=float(timeout_s),
+                terminal_only=bool(terminal_only),
+            )
+        except (KeyError, TaskStateNotFoundError):
+            out = {"missing": True}
         if bool(out.get("missing")):
-            raise KeyError(f"Unknown request_id: {request_id}") from None
+            out = await self._task_state.async_wait_task_status_change(
+                request_id=str(request_id),
+                timeout_s=float(timeout_s),
+                terminal_only=bool(terminal_only),
+            )
+            if bool(out.get("missing")):
+                raise KeyError(f"Unknown request_id: {request_id}") from None
         record = out.get("record")
         if not isinstance(record, dict):
             return None
