@@ -28,6 +28,11 @@ from mint_server.backend.model_work_execution_context import (
 from mint_server.backend.task_payload_store import TaskPayloadStore
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_task_payload_root(monkeypatch, tmp_path):
+    monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(tmp_path / "payloads"))
+
+
 def _lease(request_id: str = "runtime-req-1", *, finalize: bool = True) -> dict:
     lease = {
         "lease_id": f"lease-{request_id}",

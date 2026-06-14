@@ -40,6 +40,14 @@ on typed control-plane behavior instead of full model runtime provisioning.
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
 | Static checks | scoped `ruff`, scheduler-CI `pyright` config, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
 
+## Hermetic Invariant Defaults
+
+The CI gate must not depend on the self-hosted runner's shared dev data
+directories.  Runtime harnesses that exercise durable finalize success use a
+temporary `MINT_TASK_PAYLOAD_ROOT_DIR` by default, so payload publication
+failures indicate contract behavior rather than filesystem permissions outside
+the test sandbox.
+
 ## Contract Coverage
 
 | Requirement | Primary evidence |
