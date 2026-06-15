@@ -2008,6 +2008,7 @@ class ModelActorSupervisorCore:
         key = spec.key
         generation = self._next_generation(key)
         self._generations[key] = generation
+        started_at = time.time()
         self._states[key] = {
             **self._states.get(key, {}),
             "domain_key": spec.domain_key,
@@ -2019,9 +2020,10 @@ class ModelActorSupervisorCore:
             "generation": generation,
             "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
             "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+            "started_at": started_at,
             "last_error": None,
             "last_action": f"reserve:{reason}",
-            "last_action_at": time.time(),
+            "last_action_at": started_at,
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
             "scheduler_status": "starting",
@@ -2057,6 +2059,7 @@ class ModelActorSupervisorCore:
                 "generation": generation,
                 "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
                 "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+                "started_at": started_at,
                 "last_error": f"{type(e).__name__}: {e}",
                 "last_action": f"start_pending:{reason}",
                 "last_action_at": time.time(),
@@ -2112,6 +2115,7 @@ class ModelActorSupervisorCore:
             "generation": generation,
             "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
             "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+            "started_at": started_at,
             "last_error": None,
             "last_action": f"create_pending_liveness:{reason}",
             "last_action_at": time.time(),
@@ -2526,8 +2530,24 @@ class ModelActorSupervisorCore:
                 threshold_percent=_liveness_gpu_busy_threshold_percent(),
             )
             previous = self._states.get(key, {})
-            state_age_s = max(0.0, now - float(previous.get("last_action_at") or now))
-            if latest_push is None and str(previous.get("state") or "") == "starting" and state_age_s <= stale_after_s:
+            started_at = float(previous.get("started_at") or previous.get("last_action_at") or now)
+            starting_age_s = max(0.0, now - started_at)
+            initial_grace_s = _liveness_initial_grace_s(stale_after_s)
+            push_ready = latest_push is not None and bool(latest_push.running) and bool(latest_push.engine_ready)
+            push_startup_error = _liveness_push_requires_recreate(latest_push)
+            if (
+                str(previous.get("state") or "") == "starting"
+                and not push_ready
+                and not push_startup_error
+                and (latest_push is None or bool(latest_push.running))
+                and starting_age_s <= initial_grace_s
+            ):
+                generation = int(
+                    getattr(latest_push, "actor_generation", None)
+                    or self._generations.get(key, 0)
+                    or previous.get("generation")
+                    or 0
+                )
                 self._states[key] = {
                     **previous,
                     "domain_key": spec.domain_key,
@@ -2536,20 +2556,25 @@ class ModelActorSupervisorCore:
                     "state": "starting",
                     "actor_name": spec.normalized_actor_name(),
                     "launcher_key": spec.launcher_key,
-                    "generation": int(self._generations.get(key, 0) or previous.get("generation") or 0),
+                    "generation": generation,
                     "consumer_id": str(
-                        previous.get("consumer_id")
+                        getattr(latest_push, "consumer_id", None)
+                        or previous.get("consumer_id")
                         or consumer_id_for_replica(
                             spec.domain_key,
                             spec.replica_id,
-                            int(self._generations.get(key, 0) or previous.get("generation") or 0),
+                            generation,
                         )
                     ),
-                    "last_error": None,
-                    "last_action": "awaiting_liveness",
+                    "health": latest_push.to_wire() if latest_push is not None else previous.get("health"),
+                    "started_at": started_at,
+                    "last_error": None if latest_push is None else (latest_push.last_error or latest_push.engine_health.last_error),
+                    "last_action": "awaiting_liveness" if latest_push is None else "awaiting_engine_ready",
                     "last_action_at": now,
-                    "liveness_stale": False,
+                    "liveness_stale": bool(push_stale),
                     "liveness_stale_after_s": stale_after_s,
+                    "liveness_startup_grace_s": initial_grace_s,
+                    "liveness_startup_age_s": starting_age_s,
                     "node_pins": resolved_node_pins,
                     "worker_aliases": original_spec.normalized_worker_aliases(),
                     "gpu_count": spec.gpu_count,
@@ -3022,6 +3047,32 @@ def _liveness_stale_after_s(reconcile_interval_s: float) -> float:
                 raw,
             )
     return max(30.0, float(reconcile_interval_s) * 3.0)
+
+
+def _liveness_initial_grace_s(stale_after_s: float) -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_INITIAL_LIVENESS_GRACE_S") or "").strip()
+    if raw:
+        try:
+            return max(float(stale_after_s), float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_INITIAL_LIVENESS_GRACE_S=%r; using default",
+                raw,
+            )
+    return max(300.0, float(stale_after_s))
+
+
+def _liveness_push_requires_recreate(push: EngineLivenessPush | None) -> bool:
+    if push is None:
+        return False
+    return any(
+        value is not None and _runtime_error_requires_recreate(str(value))
+        for value in (
+            push.last_error,
+            push.engine_health.last_error,
+            push.engine_health.reason,
+        )
+    )
 
 
 def _liveness_gpu_busy_threshold_percent() -> float:

@@ -1870,6 +1870,58 @@ async def test_model_actor_supervisor_keeps_stale_gpu_busy_runtime_without_pull(
 
 
 @pytest.mark.anyio
+async def test_model_actor_supervisor_preserves_slow_starting_runtime_until_initial_liveness_grace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_MODEL_RUNTIME_INITIAL_LIVENESS_GRACE_S", "300")
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        reconcile_interval_s=1.0,
+        **_disabled_control_plane_kwargs(),
+    )
+    await supervisor.reconcile_once()
+    actor = created[0]
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=actor.generation,
+            engine_ready=False,
+            utilization_percent=0.0,
+            pushed_at=time.time() - 120.0,
+        ).to_wire()
+    )
+
+    out = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    replica = out["snapshot"]["replicas"][label]
+    assert len(created) == 1
+    assert replica["state"] == "starting"
+    assert replica["generation"] == actor.generation
+    assert replica["last_action"] == "awaiting_engine_ready"
+    assert replica["liveness_stale"] is True
+    assert replica["liveness_startup_grace_s"] == 300.0
+    assert replica["liveness_startup_age_s"] < 300.0
+    assert synced[-1][0]["status"] == "starting"
+
+
+@pytest.mark.anyio
 async def test_model_actor_supervisor_restarts_stale_gpu_idle_runtime_without_pull() -> None:
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
