@@ -250,13 +250,11 @@ def actor_runtime_env_vars(
         raise RuntimeError("MINT_CODE_ROOT is required")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
-    ray_gcs_address = _env_nonempty(os.environ, "MINT_RAY_GCS_ADDRESS")
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    direct_ray_address = ray_gcs_address or (
-        ray_address if ray_address is not None and not ray_address.startswith("ray://") else None
-    )
+    from .ray_utils import strict_ray_gcs_address
+
+    direct_ray_address = strict_ray_gcs_address()
     if include_ray_attach_hints and direct_ray_address is None:
-        raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 
     out = {
         "MINT_RAY_NAMESPACE": RAY_NAMESPACE,

@@ -284,11 +284,11 @@ def get_or_create_model_engine_host(
         except Exception:
             pass
 
-    from ..ray_utils import preferred_ray_gcs_address
+    from ..ray_utils import strict_ray_gcs_address
 
-    resolved_ray_address = str(ray_address or "").strip() or preferred_ray_gcs_address()
+    resolved_ray_address = str(ray_address or "").strip() or strict_ray_gcs_address()
     if resolved_ray_address is None:
-        raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 
     preferred_python = (preferred_vllm_python_executable() or "").strip()
     runtime_env_extra_payload = {

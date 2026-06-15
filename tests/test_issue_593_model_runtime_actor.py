@@ -2410,7 +2410,8 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
         "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
-    monkeypatch.setenv("RAY_ADDRESS", "local")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "local")
 
     out = get_or_create_model_engine_host(
         domain_key="vllm:model-a",
@@ -2484,7 +2485,8 @@ def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> No
         "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
-    monkeypatch.setenv("RAY_ADDRESS", "local")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "local")
 
     out = get_or_create_model_engine_host(
         domain_key="vllm:model-a",
@@ -2560,7 +2562,8 @@ def test_issue_679_get_or_create_recreates_stale_runtime_env(monkeypatch) -> Non
         "mint_server.backend.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
-    monkeypatch.setenv("RAY_ADDRESS", "local")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "local")
 
     out = get_or_create_model_engine_host(
         domain_key="bumblebee:model-a",

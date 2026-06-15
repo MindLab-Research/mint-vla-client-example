@@ -117,6 +117,15 @@ def test_init_ray_prefers_ray_client_over_gcs_address(monkeypatch):
     assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
 
 
+def test_strict_ray_gcs_address_ignores_legacy_ray_address(monkeypatch):
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_HEAD_ADDRESS_PATH", raising=False)
+
+    assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
+    assert ray_utils.strict_ray_gcs_address() is None
+
+
 def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch):
     calls: list[dict[str, object]] = []
 

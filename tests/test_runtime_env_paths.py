@@ -50,7 +50,12 @@ def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
     layout = checkout_runtime_env_layout(str(root))
     host_python = Path(layout.host_python)
     host_python.unlink()
-    host_python.symlink_to(Path(sys.executable))
+    host_python.write_text(
+        "#!/bin/sh\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    host_python.chmod(0o755)
 
 
 def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, str]]:
@@ -108,7 +113,7 @@ def test_config_prepends_actor_extra_pythonpath(tmp_path):
         "PFS_RUNTIME_ENV_ROOT": str(env_root),
         "MINT_CODE_ROOT": "/repo",
         "PFS_HF_MODULES_PATH": "/hf",
-        "RAY_ADDRESS": "local",
+        "MINT_RAY_GCS_ADDRESS": "local",
         "MINT_ACTOR_EXTRA_PYTHONPATH": str(extra),
     }
 
@@ -1181,7 +1186,35 @@ def test_actor_runtime_env_vars_requires_direct_ray_address(tmp_path):
         },
     )
     assert out.returncode != 0
-    assert "MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required" in (out.stdout + out.stderr)
+    assert "MINT_RAY_GCS_ADDRESS is required" in (out.stdout + out.stderr)
+
+
+def test_actor_runtime_env_vars_rejects_legacy_ray_address_as_attach_hint(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from mint_server.config import actor_runtime_env_vars; "
+                "actor_runtime_env_vars(pythonpath='X')"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+        },
+    )
+    assert out.returncode != 0
+    combined = out.stdout + out.stderr
+    assert "MINT_RAY_GCS_ADDRESS is required" in combined
+    assert "RAY_ADDRESS" not in combined
 
 
 def test_actor_runtime_env_vars_prefers_explicit_gcs_attach_hint(tmp_path):
@@ -1499,6 +1532,7 @@ def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
             "MINT_CODE_ROOT": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_WORKING_DIR": str(local_repo),
         },
     )

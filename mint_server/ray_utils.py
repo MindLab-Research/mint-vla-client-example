@@ -129,6 +129,16 @@ def preferred_ray_gcs_address() -> str | None:
     return None
 
 
+def strict_ray_gcs_address() -> str | None:
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
+    configured_path = _configured_ray_head_address_path()
+    if configured_path is not None:
+        return _read_configured_ray_head_address(configured_path)
+    return None
+
+
 def preferred_driver_ray_address() -> str:
     for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
         addr = os.environ.get(name, "").strip()

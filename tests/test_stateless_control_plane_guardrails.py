@@ -298,15 +298,33 @@ def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
     assert offenders == []
 
 
+def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> None:
+    expectations = {
+        "mint_server/config.py": ["actor_runtime_env_vars"],
+        "mint_server/backend/model_engine_host.py": ["get_or_create_model_engine_host"],
+        "mint_server/backend/model_actor_supervisor.py": ["_create_ray_actor"],
+        "mint_server/backend/verl_inference.py": ["initialize"],
+    }
+    for rel, function_names in expectations.items():
+        path = REPO_ROOT / rel
+        text = path.read_text(encoding="utf-8")
+        if rel == "mint_server/backend/verl_inference.py":
+            functions = _class_methods(path)["VerlInferenceEngine"]
+        else:
+            functions = _module_functions(path)
+        for function_name in function_names:
+            source = ast.get_source_segment(text, functions[function_name]) or ""
+            assert "strict_ray_gcs_address" in source, f"{rel}:{function_name}"
+            assert "preferred_ray_gcs_address" not in source, f"{rel}:{function_name}"
+
+
 def test_ray_address_production_references_are_explicitly_owned() -> None:
     allowed_files = {
         "mint_server/config.py",  # actor env builder and driver address fallback.
         "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
-        "mint_server/backend/model_actor_supervisor.py",  # fallback error text.
         "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
         "mint_server/backend/multinode_inference.py",  # no-attach runtime env key and diagnostics.
         "mint_server/backend/node_placement.py",  # driver/state API fallback.
-        "mint_server/backend/verl_inference.py",  # fallback error text.
         "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
         "ops/backend/config.py",  # ops dashboard config fallback.
         "scripts/run_server.py",  # launcher observability.
