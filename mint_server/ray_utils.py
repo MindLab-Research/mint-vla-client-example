@@ -201,13 +201,11 @@ def _driver_runtime_env() -> dict[str, Any]:
     # fails with ModuleNotFoundError. Pass PFS_PYTHONPATH as env_vars so the
     # head node can resolve mint_server without an upload.
     if not working_dir:
-        pfs_pythonpath = ""
-        try:
-            from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
-
-            pfs_pythonpath = str(PFS_PYTHONPATH or "")
-        except Exception:
-            pfs_pythonpath = ""
+        # Keep Ray Client's job-level bootstrap lean. The head-side Ray Client
+        # backend only needs to unpickle Mint classes; full runtime/vendor paths
+        # belong in actor runtime_env, where they are applied after Ray's native
+        # worker registration path is complete.
+        pfs_pythonpath = os.environ.get("MINT_RAY_JOB_PYTHONPATH", "").strip()
         if not pfs_pythonpath:
             pfs_pythonpath = os.environ.get("MINT_CODE_ROOT", "").strip()
         if pfs_pythonpath:
@@ -242,15 +240,6 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
         return None
     runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
     runtime_env = _blank_ray_worker_bootstrap_attach_env(addr, runtime_env)
-    if isinstance(runtime_env, dict):
-        try:
-            from mint_server.config import preferred_vllm_python_executable  # noqa: PLC0415
-
-            preferred_python = (preferred_vllm_python_executable() or "").strip()
-        except Exception:
-            preferred_python = ""
-        if preferred_python:
-            runtime_env.setdefault("py_executable", preferred_python)
     return runtime_env or None
 
 
@@ -365,7 +354,7 @@ def _blank_ray_worker_bootstrap_attach_env(address: str, existing: Any) -> dict[
     # inherited value before Ray's Python bootstrap starts.
     env_vars.pop("RAY_ADDRESS", None)
     for key in _RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS:
-        env_vars[key] = ""
+        env_vars.pop(key, None)
     runtime_env["env_vars"] = env_vars
     return runtime_env
 

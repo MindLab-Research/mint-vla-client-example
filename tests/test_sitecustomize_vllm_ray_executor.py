@@ -392,6 +392,69 @@ def test_initialize_ray_cluster_patches_v0_executor_layout(monkeypatch):
     }
 
 
+def test_sitecustomize_import_patches_ray_executor_before_vllm_use_v1_exists(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def original(parallel_config, ray_address=None):
+        calls["original"] = {
+            "parallel_config": parallel_config,
+            "ray_address": ray_address,
+            "ray_address_env": __import__("os").environ.get("RAY_ADDRESS"),
+        }
+        return "ok"
+
+    fake_vllm = _fake_package("vllm")
+    fake_vllm_executor = _fake_package("vllm.executor")
+    fake_ray_utils_mod = types.ModuleType("vllm.executor.ray_utils")
+    fake_ray_distributed_mod = types.ModuleType("vllm.executor.ray_distributed_executor")
+    fake_ray_utils_mod.initialize_ray_cluster = original
+    fake_ray_distributed_mod.initialize_ray_cluster = original
+    fake_vllm.executor = fake_vllm_executor  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_utils = fake_ray_utils_mod  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_distributed_executor = fake_ray_distributed_mod  # type: ignore[attr-defined]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.executor", fake_vllm_executor)
+    monkeypatch.setitem(sys.modules, "vllm.executor.ray_utils", fake_ray_utils_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.executor.ray_distributed_executor",
+        fake_ray_distributed_mod,
+    )
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.delenv("VLLM_USE_V1", raising=False)
+
+    _load_repo_sitecustomize()
+
+    assert getattr(
+        fake_ray_utils_mod.initialize_ray_cluster,
+        "_mint_patched_explicit_cluster_address",
+    )
+
+    # Match the Ray backend path that sets VLLM_USE_V1 later, after Python
+    # startup has already imported sitecustomize.
+    monkeypatch.setenv("VLLM_USE_V1", "0")
+    parallel_config = types.SimpleNamespace(ray_runtime_env={"env_vars": {}})
+
+    out = fake_ray_distributed_mod.initialize_ray_cluster(
+        parallel_config,
+        ray_address=None,
+    )
+
+    assert out == "ok"
+    assert calls["original"] == {
+        "parallel_config": parallel_config,
+        "ray_address": "192.168.40.99:6379",
+        "ray_address_env": None,
+    }
+
+
 def test_runtime_env_to_dict_blanks_driver_attach_hints(monkeypatch):
     class FakeRuntimeEnv:
         def to_dict(self):
@@ -440,6 +503,111 @@ def test_runtime_env_to_dict_blanks_driver_attach_hints(monkeypatch):
         "MINT_RAY_GCS_ADDRESS": "192.168.39.234:6379",
     }
     assert data["py_executable"] == "/repo/scripts/vllm_worker_python.py"
+
+
+def test_ray_init_patch_uses_mint_gcs_for_vllm_worker_bare_init(monkeypatch):
+    calls: dict[str, object] = {}
+
+    fake_ray = types.ModuleType("ray")
+
+    def original_init(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "ok"
+
+    fake_ray.init = original_init  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_ADDRESS", "stale-local:6379")
+    monkeypatch.setattr(sys, "argv", ["/repo/scripts/vllm_worker_python.py", "-c", "import ray"])
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_init_drop_worker_attach_hints()
+
+    out = fake_ray.init()  # type: ignore[attr-defined]
+
+    assert out == "ok"
+    assert calls == {"args": (), "kwargs": {"address": "192.168.40.99:6379"}}
+
+
+def test_ray_init_patch_refuses_vllm_worker_local_ray_without_mint_gcs(monkeypatch):
+    calls: dict[str, object] = {}
+
+    fake_ray = types.ModuleType("ray")
+
+    def original_init(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "ok"
+
+    fake_ray.init = original_init  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setattr(sys, "argv", ["/repo/scripts/vllm_worker_python.py", "-c", "import ray"])
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_init_drop_worker_attach_hints()
+
+    try:
+        fake_ray.init()  # type: ignore[attr-defined]
+    except RuntimeError as e:
+        assert "MINT_RAY_GCS_ADDRESS" in str(e)
+    else:
+        raise AssertionError("bare vLLM worker ray.init must not start local Ray")
+    assert calls == {}
+
+
+def test_ray_init_patch_does_not_force_address_in_ray_default_worker(monkeypatch):
+    calls: dict[str, object] = {}
+
+    fake_ray = types.ModuleType("ray")
+
+    def original_init(*args, **kwargs):
+        calls["args"] = args
+        calls["kwargs"] = kwargs
+        return "ok"
+
+    fake_ray.init = original_init  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setattr(sys, "argv", ["python", "-m", "ray._private.workers.default_worker"])
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_init_drop_worker_attach_hints()
+
+    out = fake_ray.init()  # type: ignore[attr-defined]
+
+    assert out == "ok"
+    assert calls == {"args": (), "kwargs": {}}
+
+
+def test_vllm_import_patches_skip_ray_default_worker_bootstrap(monkeypatch):
+    fake_vllm = _fake_package("vllm")
+    fake_vllm_v1 = _fake_package("vllm.v1")
+    fake_vllm_executor = _fake_package("vllm.v1.executor")
+    fake_ray_utils_mod = types.ModuleType("vllm.v1.executor.ray_utils")
+
+    def original_initialize_ray_cluster(*_args, **_kwargs):
+        return "ok"
+
+    fake_ray_utils_mod.initialize_ray_cluster = original_initialize_ray_cluster
+    fake_vllm_v1.executor = fake_vllm_executor  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_utils = fake_ray_utils_mod  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor", fake_vllm_executor)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_utils", fake_ray_utils_mod)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setattr(sys, "argv", ["python", "-m", "ray._private.workers.default_worker"])
+
+    _load_repo_sitecustomize()
+
+    assert fake_ray_utils_mod.initialize_ray_cluster is original_initialize_ray_cluster
 
 
 def test_parallel_config_ray_runtime_env_blanks_driver_attach_hints_and_sets_wrapper(monkeypatch):
@@ -684,19 +852,14 @@ def test_ray_init_patch_drops_runtime_ray_address_reintroduced_by_worker(monkeyp
     module = _load_repo_sitecustomize()
     module._patch_ray_init_drop_worker_attach_hints()
 
-    out = fake_ray.init(address="auto", namespace="mint")  # type: ignore[attr-defined]
+    try:
+        fake_ray.init(address="auto", namespace="mint")  # type: ignore[attr-defined]
+    except RuntimeError as e:
+        assert "MINT_RAY_GCS_ADDRESS" in str(e)
+    else:
+        raise AssertionError("vLLM worker ray.init(address='auto') must not start local Ray")
 
-    assert out == {"ok": True}
-    assert calls == [
-        {
-            "args": (),
-            "kwargs": {"address": "auto", "namespace": "mint"},
-            "ray_address_env": None,
-            "ray_client_env": None,
-            "mint_ray_client_env": None,
-            "mint_ray_gcs_env": None,
-        }
-    ]
+    assert calls == []
     assert "RAY_ADDRESS" not in __import__("os").environ
     assert "MINT_RAY_GCS_ADDRESS" not in __import__("os").environ
 

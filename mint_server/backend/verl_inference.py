@@ -2888,7 +2888,6 @@ class VerlInferenceEngine:
             actor_ld_library_path,
             actor_runtime_env_vars,
             otel_env_vars,
-            preferred_vllm_python_executable,
         )
 
         from verl.workers.config import CheckpointEngineConfig, HFModelConfig, RolloutConfig
@@ -2966,9 +2965,6 @@ class VerlInferenceEngine:
                 include_ray_attach_hints=False,
             )
         }
-        preferred_python = (preferred_vllm_python_executable() or "").strip()
-        if preferred_python:
-            runtime_env["py_executable"] = preferred_python
 
         actor_options: dict[str, Any] = {
             **_vllm_actor_pin_options_for_model(self.model_path, required_gpus=int(total_gpus)),

@@ -305,8 +305,6 @@ def get_or_create_model_engine_host(
             include_ray_attach_hints=False,
         )
     }
-    if preferred_python:
-        runtime_env["py_executable"] = preferred_python
 
     remote_cls = ray.remote(num_cpus=0, max_concurrency=64, max_restarts=-1)(ModelEngineHost)
     options: dict[str, Any] = {

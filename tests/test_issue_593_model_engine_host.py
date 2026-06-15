@@ -177,10 +177,7 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert env_vars["MINT_VLLM_CHILD_PYTHON_EXECUTABLE"] == "/repo/scripts/vllm_worker_python.py"
     assert env_vars["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"
-    assert (
-        created[-1]["options"]["runtime_env"]["py_executable"]
-        == "/repo/scripts/vllm_worker_python.py"
-    )
+    assert "py_executable" not in created[-1]["options"]["runtime_env"]
     assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
 
 

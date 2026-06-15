@@ -33,10 +33,17 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     assert "syncing dev checkout" in text
     assert "git -C" in text
     assert "MINT_GIT_SHA" in text
+    assert "MINT_CONTROL_PLANE_NODE" in text
     assert "MINT_DEV_STOP_EXISTING_PORT_SERVER" in text
     assert '"scripts/run_server.py"' in text
+    assert "MINT_DEV_TOPOLOGY_SOURCE_DIR" in text
+    assert "syncing topology env" in text
+    assert 'rsync -a --delete --include \'*/\' --include \'*.yaml\' --exclude \'*\'' in text
     assert "scripts/tools/dev_ray_cleanup.py gc-stale-actors" in text
     assert "scripts/tools/dev_ray_cleanup.py reset-control-plane" in text
+    assert "MINT_DEV_RESET_SKIP_RAY_WHEN_NO_ALIVE" in text
+    assert 'bootstrap_timeout_s="${MINT_DEV_BOOTSTRAP_TIMEOUT_S:-180}"' in text
+    assert 'scripts/bootstrap_control_plane.py --timeout-s "${bootstrap_timeout_s}"' in text
     # Optional deployment policy must not carry code root or namespace.
     assert "MINT_DEV_DEPLOYMENT_ENV" in text
     assert (
