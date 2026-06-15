@@ -5,10 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import mint_server.backend.dense_trainer as dense_trainer
-import mint_server.backend.runtime_observability as runtime_obs_module
-from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
-from mint_server.backend.training_session_manager import TrainingSession
+import mint_server.backend.training.dense.dense_trainer as dense_trainer
+import mint_server.backend.core.runtime_observability as runtime_obs_module
+from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
+from mint_server.backend.training.training_session_manager import TrainingSession
 
 
 @pytest.fixture
@@ -319,7 +319,7 @@ async def test_issue_561_rebind_refuses_poisoned_dense_actor(monkeypatch: pytest
         lambda actor_name: "forward_backward:CUDA error: device-side assert triggered",
     )
     monkeypatch.setattr(
-        "mint_server.backend.verl_training.ray.get_actor",
+        "mint_server.backend.training.verl.verl_training.ray.get_actor",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("poisoned actor must not be rebound")),
     )
 
@@ -352,10 +352,10 @@ def test_issue_561_training_worker_validates_input_contract_before_gpu(monkeypat
 
     obs = runtime_obs_module.RuntimeObservability()
     events: list[tuple[str, dict[str, object] | None]] = []
-    monkeypatch.setattr("mint_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training._get_torch", lambda: SimpleNamespace())
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", obs)
     monkeypatch.setattr(
-        "mint_server.backend.verl_training.record_span_event_otel",
+        "mint_server.backend.training.verl.verl_training.record_span_event_otel",
         lambda name, *, attributes=None: events.append((name, attributes)),
     )
 
@@ -427,8 +427,8 @@ def test_issue_561_rejects_non_finite_weight_inputs_before_gpu(monkeypatch: pyte
     )
     worker.tokenizer = SimpleNamespace(vocab_size=16)
 
-    monkeypatch.setattr("mint_server.backend.verl_training._get_torch", lambda: SimpleNamespace())
-    monkeypatch.setattr("mint_server.backend.verl_training.record_span_event_otel", lambda *args, **kwargs: None)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training._get_torch", lambda: SimpleNamespace())
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.record_span_event_otel", lambda *args, **kwargs: None)
     monkeypatch.setattr(runtime_obs_module, "runtime_observability", runtime_obs_module.RuntimeObservability())
 
     bad_item = {

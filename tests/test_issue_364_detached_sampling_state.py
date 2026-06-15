@@ -11,8 +11,8 @@ import pytest
 from fastapi import HTTPException
 
 from mint_server import app as app_module
-from mint_server.backend.task_state_store import FutureStatus
-from mint_server.backend.session_manager import SessionManager
+from mint_server.backend.stores.task_state_store import FutureStatus
+from mint_server.backend.sessions.session_manager import SessionManager
 from mint_server.models.types import SampleResponse, SampledSequence
 from mint_server.routes import sampling as sampling_route
 from mint_server.routes import service as service_route
@@ -90,10 +90,10 @@ class _FakeModelActorInventory:
 def _install_fake_model_actor_inventory(
     monkeypatch: pytest.MonkeyPatch, pool: _FakeModelActorInventory
 ) -> None:
-    module = types.ModuleType("mint_server.backend.model_actor_supervisor")
+    module = types.ModuleType("mint_server.backend.actors.model_actor_supervisor")
     module.get_model_actor_supervisor = lambda: pool
     monkeypatch.setitem(
-        sys.modules, "mint_server.backend.model_actor_supervisor", module
+        sys.modules, "mint_server.backend.actors.model_actor_supervisor", module
     )
 
 
@@ -103,7 +103,7 @@ def test_issue_364_register_multi_lora_session_persists_detached_metadata(
     persisted: list[dict] = []
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.upsert_sampling_session",
+        "mint_server.backend.stores.sampling_session_store.upsert_sampling_session",
         lambda info: persisted.append(dict(info)),
     )
 
@@ -213,7 +213,7 @@ async def test_issue_364_app_restore_sampling_sessions_reads_detached_store(
         ]
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_list_sampling_sessions",
+        "mint_server.backend.stores.sampling_session_store.async_list_sampling_sessions",
         _async_list_sampling_sessions,
     )
 
@@ -238,7 +238,7 @@ def test_issue_364_get_session_no_longer_uses_process_local_fallback(
         return None
 
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.async_get_session_index",
+        "mint_server.backend.stores.session_index_store.async_get_session_index",
         _async_get_session_index,
     )
     monkeypatch.setattr(
@@ -259,7 +259,7 @@ def test_issue_364_list_sessions_no_longer_uses_process_local_fallback(
         return []
 
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.async_list_session_index",
+        "mint_server.backend.stores.session_index_store.async_list_session_index",
         _async_list_session_index,
     )
     monkeypatch.setattr(
@@ -293,22 +293,22 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
     }
 
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.get_sampler_index",
+        "mint_server.backend.stores.session_index_store.get_sampler_index",
         lambda sampler_id: {
             "sampler_id": sampler_id,
             "session_id": "parent-session-364",
         },
     )
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.delete_sampler_index",
+        "mint_server.backend.stores.session_index_store.delete_sampler_index",
         lambda sampler_id: calls.append(("delete", sampler_id, None)),
     )
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.remove_sampler_from_session",
+        "mint_server.backend.stores.session_index_store.remove_sampler_from_session",
         lambda session_id, sampler_id: calls.append(("unlink", sampler_id, session_id)),
     )
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.get_sampling_session_info",
         lambda session_id: (
             dict(detached_info)
             if session_id == detached_info.get("session_id")
@@ -321,7 +321,7 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
         detached_info.clear()
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.delete_sampling_session",
+        "mint_server.backend.stores.sampling_session_store.delete_sampling_session",
         _delete_sampling_session,
     )
 
@@ -340,7 +340,7 @@ def test_issue_364_end_session_cleans_sampler_index_and_parent_session_link(
 async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     async def _async_get_sampling_session_info(session_id: str):
         assert session_id == "sess-364-live"
@@ -392,7 +392,7 @@ async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
     monkeypatch.setattr(futures_route, "task_futures", fake_task_futures)
     monkeypatch.setattr(mws, "model_work_scheduler", _FakeScheduler())
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
     )
     monkeypatch.setattr(
@@ -400,7 +400,7 @@ async def test_issue_364_sample_once_uses_detached_store_and_scheduler_future(
         _async_remote_sampling_session,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_model_config",
+        "mint_server.backend.core.model_registry.get_model_config",
         lambda _model_name: SimpleNamespace(max_model_len=8192),
     )
 
@@ -447,7 +447,7 @@ async def test_issue_364_refreshes_local_sampler_on_version_mismatch(
 
     monkeypatch.setattr(sampling_route, "session_manager", manager)
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
     )
 
@@ -499,8 +499,8 @@ def test_issue_364_restore_sampling_session_merges_last_activity_without_version
 def test_issue_364_model_actor_inventory_wrapper_preserves_metadata_without_ray(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-    from mint_server.backend.model_actor_supervisor import (
+    import mint_server.backend.actors.model_actor_inventory as model_actor_inventory_module
+    from mint_server.backend.actors.model_actor_supervisor import (
         ActorType,
         ModelActorSupervisor,
     )
@@ -653,15 +653,15 @@ async def test_issue_364_save_weights_for_sampler_persists_lora_int_id(
         lambda *_args, **_kwargs: "mint://ckpt/run-364/_ephemeral_364",
     )
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.add_sampler_to_session",
+        "mint_server.backend.stores.session_index_store.add_sampler_to_session",
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.add_heartbeat_sampler_to_session",
+        "mint_server.backend.stores.session_index_store.add_heartbeat_sampler_to_session",
         lambda **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.session_index_store.upsert_sampler_index",
+        "mint_server.backend.stores.session_index_store.upsert_sampler_index",
         lambda _payload: None,
     )
 
@@ -713,7 +713,7 @@ async def test_issue_364_owner_cleanup_respects_detached_sampling_last_activity(
         }
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
     )
 
@@ -745,15 +745,15 @@ async def test_issue_364_sampling_restore_drops_stale_local_snapshot_when_store_
         return None
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
     )
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.get_sampling_session_info",
         lambda _session_id: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.delete_sampling_session",
+        "mint_server.backend.stores.sampling_session_store.delete_sampling_session",
         lambda _session_id: None,
     )
 
@@ -777,7 +777,7 @@ async def test_issue_364_asample_missing_detached_sampler_is_404(
 
     monkeypatch.setattr(sampling_route, "session_manager", None)
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.async_get_sampling_session_info",
         _async_get_sampling_session_info,
     )
     monkeypatch.setattr(

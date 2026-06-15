@@ -70,7 +70,7 @@ Patterns used:
 - Path-based loading on shared filesystem: used to avoid serializing 10k+ tensors through Ray.
 
 Key knobs and locations:
-- `MINT_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `mint_server/routes/service.py` and `mint_server/backend/session_manager.py`).
+- `MINT_CHECKPOINT_DIR` controls where server-side code expects checkpoints/adapters for `file://` and `mint://` URIs (see `mint_server/routes/service.py` and `mint_server/backend/sessions/session_manager.py`).
 - External `tinker://` request payloads are accepted only at the API compatibility boundary and rewritten to `mint://` before route handlers run.
 
 ## Resume metadata lookup
@@ -137,8 +137,8 @@ MoE training runs in Megatron, but inference consumes PEFT-style adapter checkpo
 - Some "export weights" APIs merge LoRA into base weights, which is unusable for vLLM multi-LoRA.
 
 Implementation locations:
-- Extraction and conversion logic: `mint_server/backend/megatron_distributed.py` (MegatronRankWorker.get_lora_state_dict)
-- Writing adapter checkpoint files: `mint_server/backend/megatron_distributed.py` (MegatronRankWorker.save_checkpoint)
+- Extraction and conversion logic: `mint_server/backend/training/megatron/megatron_distributed.py` (MegatronRankWorker.get_lora_state_dict)
+- Writing adapter checkpoint files: `mint_server/backend/training/megatron/megatron_distributed.py` (MegatronRankWorker.save_checkpoint)
 
 Preferred path (default):
 - Use Megatron-Bridge's newer adapter export API when available:

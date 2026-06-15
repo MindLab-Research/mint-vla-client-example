@@ -308,11 +308,11 @@ Implement the minimal root-cause fix.
 After code changes:
 1) push the branch and update the issue checkout on `mint-dev` with git
 2) if the change touches code that can be imported/executed inside detached actors, run the 3b "Namespace cleanup" snippet to kill the issue namespace actors so the next run loads new code:
-   - vLLM: `mint_server/backend/verl_inference.py`, `mint_server/backend/multi_lora_engine.py`, `mint_server/backend/multinode_inference.py`, `mint_server/backend/vllm_*.py`
-   - Megatron: `mint_server/backend/megatron_distributed.py`, `mint_server/backend/megatron_training.py`, `mint_server/backend/verl_patches.py`
-   - Dense training pool: `mint_server/backend/verl_training.py`
-   - Detached stores/schedulers: `mint_server/backend/task_state_store.py`, `mint_server/backend/model_work_scheduler.py`, `mint_server/backend/model_engine_host.py`, `mint_server/backend/training_session_store.py`, `mint_server/backend/gateway_session_store.py`
-   - Shared (kills required for all GPU actor types): `mint_server/config.py`, `mint_server/ray_utils.py`, `mint_server/backend/ray_kill.py`, `mint_server/backend/model_registry.py`
+   - vLLM: `mint_server/backend/training/verl/verl_inference.py`, `mint_server/backend/inference/multi_lora_engine.py`, `mint_server/backend/inference/multinode_inference.py`, `mint_server/backend/vllm_*.py`
+   - Megatron: `mint_server/backend/training/megatron/megatron_distributed.py`, `mint_server/backend/training/megatron/megatron_training.py`, `mint_server/backend/training/verl/verl_patches.py`
+   - Dense training pool: `mint_server/backend/training/verl/verl_training.py`
+   - Detached stores/schedulers: `mint_server/backend/stores/task_state_store.py`, `mint_server/backend/scheduling/model_work_scheduler.py`, `mint_server/backend/actors/model_engine_host.py`, `mint_server/backend/stores/training_session_store.py`, `mint_server/backend/stores/gateway_session_store.py`
+   - Shared (kills required for all GPU actor types): `mint_server/config.py`, `mint_server/ray_utils.py`, `mint_server/backend/ray_cluster/ray_kill.py`, `mint_server/backend/core/model_registry.py`
    - If uncertain: run namespace cleanup (issue namespace makes this safe).
 3) restart the issue-scoped dev server (stop/start using the issue-scoped commands in 3b)
 4) confirm health endpoint

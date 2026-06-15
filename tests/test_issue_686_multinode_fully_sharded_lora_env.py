@@ -4,7 +4,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-import mint_server.backend.multinode_inference as mi
+import mint_server.backend.inference.multinode_inference as mi
 
 
 def test_issue_686_multinode_fully_sharded_lora_env_defaults_to_enabled(

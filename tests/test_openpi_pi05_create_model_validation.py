@@ -22,7 +22,7 @@ def _fake_get_model_config(base_model: str):
 
 
 def test_openpi_pi05_requires_lora_config(monkeypatch) -> None:
-    from mint_server.backend import openpi_pi05_training
+    from mint_server.backend.openpi import openpi_pi05_training
 
     monkeypatch.setattr(openpi_pi05_training, "get_model_config", _fake_get_model_config)
 
@@ -31,7 +31,7 @@ def test_openpi_pi05_requires_lora_config(monkeypatch) -> None:
 
 
 def test_openpi_pi05_rejects_unsupported_lora_rank(monkeypatch) -> None:
-    from mint_server.backend import openpi_pi05_training
+    from mint_server.backend.openpi import openpi_pi05_training
 
     monkeypatch.setattr(openpi_pi05_training, "get_model_config", _fake_get_model_config)
 
@@ -40,7 +40,7 @@ def test_openpi_pi05_rejects_unsupported_lora_rank(monkeypatch) -> None:
 
 
 def test_openpi_pi05_rejects_partial_lora_toggle_contract(monkeypatch) -> None:
-    from mint_server.backend import openpi_pi05_training
+    from mint_server.backend.openpi import openpi_pi05_training
 
     monkeypatch.setattr(openpi_pi05_training, "get_model_config", _fake_get_model_config)
 
@@ -56,7 +56,7 @@ def test_openpi_pi05_rejects_partial_lora_toggle_contract(monkeypatch) -> None:
 
 
 def test_openpi_pi05_accepts_the_upstream_lora_contract(monkeypatch) -> None:
-    from mint_server.backend import openpi_pi05_training
+    from mint_server.backend.openpi import openpi_pi05_training
 
     monkeypatch.setattr(openpi_pi05_training, "get_model_config", _fake_get_model_config)
 
@@ -65,7 +65,7 @@ def test_openpi_pi05_accepts_the_upstream_lora_contract(monkeypatch) -> None:
 
 
 def test_non_openpi_pi05_models_are_left_untouched(monkeypatch) -> None:
-    from mint_server.backend import openpi_pi05_training
+    from mint_server.backend.openpi import openpi_pi05_training
 
     monkeypatch.setattr(openpi_pi05_training, "get_model_config", _fake_get_model_config)
 

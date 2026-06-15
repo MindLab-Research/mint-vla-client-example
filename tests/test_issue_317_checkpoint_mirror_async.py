@@ -68,7 +68,7 @@ async def test_issue_317_load_state_restores_session_from_detached_metadata(
 ) -> None:
     from mint_server.models.types import LoadStateRequest
     from mint_server.routes import weights
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     inflight_calls = _stub_training_inflight(monkeypatch, weights)
     checkpoint_dir = tmp_path / "restore-load"

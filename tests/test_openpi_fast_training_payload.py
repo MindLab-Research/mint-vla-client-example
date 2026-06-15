@@ -1,7 +1,7 @@
 import pytest
 
-import mint_server.backend.openpi_fast_training as openpi_fast_training
-from mint_server.backend.model_registry import MODEL_CONFIGS
+import mint_server.backend.openpi.openpi_fast_training as openpi_fast_training
+from mint_server.backend.core.model_registry import MODEL_CONFIGS
 from mint_server.models.types import Datum, EncodedTextChunk, ImageChunk, ModelInput
 
 

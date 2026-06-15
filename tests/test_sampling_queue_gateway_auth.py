@@ -5,7 +5,7 @@ import sys
 import types
 from types import SimpleNamespace
 
-from mint_server.backend import model_work_dispatch
+from mint_server.backend.scheduling import model_work_dispatch
 from mint_server.models.types import (
     ModelInput,
     SampleRequest,

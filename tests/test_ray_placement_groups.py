@@ -32,8 +32,8 @@ def _import_pg_module(monkeypatch: pytest.MonkeyPatch, *, pg_info: dict[str, obj
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    return importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    return importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
 
 def test_get_named_placement_group_rejects_wrong_namespace(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,8 +77,8 @@ def test_get_named_placement_group_passes_namespace_when_supported(
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
     assert module.get_named_placement_group("megatron_qwen_pg", namespace="ns-a") is handle
     assert calls == [("megatron_qwen_pg", "ns-a")]
@@ -147,8 +147,8 @@ def test_remove_named_placement_group_falls_back_to_table_id_for_unknown_namespa
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
     monkeypatch.setitem(sys.modules, "ray.util.placement_group", placement_group_module)
     monkeypatch.setitem(sys.modules, "ray._raylet", raylet_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
     assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is True
     assert len(removed) == 1
@@ -184,8 +184,8 @@ def test_remove_named_placement_group_ignores_removed_table_entries(
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
     assert module.remove_named_placement_group("megatron_qwen_pg", namespace="ns-a") is False
     assert removed == []
@@ -217,8 +217,8 @@ def test_remove_named_placement_group_handles_old_ray_namespace_miss(
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
     assert module.remove_named_placement_group("missing_pg", namespace="ns-a") is False
     assert calls == [
@@ -245,8 +245,8 @@ def test_get_named_placement_group_classifies_missing_old_ray_lookup(
 
     monkeypatch.setitem(sys.modules, "ray", ray_module)
     monkeypatch.setitem(sys.modules, "ray.util", ray_util_module)
-    sys.modules.pop("mint_server.backend.ray_placement_groups", None)
-    module = importlib.import_module("mint_server.backend.ray_placement_groups")
+    sys.modules.pop("mint_server.backend.ray_cluster.ray_placement_groups", None)
+    module = importlib.import_module("mint_server.backend.ray_cluster.ray_placement_groups")
 
     with pytest.raises(module.PlacementGroupNotFoundError):
         module.get_named_placement_group("missing_pg", namespace="ns-a")

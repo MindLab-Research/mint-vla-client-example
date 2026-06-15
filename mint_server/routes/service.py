@@ -27,7 +27,7 @@ from ..auth_identity import can_bypass_ownership_user_data
 from ..auth_identity import can_manage_system
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.session_heartbeat_store import session_heartbeat_store
+from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
 from ..health_checks import internal_lightweight_healthz_response, public_business_healthz_response
 from ..model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
@@ -46,7 +46,7 @@ from ..models.types import (
 from ..server_info import get_server_info
 
 if TYPE_CHECKING:
-    from ..backend.session_manager import SessionManager
+    from mint_server.backend.sessions.session_manager import SessionManager
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -140,7 +140,7 @@ async def internal_healthz() -> dict:
 @router.get("/get_server_capabilities")
 async def get_server_capabilities(http_request: Request) -> dict:
     """Return server capabilities for tinker client."""
-    from ..backend.model_registry import get_model_config, list_supported_models
+    from mint_server.backend.core.model_registry import get_model_config, list_supported_models
     from ..gateway import get_gateway_config, get_upstream_capabilities, upstream_for_model
 
     supported_local = list_supported_models()
@@ -260,7 +260,7 @@ async def create_session(request: CreateSessionRequest, http_request: Request) -
     session_id = str(uuid.uuid4())
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
-    from ..backend.session_index_store import upsert_session_index
+    from mint_server.backend.stores.session_index_store import upsert_session_index
 
     try:
         upsert_session_index(
@@ -365,7 +365,7 @@ async def _create_sampling_session_impl(
                 http_request=http_request,
             )
 
-        from ..backend.bumblebee_lora import prepare_lora_adapter_for_vllm
+        from mint_server.backend.training.bumblebee.bumblebee_lora import prepare_lora_adapter_for_vllm
 
         try:
             adapter_path = prepare_lora_adapter_for_vllm(adapter_path)
@@ -408,7 +408,7 @@ async def _create_sampling_session_impl(
         lora_rank = 0
 
     def _write_sampler_index(sampler_id: str) -> None:
-        from ..backend.session_index_store import add_sampler_to_session, upsert_sampler_index
+        from mint_server.backend.stores.session_index_store import add_sampler_to_session, upsert_sampler_index
 
         # Generic create_sampling_session children stay out of root heartbeat fanout.
         add_sampler_to_session(
@@ -454,7 +454,7 @@ async def _create_sampling_session_impl(
         sampling_session_id = f"{request.session_id}:sample:{request.sampling_session_seq_id}"
         existing_info = None
         try:
-            from ..backend.sampling_session_store import async_get_sampling_session_info
+            from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
             existing_info = await async_get_sampling_session_info(sampling_session_id)
         except Exception:
@@ -480,7 +480,7 @@ async def _create_sampling_session_impl(
         sampling_session_id = str(uuid.uuid4())
 
     try:
-        from ..backend.sampling_session_store import upsert_sampling_session
+        from mint_server.backend.stores.sampling_session_store import upsert_sampling_session
 
         upsert_sampling_session(
             {
@@ -503,7 +503,7 @@ async def _create_sampling_session_impl(
         _write_sampler_index(sampling_session_id)
     except Exception as e:
         try:
-            from ..backend.sampling_session_store import delete_sampling_session
+            from mint_server.backend.stores.sampling_session_store import delete_sampling_session
 
             delete_sampling_session(sampling_session_id)
         except Exception:
@@ -546,7 +546,7 @@ async def ensure_sampling_session(
     sampling_session_id = response.sampling_session_id
     base_model = None
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         info = await async_get_sampling_session_info(sampling_session_id)
         if isinstance(info, dict):
@@ -573,7 +573,7 @@ async def get_session(session_id: str, http_request: Request) -> GetSessionRespo
     request_user_data = _get_user_data(http_request)
     info = None
     try:
-        from ..backend.session_index_store import async_get_session_index
+        from mint_server.backend.stores.session_index_store import async_get_session_index
 
         info = await async_get_session_index(session_id)
     except Exception as e:
@@ -596,7 +596,7 @@ async def list_sessions(limit: int = 20, offset: int = 0, http_request: Request 
     entries: list[dict] = []
 
     try:
-        from ..backend.session_index_store import async_list_session_index
+        from mint_server.backend.stores.session_index_store import async_list_session_index
 
         infos = await async_list_session_index()
     except Exception as e:
@@ -626,7 +626,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
     request_user_data = _get_user_data(http_request)
     info = None
     try:
-        from ..backend.session_index_store import async_get_sampler_index
+        from mint_server.backend.stores.session_index_store import async_get_sampler_index
 
         info = await async_get_sampler_index(sampler_id)
     except Exception as e:
@@ -638,7 +638,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         base_model = info.get("base_model")
         if not base_model:
             try:
-                from ..backend.sampling_session_store import async_get_sampling_session_info
+                from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
                 persisted = await async_get_sampling_session_info(sampler_id)
             except Exception:
@@ -679,7 +679,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
         )
 
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         persisted = await async_get_sampling_session_info(sampler_id)
     except Exception:
@@ -831,7 +831,7 @@ async def _child_sampler_ids_for_heartbeat(
     request_user_data: dict | None,
 ) -> list[str]:
     try:
-        from ..backend.session_index_store import async_get_sampler_index, async_get_session_index
+        from mint_server.backend.stores.session_index_store import async_get_sampler_index, async_get_session_index
 
         info = await async_get_session_index(root_session_id)
     except Exception as e:
@@ -881,7 +881,7 @@ async def _child_sampler_ids_for_heartbeat(
 
 
 async def _touch_child_sampler_sessions(root_session_id: str, request_user_data: dict | None) -> None:
-    from ..backend.sampling_session_store import async_set_sampling_session_last_activity
+    from mint_server.backend.stores.sampling_session_store import async_set_sampling_session_last_activity
 
     for sampler_id in await _child_sampler_ids_for_heartbeat(root_session_id, request_user_data):
         try:
@@ -913,7 +913,7 @@ async def session_heartbeat(
     """
     await _update_session_heartbeat_store(request.session_id)
     try:
-        from ..backend.sampling_session_store import async_set_sampling_session_last_activity
+        from mint_server.backend.stores.sampling_session_store import async_set_sampling_session_last_activity
 
         await async_set_sampling_session_last_activity(request.session_id, time.time())
     except Exception as e:

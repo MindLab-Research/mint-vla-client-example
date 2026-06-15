@@ -32,10 +32,10 @@ def main() -> int:
 
     # Namespace propagation across modules that create/get detached actors.
     required = {
-        "mint_server/backend/multi_lora_engine.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
-        "mint_server/backend/megatron_distributed.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
-        "mint_server/backend/multinode_inference.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
-        "mint_server/backend/verl_training.py": "PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE",
+        "mint_server/backend/inference/multi_lora_engine.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
+        "mint_server/backend/training/megatron/megatron_distributed.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
+        "mint_server/backend/inference/multinode_inference.py": "PERSISTENT_NAMESPACE = RAY_NAMESPACE",
+        "mint_server/backend/training/verl/verl_training.py": "PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE",
     }
     for rel, needle in required.items():
         txt = (_repo_root / rel).read_text(encoding="utf-8")
@@ -51,8 +51,8 @@ def main() -> int:
 
     # Regression guard: no hard-coded shared dev root in worker PYTHONPATH.
     for rel in (
-        "mint_server/backend/verl_inference.py",
-        "mint_server/backend/verl_training.py",
+        "mint_server/backend/training/verl/verl_inference.py",
+        "mint_server/backend/training/verl/verl_training.py",
     ):
         txt = (_repo_root / rel).read_text(encoding="utf-8")
         if "/vePFS-Mindverse/share/code/mint-server" in txt:

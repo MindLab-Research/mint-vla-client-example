@@ -3,12 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend import sampling_cleanup_executor as cleanup_executor_module
-from mint_server.backend import sampling_session_store as sampling_store_module
-from mint_server.backend import session_manager as session_manager_module
+from mint_server.backend.inference import sampling_cleanup_executor as cleanup_executor_module
+from mint_server.backend.stores import sampling_session_store as sampling_store_module
+from mint_server.backend.sessions import session_manager as session_manager_module
 from mint_server.routes import service as service_route
 
-task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
 
 
 @pytest.fixture
@@ -199,7 +199,7 @@ async def test_issue_369_sampling_heartbeat_updates_detached_last_activity(monke
 def test_issue_369_session_manager_base_model_getter_restores_from_detached_store(monkeypatch) -> None:
     manager = session_manager_module.SessionManager()
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.get_sampling_session_info",
+        "mint_server.backend.stores.sampling_session_store.get_sampling_session_info",
         lambda session_id: {
             "session_id": session_id,
             "base_model": "Qwen/Qwen3-30B-A3B-Instruct-2507",

@@ -42,7 +42,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
 ) -> None:
     from mint_server.routes import training as training_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
     import mint_server.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
@@ -241,8 +241,8 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     stub_engine = StubTrainingEngine()
     stub_task_futures = StubTaskFutureService()
 
-    import mint_server.backend.session_index_store as session_index_store_module
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.session_index_store as session_index_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     training_store_updates: list[dict] = []
     session_index_updates: list[tuple[str, str, str | None, str]] = []
@@ -303,10 +303,10 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
     tmp_path: Path, monkeypatch
 ) -> None:
     from mint_server.routes import training as training_routes
-    from mint_server.backend.training_session_manager import TrainingSessionManager
+    from mint_server.backend.training.training_session_manager import TrainingSessionManager
     from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    import mint_server.backend.session_index_store as session_index_store_module
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.session_index_store as session_index_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "loaded-config-checkpoint"
     checkpoint_dir.mkdir()
@@ -396,10 +396,10 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     tmp_path: Path, monkeypatch
 ) -> None:
     from mint_server.routes import training as training_routes
-    from mint_server.backend.training_engine_router import TrainingEngineRouter
+    from mint_server.backend.sessions.training_engine_router import TrainingEngineRouter
     from mint_server.models.types import CreateModelFromStateRequest
-    import mint_server.backend.session_index_store as session_index_store_module
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.session_index_store as session_index_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "openpi-training"
     (checkpoint_dir / "1" / "params").mkdir(parents=True)
@@ -530,7 +530,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -626,7 +626,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
 def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monkeypatch) -> None:
     from mint_server.routes import weights as weights_routes
     from mint_server.models.types import LoadStateRequest
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "resolved-load-state"
     checkpoint_dir.mkdir()
@@ -728,7 +728,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
 def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkeypatch) -> None:
     from mint_server.routes import weights as weights_routes
     from mint_server.models.types import LoadStateRequest, LoRAConfig
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "issue-417-load"
     checkpoint_dir.mkdir()
@@ -854,7 +854,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
 ) -> None:
     from mint_server.routes import weights as weights_routes
     from mint_server.models.types import LoadStateRequest, LoRAConfig
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
 
     checkpoint_dir = tmp_path / "issue-417-load-persist-fail"
     checkpoint_dir.mkdir()
@@ -959,7 +959,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
 def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(monkeypatch) -> None:
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1009,7 +1009,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1092,7 +1092,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
 def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1149,7 +1149,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1237,7 +1237,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
 def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, route_path: str) -> None:
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
-    import mint_server.backend.training_session_store as training_store_module
+    import mint_server.backend.stores.training_session_store as training_store_module
     import mint_server.gateway as gateway_module
 
     async def _get_training_route_session_info(_model_id: str):
@@ -1270,7 +1270,7 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
 def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) -> None:
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     class StubTaskFutureService:
         async def async_create_with_id(self, request_id: str) -> None:
@@ -1325,7 +1325,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     weights_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)

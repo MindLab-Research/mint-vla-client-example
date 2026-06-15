@@ -7,13 +7,13 @@ import pytest
 import torch
 
 from mint_server.checkpoints import checkpoint_has_optimizer_state, validate_checkpoint_dir
-from mint_server.backend.verl_training import (
+from mint_server.backend.training.verl.verl_training import (
     VerlTrainingEngine,
     _select_moe_training_backend,
 )
 from mint_server.routes.training import _infer_training_backend_for_base_model
-from mint_server.backend.model_actor_supervisor import domain_key_for_training_base_model
-from mint_server.backend.bumblebee_distributed import (
+from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
+from mint_server.backend.training.bumblebee.bumblebee_distributed import (
     BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS,
     BUMBLEBEE_TRAIN_STATE_CHECKPOINT_FORMAT,
     BUMBLEBEE_TRAIN_STATE_FILE,
@@ -222,7 +222,7 @@ def test_bumblebee_runtime_pythonpath_prepends_overlay_then_repo(monkeypatch, tm
     monkeypatch.setenv("MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH", str(overlay))
     monkeypatch.setenv("MINT_BUMBLEBEE_MEGATRON_LM_PATH", str(megatron))
     monkeypatch.setenv("MINT_BUMBLEBEE_REPO_PATH", str(repo))
-    monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
+    monkeypatch.setattr("mint_server.backend.training.bumblebee.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
 
     assert _bumblebee_runtime_pythonpath().split(":")[:4] == [
         str(overlay),
@@ -238,7 +238,7 @@ def test_bumblebee_qwen35_runtime_defaults_use_runtime_vendor_megatron(monkeypat
     monkeypatch.delenv("MINT_BUMBLEBEE_MODEL_NAME", raising=False)
     monkeypatch.delenv("MINT_BUMBLEBEE_MEGATRON_LM_PATH", raising=False)
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", str(tmp_path))
-    monkeypatch.setattr("mint_server.backend.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
+    monkeypatch.setattr("mint_server.backend.training.bumblebee.bumblebee_distributed.PFS_PYTHONPATH", "/runtime/site-packages")
 
     expected_vendor = str(tmp_path / "vendor" / "Megatron-LM")
     assert _bumblebee_default_megatron_lm_path("Qwen/Qwen3.5-27B") == expected_vendor
@@ -683,7 +683,7 @@ def test_issue_670_bumblebee_group_ready_checks_rank_workers():
 
 
 def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics_fail(monkeypatch):
-    import mint_server.backend.bumblebee_distributed as bb
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
 
     stale_actor = SimpleNamespace()
     created_actor = object()
@@ -715,7 +715,7 @@ def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics
     monkeypatch.setattr(bb, "BumblebeeWorkerGroup", _FakeRemoteClass())
     monkeypatch.setattr(bb, "actor_runtime_env_vars", lambda **_kwargs: {})
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_publication.publish_backend_model_actor",
+        "mint_server.backend.actors.model_actor_publication.publish_backend_model_actor",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(bb, "is_topology_desired_model", lambda *_args, **_kwargs: False)
@@ -741,7 +741,7 @@ def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics
 
 
 def test_issue_670_bumblebee_get_or_create_keeps_actor_when_diagnostics_timeout(monkeypatch):
-    import mint_server.backend.bumblebee_distributed as bb
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
 
     busy_actor = SimpleNamespace()
     kill_calls: list[dict] = []
@@ -763,7 +763,7 @@ def test_issue_670_bumblebee_get_or_create_keeps_actor_when_diagnostics_timeout(
     busy_actor.get_diagnostics = _BusyDiagnostics()
     monkeypatch.setattr(bb.ray_kill, "kill", lambda *args, **kwargs: kill_calls.append(kwargs))
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_publication.publish_backend_model_actor",
+        "mint_server.backend.actors.model_actor_publication.publish_backend_model_actor",
         lambda launch, **_kwargs: published.append(launch),
     )
     monkeypatch.setattr(bb, "is_topology_desired_model", lambda *_args, **_kwargs: False)
@@ -944,9 +944,9 @@ def test_bumblebee_sft_forward_backward_uses_model_masked_loss(monkeypatch):
     monkeypatch.setitem(sys.modules, "bumblebee.runtime", types.ModuleType("bumblebee.runtime"))
     monkeypatch.setitem(sys.modules, "bumblebee.runtime.adapters", types.ModuleType("bumblebee.runtime.adapters"))
     monkeypatch.setitem(sys.modules, "bumblebee.runtime.adapters.mint", mint_module)
-    megatron_training_module = types.ModuleType("mint_server.backend.megatron_training")
+    megatron_training_module = types.ModuleType("mint_server.backend.training.megatron.megatron_training")
     megatron_training_module.benchmark_debug_input_entries = lambda data_items: []
-    monkeypatch.setitem(sys.modules, "mint_server.backend.megatron_training", megatron_training_module)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.training.megatron.megatron_training", megatron_training_module)
 
     payload = worker.forward_backward(
         [{"input_ids": [1, 2, 3]}],

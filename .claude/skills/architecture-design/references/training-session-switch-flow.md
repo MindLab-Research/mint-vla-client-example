@@ -65,8 +65,8 @@ Relevant code:
 
 - route enqueue metadata: `mint_server/routes/training.py`
 - executor registration: `mint_server/backend/model_runtime_executor.py`
-- scheduler and lease state: `mint_server/backend/model_work_scheduler.py`
-- runtime claim/execute loop: `mint_server/backend/model_engine_host.py`
+- scheduler and lease state: `mint_server/backend/scheduling/model_work_scheduler.py`
+- runtime claim/execute loop: `mint_server/backend/actors/model_engine_host.py`
 
 ## Route metadata: scheduler vs execution serialization
 
@@ -169,7 +169,7 @@ The real mutable state lives in backend actors:
 
 ## Dense backend session switching
 
-Dense training uses a pooled `TrainingWorker` in `mint_server/backend/verl_training.py`.
+Dense training uses a pooled `TrainingWorker` in `mint_server/backend/training/verl/verl_training.py`.
 
 Every training RPC passes `session.model_id` into the worker. The worker calls:
 

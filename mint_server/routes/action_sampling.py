@@ -6,7 +6,7 @@ import logging
 
 from fastapi import APIRouter
 
-from ..backend.task_state_store import billing_observations_from_input, task_futures
+from mint_server.backend.stores.task_state_store import billing_observations_from_input, task_futures
 from ..models.types import ActRequest
 
 logger = logging.getLogger(__name__)
@@ -19,7 +19,7 @@ action_session_manager: object | None = None
 
 def _current_action_session_manager() -> object | None:
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:

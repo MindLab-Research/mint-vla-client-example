@@ -5,7 +5,7 @@ from typing import Any, cast
 
 import pytest
 
-from mint_server.backend.model_work_admission import ModelWorkAdmissionRejectedError
+from mint_server.backend.scheduling.model_work_admission import ModelWorkAdmissionRejectedError
 
 from .helpers import (
     assert_scheduler_surfaces_progress_while_blocked,

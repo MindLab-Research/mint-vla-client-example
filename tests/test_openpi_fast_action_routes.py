@@ -458,7 +458,7 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 

@@ -1,7 +1,7 @@
 import pytest
 
-import mint_server.backend.openpi_pi05_training as openpi_pi05_training
-from mint_server.backend.model_registry import ModelConfig
+import mint_server.backend.openpi.openpi_pi05_training as openpi_pi05_training
+from mint_server.backend.core.model_registry import ModelConfig
 from mint_server.models.types import Datum, EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
 

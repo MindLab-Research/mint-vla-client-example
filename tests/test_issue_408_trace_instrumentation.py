@@ -53,7 +53,7 @@ def _span_recorder(store: list[tuple[str, dict[str, object]]], name: str, **kwar
 async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.backend import session_index_store as sis
+    from mint_server.backend.stores import session_index_store as sis
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
@@ -199,9 +199,9 @@ async def test_issue_408_save_weights_for_sampler_emits_trace_spans(
 
 
 def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
-    from mint_server.backend import megatron_distributed as md
-    from mint_server.backend import model_registry as model_registry
-    from mint_server.backend import model_actor_supervisor as model_actor_supervisor_mod
+    from mint_server.backend.training.megatron import megatron_distributed as md
+    from mint_server.backend.core import model_registry as model_registry
+    from mint_server.backend.actors import model_actor_supervisor as model_actor_supervisor_mod
     from mint_server import config as config_mod
 
     span_calls: list[tuple[str, dict[str, object]]] = []
@@ -316,9 +316,9 @@ def test_issue_408_megatron_create_path_emits_trace_spans(monkeypatch) -> None:
 
 
 def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) -> None:
-    from mint_server.backend import megatron_distributed as md
-    from mint_server.backend import model_registry as model_registry
-    from mint_server.backend import model_actor_supervisor as model_actor_supervisor_mod
+    from mint_server.backend.training.megatron import megatron_distributed as md
+    from mint_server.backend.core import model_registry as model_registry
+    from mint_server.backend.actors import model_actor_supervisor as model_actor_supervisor_mod
     from mint_server import config as config_mod
 
     fake_new_actor = object()
@@ -413,7 +413,7 @@ def test_issue_572_megatron_existing_actor_rank_mismatch_recreates(monkeypatch) 
 async def test_issue_408_async_get_or_create_megatron_worker_group_propagates_context(
     monkeypatch,
 ) -> None:
-    from mint_server.backend import megatron_distributed as md
+    from mint_server.backend.training.megatron import megatron_distributed as md
 
     captured: dict[str, object] = {}
 

@@ -7,8 +7,8 @@ import types
 
 import pytest
 
-import mint_server.backend.multinode_inference as mni
-import mint_server.backend.vllm_stop as vllm_stop
+import mint_server.backend.inference.multinode_inference as mni
+import mint_server.backend.inference.vllm_stop as vllm_stop
 
 
 @pytest.fixture
@@ -130,7 +130,7 @@ def _stub_task_futures(monkeypatch):
     async def _noop_async_update_meta(*args, **kwargs):
         return None
 
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
     monkeypatch.setattr(
         task_state_store_module.task_futures,
         "async_update_meta",

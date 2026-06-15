@@ -6,7 +6,7 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
-from mint_server.backend.bumblebee_lora import prepare_lora_adapter_for_vllm
+from mint_server.backend.training.bumblebee.bumblebee_lora import prepare_lora_adapter_for_vllm
 from mint_server.models.types import CreateSamplingSessionRequest
 from mint_server.routes import service as service_route
 
@@ -119,8 +119,8 @@ def test_create_sampling_session_converts_rank_sharded_bumblebee_lora(tmp_path, 
     adapter = tmp_path / "adapter"
     _write_rank_sharded_adapter(adapter)
 
-    import mint_server.backend.sampling_session_store as sampling_store
-    import mint_server.backend.session_index_store as session_index
+    import mint_server.backend.stores.sampling_session_store as sampling_store
+    import mint_server.backend.stores.session_index_store as session_index
     import mint_server.gateway as gateway
     import mint_server.supported_models_gate as gate
 

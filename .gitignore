@@ -234,6 +234,7 @@ ray_head_ip.txt
 
 # Work-in-progress investigation scripts
 scripts/wip/*
+!scripts/wip/check_import_layers.py
 !scripts/wip/openpi_libero_sft.py
 !scripts/wip/openpi_libero_fast_rl.py
 !scripts/wip/openpi_libero_resume_sft.py

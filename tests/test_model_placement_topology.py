@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mint_server.backend.model_placement_topology import (
+from mint_server.backend.contracts.model_placement_topology import (
     EnginePlacementTopology,
     ParallelTopology,
 )

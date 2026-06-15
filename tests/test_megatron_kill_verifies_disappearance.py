@@ -93,9 +93,9 @@ def _ensure_peft_stubbed() -> None:
 def _import_megatron_modules():
     _ensure_ray_stubbed()
     _ensure_peft_stubbed()
-    dist = importlib.import_module("mint_server.backend.megatron_distributed")
-    ray_kill = importlib.import_module("mint_server.backend.ray_kill")
-    model_actor_inventory = importlib.import_module("mint_server.backend.model_actor_supervisor")
+    dist = importlib.import_module("mint_server.backend.training.megatron.megatron_distributed")
+    ray_kill = importlib.import_module("mint_server.backend.ray_cluster.ray_kill")
+    model_actor_inventory = importlib.import_module("mint_server.backend.actors.model_actor_supervisor")
     return dist, ray_kill, model_actor_inventory
 
 

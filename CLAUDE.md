@@ -127,7 +127,7 @@ export MINT_GATEWAY_CONFIG_JSON='
 
 Per-deployment model advertisement and tuning:
 - Set `MINT_SUPPORTED_MODELS` on each server to the models that deployment should advertise.
-- Tune `mint_server/backend/model_registry.py` (or set `MINT_MODEL_CONFIG_OVERRIDES_JSON`) to match the GPU type and desired TP/EP/CP.
+- Tune `mint_server/backend/core/model_registry.py` (or set `MINT_MODEL_CONFIG_OVERRIDES_JSON`) to match the GPU type and desired TP/EP/CP.
 
 **Finding the running server process:**
 ```bash

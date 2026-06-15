@@ -405,7 +405,7 @@ def test_issue_670_bumblebee_explicit_load_recycles_when_rank_liveness_probe_fai
         engine._workers[model_id] = recovered_worker
         return recovered_worker
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(engine, "_recycle_worker_after_failure", fake_recycle)
     monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle_bumblebee)
@@ -525,7 +525,7 @@ def test_issue_670_bumblebee_public_forward_backward_recycles_and_poisons(monkey
         assert timeout_s == 10
         return {"ok": True}
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
@@ -593,7 +593,7 @@ def test_issue_670_bumblebee_public_training_step_ops_recycle_and_poison(
         assert timeout_s == 10
         return {"ok": True}
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
@@ -626,7 +626,7 @@ def test_issue_670_bumblebee_public_training_ops_block_poisoned_session(monkeypa
     )
     request = _issue_670_training_request()
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_model_config",
+        "mint_server.backend.core.model_registry.get_model_config",
         lambda *_args, **_kwargs: SimpleNamespace(is_moe=True),
     )
 
@@ -677,7 +677,7 @@ def test_issue_670_bumblebee_successful_explicit_load_unpoisons_public_training(
         assert timeout_s == 10
         return {"ok": True}
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_await_with_keepalive", fake_keepalive)
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
 
@@ -742,7 +742,7 @@ def test_issue_193_megatron_load_weights_missing_actor_with_dirty_sibling_fails_
     monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
     monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _SiblingDirtySessionManager,
     )
 
@@ -844,7 +844,7 @@ def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(mo
 
     monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _CleanSessionManager,
     )
 
@@ -1029,7 +1029,7 @@ def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkey
         engine._workers[model_id] = recovered_worker
         return recovered_worker
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
 
     async def _run():
@@ -1063,7 +1063,7 @@ def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(mon
     async def fake_recycle(*_args, **_kwargs):
         return object()
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
     monkeypatch.setattr(engine, "_recycle_bumblebee_actor", fake_recycle)
 
     async def _run():
@@ -1359,15 +1359,15 @@ def test_issue_193_megatron_rebind_reuses_existing_actor_without_ready_probe(mon
 
     monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_model_config",
+        "mint_server.backend.core.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True, train_use_fp8=False),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_training_parallelism",
+        "mint_server.backend.core.model_registry.get_training_parallelism",
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_topology_desired_model",
+        "mint_server.backend.core.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(
@@ -1376,7 +1376,7 @@ def test_issue_193_megatron_rebind_reuses_existing_actor_without_ready_probe(mon
         lambda actor_name, namespace=None: worker,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             register=lambda *args, **kwargs: register_calls.append((args, kwargs)),
             mark_ready=lambda actor_name: mark_ready_calls.append(actor_name),
@@ -1423,23 +1423,23 @@ def test_issue_193_megatron_rebind_created_actor_ready_death_maps_to_missing_wor
 
     monkeypatch.setattr(engine, "_resolve_hf_model_path", lambda requested_model: f"/resolved/{requested_model}")
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_model_config",
+        "mint_server.backend.core.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True, train_use_fp8=False),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_training_parallelism",
+        "mint_server.backend.core.model_registry.get_training_parallelism",
         lambda _model: (1, 1, 1, 1, 1),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.is_topology_desired_model",
+        "mint_server.backend.core.model_registry.is_topology_desired_model",
         lambda _model: False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.async_get_or_create_megatron_worker_group",
+        "mint_server.backend.training.megatron.megatron_distributed.async_get_or_create_megatron_worker_group",
         lambda **_kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             register=lambda *args, **kwargs: None,
             mark_ready=lambda *_args, **_kwargs: None,
@@ -1538,7 +1538,7 @@ def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch
 
     monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _MissingCacheSessionManager,
     )
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
@@ -1592,7 +1592,7 @@ def test_issue_193_megatron_missing_actor_invalid_session_metadata_fails_closed(
 
     monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _InvalidMetaSessionManager,
     )
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
@@ -1650,7 +1650,7 @@ def test_issue_193_megatron_missing_actor_with_persisted_dirty_marker_fails_clos
     monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
     monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _DirtySessionManager,
     )
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)
@@ -1699,7 +1699,7 @@ def test_issue_651_explicit_load_defers_same_session_actor_only_marker_cleanup(m
             raise AssertionError("explicit checkpoint reload should not require an existing session cache")
 
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _DirtySelfSessionManager,
     )
 
@@ -1738,7 +1738,7 @@ def test_issue_651_explicit_load_preserves_dirty_sibling_fail_closed(monkeypatch
             raise AssertionError("dirty sibling must fail closed before clearing actor-only state")
 
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _DirtySiblingSessionManager,
     )
 
@@ -1790,7 +1790,7 @@ def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkey
     monkeypatch.setattr(engine, "_rebind_megatron_worker", fake_rebind)
     monkeypatch.setattr(engine, "_recycle_megatron_actor", fake_recycle)
     monkeypatch.setattr(
-        "mint_server.backend.megatron_distributed.MegatronSessionStateManager",
+        "mint_server.backend.training.megatron.megatron_distributed.MegatronSessionStateManager",
         _SiblingDirtySessionManager,
     )
     monkeypatch.setattr(engine, "_log_worker_request_context", _noop_log_worker_request_context)

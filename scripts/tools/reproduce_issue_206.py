@@ -69,7 +69,7 @@ def main() -> int:
         if state in ("CREATED", "REMOVED"):
             return _fail(f"Expected placement group to be pending, got state={state!r}")
 
-        from mint_server.backend.async_ray_control import async_pending_gpu_pg_observation
+        from mint_server.backend.ray_cluster.async_ray_control import async_pending_gpu_pg_observation
 
         obs = asyncio.run(async_pending_gpu_pg_observation(timeout_s=10.0))
         if not isinstance(obs, dict):

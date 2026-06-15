@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-import mint_server.backend.multinode_inference as mi
+import mint_server.backend.inference.multinode_inference as mi
 
 
 class _RegistryStub:

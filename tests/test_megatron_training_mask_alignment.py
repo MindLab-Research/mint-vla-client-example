@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from mint_server.backend.megatron_training import mint_datum_to_tensordict
+from mint_server.backend.training.megatron.megatron_training import mint_datum_to_tensordict
 
 
 def _tensor(data: list[float] | list[int], dtype: str = "float32") -> dict:

@@ -12,7 +12,7 @@ This project has multiple identifiers that look similar but have different owner
 
 - `model_id`
   - Created by `POST /api/v1/create_model` (training routes).
-  - Tracks a live training session in server memory (`mint_server/backend/training_session_manager.py`).
+  - Tracks a live training session in server memory (`mint_server/backend/training/training_session_manager.py`).
   - Minimal recovery metadata is persisted through `TaskStateStore` training-session methods.
   - The actual trainable weights/optimizer live in Ray actors (backend-dependent).
   - Automatically cleaned up after idle timeout (`MINT_TRAINING_INACTIVITY_TIMEOUT`, default 3600s).

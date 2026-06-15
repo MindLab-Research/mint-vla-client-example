@@ -45,14 +45,14 @@ def test_issue_218_async_checkpoint_archive_delegates_to_ray_helper(tmp_path, mo
             return "fake-ref"
 
     monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
-    monkeypatch.setattr("mint_server.backend.async_ray_control._ensure_ray_initialized", lambda: seen.setdefault("init", True))
+    monkeypatch.setattr("mint_server.backend.ray_cluster.async_ray_control._ensure_ray_initialized", lambda: seen.setdefault("init", True))
 
     async def _fake_await_ray_ref(ref):
         seen["ref"] = ref
         Path(archive_path).write_bytes(b"archive")
         return str(archive_path)
 
-    monkeypatch.setattr("mint_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+    monkeypatch.setattr("mint_server.backend.ray_cluster.async_ray_control._await_ray_ref", _fake_await_ray_ref)
 
     asyncio.run(checkpoints.async_create_checkpoint_archive(str(ckpt_dir), str(archive_path), timeout_s=12.5))
 
@@ -77,12 +77,12 @@ def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path
             return "timeout-ref"
 
     monkeypatch.setattr(checkpoints, "_create_checkpoint_archive_remote", lambda: _FakeRemote())
-    monkeypatch.setattr("mint_server.backend.async_ray_control._ensure_ray_initialized", lambda: None)
+    monkeypatch.setattr("mint_server.backend.ray_cluster.async_ray_control._ensure_ray_initialized", lambda: None)
 
     async def _fake_await_ray_ref(_ref):
         await asyncio.sleep(3600)
 
-    monkeypatch.setattr("mint_server.backend.async_ray_control._await_ray_ref", _fake_await_ray_ref)
+    monkeypatch.setattr("mint_server.backend.ray_cluster.async_ray_control._await_ray_ref", _fake_await_ray_ref)
     monkeypatch.setattr("ray.cancel", lambda ref, force=False: cancelled.append((ref, force)))
 
     with pytest.raises(asyncio.TimeoutError):

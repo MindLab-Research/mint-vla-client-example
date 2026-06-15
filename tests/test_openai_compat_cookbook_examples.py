@@ -2012,7 +2012,7 @@ def test_session_cache_evicts_oldest_when_full(monkeypatch):
 def test_list_models_returns_oai_format(monkeypatch):
     """/models 端点返回 OpenAI 格式的 model 列表。"""
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.core.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
         raising=False,
     )
@@ -2033,7 +2033,7 @@ def test_list_models_returns_oai_format(monkeypatch):
 def test_retrieve_model_returns_oai_format(monkeypatch):
     """/models/{id} 端点返回单个 OpenAI model 对象。"""
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.core.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507", "Qwen/Qwen3-30B-A3B-Instruct-2507"],
         raising=False,
     )
@@ -2049,7 +2049,7 @@ def test_retrieve_model_returns_oai_format(monkeypatch):
 
 def test_retrieve_model_not_found_returns_oai_error_json(monkeypatch):
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.core.model_registry.list_supported_models",
         lambda: ["Qwen/Qwen3-4B-Instruct-2507"],
         raising=False,
     )
@@ -2067,7 +2067,7 @@ def test_list_models_registry_error_returns_oai_error_json(monkeypatch):
         raise ValueError("bad config")
 
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.list_supported_models",
+        "mint_server.backend.core.model_registry.list_supported_models",
         _boom,
         raising=False,
     )

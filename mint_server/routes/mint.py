@@ -11,8 +11,8 @@ from fastapi import APIRouter, HTTPException, Request
 from ..auth_identity import can_bypass_ownership
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import billing_observations_from_input, task_futures
-from ..backend.mintx_ops import interpolate_checkpoints_to_dir
+from mint_server.backend.stores.task_state_store import billing_observations_from_input, task_futures
+from mint_server.backend.core.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
     MIRROR_STATUS_PENDING,
     begin_async_checkpoint_mirror,
@@ -65,7 +65,7 @@ action_session_manager = None
 
 def _current_training_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -77,7 +77,7 @@ def _current_training_manager():
 
 def _current_training_engine():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -89,7 +89,7 @@ def _current_training_engine():
 
 def _current_action_session_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -209,7 +209,7 @@ async def _enqueue_mint_model_work(
     token_cost: int = 1,
     extra: dict | None = None,
 ) -> None:
-    from ..backend.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
 
     try:
         await enqueue_model_work(
@@ -524,7 +524,7 @@ async def act(
         request=request,
     )
     try:
-        from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
+        from mint_server.backend.actors.model_actor_supervisor import domain_key_for_internal_runtime
 
         extra = {
             "gateway_auth": _gateway_auth_dict(billing_auth),
@@ -622,7 +622,7 @@ async def vla_train_step(
         )
         domain_key = str(scheduler_extra.get("scheduler_domain") or "")
         if not domain_key:
-            from ..backend.model_actor_supervisor import (
+            from mint_server.backend.actors.model_actor_supervisor import (
                 domain_key_for_training_base_model,
             )
 
@@ -690,7 +690,7 @@ async def _get_route_training_store_info(model_id: str) -> dict | None:
         return None
 
     try:
-        from ..backend.training_session_store import async_get_training_session_info
+        from mint_server.backend.stores.training_session_store import async_get_training_session_info
 
         store_info = await async_get_training_session_info(model_id)
     except Exception as e:
@@ -770,7 +770,7 @@ async def interpolate_checkpoints(
         },
     }
     try:
-        from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
+        from mint_server.backend.actors.model_actor_supervisor import domain_key_for_internal_runtime
 
         extra = {
             "gateway_auth": _gateway_auth_dict(billing_auth),
@@ -822,7 +822,7 @@ async def _do_interpolate_checkpoints(
             )
 
         # validate metadata/model lineage before choosing output location
-        from ..backend.mintx_ops import _validate_source_metadata
+        from mint_server.backend.core.mintx_ops import _validate_source_metadata
 
         model_id, model_name, _backend, _first_meta = _validate_source_metadata(
             resolved_sources
@@ -966,7 +966,7 @@ async def forward_backward_reverse_kl(
 
     inflight_marked = False
     try:
-        from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+        from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
         await training_routes._mark_training_inflight(request.model_id, +1)
         inflight_marked = True

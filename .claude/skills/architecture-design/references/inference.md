@@ -26,7 +26,7 @@
 ## Multi-node inference (multi-node TP or MoE TP>=4)
 
 `MultiModelInferenceManager.get_engine()` selects a different engine implementation when vLLM must run via Ray distributed execution:
-- `MultiNodeInferenceEngine` (in `mint_server/backend/multinode_inference.py`) for:
+- `MultiNodeInferenceEngine` (in `mint_server/backend/inference/multinode_inference.py`) for:
   - `config.total_gpus > 8` (true multi-node TP), or
   - `(config.is_moe and config.total_gpus >= 4)` (route MoE TP>=4 through the same engine even if it fits on one node).
 - `MultiLoRAInferenceEngine` otherwise.

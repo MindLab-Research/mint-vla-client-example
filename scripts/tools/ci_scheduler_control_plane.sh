@@ -37,14 +37,14 @@ run_step() {
 }
 
 PYTHON_TARGETS=(
-  mint_server/backend/control_plane_contracts.py
-  mint_server/backend/model_work_scheduler.py
-  mint_server/backend/model_engine_host.py
-  mint_server/backend/model_work_task_gateway.py
-  mint_server/backend/model_actor_supervisor.py
-  mint_server/backend/engine_liveness.py
-  mint_server/backend/cluster_placement_controller.py
-  mint_server/backend/model_placement_topology.py
+  mint_server/backend/contracts/control_plane_contracts.py
+  mint_server/backend/scheduling/model_work_scheduler.py
+  mint_server/backend/actors/model_engine_host.py
+  mint_server/backend/scheduling/model_work_task_gateway.py
+  mint_server/backend/actors/model_actor_supervisor.py
+  mint_server/backend/contracts/engine_liveness.py
+  mint_server/backend/scheduling/cluster_placement_controller.py
+  mint_server/backend/contracts/model_placement_topology.py
   tests/test_cluster_placement_controller.py
   tests/test_stateless_control_plane_guardrails.py
   tests/test_issue_593_model_work_scheduler.py
@@ -63,18 +63,18 @@ mapfile -t COMPONENT_TESTS < <(find tests/component/control_plane -name '*.py' -
 PY_COMPILE_TARGETS=("${PYTHON_TARGETS[@]}" "${COMPONENT_TESTS[@]}")
 
 COVERAGE_SOURCE_FILES=(
-  mint_server/backend/control_plane_contracts.py
-  mint_server/backend/model_work_scheduler.py
-  mint_server/backend/model_engine_host.py
-  mint_server/backend/model_work_task_gateway.py
-  mint_server/backend/model_actor_supervisor.py
-  mint_server/backend/engine_liveness.py
-  mint_server/backend/cluster_placement_controller.py
-  mint_server/backend/model_placement_topology.py
+  mint_server/backend/contracts/control_plane_contracts.py
+  mint_server/backend/scheduling/model_work_scheduler.py
+  mint_server/backend/actors/model_engine_host.py
+  mint_server/backend/scheduling/model_work_task_gateway.py
+  mint_server/backend/actors/model_actor_supervisor.py
+  mint_server/backend/contracts/engine_liveness.py
+  mint_server/backend/scheduling/cluster_placement_controller.py
+  mint_server/backend/contracts/model_placement_topology.py
 )
 
 COVERAGE_FILE_MIN_EXCEPTIONS=(
-  mint_server/backend/model_actor_supervisor.py=65
+  mint_server/backend/actors/model_actor_supervisor.py=65
 )
 
 COVERAGE_TEST_TARGETS=(
@@ -124,7 +124,7 @@ run_step "scoped pyright" "${UV_RUN[@]}" pyright --project pyrightconfig.schedul
 run_step "py_compile" "${UV_RUN[@]}" python -m py_compile "${PY_COMPILE_TARGETS[@]}"
 run_step "coverage erase" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage erase
 run_step "coverage collect" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage run \
-  --source=mint_server.backend.control_plane_contracts,mint_server.backend.model_work_scheduler,mint_server.backend.model_engine_host,mint_server.backend.model_work_task_gateway,mint_server.backend.model_actor_supervisor,mint_server.backend.engine_liveness,mint_server.backend.cluster_placement_controller,mint_server.backend.model_placement_topology \
+  --source=mint_server.backend.contracts.control_plane_contracts,mint_server.backend.scheduling.model_work_scheduler,mint_server.backend.actors.model_engine_host,mint_server.backend.scheduling.model_work_task_gateway,mint_server.backend.actors.model_actor_supervisor,mint_server.backend.contracts.engine_liveness,mint_server.backend.scheduling.cluster_placement_controller,mint_server.backend.contracts.model_placement_topology \
   -m pytest "${COVERAGE_TEST_TARGETS[@]}" -q
 run_step "coverage hard gate" env COVERAGE_FILE="$COVERAGE_FILE" "${UV_RUN[@]}" coverage report \
   --fail-under="$MINT_SCHEDULER_COVERAGE_MIN" \

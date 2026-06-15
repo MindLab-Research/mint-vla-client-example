@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from mint_server.backend.task_state_store import TaskStateNotFoundError, TaskStateStoreClient
+from mint_server.backend.stores.task_state_store import TaskStateNotFoundError, TaskStateStoreClient
 
 
 class _RemoteMethod:

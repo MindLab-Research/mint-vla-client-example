@@ -40,7 +40,7 @@ def anyio_backend():
 async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_session(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.backend import session_index_store as sis
+    from mint_server.backend.stores import session_index_store as sis
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
@@ -173,7 +173,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
 async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.backend import session_index_store as sis
+    from mint_server.backend.stores import session_index_store as sis
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
@@ -295,7 +295,7 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
 async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.backend import session_index_store as sis
+    from mint_server.backend.stores import session_index_store as sis
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
@@ -395,7 +395,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
 async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.backend import session_index_store as sis
+    from mint_server.backend.stores import session_index_store as sis
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()

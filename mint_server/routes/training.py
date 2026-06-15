@@ -43,7 +43,7 @@ from ..auth_identity import can_write
 from ..auth_identity import get_apikey_id as _request_apikey_id
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
+from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
 from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..logging_context import (
     classify_failure_reason,
@@ -55,7 +55,7 @@ from ..logging_context import (
     start_as_current_span_from_traceparent,
 )
 
-from ..backend.task_state_store import (
+from mint_server.backend.stores.task_state_store import (
     FutureStatus,
     billing_observations_from_auth,
     billing_observations_from_input,
@@ -114,9 +114,9 @@ from ..models.types import (
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
-    from ..backend.session_manager import SessionManager
-    from ..backend.training_session_manager import TrainingSessionManager
-    from ..backend.verl_training import VerlTrainingEngine
+    from mint_server.backend.sessions.session_manager import SessionManager
+    from mint_server.backend.training.training_session_manager import TrainingSessionManager
+    from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -171,7 +171,7 @@ inference_manager: SessionManager | None = None  # For ephemeral flow
 
 def _current_training_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -183,7 +183,7 @@ def _current_training_manager():
 
 def _current_training_engine():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -195,7 +195,7 @@ def _current_training_engine():
 
 def _current_inference_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -211,7 +211,7 @@ def _require_write_access(request: Request) -> None:
 
 
 async def _mark_training_inflight(model_id: str, delta: int) -> None:
-    from ..backend.training_session_store import async_mark_training_session_inflight
+    from mint_server.backend.stores.training_session_store import async_mark_training_session_inflight
 
     await async_mark_training_session_inflight(model_id, delta)
 
@@ -368,7 +368,7 @@ def _training_model_work_domain_key(
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
     if backend_value in {"bumblebee", "megatron"} and base:
-        from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+        from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
         return domain_key_for_training_base_model(base, backend=backend_value)
     if base:
@@ -391,8 +391,8 @@ async def _enqueue_training_model_work_route(
     backend: str,
     queued_meta: dict[str, Any],
 ) -> dict[str, Any]:
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     domain_key = _training_model_work_domain_key(
         backend=backend, base_model=base_model, model_id=model_id
@@ -444,7 +444,7 @@ def _get_webhook_url(request: Request) -> str | None:
 
 
 def _find_actor_handle(actor_name: str, namespace: str):
-    from ..backend.model_actor_supervisor import get_model_actor_supervisor
+    from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
     pool = get_model_actor_supervisor()
     for entry in pool.iter_entries():
@@ -468,7 +468,7 @@ def _snapshot_from_training_session(model_id: str):
     if session is None:
         return None
     try:
-        from ..backend.training_session_manager import TrainingSessionSnapshot
+        from mint_server.backend.training.training_session_manager import TrainingSessionSnapshot
 
         lora_config = getattr(session, "lora_config", None)
         if lora_config is not None and hasattr(lora_config, "model_dump"):
@@ -663,7 +663,7 @@ async def _restore_training_session(model_id: str):
     if engine is None or manager is None:
         return None
     try:
-        from ..backend.training_session_store import async_get_training_session_info
+        from mint_server.backend.stores.training_session_store import async_get_training_session_info
 
         info = await async_get_training_session_info(model_id)
         if not isinstance(info, dict):
@@ -835,7 +835,7 @@ async def _raise_if_local_model_id_exists(model_id: str) -> None:
             detail=f"Model_id conflict: local model already exists: {model_id!r}",
         )
     try:
-        from ..backend.training_session_store import async_get_training_session_info
+        from mint_server.backend.stores.training_session_store import async_get_training_session_info
 
         info = await async_get_training_session_info(model_id)
     except Exception as e:
@@ -998,7 +998,7 @@ async def _best_effort_delete_training_session(
             session.is_active = False
             if actor_name:
                 try:
-                    from ..backend.model_actor_supervisor import (
+                    from mint_server.backend.actors.model_actor_supervisor import (
                         get_model_actor_supervisor,
                     )
 
@@ -1017,7 +1017,7 @@ async def _best_effort_delete_training_session(
         pass
 
     try:
-        from ..backend.training_session_store import delete_training_session
+        from mint_server.backend.stores.training_session_store import delete_training_session
 
         delete_training_session(model_id)
     except Exception as e:
@@ -1030,7 +1030,7 @@ async def _best_effort_delete_training_session(
         )
 
     try:
-        from ..backend.model_actor_supervisor import get_model_actor_supervisor
+        from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
         get_model_actor_supervisor().clear_session(model_id)
     except Exception:
@@ -1049,10 +1049,10 @@ async def cleanup_stale_training_sessions_once(
     if training_engine is None or training_manager is None:
         return []
 
-    from ..backend.session_heartbeat_store import session_heartbeat_store
+    from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
 
     try:
-        from ..backend.training_session_store import async_list_training_sessions
+        from mint_server.backend.stores.training_session_store import async_list_training_sessions
 
         infos = await async_list_training_sessions()
     except Exception as e:
@@ -1190,7 +1190,7 @@ def _field(obj: Any, key: str, default=None):
 
 async def _get_training_route_session_info(model_id: str) -> dict[str, Any] | None:
     try:
-        from ..backend.training_session_store import async_get_training_session_info
+        from mint_server.backend.stores.training_session_store import async_get_training_session_info
 
         info = await async_get_training_session_info(model_id)
     except Exception as e:
@@ -1274,7 +1274,7 @@ async def _protect_training_session_enqueue_window(
     if not session_id:
         return
     try:
-        from ..backend.session_heartbeat_store import session_heartbeat_store
+        from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
 
         await session_heartbeat_store.async_update(
             session_id=session_id, now=time.time()
@@ -1310,7 +1310,7 @@ _TOKENIZER_METADATA_FILES = (
 
 
 def _infer_training_backend_for_base_model(base_model: str) -> str:
-    from ..backend.model_registry import get_model_config
+    from mint_server.backend.core.model_registry import get_model_config
 
     cfg = get_model_config(base_model)
     training_backend = str(getattr(cfg, "training_backend", "mint_text") or "mint_text")
@@ -1318,7 +1318,7 @@ def _infer_training_backend_for_base_model(base_model: str) -> str:
         return "openpi_fast"
     if training_backend == "openpi_pi05":
         return "openpi_pi05"
-    from ..backend.verl_training import _select_moe_training_backend, _uses_distributed_training_backend
+    from mint_server.backend.core.training_backend_selection import _select_moe_training_backend, _uses_distributed_training_backend
 
     if _uses_distributed_training_backend(base_model):
         return _select_moe_training_backend(base_model)
@@ -1468,7 +1468,7 @@ async def _collect_control_plane_tokenizer_metadata(session: Any) -> dict[str, A
 
 
 def _next_training_session_metadata_version(session: Any) -> int:
-    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+    from mint_server.backend.training.training_session_manager import TRAINING_SESSION_METADATA_VERSION
 
     current = max(
         int(
@@ -1518,7 +1518,7 @@ def _build_training_session_store_payload(
     metadata_version: int | None = None,
     extra_fields: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+    from mint_server.backend.training.training_session_manager import TRAINING_SESSION_METADATA_VERSION
 
     if lora_config is None:
         lora_payload = None
@@ -1573,12 +1573,12 @@ def _build_training_session_store_payload(
 
 
 async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
-    from ..backend.training_session_manager import (
+    from mint_server.backend.training.training_session_manager import (
         MATERIALIZATION_STATE_FAILED,
         MATERIALIZATION_STATE_MATERIALIZING,
         MATERIALIZATION_STATE_READY,
     )
-    from ..backend.training_session_store import async_upsert_training_session
+    from mint_server.backend.stores.training_session_store import async_upsert_training_session
 
     engine = _current_training_engine()
     if engine is None:
@@ -1705,7 +1705,7 @@ def _get_max_model_len(base_model: str | None) -> int:
         raise HTTPException(
             status_code=500, detail="Training session missing base_model"
         )
-    from ..backend.model_registry import get_model_config
+    from mint_server.backend.core.model_registry import get_model_config
 
     try:
         return int(get_model_config(base_model).max_model_len)
@@ -1727,7 +1727,7 @@ def _validate_rollout_correction_config_or_400(
     if rollout_correction_config is None:
         return
 
-    from ..backend.model_registry import get_model_config
+    from mint_server.backend.core.model_registry import get_model_config
 
     if not bool(get_model_config(base_model).is_moe):
         raise HTTPException(
@@ -1790,7 +1790,7 @@ def _build_training_scheduler_extra(
     training_op: str,
     seq_id: int | None = None,
 ) -> dict[str, Any]:
-    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+    from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
     enabled = str(os.environ.get("MINT_SCHEDULER_ENABLE", "1")).strip().lower() in (
         "1",
@@ -1876,7 +1876,7 @@ def _build_create_scheduler_extra(
     model_id: str,
     training_op: str,
 ) -> dict[str, Any]:
-    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+    from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
     scheduler_domain = domain_key_for_training_base_model(base_model)
     return {
@@ -1955,8 +1955,8 @@ async def _enqueue_internal_serialized_model_op(
     extra: dict[str, Any],
     user_id: str | None = None,
 ) -> str:
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     request_id = uuid.uuid4().hex
     inflight_marked = False
@@ -2014,8 +2014,8 @@ async def create_model(
     )
     _validate_lora_rank_or_400(request.lora_config)
     try:
-        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
-        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
+        from mint_server.backend.openpi.openpi_fast_training import validate_openpi_fast_create_request
+        from mint_server.backend.openpi.openpi_pi05_training import validate_openpi_pi05_create_request
 
         validate_openpi_fast_create_request(request)
         validate_openpi_pi05_create_request(request)
@@ -2101,8 +2101,8 @@ async def create_model(
         training_op="create_model",
     )
 
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
@@ -2184,7 +2184,7 @@ async def _do_create_model(
     webhook_url: str | None,
 ) -> None:
     """Background task to create training model."""
-    from ..backend.training_session_manager import (
+    from mint_server.backend.training.training_session_manager import (
         MATERIALIZATION_STATE_UNMATERIALIZED,
         TRAINING_SESSION_METADATA_VERSION,
     )
@@ -2253,7 +2253,7 @@ async def _do_create_model(
             )
         session.namespace = RAY_NAMESPACE
 
-        from ..backend.training_session_store import async_upsert_training_session
+        from mint_server.backend.stores.training_session_store import async_upsert_training_session
 
         await async_upsert_training_session(
             _build_training_session_store_payload(
@@ -2270,7 +2270,7 @@ async def _do_create_model(
         manager.mark_persisted(model_id)
 
         try:
-            from ..backend.session_index_store import add_training_run_to_session
+            from mint_server.backend.stores.session_index_store import add_training_run_to_session
 
             add_training_run_to_session(
                 session_id=request.session_id,
@@ -2322,13 +2322,13 @@ async def _do_create_model(
                 manager.delete_session(model_id)
         if session_created:
             try:
-                from ..backend.training_session_store import delete_training_session
+                from mint_server.backend.stores.training_session_store import delete_training_session
 
                 delete_training_session(model_id)
             except Exception:
                 pass
         try:
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
+            from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
             get_model_actor_supervisor().clear_session(model_id)
         except Exception:
@@ -2409,8 +2409,8 @@ async def create_model_from_state(
     )
     _validate_lora_rank_or_400(request.lora_config)
     try:
-        from ..backend.openpi_fast_training import validate_openpi_fast_create_request
-        from ..backend.openpi_pi05_training import validate_openpi_pi05_create_request
+        from mint_server.backend.openpi.openpi_fast_training import validate_openpi_fast_create_request
+        from mint_server.backend.openpi.openpi_pi05_training import validate_openpi_pi05_create_request
 
         validate_openpi_fast_create_request(request)
         validate_openpi_pi05_create_request(request)
@@ -2553,8 +2553,8 @@ async def create_model_from_state(
                 detail=f"Model_id conflict: {model_id!r} is registered as remote via upstream {upstream_alias!r}",
             )
 
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     resolved_state_path = _resolve_state_path(
         request.state_path,
@@ -2614,7 +2614,7 @@ async def _do_create_model_from_state(
     request_id: str, request: CreateModelFromStateRequest, user_id: str | None
 ) -> None:
     """Background task to create model and load checkpoint."""
-    from ..backend.training_session_manager import (
+    from mint_server.backend.training.training_session_manager import (
         MATERIALIZATION_STATE_READY,
         TRAINING_SESSION_METADATA_VERSION,
     )
@@ -2715,7 +2715,7 @@ async def _do_create_model_from_state(
                 str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
             )
 
-        from ..backend.training_session_store import async_upsert_training_session
+        from mint_server.backend.stores.training_session_store import async_upsert_training_session
 
         actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(
             model_id
@@ -2737,7 +2737,7 @@ async def _do_create_model_from_state(
         manager.mark_persisted(model_id)
 
         try:
-            from ..backend.session_index_store import add_training_run_to_session
+            from mint_server.backend.stores.session_index_store import add_training_run_to_session
 
             add_training_run_to_session(
                 session_id=request.session_id,
@@ -2798,7 +2798,7 @@ async def _do_create_model_from_state(
                 manager.delete_session(model_id)
         if session_created:
             try:
-                from ..backend.training_session_store import delete_training_session
+                from mint_server.backend.stores.training_session_store import delete_training_session
 
                 delete_training_session(model_id)
             except Exception:
@@ -4376,7 +4376,7 @@ async def _do_save_weights_for_sampler(
             )
 
             try:
-                from ..backend.session_index_store import (
+                from mint_server.backend.stores.session_index_store import (
                     add_heartbeat_sampler_to_session,
                     upsert_sampler_index,
                 )
@@ -4505,7 +4505,7 @@ async def _get_authoritative_training_info(model_id: str) -> dict[str, Any] | No
 
 
 async def _list_authoritative_training_infos() -> dict[str, dict[str, Any]]:
-    from ..backend.training_session_store import async_list_training_sessions
+    from mint_server.backend.stores.training_session_store import async_list_training_sessions
 
     infos_by_id: dict[str, dict[str, Any]] = {}
     for info in await async_list_training_sessions():
@@ -4820,13 +4820,13 @@ async def _do_delete_model(request_id: str, model_id: str) -> None:
             manager.delete_session(model_id)
 
         try:
-            from ..backend.training_session_store import delete_training_session
+            from mint_server.backend.stores.training_session_store import delete_training_session
 
             delete_training_session(model_id)
         except Exception:
             pass
         try:
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
+            from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
             get_model_actor_supervisor().clear_session(model_id)
         except Exception:
@@ -4878,7 +4878,7 @@ async def _do_get_session_guard_state(request_id: str, model_id: str) -> None:
 async def _get_control_plane_tokenizer_info(
     model_id: str, info: dict[str, Any]
 ) -> dict[str, Any]:
-    from ..backend.training_session_manager import (
+    from mint_server.backend.training.training_session_manager import (
         MATERIALIZATION_STATE_READY,
         TRAINING_SESSION_METADATA_VERSION,
     )
@@ -4917,7 +4917,7 @@ async def _get_control_plane_tokenizer_info(
             "tokenizer_source_path"
         )
     try:
-        from ..backend.training_session_store import async_upsert_training_session
+        from mint_server.backend.stores.training_session_store import async_upsert_training_session
 
         await async_upsert_training_session(backfill_payload)
         merged_info = dict(info)

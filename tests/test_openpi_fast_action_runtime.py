@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.training.training_session_manager import TrainingSession
 from mint_server.models.types import EncodedTextChunk, ImageChunk, ModelInput, TensorData
 
 
@@ -45,7 +45,7 @@ def _make_observation() -> ModelInput:
 
 
 def test_openpi_fast_action_worker_prefers_env_tokenizer_override(monkeypatch, tmp_path: Path) -> None:
-    from mint_server.backend.openpi_fast_action_worker import _resolve_fast_tokenizer_path
+    from mint_server.backend.openpi.openpi_fast_action_worker import _resolve_fast_tokenizer_path
 
     override = tmp_path / "fast-override"
     override.mkdir()
@@ -56,7 +56,7 @@ def test_openpi_fast_action_worker_prefers_env_tokenizer_override(monkeypatch, t
 
 
 def test_openpi_fast_action_worker_prefers_local_fast_snapshot(monkeypatch, tmp_path: Path) -> None:
-    from mint_server.backend.openpi_fast_action_worker import _resolve_fast_tokenizer_path
+    from mint_server.backend.openpi.openpi_fast_action_worker import _resolve_fast_tokenizer_path
 
     hf_home = tmp_path / "hf-home"
     snapshot_dir = hf_home / "hub" / "models--physical-intelligence--fast" / "snapshots" / "rev-123"
@@ -72,7 +72,7 @@ def test_openpi_fast_action_worker_prefers_local_fast_snapshot(monkeypatch, tmp_
 
 
 def test_openpi_fast_action_worker_captures_non_protocol_stdout(monkeypatch) -> None:
-    import mint_server.backend.openpi_fast_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_fast_action_worker as worker_module
 
     def _fake_dispatch(session, op, payload):
         _ = session, op, payload
@@ -93,7 +93,7 @@ def test_openpi_fast_action_worker_captures_non_protocol_stdout(monkeypatch) -> 
 
 def test_openpi_fast_action_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
     import io
-    import mint_server.backend.openpi_fast_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_fast_action_worker as worker_module
 
     protocol_stream = io.StringIO()
     monkeypatch.setattr(worker_module, "_PROTOCOL_STDOUT", protocol_stream)
@@ -104,7 +104,7 @@ def test_openpi_fast_action_worker_reply_prefers_protocol_stream(monkeypatch) ->
 
 
 def test_openpi_fast_action_worker_dispatch_supports_session_state_ops() -> None:
-    import mint_server.backend.openpi_fast_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_fast_action_worker as worker_module
 
     class _FakeSession:
         def save_session_state(self, payload):
@@ -119,7 +119,7 @@ def test_openpi_fast_action_worker_dispatch_supports_session_state_ops() -> None
 
 
 def test_openpi_fast_action_worker_dispatch_cleans_up_replaced_session(monkeypatch) -> None:
-    import mint_server.backend.openpi_fast_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_fast_action_worker as worker_module
 
     events = []
 
@@ -145,7 +145,7 @@ def test_openpi_fast_action_worker_dispatch_cleans_up_replaced_session(monkeypat
 
 
 def test_openpi_fast_action_worker_act_falls_back_on_missing_action_prefix() -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     fallback_calls: list[tuple[list[int], int, int]] = []
 
@@ -183,7 +183,7 @@ def test_openpi_fast_action_worker_act_falls_back_on_missing_action_prefix() -> 
 
 
 def test_openpi_fast_action_worker_act_fails_on_strict_decode_short_payload() -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
     session._observation_from_payload = lambda payload: {"payload": payload}
@@ -231,7 +231,7 @@ def test_openpi_fast_action_worker_act_fails_on_strict_decode_short_payload() ->
 
 
 def test_openpi_fast_action_worker_extracts_action_tokens_without_text_roundtrip() -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     session = OpenPIFastActionSession.__new__(OpenPIFastActionSession)
     session._action_horizon = 1
@@ -268,7 +268,7 @@ def test_openpi_fast_action_worker_extracts_action_tokens_without_text_roundtrip
 
 
 def test_openpi_fast_action_worker_truncates_excess_decoded_dct_tokens(monkeypatch) -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     warnings: list[str] = []
 
@@ -297,7 +297,7 @@ def test_openpi_fast_action_worker_truncates_excess_decoded_dct_tokens(monkeypat
         _act_tokens_to_paligemma_tokens=lambda tokens: np.asarray([1, 2, 3], dtype=np.int32),
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_action_worker.logger.warning",
+        "mint_server.backend.openpi.openpi_fast_action_worker.logger.warning",
         lambda msg, *args: warnings.append(msg % args if args else msg),
     )
 
@@ -312,7 +312,7 @@ def test_openpi_fast_action_worker_truncates_excess_decoded_dct_tokens(monkeypat
 
 
 def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     calls: list[dict[str, object]] = []
 
@@ -360,7 +360,7 @@ def test_openpi_fast_action_worker_act_bounds_decoding_to_expected_suffix_len() 
 
 
 def test_openpi_fast_action_worker_trims_sampled_tokens_at_first_eos() -> None:
-    from mint_server.backend.openpi_fast_action_worker import OpenPIFastActionSession
+    from mint_server.backend.openpi.openpi_fast_action_worker import OpenPIFastActionSession
 
     seen_tokens: list[np.ndarray] = []
 
@@ -396,7 +396,7 @@ def test_openpi_fast_action_worker_trims_sampled_tokens_at_first_eos() -> None:
 
 
 def test_openpi_pi05_action_worker_dispatch_supports_session_state_ops() -> None:
-    import mint_server.backend.openpi_pi05_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_pi05_action_worker as worker_module
 
     class _FakeSession:
         def save_session_state(self, payload):
@@ -411,7 +411,7 @@ def test_openpi_pi05_action_worker_dispatch_supports_session_state_ops() -> None
 
 
 def test_openpi_pi05_action_worker_dispatch_cleans_up_replaced_session(monkeypatch) -> None:
-    import mint_server.backend.openpi_pi05_action_worker as worker_module
+    import mint_server.backend.openpi.openpi_pi05_action_worker as worker_module
 
     events = []
 
@@ -524,7 +524,7 @@ def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.action_session_manager import _default_runtime_factory
+    from mint_server.backend.openpi.action_session_manager import _default_runtime_factory
 
     runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
@@ -554,16 +554,16 @@ def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "mint_server.backend.action_session_manager.start_openpi_shared_ray_runtime",
+        "mint_server.backend.openpi.action_session_manager.start_openpi_shared_ray_runtime",
         _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
         _unexpected_local_fast_start,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_runtime.OpenPIFastWorkerClient.start",
         _unexpected_local_worker_start,
     )
 
@@ -582,7 +582,7 @@ def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
         {
             "session_id": "session-1:action:3",
             "base_model": OPENPI_FAST_MODEL,
-            "worker_module": "mint_server.backend.openpi_fast_action_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_fast_action_worker",
             "python_executable": str(runtime_env["layout"].host_python),
             "pythonpath": runtime_env["pythonpath"],
             "config_name": "pi0_fast_libero_low_mem_finetune",
@@ -599,7 +599,7 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.action_session_manager import _default_pi05_runtime_factory
+    from mint_server.backend.openpi.action_session_manager import _default_pi05_runtime_factory
 
     runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
@@ -628,16 +628,16 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "mint_server.backend.action_session_manager.start_openpi_shared_ray_runtime",
+        "mint_server.backend.openpi.action_session_manager.start_openpi_shared_ray_runtime",
         _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
         _unexpected_local_fast_start,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_runtime.OpenPIFastWorkerClient.start",
         _unexpected_local_worker_start,
     )
 
@@ -656,7 +656,7 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
         {
             "session_id": "session-1:action:9",
             "base_model": "openpi/pi05-libero-low-mem-finetune",
-            "worker_module": "mint_server.backend.openpi_pi05_action_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_pi05_action_worker",
             "python_executable": str(runtime_env["layout"].host_python),
             "pythonpath": runtime_env["pythonpath"],
             "config_name": "pi05_libero",
@@ -669,8 +669,8 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
 
 
 def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_actor(monkeypatch) -> None:
-    from mint_server.backend import action_session_manager
-    from mint_server.backend.model_actor_supervisor import ActorType
+    from mint_server.backend.openpi import action_session_manager
+    from mint_server.backend.actors.model_actor_supervisor import ActorType
 
     class _FakeActorHandle:
         class _Describe:
@@ -689,7 +689,7 @@ def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_ac
         base_model = OPENPI_FAST_MODEL
         actor_handle = actor_handle_obj
         metadata = {
-            "worker_module": "mint_server.backend.openpi_fast_action_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_fast_action_worker",
             "pool_key": {"base_model": OPENPI_FAST_MODEL},
         }
 
@@ -738,22 +738,22 @@ def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_ac
     client = action_session_manager._recover_detached_action_runtime_client(
         action_session_id="session-1:action:3",
         supports_base_model=lambda base_model: base_model == OPENPI_FAST_MODEL,
-        supports_worker_module=lambda worker_module: worker_module == "mint_server.backend.openpi_fast_action_worker",
+        supports_worker_module=lambda worker_module: worker_module == "mint_server.backend.openpi.openpi_fast_action_worker",
     )
 
     assert isinstance(client, _FakeSharedClient)
     assert init == {
         "actor": actor_handle_obj,
         "actor_name": "mint_openpi_shared_deadbeef",
-        "worker_module": "mint_server.backend.openpi_fast_action_worker",
+        "worker_module": "mint_server.backend.openpi.openpi_fast_action_worker",
         "session_id": "session-1:action:3",
         "ready_timeout_s": 123.0,
     }
 
 
 def test_action_session_router_recovers_shared_session_from_known_session_ids(monkeypatch) -> None:
-    from mint_server.backend import action_session_manager
-    from mint_server.backend.model_actor_supervisor import ActorType
+    from mint_server.backend.openpi import action_session_manager
+    from mint_server.backend.actors.model_actor_supervisor import ActorType
 
     class _FakeActorHandle:
         class _Describe:
@@ -770,7 +770,7 @@ def test_action_session_router_recovers_shared_session_from_known_session_ids(mo
         base_model = OPENPI_FAST_MODEL
         actor_handle = _FakeActorHandle()
         metadata = {
-            "worker_module": "mint_server.backend.openpi_fast_action_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_fast_action_worker",
             "pool_key": {"base_model": OPENPI_FAST_MODEL},
         }
 
@@ -800,8 +800,8 @@ def test_action_session_router_recovers_shared_session_from_known_session_ids(mo
 
 
 def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor_inventory(monkeypatch) -> None:
-    from mint_server.backend import openpi_action_ray_runtime
-    from mint_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+    from mint_server.backend.openpi import openpi_action_ray_runtime
+    from mint_server.backend.openpi.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 
     state: dict[str, object] = {}
 
@@ -860,7 +860,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor
             base_model=OPENPI_FAST_MODEL,
             spec=OpenPIFastActionRuntimeSpec(
                 python_executable="/tmp/runtime/host-venv/bin/python",
-                worker_module="mint_server.backend.openpi_fast_action_worker",
+                worker_module="mint_server.backend.openpi.openpi_fast_action_worker",
                 pythonpath=("/tmp/runtime/site-packages", "/tmp/runtime/src/openpi/src"),
             ),
         )
@@ -876,7 +876,7 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor
     assert register["base_model"] == OPENPI_FAST_MODEL
     assert register["session_id"] == "session-1:action:3"
     assert register["node_id"] == "node-456"
-    assert register["metadata"]["worker_module"] == "mint_server.backend.openpi_fast_action_worker"
+    assert register["metadata"]["worker_module"] == "mint_server.backend.openpi.openpi_fast_action_worker"
     assert register["metadata"]["actor_id"] == "actor-123"
     assert register["metadata"]["node_ip"] == "192.168.0.8"
     assert register["metadata"]["pid"] == 999
@@ -884,8 +884,8 @@ def test_start_openpi_action_ray_runtime_registers_actor_metadata_in_model_actor
 
 
 def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) -> None:
-    from mint_server.backend import openpi_action_ray_runtime
-    from mint_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+    from mint_server.backend.openpi import openpi_action_ray_runtime
+    from mint_server.backend.openpi.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 
     state: dict[str, object] = {}
     node_id = "b" * 56
@@ -971,8 +971,8 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
 
 def test_openpi_action_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
-    from mint_server.backend.openpi_action_ray_runtime import OpenPIActionRayRuntimeClient
-    from mint_server.backend.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+    from mint_server.backend.openpi.openpi_action_ray_runtime import OpenPIActionRayRuntimeClient
+    from mint_server.backend.openpi.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
 
     client = OpenPIActionRayRuntimeClient(
         actor=object(),
@@ -986,7 +986,7 @@ def test_openpi_action_ray_runtime_client_ray_get_awaits_future_without_ray_get(
     ref = SimpleNamespace(future=lambda: fut)
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_action_ray_runtime.ray.get",
+        "mint_server.backend.openpi.openpi_action_ray_runtime.ray.get",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("ray.get should not be called")),
     )
 
@@ -994,7 +994,7 @@ def test_openpi_action_ray_runtime_client_ray_get_awaits_future_without_ray_get(
 
 
 def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint(tmp_path: Path) -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeTrainingRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -1017,7 +1017,7 @@ def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint
 
 
 def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tmp_path: Path) -> None:
-    from mint_server.backend.action_session_manager import OpenPIFastActionSessionManager
+    from mint_server.backend.openpi.action_session_manager import OpenPIFastActionSessionManager
 
     checkpoint_dir = tmp_path / "model-1" / "export-1"
     (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)
@@ -1067,7 +1067,7 @@ def test_action_session_manager_create_session_retries_retryable_actor_death(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from mint_server.backend import action_session_manager
+    from mint_server.backend.openpi import action_session_manager
 
     checkpoint_dir = tmp_path / "model-1" / "export-1"
     (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)
@@ -1174,7 +1174,7 @@ def test_action_session_manager_create_session_retries_retryable_actor_death(
 
 
 def test_action_session_manager_act_returns_actions(tmp_path: Path) -> None:
-    from mint_server.backend.action_session_manager import OpenPIFastActionSessionManager
+    from mint_server.backend.openpi.action_session_manager import OpenPIFastActionSessionManager
 
     checkpoint_dir = tmp_path / "model-1" / "export-1"
     (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)
@@ -1212,7 +1212,7 @@ def test_action_session_manager_act_returns_actions(tmp_path: Path) -> None:
 
 
 def test_action_session_manager_rejects_unsupported_model_family(tmp_path: Path) -> None:
-    from mint_server.backend.action_session_manager import OpenPIFastActionSessionManager
+    from mint_server.backend.openpi.action_session_manager import OpenPIFastActionSessionManager
 
     checkpoint_dir = tmp_path / "model-1" / "export-1"
     (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)

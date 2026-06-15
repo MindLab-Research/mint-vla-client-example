@@ -22,18 +22,18 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from ..config import config as server_config
-from ..backend.model_work_scheduler import ModelWorkSchedulerConflictError
-from ..backend.queue_stage_timing import (
+from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerConflictError
+from mint_server.backend.scheduling.queue_stage_timing import (
     attach_queue_stage_timing,
     build_queue_stage_timing,
 )
-from ..backend.task_state_store import (
+from mint_server.backend.stores.task_state_store import (
     FutureStatus,
     TaskStateStoreUnavailableError,
     billing_observations_from_auth,
     task_futures,
 )
-from ..backend.model_work_admission import (
+from mint_server.backend.scheduling.model_work_admission import (
     ModelWorkAdmissionRejectedError,
     enqueue_model_work,
 )
@@ -65,7 +65,7 @@ from ..sampling_utils import (
 )
 
 if TYPE_CHECKING:
-    from ..backend.session_manager import SessionManager
+    from mint_server.backend.sessions.session_manager import SessionManager
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +100,7 @@ _SAMPLE_ONCE_ROUTE = "sample_once"
 
 def _active_session_manager() -> SessionManager | None:
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -205,7 +205,7 @@ def build_sample_once_billing_observations(
 def _record_vllm_workload_start(
     *, actor_name: str | None, base_model: str, op: str
 ) -> None:
-    from ..backend.runtime_observability import runtime_observability
+    from mint_server.backend.core.runtime_observability import runtime_observability
 
     runtime_observability.begin_vllm_request(
         actor_name=actor_name, base_model=base_model, op=op
@@ -245,7 +245,7 @@ def _record_vllm_workload_finish(
     ttft_s: float | None = None,
     tpot_s: float | None = None,
 ) -> None:
-    from ..backend.runtime_observability import runtime_observability
+    from mint_server.backend.core.runtime_observability import runtime_observability
 
     runtime_observability.finish_vllm_request(
         actor_name=actor_name,
@@ -352,7 +352,7 @@ async def _async_get_detached_sampling_snapshot(
     session_id: str,
 ) -> SamplingSessionSnapshot | None:
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         info = await async_get_sampling_session_info(session_id)
     except Exception:
@@ -384,7 +384,7 @@ async def _async_get_http_sampling_snapshot(
     session_id: str,
 ) -> SamplingSessionSnapshot | None:
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         info = await async_get_sampling_session_info(session_id)
     except Exception as e:
@@ -451,7 +451,7 @@ async def _restore_local_sampling_session_if_needed(session_id: str) -> bool:
         return _has_local_sampling_session(session_id)
 
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         info = await async_get_sampling_session_info(session_id)
     except Exception as e:
@@ -483,7 +483,7 @@ async def _refresh_sampling_session_if_stale(
     if manager is None or not snapshot.uses_multi_lora:
         return snapshot
     try:
-        from ..backend.sampling_session_store import async_get_sampling_session_info
+        from mint_server.backend.stores.sampling_session_store import async_get_sampling_session_info
 
         info = await async_get_sampling_session_info(session_id)
     except Exception as e:
@@ -1218,7 +1218,7 @@ async def _asample_impl(
             )
         token_ids = request.prompt.to_token_ids()
         prompt_token_count = len(token_ids)
-        from ..backend.model_registry import get_model_config
+        from mint_server.backend.core.model_registry import get_model_config
 
         try:
             max_model_len = int(get_model_config(base_model).max_model_len)
@@ -1717,7 +1717,7 @@ async def _do_sample(
                 )
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
-                from ..backend.model_registry import get_model_config
+                from mint_server.backend.core.model_registry import get_model_config
 
                 max_model_len = int(get_model_config(base_model).max_model_len)
                 total_len = len(token_ids) + int(request.sampling_params.max_tokens)
@@ -1781,7 +1781,7 @@ async def _do_sample(
                 )
                 if engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
-                from ..backend.model_actor_supervisor import get_model_actor_supervisor
+                from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
                 model_actor_supervisor = get_model_actor_supervisor()
                 model_actor_supervisor_actor_name = getattr(engine, "actor_name", None)
@@ -2266,7 +2266,7 @@ async def compute_logprobs(
                 detail=f"Session {request.sampling_session_id!r} missing base_model",
             )
         token_ids = request.sequence.to_token_ids()
-        from ..backend.model_registry import get_model_config
+        from mint_server.backend.core.model_registry import get_model_config
 
         try:
             max_model_len = int(get_model_config(base_model).max_model_len)
@@ -2289,8 +2289,8 @@ async def compute_logprobs(
             )
 
     user_id = _get_user_id(http_request)
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     request_json = request.model_dump_json().encode("utf-8")
     request_id = uuid.uuid4().hex
@@ -2407,7 +2407,7 @@ async def _do_compute_logprobs(
             if is_multi_lora:
                 if not base_model:
                     raise RuntimeError(f"Session {session_id!r} missing base_model")
-                from ..backend.model_registry import get_model_config
+                from mint_server.backend.core.model_registry import get_model_config
 
                 max_model_len = int(get_model_config(base_model).max_model_len)
                 total_len = len(token_ids) + 1
@@ -2439,7 +2439,7 @@ async def _do_compute_logprobs(
                 )
                 if multi_lora_engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
-                from ..backend.model_actor_supervisor import get_model_actor_supervisor
+                from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
                 model_actor_supervisor = get_model_actor_supervisor()
                 model_actor_supervisor_actor_name = getattr(

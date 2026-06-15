@@ -6,9 +6,9 @@ ray = pytest.importorskip("ray")
 if not hasattr(ray, "remote"):
     pytest.skip("ray runtime without actor decorators is not usable for Megatron tests", allow_module_level=True)
 
-from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import VerlTrainingEngine
-from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+from mint_server.backend.training.training_session_manager import TrainingSession
+from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
+from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 from mint_server.models.types import LoRAConfig
 
 
@@ -121,7 +121,7 @@ def test_issue_476_megatron_train_step_passes_actual_rank(monkeypatch):
     monkeypatch.setattr(engine, "_touch_actor", lambda _session: None)
     monkeypatch.setattr(engine, "_record_megatron_result_metrics", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        "mint_server.backend.model_registry.get_model_config",
+        "mint_server.backend.core.model_registry.get_model_config",
         lambda _model: SimpleNamespace(is_moe=True),
     )
 

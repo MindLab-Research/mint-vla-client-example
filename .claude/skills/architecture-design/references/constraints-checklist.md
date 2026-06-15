@@ -19,7 +19,7 @@
   - Audit filesystem assumptions: can the API server see the same paths as the actor?
 
 - Adding a new model or changing parallelism
-  - Update `mint_server/backend/model_registry.py` (inference and training parallelism are specified separately).
+  - Update `mint_server/backend/core/model_registry.py` (inference and training parallelism are specified separately).
   - Check inference-vs-training constraints independently (vLLM LoRA limitations differ from Megatron LoRA limitations).
 
 - Changing weight transfer

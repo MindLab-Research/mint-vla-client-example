@@ -16,11 +16,11 @@ below. It is evidence, not the current normative architecture contract.
 ## Major fixes landed during validation
 
 - Action temperature is now forwarded into action sampling in `mint_server/routes/action_sampling.py:20-30`.
-- Action-session recovery across queued act paths is now worker-module-aware in `mint_server/backend/action_session_manager.py:96-122` and `mint_server/backend/action_session_manager.py:453-485`.
-- Action-session state roots are now namespace-scoped in `mint_server/backend/openpi_ray_runtime.py:41`.
-- FAST action decoding now fails loudly on malformed outputs in `mint_server/backend/openpi_fast_action_worker.py:239-338`.
+- Action-session recovery across queued act paths is now worker-module-aware in `mint_server/backend/openpi/action_session_manager.py:96-122` and `mint_server/backend/openpi/action_session_manager.py:453-485`.
+- Action-session state roots are now namespace-scoped in `mint_server/backend/openpi/openpi_ray_runtime.py:41`.
+- FAST action decoding now fails loudly on malformed outputs in `mint_server/backend/openpi/openpi_fast_action_worker.py:239-338`.
 - The grouped RL harness no longer aborts on a same-state group with zero within-group reward variance; zero-variance groups now contribute zero centered reward instead.
-- Shared FAST action actor recreate drift on the tested deterministic paths was removed on the XLA-flags setup wired through `scripts/wip/openpi_vla_start_server.sh` and `mint_server/backend/openpi_ray_runtime.py`.
+- Shared FAST action actor recreate drift on the tested deterministic paths was removed on the XLA-flags setup wired through `scripts/wip/openpi_vla_start_server.sh` and `mint_server/backend/openpi/openpi_ray_runtime.py`.
 
 ## Prompt task status
 

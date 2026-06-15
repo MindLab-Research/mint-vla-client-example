@@ -124,7 +124,7 @@ def _stub_training_inflight(
 
 @pytest.mark.anyio
 async def test_issue_281_forward_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
     from mint_server.models.types import ForwardBackwardInput, ForwardRequest
     from mint_server.routes import training as tr
 
@@ -244,7 +244,7 @@ async def test_issue_281_do_forward_backward_releases_durable_inflight_when_runt
 async def test_issue_281_training_routes_mark_queued_stage_metadata(
     monkeypatch, route_name: str, request_obj, training_op: str
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
     from mint_server.models import types as model_types
     from mint_server.routes import training as tr
 
@@ -314,7 +314,7 @@ async def test_issue_281_training_routes_mark_queued_stage_metadata(
 async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
     import mint_server.client_compat as client_compat
     from mint_server.models.types import SaveWeightsForSamplerRequest
     from mint_server.routes import training as tr
@@ -371,8 +371,8 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(
 
 @pytest.mark.anyio
 async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
     from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
     from mint_server.routes import sampling as sr
 
@@ -418,8 +418,8 @@ async def test_issue_281_asample_enqueues_scheduler_metadata(monkeypatch) -> Non
 async def test_issue_281_compute_logprobs_enqueues_scheduler_metadata(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
     from mint_server.models.types import ComputeLogprobsRequest, ModelInput
     from mint_server.routes import sampling as sr
 
@@ -482,7 +482,7 @@ async def test_issue_281_do_create_model_active_duplicate_fails_without_deleting
     monkeypatch,
 ) -> None:
     from mint_server.models.types import CreateModelRequest, LoRAConfig
-    import mint_server.backend.training_session_store as training_session_store
+    import mint_server.backend.stores.training_session_store as training_session_store
     from mint_server.routes import training as tr
 
     deleted: list[str] = []
@@ -539,7 +539,7 @@ async def test_issue_281_do_create_model_from_state_active_duplicate_fails_witho
     monkeypatch,
 ) -> None:
     from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
-    import mint_server.backend.training_session_store as training_session_store
+    import mint_server.backend.stores.training_session_store as training_session_store
     from mint_server.routes import training as tr
 
     deleted: list[str] = []
@@ -647,8 +647,8 @@ async def test_issue_281_do_reset_expert_bias_resolves_future(monkeypatch) -> No
 @pytest.mark.anyio
 async def test_issue_281_do_delete_model_deletes_then_resolves(monkeypatch) -> None:
     _install_ray_stub(monkeypatch)
-    import mint_server.backend.model_actor_supervisor as model_actor_inventory
-    import mint_server.backend.training_session_store as training_session_store
+    import mint_server.backend.actors.model_actor_supervisor as model_actor_inventory
+    import mint_server.backend.stores.training_session_store as training_session_store
     from mint_server.routes import training as tr
 
     calls: dict[str, list] = {
@@ -812,8 +812,8 @@ async def test_issue_281_do_get_tokenizer_info_releases_durable_inflight(
 async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    import mint_server.backend.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
     from mint_server.models.types import ModelInput, SampleRequest, SamplingParams
     from mint_server.routes import sampling as sr
 
@@ -857,8 +857,8 @@ async def test_issue_281_asample_falls_back_to_base_model_scheduler_domain(
 async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_finishes(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    from mint_server.backend.training_session_manager import TrainingSessionManager
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    from mint_server.backend.training.training_session_manager import TrainingSessionManager
     from mint_server.models.types import ResetExpertBiasRequest
     from mint_server.routes import training as tr
 
@@ -923,8 +923,8 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
 async def test_issue_281_public_healthz_ignores_timeout_observation(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    import mint_server.backend.task_state_store as tss
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    import mint_server.backend.stores.task_state_store as tss
     from mint_server import health_checks
     from mint_server.health_state import (
         clear_runtime_degraded_state,
@@ -954,8 +954,8 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(
 async def test_issue_281_public_healthz_ignores_pending_pg_observation(
     monkeypatch,
 ) -> None:
-    import mint_server.backend.model_work_scheduler as mws
-    import mint_server.backend.task_state_store as tss
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+    import mint_server.backend.stores.task_state_store as tss
     from mint_server import health_checks
     from mint_server.health_state import (
         clear_runtime_degraded_state,

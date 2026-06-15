@@ -3,7 +3,7 @@
 Mint separates desired actor reconciliation from local actor inventory:
 
 - `ModelActorSupervisor` is the desired-state reconciler. It owns node-pin based model-runtime actor planning and talks to `ModelWorkScheduler` about replica availability.
-- `ModelActorInventory` (`mint_server/backend/model_actor_inventory.py`) is an internal helper owned by `ModelActorSupervisor`. It tracks local metadata, inflight counts, session bindings, protection flags, RSS samples, and actor handles for admin list/kill and observability. Legacy direct GPU launch paths must publish lifecycle through the explicit `ModelActorSupervisor` inventory contract (`register`, `mark_ready`, `unregister`, inflight/session/protection methods), not by reaching around the supervisor.
+- `ModelActorInventory` (`mint_server/backend/actors/model_actor_inventory.py`) is an internal helper owned by `ModelActorSupervisor`. It tracks local metadata, inflight counts, session bindings, protection flags, RSS samples, and actor handles for admin list/kill and observability. Legacy direct GPU launch paths must publish lifecycle through the explicit `ModelActorSupervisor` inventory contract (`register`, `mark_ready`, `unregister`, inflight/session/protection methods), not by reaching around the supervisor.
 - Durable task/lease/result state lives in `TaskStateStore`; hot scheduling state lives in `ModelWorkScheduler`.
 
 ## No LRU capacity manager

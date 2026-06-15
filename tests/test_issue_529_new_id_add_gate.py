@@ -6,9 +6,9 @@ import types
 
 import pytest
 
-import mint_server.backend.lora_utils as lora_utils
-import mint_server.backend.multi_lora_engine as mle
-import mint_server.backend.multinode_inference as mni
+import mint_server.backend.inference.lora_utils as lora_utils
+import mint_server.backend.inference.multi_lora_engine as mle
+import mint_server.backend.inference.multinode_inference as mni
 
 
 @pytest.fixture

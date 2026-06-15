@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend.training_session_manager import TrainingSession, TrainingSessionManager
-from mint_server.backend.verl_training import VerlTrainingEngine
+from mint_server.backend.training.training_session_manager import TrainingSession, TrainingSessionManager
+from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
 
 def _completed_ref(value):
@@ -65,10 +65,10 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
     engine._actor_loaded_sessions[actor_name] = model_id
     engine._actor_volatile_sessions[actor_name] = {model_id}
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             is_protected=lambda name: False,
             set_session=lambda name, session_id: set_session_calls.append((name, session_id)),
@@ -107,17 +107,17 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
     engine._model_actor_supervisor_actor_names[model_id] = actor_name
     engine._model_actor_supervisor_actor_names[sibling_model_id] = actor_name
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             is_protected=lambda name: False,
             set_session=lambda name, session_id: set_session_calls.append((name, session_id)),
         ),
     )
     monkeypatch.setattr(
-        "mint_server.backend.dense_trainer.clear_dense_trainer_session",
+        "mint_server.backend.training.dense.dense_trainer.clear_dense_trainer_session",
         lambda target_model_id: cleared_dense_sessions.append(target_model_id),
     )
     monkeypatch.setattr(verl_training.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
@@ -157,11 +157,11 @@ async def test_issue_381_idle_cleanup_uses_engine_delete_session(monkeypatch: py
 
     manager._engine = _StubEngine()
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.delete_training_session",
+        "mint_server.backend.stores.training_session_store.delete_training_session",
         lambda model_id: deleted_store_sessions.append(model_id),
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_actor_supervisor.get_model_actor_supervisor",
+        "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(clear_session=lambda model_id: cleared_sessions.append(model_id)),
     )
 

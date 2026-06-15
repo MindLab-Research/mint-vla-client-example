@@ -5,11 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import mint_server.backend.runtime_observability as runtime_obs_module
+import mint_server.backend.core.runtime_observability as runtime_obs_module
 
 
 def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
@@ -76,7 +76,7 @@ def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkey
     ],
 )
 def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model: str, actor_name: str) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
 
     obs = runtime_obs_module.RuntimeObservability()
@@ -164,7 +164,7 @@ def test_issue_561_poisoned_dense_trainer_is_not_reused(monkeypatch, base_model:
 
 
 def test_issue_561_poisoned_dense_trainer_recreate_aborts_when_retire_fails(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     actor_name = "mint_dense_qwen__qwen3_0_6b"
     poisoned_entry = SimpleNamespace(
@@ -192,7 +192,7 @@ def test_issue_561_poisoned_dense_trainer_recreate_aborts_when_retire_fails(monk
 
 
 def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
@@ -263,7 +263,7 @@ def test_issue_561_dead_dense_actor_absent_name_recreates(monkeypatch) -> None:
 
 
 def test_issue_561_dense_trainer_recreates_on_max_rank_mismatch(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")
@@ -336,7 +336,7 @@ def test_issue_561_dense_trainer_recreates_on_max_rank_mismatch(monkeypatch) -> 
 
 
 def test_issue_561_dense_trainer_fails_closed_when_max_rank_unknown(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     class _Heartbeat:
         def remote(self):
@@ -365,7 +365,7 @@ def test_issue_561_dense_trainer_fails_closed_when_max_rank_unknown(monkeypatch)
 
 
 def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     actor_name = dt._make_actor_name(model_key="Qwen/Qwen3-0.6B", max_rank=dt.DEFAULT_MAX_LORA_RANK)
     monkeypatch.setenv("MINT_DENSE_INFLIGHT_WAIT_S", "0.001")
@@ -389,7 +389,7 @@ def test_issue_561_inflight_guard_uses_actor_identity(monkeypatch) -> None:
 
 
 def test_issue_561_poison_metadata_preserves_first_fault() -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     metadata = dt._poison_metadata(
         {
@@ -414,7 +414,7 @@ def test_issue_561_poison_metadata_preserves_first_fault() -> None:
 
 
 def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     metadata_updates: list[dict[str, object]] = []
     clears: list[tuple[str, object]] = []
@@ -483,7 +483,7 @@ def test_issue_561_retire_dense_trainer_persists_fatal_metadata(monkeypatch) -> 
 
 
 def test_issue_561_retire_metadata_failure_does_not_block_recreate(monkeypatch) -> None:
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
 
     unregisters: list[str] = []
     obs = runtime_obs_module.RuntimeObservability()
@@ -546,7 +546,7 @@ def test_dense_trainer_registers_creating_before_ready_wait(monkeypatch) -> None
     (creating=True) BEFORE the up-to-600s __ray_ready__ wait, otherwise the actor
     is unprotected during init and gets reaped mid forward_backward.
     """
-    from mint_server.backend import dense_trainer as dt
+    from mint_server.backend.training.dense import dense_trainer as dt
     from mint_server import config as cfg
 
     monkeypatch.setattr(cfg, "PFS_RUNTIME_ENV_ROOT", "/tmp/runtime-root")

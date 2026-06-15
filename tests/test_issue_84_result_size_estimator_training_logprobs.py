@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mint_server.backend.result_size_estimator import estimate_forward_result_bytes
+from mint_server.backend.core.result_size_estimator import estimate_forward_result_bytes
 from mint_server.models.types import (
     Datum,
     EncodedTextChunk,

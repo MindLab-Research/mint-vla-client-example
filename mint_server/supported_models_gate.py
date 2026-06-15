@@ -6,7 +6,7 @@ from .config import ALLOW_UNSUPPORTED_MODELS
 
 
 def _normalize_local_model_name(base_model: str) -> str | None:
-    from .backend.model_registry import MODEL_CONFIGS, normalize_model_name
+    from mint_server.backend.core.model_registry import MODEL_CONFIGS, normalize_model_name
 
     if base_model in MODEL_CONFIGS:
         return base_model
@@ -23,7 +23,7 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
         Canonical local model name (for MODEL_CONFIGS-backed models), or the original
         `base_model` for gateway-routed models.
     """
-    from .backend.model_registry import MODEL_CONFIGS, list_supported_models
+    from mint_server.backend.core.model_registry import MODEL_CONFIGS, list_supported_models
     from .gateway import get_upstream_capabilities, upstream_for_model
 
     local_name = _normalize_local_model_name(base_model)

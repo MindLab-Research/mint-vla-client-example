@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import asyncio
 
-from mint_server.backend.control_plane_contracts import (
+from mint_server.backend.contracts.control_plane_contracts import (
     AppendWorkResult,
     CancelTaskResult,
     TaskRecord,
     TaskStatusChange,
 )
-from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
-from mint_server.backend.task_payload_presenter import present_terminal_retrieve_result
-from mint_server.backend.task_payload_store import TaskPayloadStore
-from mint_server.backend.task_state_store import TaskStateStore
+from mint_server.backend.scheduling.model_work_task_gateway import SchedulerModelWorkTaskGateway
+from mint_server.backend.scheduling.task_payload_presenter import present_terminal_retrieve_result
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore
+from mint_server.backend.stores.task_state_store import TaskStateStore
 
 
 def _submit_kwargs(request_id: str = "req-gateway") -> dict:

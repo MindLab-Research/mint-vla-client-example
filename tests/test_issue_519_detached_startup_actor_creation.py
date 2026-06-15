@@ -53,7 +53,7 @@ def _install_fake_ray(monkeypatch):
 @pytest.mark.parametrize(
     ("module_name", "factory_name"),
     [
-        ("mint_server.backend.maintenance_cron_actor", "_get_or_create_actor"),
+        ("mint_server.backend.ops.maintenance_cron_actor", "_get_or_create_actor"),
     ],
 )
 def test_issue_519_detached_actor_creation_skips_blocking_probe(monkeypatch, module_name: str, factory_name: str) -> None:

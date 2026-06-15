@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from mint_server.backend.model_work_scheduler import (
+from mint_server.backend.scheduling.model_work_scheduler import (
     CURRENT_CODE_IDENTITY,
     ModelWorkSchedulerConflictError,
     ModelWorkSchedulerCodeIdentityMismatchError,
@@ -13,7 +13,7 @@ from mint_server.backend.model_work_scheduler import (
     _model_work_scheduler_use_task_state_store_from_env,
     _ray_model_work_scheduler_actor_name,
 )
-from mint_server.backend.task_state_store import TaskStateConflictError, TaskStateStore
+from mint_server.backend.stores.task_state_store import TaskStateConflictError, TaskStateStore
 
 
 @pytest.fixture(autouse=True)
@@ -746,7 +746,7 @@ def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
 
 
 def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(monkeypatch) -> None:
-    import mint_server.backend.model_work_scheduler as module
+    import mint_server.backend.scheduling.model_work_scheduler as module
     import ray
 
     captured: dict[str, Any] = {"methods": {}}

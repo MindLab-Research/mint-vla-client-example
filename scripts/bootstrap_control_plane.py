@@ -70,7 +70,8 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     _prepare_runtime(str(args.config_path) if args.config_path else None)
 
-    from mint_server.backend import config_actor, model_actor_supervisor
+    from mint_server.backend.core import config_actor
+    from mint_server.backend.actors import model_actor_supervisor
     from mint_server.config import RAY_NAMESPACE
     from mint_server.ray_utils import init_ray
 

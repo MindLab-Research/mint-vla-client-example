@@ -2272,7 +2272,7 @@ def _patch_vllm_gpu_worker_kv_debug_info() -> None:
 
 def _patch_vllm_qwen35_text_only_adapter() -> None:
     try:
-        from mint_server.backend.qwen35_text_vllm_adapter import (
+        from mint_server.backend.inference.qwen35_text_vllm_adapter import (
             install_vllm_qwen35_text_only_adapter_patches,
         )
     except Exception:

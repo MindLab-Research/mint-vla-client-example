@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-import mint_server.backend.openpi_fast_worker as fast_worker_module
-import mint_server.backend.openpi_pi05_worker as pi05_worker_module
+import mint_server.backend.openpi.openpi_fast_worker as fast_worker_module
+import mint_server.backend.openpi.openpi_pi05_worker as pi05_worker_module
 
 
 def test_openpi_fast_worker_save_session_state_uses_manager() -> None:
@@ -33,7 +33,7 @@ def test_openpi_fast_worker_save_session_state_uses_manager() -> None:
     )
 
     assert calls["session_id"] == "session-a"
-    assert calls["worker_module"] == "mint_server.backend.openpi_fast_worker"
+    assert calls["worker_module"] == "mint_server.backend.openpi.openpi_fast_worker"
     assert calls["runtime_signature"] == {"config_name": "pi0_fast_libero_low_mem_finetune"}
     assert calls["state"] == {"marker": "fast-session-tree"}
     assert calls["rng"] == {"seed": [11, 12]}
@@ -75,7 +75,7 @@ def test_openpi_fast_worker_load_session_state_restores_aux_state() -> None:
     )
 
     assert calls["session_id"] == "session-a"
-    assert calls["expected_worker_module"] == "mint_server.backend.openpi_fast_worker"
+    assert calls["expected_worker_module"] == "mint_server.backend.openpi.openpi_fast_worker"
     assert calls["expected_runtime_signature"] == {"config_name": "pi0_fast_libero_low_mem_finetune"}
     assert calls["load_train_state_fn"] is fake_session._load_session_train_state_checkpoint
     assert fake_session._state == "new-state"
@@ -130,14 +130,14 @@ def test_openpi_pi05_worker_save_and_load_session_state_use_manager() -> None:
         {"session_id": "session-b"},
     )
 
-    assert save_calls["worker_module"] == "mint_server.backend.openpi_pi05_worker"
+    assert save_calls["worker_module"] == "mint_server.backend.openpi.openpi_pi05_worker"
     assert save_calls["runtime_signature"] == {
         "config_name": "pi05_libero",
         "max_token_len": 48,
     }
     assert save_calls["state"] == {"marker": "pi05-session-tree"}
     assert save_calls["save_train_state_fn"] is fake_session._save_session_train_state_checkpoint
-    assert load_calls["expected_worker_module"] == "mint_server.backend.openpi_pi05_worker"
+    assert load_calls["expected_worker_module"] == "mint_server.backend.openpi.openpi_pi05_worker"
     assert load_calls["expected_runtime_signature"] == {
         "config_name": "pi05_libero",
         "max_token_len": 48,

@@ -92,7 +92,7 @@ def _get_vllm_actor_entry(*, actor_name: str) -> dict[str, Any] | None:
 
 
 def _expected_vllm_actor_name(model_name: str) -> str:
-    # Must match mint_server.backend.multi_lora_engine._model_to_actor_name().
+    # Must match mint_server.backend.inference.multi_lora_engine._model_to_actor_name().
     model_part = model_name.split("/")[-1] if "/" in model_name else model_name
     safe_name = model_part.lower().replace(" ", "_")
     return f"mint_vllm_{safe_name}"

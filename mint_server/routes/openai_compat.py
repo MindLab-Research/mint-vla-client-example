@@ -30,7 +30,7 @@ from ..models.types import (
     OAIToolCall,
     OAIUsage,
 )
-from ..backend.task_state_store import task_futures
+from mint_server.backend.stores.task_state_store import task_futures
 from ..runtime_env import env_get
 from .sampling import build_sample_once_billing_observations, sample_once
 from .service import ensure_sampling_session
@@ -95,7 +95,7 @@ def _error_response(
 
 
 def _list_supported_models() -> list[str]:
-    from ..backend.model_registry import list_supported_models
+    from mint_server.backend.core.model_registry import list_supported_models
 
     return list_supported_models()
 

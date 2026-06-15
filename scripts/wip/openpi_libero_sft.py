@@ -58,7 +58,7 @@ requests.delete = _delete
 
 import openpi.training.config as config_mod
 from openpi import transforms as T
-from mint_server.backend.model_registry import MODEL_CONFIGS
+from mint_server.backend.core.model_registry import MODEL_CONFIGS
 
 DATASET_ROOT = Path('/vePFS-Mindverse/share/code/conley/.hf-lerobot/physical-intelligence/libero')
 ASSETS_DIR_BY_BASE_MODEL = {

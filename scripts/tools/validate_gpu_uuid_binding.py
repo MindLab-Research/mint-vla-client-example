@@ -69,7 +69,7 @@ def inspect_node() -> dict[str, Any]:
 
 @ray.remote(num_cpus=0.01, num_gpus=1)
 def inspect_allocated_gpu() -> dict[str, Any]:
-    from mint_server.backend.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
+    from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 
     try:
         import ray.util  # type: ignore[attr-defined]

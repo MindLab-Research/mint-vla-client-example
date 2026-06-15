@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import anyio
 
-from mint_server.backend.task_state_store import TaskStateStore
+from mint_server.backend.stores.task_state_store import TaskStateStore
 from mint_server.models.types import ActRequest, ModelInput
 from mint_server.routes import action_sampling
 from mint_server.routes import training as training_routes

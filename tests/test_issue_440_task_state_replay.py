@@ -4,7 +4,7 @@ import anyio
 import pytest
 
 import mint_server.config as config_module
-from mint_server.backend.task_state_store import FutureStatus, _meta_with_request_op
+from mint_server.backend.stores.task_state_store import FutureStatus, _meta_with_request_op
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
@@ -130,8 +130,8 @@ def _response_stub():
 
 
 def test_issue_440_train_step_result_uses_task_state_store_as_replay_index(monkeypatch, tmp_path):
-    import mint_server.backend.task_state_store as task_state_store_module
-    from mint_server.backend.task_payload_store import TaskPayloadStore
+    import mint_server.backend.stores.task_state_store as task_state_store_module
+    from mint_server.backend.stores.task_payload_store import TaskPayloadStore
 
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))
@@ -178,7 +178,7 @@ def test_issue_440_random_unknown_without_task_state_record_stays_404(monkeypatc
 
 
 def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
 
     monkeypatch.setattr(futures_route, "task_futures", _UnknownTaskFutureService())
     monkeypatch.setattr(
@@ -211,7 +211,7 @@ def test_issue_440_known_terminal_future_evicted_not_unknown(monkeypatch):
 
 
 def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
 
     monkeypatch.setattr(config_module.config, "api_key", "", raising=False)
     monkeypatch.setattr(config_module.config, "internal_api_token", "secret", raising=False)
@@ -243,8 +243,8 @@ def test_issue_440_failure_replay_keeps_public_masking(monkeypatch):
 
 
 def test_issue_440_concurrent_task_state_replay_returns_equivalent_payloads(monkeypatch, tmp_path):
-    import mint_server.backend.task_state_store as task_state_store_module
-    from mint_server.backend.task_payload_store import TaskPayloadStore
+    import mint_server.backend.stores.task_state_store as task_state_store_module
+    from mint_server.backend.stores.task_payload_store import TaskPayloadStore
 
     payload_root = tmp_path / "payloads"
     monkeypatch.setenv("MINT_TASK_PAYLOAD_ROOT_DIR", str(payload_root))

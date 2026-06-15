@@ -251,7 +251,7 @@ def test_actor_env_with_legacy_bridges_prefers_modern_volcengine_env(tmp_path) -
 
 
 def test_config_actor_exposes_no_mutating_api() -> None:
-    from mint_server.backend import config_actor
+    from mint_server.backend.core import config_actor
 
     assert hasattr(config_actor, "ensure_started")
     assert hasattr(config_actor, "get_snapshot")
@@ -261,7 +261,7 @@ def test_config_actor_exposes_no_mutating_api() -> None:
 
 
 def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
-    from mint_server.backend import config_actor
+    from mint_server.backend.core import config_actor
 
     expected = build_config_snapshot(
         environ={"MINT_CONFIG_ACTOR_NAME": "mint_config"},
@@ -293,7 +293,7 @@ def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
 
 
 def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
-    from mint_server.backend import config_actor
+    from mint_server.backend.core import config_actor
 
     captured: dict[str, object] = {}
     monkeypatch.setattr(config_actor, "RAY_NAMESPACE", "mint-ns")
@@ -334,7 +334,7 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
 
 
 def test_config_actor_options_honor_control_plane_node_pin(monkeypatch) -> None:
-    from mint_server.backend import config_actor
+    from mint_server.backend.core import config_actor
 
     class FakeRay:
         @staticmethod
@@ -387,11 +387,11 @@ def test_only_config_actor_disables_config_actor_hydration() -> None:
 
     assert matches == [
         (
-            "mint_server/backend/async_ray_control.py",
+            "mint_server/backend/ray_cluster/async_ray_control.py",
             "include_config_snapshot=False,",
         ),
         (
-            "mint_server/backend/config_actor.py",
+            "mint_server/backend/core/config_actor.py",
             "include_config_snapshot=False,",
         )
     ]

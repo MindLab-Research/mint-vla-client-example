@@ -87,10 +87,10 @@ def test_lifespan_checks_control_plane_without_creating_actors(monkeypatch: pyte
     monkeypatch.setattr(app_module.openai_compat, "preload_supported_tokenizers", lambda: [])
     monkeypatch.setattr(app_module, "close_http_clients", _close_http_clients)
 
-    import mint_server.backend.action_session_manager as action_manager_module
-    import mint_server.backend.config_actor as config_actor_module
-    import mint_server.backend.maintenance_cron_actor as cron_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.openpi.action_session_manager as action_manager_module
+    import mint_server.backend.core.config_actor as config_actor_module
+    import mint_server.backend.ops.maintenance_cron_actor as cron_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)
@@ -187,10 +187,10 @@ def test_lifespan_leaves_execution_route_globals_unbound(monkeypatch: pytest.Mon
     monkeypatch.setattr(app_module.openai_compat, "preload_supported_tokenizers", lambda: [])
     monkeypatch.setattr(app_module, "close_http_clients", _close_http_clients)
 
-    import mint_server.backend.action_session_manager as action_manager_module
-    import mint_server.backend.config_actor as config_actor_module
-    import mint_server.backend.maintenance_cron_actor as cron_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.openpi.action_session_manager as action_manager_module
+    import mint_server.backend.core.config_actor as config_actor_module
+    import mint_server.backend.ops.maintenance_cron_actor as cron_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)
@@ -266,10 +266,10 @@ def test_lifespan_degrades_but_yields_when_usage_postgres_unhealthy(monkeypatch:
     monkeypatch.setattr(app_module.openai_compat, "preload_supported_tokenizers", lambda: [])
     monkeypatch.setattr(app_module, "close_http_clients", _close_http_clients)
 
-    import mint_server.backend.action_session_manager as action_manager_module
-    import mint_server.backend.config_actor as config_actor_module
-    import mint_server.backend.maintenance_cron_actor as cron_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.openpi.action_session_manager as action_manager_module
+    import mint_server.backend.core.config_actor as config_actor_module
+    import mint_server.backend.ops.maintenance_cron_actor as cron_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)

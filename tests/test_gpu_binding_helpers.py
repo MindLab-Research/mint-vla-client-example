@@ -1,7 +1,4 @@
-import os
-from unittest.mock import patch
-
-from mint_server.backend import gpu_binding_helpers as h
+from mint_server.backend.ray_cluster import gpu_binding_helpers as h
 
 
 def test_physical_gpu_from_ray_id_maps_visible_index_to_physical_index():

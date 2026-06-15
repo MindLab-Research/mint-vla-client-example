@@ -301,7 +301,7 @@ def register_remote_sampling_session(*, sampling_session_id: str, upstream_alias
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         gateway_session_store.upsert_sampling_session(
             sampling_session_id=sampling_session_id,
@@ -327,7 +327,7 @@ async def async_register_remote_sampling_session(
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         await gateway_session_store.async_upsert_sampling_session(
             sampling_session_id=sampling_session_id,
@@ -353,7 +353,7 @@ def remote_sampling_session(sampling_session_id: str) -> tuple[str, str] | None:
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         info = gateway_session_store.get_sampling_session(sampling_session_id)
         if info is not None:
@@ -376,7 +376,7 @@ async def async_remote_sampling_session(sampling_session_id: str) -> tuple[str, 
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         info = await gateway_session_store.async_get_sampling_session(sampling_session_id)
         if info is not None:
@@ -397,7 +397,7 @@ def unregister_remote_sampling_session(sampling_session_id: str) -> None:
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         gateway_session_store.delete_sampling_session(sampling_session_id)
     except Exception:
@@ -415,7 +415,7 @@ async def async_unregister_remote_sampling_session(sampling_session_id: str) -> 
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         await gateway_session_store.async_delete_sampling_session(sampling_session_id)
     except Exception:
@@ -444,7 +444,7 @@ def register_remote_training_model(
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         gateway_session_store.upsert_training_model(
             model_id=model_id,
@@ -480,7 +480,7 @@ async def async_register_remote_training_model(
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         await gateway_session_store.async_upsert_training_model(
             model_id=model_id,
@@ -507,7 +507,7 @@ def remote_training_model_info(model_id: str) -> dict[str, str | None] | None:
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         info = gateway_session_store.get_training_model_info(model_id)
         if info is not None:
@@ -531,7 +531,7 @@ async def async_remote_training_model_info(model_id: str) -> dict[str, str | Non
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         info = await gateway_session_store.async_get_training_model_info(model_id)
         if info is not None:
@@ -579,7 +579,7 @@ def unregister_remote_training_model(model_id: str) -> None:
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         gateway_session_store.delete_training_model(model_id)
     except Exception:
@@ -597,7 +597,7 @@ async def async_unregister_remote_training_model(model_id: str) -> None:
     try:
         from fastapi import HTTPException
 
-        from .backend import gateway_session_store
+        from mint_server.backend.stores import gateway_session_store
 
         await gateway_session_store.async_delete_training_model(model_id)
     except Exception:

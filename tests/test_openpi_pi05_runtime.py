@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.training.training_session_manager import TrainingSession
 from mint_server.models.types import (
     AdamParams,
     Datum,
@@ -128,13 +128,13 @@ def _pi05_model_config():
 
 
 def test_openpi_pi05_engine_create_training_session_starts_runtime(monkeypatch) -> None:
-    from mint_server.backend.openpi_pi05_training import (
+    from mint_server.backend.openpi.openpi_pi05_training import (
         OPENPI_PI05_TRAINING_BACKEND,
         OpenPIPi05TrainingEngine,
     )
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.get_model_config",
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
         lambda base_model: _pi05_model_config(),
     )
 
@@ -164,7 +164,7 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_pi05_training import _default_runtime_factory
+    from mint_server.backend.openpi.openpi_pi05_training import _default_runtime_factory
 
     configure_runtime_env()
     calls: list[dict[str, object]] = []
@@ -184,12 +184,12 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(
         raise AssertionError(f"local subprocess path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.start_openpi_shared_ray_runtime",
+        "mint_server.backend.openpi.openpi_pi05_training.start_openpi_shared_ray_runtime",
         _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_runtime.OpenPIFastWorkerClient.start",
         _unexpected_local_start,
     )
 
@@ -205,7 +205,7 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(
     assert calls == [
         {
             "model_id": "model-1",
-            "worker_module": "mint_server.backend.openpi_pi05_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_pi05_worker",
             "config_name": "pi05_libero",
             "max_model_len": 200,
         }
@@ -213,10 +213,10 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_ray_runtime(
 
 
 def test_openpi_pi05_engine_forward_backward_builds_payload_and_updates_grad_state(monkeypatch) -> None:
-    from mint_server.backend.openpi_pi05_training import OpenPIPi05TrainingEngine
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.get_model_config",
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
         lambda base_model: _pi05_model_config(),
     )
 
@@ -245,10 +245,10 @@ def test_openpi_pi05_engine_forward_backward_builds_payload_and_updates_grad_sta
 
 
 def test_openpi_pi05_engine_rejects_unknown_loss_functions(monkeypatch) -> None:
-    from mint_server.backend.openpi_pi05_training import OpenPIPi05TrainingEngine
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.get_model_config",
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
         lambda base_model: _pi05_model_config(),
     )
 
@@ -266,10 +266,10 @@ def test_openpi_pi05_engine_rejects_unknown_loss_functions(monkeypatch) -> None:
 
 
 def test_openpi_pi05_engine_train_step_composes_forward_backward_and_optim_step(monkeypatch) -> None:
-    from mint_server.backend.openpi_pi05_training import OpenPIPi05TrainingEngine
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.get_model_config",
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
         lambda base_model: _pi05_model_config(),
     )
 
@@ -293,10 +293,10 @@ def test_openpi_pi05_engine_train_step_composes_forward_backward_and_optim_step(
 
 
 def test_openpi_pi05_engine_save_load_and_shutdown_delegate_to_runtime(monkeypatch) -> None:
-    from mint_server.backend.openpi_pi05_training import OpenPIPi05TrainingEngine
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_pi05_training.get_model_config",
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
         lambda base_model: _pi05_model_config(),
     )
 

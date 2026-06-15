@@ -1,4 +1,4 @@
-from mint_server.backend.model_registry import MODEL_CONFIGS, ModelConfig
+from mint_server.backend.core.model_registry import MODEL_CONFIGS, ModelConfig
 
 
 def test_text_models_default_to_text_family_metadata() -> None:

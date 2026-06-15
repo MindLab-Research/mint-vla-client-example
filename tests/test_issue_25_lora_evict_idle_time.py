@@ -1,7 +1,7 @@
 import asyncio
 import time
 
-from mint_server.backend.lora_registry import LoRARegistry
+from mint_server.backend.inference.lora_registry import LoRARegistry
 
 
 def test_lru_candidates_skip_recently_used(monkeypatch):

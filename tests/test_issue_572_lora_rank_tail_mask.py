@@ -13,7 +13,7 @@ torch = pytest.importorskip("torch")
 
 
 def test_issue_572_zero_rank_tail_masks_params_and_grads() -> None:
-    from mint_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+    from mint_server.backend.inference.lora_utils import zero_lora_rank_tail_named_parameters
 
     params = {
         "layers.0.self_attn.q_proj.lora_A.default.weight": torch.nn.Parameter(torch.ones(64, 3)),
@@ -38,7 +38,7 @@ def test_issue_572_zero_rank_tail_masks_params_and_grads() -> None:
 
 
 def test_issue_572_zero_rank_tail_supports_tp_sharded_rank_params() -> None:
-    from mint_server.backend.lora_utils import zero_lora_rank_tail_named_parameters
+    from mint_server.backend.inference.lora_utils import zero_lora_rank_tail_named_parameters
 
     rank0 = {
         "decoder.layers.0.self_attention.linear_qkv.adapter.linear_in.weight": torch.nn.Parameter(torch.ones(16, 3)),
@@ -87,7 +87,7 @@ def test_issue_572_zero_rank_tail_supports_tp_sharded_rank_params() -> None:
 
 
 def test_issue_572_pad_and_truncate_support_megatron_adapter_names() -> None:
-    from mint_server.backend.lora_utils import pad_lora_state_dict, truncate_lora_state_dict
+    from mint_server.backend.inference.lora_utils import pad_lora_state_dict, truncate_lora_state_dict
 
     state = {
         "layers.0.mlp.adapter.linear_in.weight": torch.ones(16, 4),
@@ -114,7 +114,7 @@ def test_issue_572_pad_and_truncate_support_megatron_adapter_names() -> None:
 
 
 def test_issue_572_rank_inference_rejects_mixed_lora_tensor_ranks() -> None:
-    from mint_server.backend.lora_utils import get_lora_rank_from_state_dict
+    from mint_server.backend.inference.lora_utils import get_lora_rank_from_state_dict
 
     with pytest.raises(ValueError, match="LoRA tensor rank mismatch"):
         get_lora_rank_from_state_dict(
@@ -126,7 +126,7 @@ def test_issue_572_rank_inference_rejects_mixed_lora_tensor_ranks() -> None:
 
 
 def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
-    from mint_server.backend.lora_utils import fit_lora_state_dict_to_reference
+    from mint_server.backend.inference.lora_utils import fit_lora_state_dict_to_reference
 
     state = {
         "layers.0.mlp.adapter.linear_in.weight": torch.arange(64 * 4).reshape(64, 4),
@@ -199,7 +199,7 @@ def test_issue_572_fit_lora_state_dict_to_tp_local_reference() -> None:
 
 
 def test_issue_572_dense_export_config_uses_actual_rank() -> None:
-    from mint_server.backend.verl_training import TrainingWorker
+    from mint_server.backend.training.verl.verl_training import TrainingWorker
 
     worker_cls = TrainingWorker.__ray_metadata__.modified_class
     worker = object.__new__(worker_cls)
@@ -227,7 +227,7 @@ def test_issue_572_dense_export_config_uses_actual_rank() -> None:
 
 def test_issue_572_dense_reverse_kl_loads_reference_with_adapter_rank(tmp_path) -> None:
     from safetensors.torch import save_file
-    from mint_server.backend.verl_training import TrainingWorker
+    from mint_server.backend.training.verl.verl_training import TrainingWorker
 
     reference_dir = tmp_path / "reference"
     reference_dir.mkdir()
@@ -292,7 +292,7 @@ def test_issue_572_dense_reverse_kl_loads_reference_with_adapter_rank(tmp_path) 
 
 def test_issue_572_dense_load_checkpoint_pads_actual_rank_adapter(tmp_path, monkeypatch) -> None:
     from safetensors.torch import save_file
-    from mint_server.backend.verl_training import TrainingWorker
+    from mint_server.backend.training.verl.verl_training import TrainingWorker
 
     save_file(
         {
@@ -352,7 +352,7 @@ def test_issue_572_dense_load_checkpoint_pads_actual_rank_adapter(tmp_path, monk
 
 def test_issue_572_dense_load_checkpoint_rejects_rank_metadata_mismatch(tmp_path) -> None:
     from safetensors.torch import save_file
-    from mint_server.backend.verl_training import TrainingWorker
+    from mint_server.backend.training.verl.verl_training import TrainingWorker
 
     save_file(
         {
@@ -377,7 +377,7 @@ def test_issue_572_dense_load_checkpoint_rejects_rank_metadata_mismatch(tmp_path
 
 def test_issue_572_dense_load_checkpoint_rejects_non_int_adapter_config_rank(tmp_path) -> None:
     from safetensors.torch import save_file
-    from mint_server.backend.verl_training import TrainingWorker
+    from mint_server.backend.training.verl.verl_training import TrainingWorker
 
     save_file(
         {
@@ -400,11 +400,11 @@ def test_issue_572_dense_load_checkpoint_rejects_non_int_adapter_config_rank(tmp
 
 
 def test_issue_572_dense_create_passes_configured_max_rank(monkeypatch) -> None:
-    import mint_server.backend.dense_trainer as dense_trainer
-    import mint_server.backend.model_registry as model_registry
-    import mint_server.backend.model_actor_supervisor as model_actor_inventory
-    import mint_server.backend.verl_training as verl_training
-    from mint_server.backend.verl_training import VerlTrainingEngine
+    import mint_server.backend.training.dense.dense_trainer as dense_trainer
+    import mint_server.backend.core.model_registry as model_registry
+    import mint_server.backend.actors.model_actor_supervisor as model_actor_inventory
+    import mint_server.backend.training.verl.verl_training as verl_training
+    from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
     monkeypatch.setattr(verl_training.server_config, "max_lora_rank", 96, raising=False)
     monkeypatch.setattr(verl_training.server_config, "training_dense_get_or_create_timeout_s", 10, raising=False)
@@ -465,7 +465,7 @@ def test_issue_572_megatron_group_reinit_passes_actual_rank_to_rank_workers() ->
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 
     group_cls = MegatronWorkerGroup.__ray_metadata__.modified_class
     group = object.__new__(group_cls)
@@ -509,8 +509,8 @@ def test_issue_572_megatron_peft_export_truncates_to_actual_rank(tmp_path, monke
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
     from safetensors.torch import load_file
-    from mint_server.backend import megatron_distributed
-    from mint_server.backend.megatron_distributed import MegatronRankWorker
+    from mint_server.backend.training.megatron import megatron_distributed
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronRankWorker
 
     monkeypatch.setattr(megatron_distributed, "get_model_config", lambda _model: SimpleNamespace(is_mla=False))
 
@@ -553,8 +553,8 @@ def test_issue_572_megatron_save_checkpoint_skips_duplicate_peft_export_by_defau
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend import megatron_distributed
-    from mint_server.backend.megatron_distributed import MegatronRankWorker
+    from mint_server.backend.training.megatron import megatron_distributed
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronRankWorker
 
     peft_utils_mod = ModuleType("verl.utils.megatron_peft_utils")
     peft_utils_mod._get_rank_checkpoint_path = lambda checkpoint_path: os.path.join(checkpoint_path, "mp_rank_00")
@@ -599,7 +599,7 @@ def test_issue_572_megatron_rank_checkpoint_preserves_tp_local_rank_for_rank32(t
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend.megatron_distributed import MegatronRankWorker
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronRankWorker
 
     verl_mod = ModuleType("verl")
     verl_utils_mod = ModuleType("verl.utils")
@@ -648,7 +648,7 @@ def test_issue_572_megatron_global_to_tp_load_requires_parallel_state(tmp_path, 
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend.megatron_distributed import MegatronRankWorker
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronRankWorker
 
     torch.save(
         {
@@ -699,8 +699,8 @@ def test_issue_572_megatron_load_checkpoint_accepts_matching_actual_rank_metadat
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    import mint_server.backend.megatron_distributed as megatron_mod
-    from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+    import mint_server.backend.training.megatron.megatron_distributed as megatron_mod
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 
     (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "target_modules": ["linear_qkv"]}))
@@ -751,7 +751,7 @@ def test_issue_572_megatron_load_checkpoint_rejects_mismatched_actual_rank_metad
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 
     (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 16, "target_modules": ["linear_qkv"]}))
@@ -775,7 +775,7 @@ def test_issue_572_megatron_load_checkpoint_rejects_rank_above_trainer_before_lo
     if not hasattr(ray, "remote"):
         pytest.skip("ray runtime without actor decorators is not usable for Megatron tests")
 
-    from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+    from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 
     (tmp_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")
     (tmp_path / "adapter_config.json").write_text(json.dumps({"r": 80, "target_modules": ["linear_qkv"]}))

@@ -6,29 +6,29 @@ import time
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import ExecutorOutcome, LeaseToken
-from mint_server.backend.engine_adapter import (
+from mint_server.backend.contracts.control_plane_contracts import ExecutorOutcome, LeaseToken
+from mint_server.backend.contracts.engine_adapter import (
     EngineHealth,
     EngineHealthStatus,
     EngineObservability,
     GpuPerformanceSample,
 )
-from mint_server.backend.engine_liveness import EngineLivenessPush
-from mint_server.backend.task_state_store import FutureStatus
-from mint_server.backend.model_engine_host import (
+from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
+from mint_server.backend.stores.task_state_store import FutureStatus
+from mint_server.backend.actors.model_engine_host import (
     ModelEngineHost,
     _default_executor,
     actor_runtime_env_vars,
     default_model_engine_host_name,
     get_or_create_model_engine_host,
 )
-from mint_server.backend.model_work_execution_context import (
+from mint_server.backend.core.model_work_execution_context import (
     get_current_model_work_consumer_generation,
     get_current_model_work_consumer_id,
     get_current_model_work_lease_id,
 )
-from mint_server.backend.model_work_scheduler import ModelWorkSchedulerConflictError
-from mint_server.backend.task_payload_store import TaskPayloadStore
+from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerConflictError
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore
 
 
 @pytest.fixture(autouse=True)
@@ -134,7 +134,7 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        "mint_server.backend.actors.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
@@ -158,7 +158,7 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
     monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "/repo/scripts/vllm_worker_python.py")
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.preferred_vllm_python_executable",
+        "mint_server.backend.actors.model_engine_host.preferred_vllm_python_executable",
         lambda: "/repo/scripts/vllm_worker_python.py",
     )
 
@@ -206,11 +206,11 @@ def test_issue_729_get_or_create_model_engine_host_uses_explicit_ray_address(mon
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        "mint_server.backend.actors.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
+        "mint_server.backend.actors.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {"RAY_CLIENT_ADDRESS": ""},
     )
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
@@ -1159,9 +1159,9 @@ async def test_model_engine_host_pushes_ready_liveness_when_scheduler_still_star
 async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_engine_ready(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_engine_host as runtime_module
-    import mint_server.backend.model_work_dispatch as dispatch_module
-    from mint_server.backend.execution_context import ExecutionContext
+    import mint_server.backend.actors.model_engine_host as runtime_module
+    import mint_server.backend.scheduling.model_work_dispatch as dispatch_module
+    from mint_server.backend.core.execution_context import ExecutionContext
 
     lease = _lease("runtime-req-default-lifecycle-ready")
     scheduler = _FakeScheduler(claims=[[lease]])
@@ -1184,7 +1184,7 @@ async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_en
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.ops.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -1212,8 +1212,8 @@ async def test_model_engine_host_default_lifecycle_blocks_claim_until_binding_en
 async def test_model_engine_host_default_lifecycle_pushes_to_supervisor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_engine_host as runtime_module
-    import mint_server.backend.model_work_dispatch as dispatch_module
+    import mint_server.backend.actors.model_engine_host as runtime_module
+    import mint_server.backend.scheduling.model_work_dispatch as dispatch_module
 
     pushes: list[EngineLivenessPush] = []
     scheduler = _FakeScheduler(claims=[])
@@ -1236,7 +1236,7 @@ async def test_model_engine_host_default_lifecycle_pushes_to_supervisor(
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(runtime_module, "_default_liveness_push", _push)
     monkeypatch.setattr(
-        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.ops.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -1259,8 +1259,8 @@ async def test_model_engine_host_default_lifecycle_pushes_to_supervisor(
 async def test_model_engine_host_default_lifecycle_restarts_binding_engine_on_backend_death(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_engine_host as runtime_module
-    import mint_server.backend.model_work_dispatch as dispatch_module
+    import mint_server.backend.actors.model_engine_host as runtime_module
+    import mint_server.backend.scheduling.model_work_dispatch as dispatch_module
 
     lease = _lease("runtime-req-default-lifecycle-restart")
     scheduler = _FakeScheduler(claims=[[lease]])
@@ -1280,7 +1280,7 @@ async def test_model_engine_host_default_lifecycle_restarts_binding_engine_on_ba
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.ops.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -1703,7 +1703,7 @@ async def test_issue_648_default_token_budget_provider_uses_kv_debug_fallback(mo
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.async_get_ray_ref",
+        "mint_server.backend.actors.model_engine_host.async_get_ray_ref",
         _async_get_ray_ref,
     )
 
@@ -2347,9 +2347,9 @@ def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
 
 @pytest.mark.anyio
 async def test_issue_593_default_executor_initializes_execution_bindings(monkeypatch) -> None:
-    import mint_server.backend.model_engine_host as runtime_module
-    import mint_server.backend.model_work_dispatch as dispatch_module
-    from mint_server.backend.execution_context import current_execution_context
+    import mint_server.backend.actors.model_engine_host as runtime_module
+    import mint_server.backend.scheduling.model_work_dispatch as dispatch_module
+    from mint_server.backend.core.execution_context import current_execution_context
     from mint_server.routes import sampling
 
     calls: list[str] = []
@@ -2374,7 +2374,7 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.ops.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -2388,9 +2388,9 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
 
 @pytest.mark.anyio
 async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) -> None:
-    import mint_server.backend.model_engine_host as runtime_module
-    import mint_server.backend.model_work_dispatch as dispatch_module
-    from mint_server.backend.execution_context import current_execution_context
+    import mint_server.backend.actors.model_engine_host as runtime_module
+    import mint_server.backend.scheduling.model_work_dispatch as dispatch_module
+    from mint_server.backend.core.execution_context import current_execution_context
     from mint_server.routes import training
 
     calls: list[str] = []
@@ -2417,7 +2417,7 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
 
     monkeypatch.setattr(runtime_module, "_EXECUTION_BINDINGS", None)
     monkeypatch.setattr(
-        "mint_server.backend.execution_bindings.initialize_execution_bindings",
+        "mint_server.backend.ops.execution_bindings.initialize_execution_bindings",
         _initialize_execution_bindings,
     )
     monkeypatch.setattr(dispatch_module, "execute_model_work_item", _execute_work_item)
@@ -2475,15 +2475,15 @@ def test_issue_593_get_or_create_recreates_stale_generation(monkeypatch) -> None
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.sync_get_ray_ref",
+        "mint_server.backend.actors.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        "mint_server.backend.actors.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
+        "mint_server.backend.actors.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
@@ -2550,15 +2550,15 @@ def test_issue_648_get_or_create_recreates_stale_claim_config(monkeypatch) -> No
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.sync_get_ray_ref",
+        "mint_server.backend.actors.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        "mint_server.backend.actors.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
+        "mint_server.backend.actors.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
@@ -2627,15 +2627,15 @@ def test_issue_679_get_or_create_recreates_stale_runtime_env(monkeypatch) -> Non
 
     monkeypatch.setitem(__import__("sys").modules, "ray", _Ray)
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.sync_get_ray_ref",
+        "mint_server.backend.actors.model_engine_host.sync_get_ray_ref",
         lambda ref, timeout_s=None: ref.value,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.apply_detached_actor_resources",
+        "mint_server.backend.actors.model_engine_host.apply_detached_actor_resources",
         lambda *_args, **_kwargs: None,
     )
     monkeypatch.setattr(
-        "mint_server.backend.model_engine_host.actor_runtime_env_vars",
+        "mint_server.backend.actors.model_engine_host.actor_runtime_env_vars",
         lambda **_kwargs: {},
     )
     monkeypatch.delenv("RAY_ADDRESS", raising=False)

@@ -5,7 +5,7 @@ import sys
 
 import pytest
 
-from mint_server.backend.cluster_placement_controller import (
+from mint_server.backend.scheduling.cluster_placement_controller import (
     ClusterPlacementController,
     PlacementBlockReason,
     PlacementGroupBundleRequest,
@@ -16,8 +16,8 @@ from mint_server.backend.cluster_placement_controller import (
     PlacementReservationStatus,
     placement_group_bundle_request_for_spec,
 )
-from mint_server.backend.model_actor_supervisor import ModelActorSpec
-from mint_server.backend.model_placement_topology import ParallelTopology
+from mint_server.backend.actors.model_actor_supervisor import ModelActorSpec
+from mint_server.backend.contracts.model_placement_topology import ParallelTopology
 
 
 class _FakePlacementGroup:

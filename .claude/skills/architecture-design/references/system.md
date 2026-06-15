@@ -58,54 +58,54 @@ Implications:
     runtime actor execution.
   - `futures.py`: `request_id` polling.
 
-- `mint_server/backend/execution_context.py`
+- `mint_server/backend/core/execution_context.py`
   - Runtime-actor-local execution context for queued model work. `ModelEngineHost`
     binds manager/engine handles with a contextvar while executing dispatcher
     work items. API workers must leave route module execution globals unbound;
     runtime dispatch must not temporarily write route globals.
 
-- `mint_server/backend/async_ray_control.py`
+- `mint_server/backend/ray_cluster/async_ray_control.py`
   - Async wrappers for Ray control-plane operations that would otherwise block the FastAPI event loop.
   - Used for actor lookup/kill and placement-group inspection on request paths.
 
 - `mint_server/models/types.py`
   - Pydantic request/response models intended to match the Tinker API.
 
-- `mint_server/backend/model_actor_inventory.py`
+- `mint_server/backend/actors/model_actor_inventory.py`
   - GPU actor inventory state machine, inflight counts, metadata cache, and actor observability helpers.
   - The authoritative instance is owned by the detached `ModelActorSupervisor`; API-process caches must not be treated as source of truth.
 
-- `mint_server/backend/model_actor_supervisor.py`
+- `mint_server/backend/actors/model_actor_supervisor.py`
   - Detached desired-state reconciler for model runtime actors, OpenPI runtime actors, and topology daemon actors.
   - Desired specs come from config/topology/provider state; runtime state is rebuildable from Ray and persisted control-plane state.
   - Owns the inventory/launcher publication contract used by backend-specific vLLM, Megatron, dense, and OpenPI launchers.
 
-- `mint_server/backend/model_actor_launchers.py`
+- `mint_server/backend/actors/model_actor_launchers.py`
   - Launcher registry used by `ModelActorSupervisor` when reconciling desired model runtime actors.
   - Owns runtime actor launch-time placement environment construction.
 
-- `mint_server/backend/model_actor_publication.py`
+- `mint_server/backend/actors/model_actor_publication.py`
   - Shared launch-publication helper for backend-created GPU actors.
   - Backend-specific launchers still own backend Ray actor and placement-group creation, but they must publish a `BackendModelActorLaunch` through this helper. Lifecycle registration, ready marking, and observability metadata merge all go through `ModelActorSupervisor`.
 
-- `mint_server/backend/session_manager.py`
+- `mint_server/backend/sessions/session_manager.py`
   - Sampling session bookkeeping and cleanup.
   - Routes named sessions and ephemeral weight sync through the current shared-engine sampling path.
 
-- `mint_server/backend/multi_lora_engine.py`
+- `mint_server/backend/inference/multi_lora_engine.py`
   - Multi-tenant inference: one detached vLLM actor per base model, with many LoRA adapters loaded and selected by `lora_int_id`.
   - Selects between single-node vLLM and `MultiNodeInferenceEngine` (Ray distributed vLLM) based on model config.
 
-- `mint_server/backend/verl_inference.py`
+- `mint_server/backend/training/verl/verl_inference.py`
   - vLLM-backed inference actor implementation and weight loading.
 
-- `mint_server/backend/verl_training.py`
+- `mint_server/backend/training/verl/verl_training.py`
   - Dense LoRA training backend via Ray actors.
 
-- `mint_server/backend/megatron_training.py`, `mint_server/backend/megatron_distributed.py`
+- `mint_server/backend/training/megatron/megatron_training.py`, `mint_server/backend/training/megatron/megatron_distributed.py`
   - MoE LoRA training backend via Megatron (distributed actors + placement groups).
 
-- `mint_server/backend/model_registry.py`
+- `mint_server/backend/core/model_registry.py`
   - Supported model allowlist and per-model parallelism/memory knobs (inference and training are specified separately).
 
 - `mint_server/config.py`

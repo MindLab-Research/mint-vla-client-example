@@ -138,7 +138,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _pick_min_moe_model(*, supported_models: list[str]) -> str:
-    from mint_server.backend.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
+    from mint_server.backend.core.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
 
     normalized_supported: set[str] = set()
     for item in supported_models:

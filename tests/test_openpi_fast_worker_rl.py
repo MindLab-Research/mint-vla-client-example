@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-import mint_server.backend.openpi_fast_worker as worker_module
+import mint_server.backend.openpi.openpi_fast_worker as worker_module
 
 
 def test_compute_importance_sampling_stats_uses_only_masked_tokens() -> None:

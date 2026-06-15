@@ -12,7 +12,7 @@ The system implements two distinct mechanisms:
 ## Dense training: pooled detached trainer actor, many sessions
 
 Actors:
-- Dense training uses a detached `TrainingWorker` (`mint_server/backend/verl_training.py`).
+- Dense training uses a detached `TrainingWorker` (`mint_server/backend/training/verl/verl_training.py`).
 - Actors are created and reused via `DenseTrainerPool` (same file).
 
 Pool key and rank policy:
