@@ -2951,6 +2951,8 @@ class VerlInferenceEngine:
                 extra={
                     "LD_LIBRARY_PATH": actor_ld_library_path(),
                     "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                    "MINT_ENABLE_VLLM_IMPORT_PATCHES": "1",
+                    "VLLM_USE_V1": "1",
                     "USE_TORCH": "1",
                     "USE_TF": "0",
                     "USE_FLAX": "0",
