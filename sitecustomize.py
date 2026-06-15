@@ -169,6 +169,24 @@ def _sanitize_vllm_ray_runtime_env_dict(payload: object) -> object:
     return out
 
 
+def _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config: object) -> object:
+    runtime_env = getattr(parallel_config, "ray_runtime_env", None)
+    if not isinstance(runtime_env, dict):
+        return runtime_env
+    sanitized = _sanitize_vllm_ray_runtime_env_dict(runtime_env)
+    if isinstance(sanitized, dict):
+        env_vars = sanitized.get("env_vars")
+        if isinstance(env_vars, dict):
+            mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            if mint_gcs_address:
+                env_vars["MINT_RAY_GCS_ADDRESS"] = mint_gcs_address
+        preferred_executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip()
+        if preferred_executable:
+            sanitized["py_executable"] = preferred_executable
+        setattr(parallel_config, "ray_runtime_env", sanitized)
+    return sanitized
+
+
 def _patch_ray_runtime_env_to_dict_drop_driver_attach_hints() -> None:
     try:
         from ray.runtime_env import RuntimeEnv
@@ -532,6 +550,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
         mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
         _sanitize_ray_worker_bootstrap_process_environment()
+        _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config)
         addr = ray_address
         if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
             env_addr = mint_gcs_address

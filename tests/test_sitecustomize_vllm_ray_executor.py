@@ -300,6 +300,41 @@ def test_runtime_env_to_dict_blanks_driver_attach_hints(monkeypatch):
     assert data["py_executable"] == "/repo/scripts/vllm_worker_python.py"
 
 
+def test_parallel_config_ray_runtime_env_blanks_driver_attach_hints_and_sets_wrapper(monkeypatch):
+    class ParallelConfig:
+        ray_runtime_env = {
+            "env_vars": {
+                "PYTHONPATH": "/runtime:/repo",
+                "RAY_ADDRESS": "192.168.39.234:6379",
+                "RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+                "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.234:10001",
+                "MINT_RAY_GCS_ADDRESS": "old-gcs:6379",
+            }
+        }
+
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "/repo/scripts/vllm_worker_python.py")
+
+    module = _load_repo_sitecustomize()
+    sanitized = module._sanitize_vllm_parallel_config_ray_runtime_env(ParallelConfig)
+
+    assert sanitized == ParallelConfig.ray_runtime_env
+    assert sanitized["env_vars"] == {
+        "PYTHONPATH": "/runtime:/repo",
+        "RAY_ADDRESS": "",
+        "RAY_CLIENT_ADDRESS": "",
+        "MINT_RAY_CLIENT_ADDRESS": "",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+        "MINT_RAY_TEMP_DIR": "",
+        "MINT_RAY_NODE_IP_ADDRESS": "",
+        "RAY_TMPDIR": "",
+        "TMPDIR": "",
+        "TMP": "",
+        "TEMP": "",
+    }
+    assert sanitized["py_executable"] == "/repo/scripts/vllm_worker_python.py"
+
+
 def test_vllm_ray_env_carries_mint_gcs_address_without_ray_address(monkeypatch):
     calls: dict[str, object] = {}
 

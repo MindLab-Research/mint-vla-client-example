@@ -388,7 +388,7 @@ def test_sitecustomize_does_not_sanitize_non_ray_worker_process() -> None:
 
 def test_sitecustomize_vllm_ray_env_patch_excludes_ray_attach_hints(monkeypatch) -> None:
     sitecustomize = _load_repo_sitecustomize()
-    captured: dict[str, object] = {}
+    captured: dict[str, set[str] | str | None] = {}
 
     def original_get_env_vars_to_copy(
         exclude_vars=None,
@@ -414,12 +414,16 @@ def test_sitecustomize_vllm_ray_env_patch_excludes_ray_attach_hints(monkeypatch)
         destination="worker",
     )
 
-    assert "RAY_ADDRESS" in captured["exclude_vars"]
-    assert "RAY_CLIENT_ADDRESS" in captured["exclude_vars"]
-    assert "MINT_RAY_CLIENT_ADDRESS" in captured["exclude_vars"]
-    assert "MINT_RAY_GCS_ADDRESS" not in captured["exclude_vars"]
-    assert "PYTHONPATH" in captured["additional_vars"]
-    assert "MINT_RAY_GCS_ADDRESS" in captured["additional_vars"]
+    exclude_vars = captured["exclude_vars"]
+    additional_vars = captured["additional_vars"]
+    assert isinstance(exclude_vars, set)
+    assert isinstance(additional_vars, set)
+    assert "RAY_ADDRESS" in exclude_vars
+    assert "RAY_CLIENT_ADDRESS" in exclude_vars
+    assert "MINT_RAY_CLIENT_ADDRESS" in exclude_vars
+    assert "MINT_RAY_GCS_ADDRESS" not in exclude_vars
+    assert "PYTHONPATH" in additional_vars
+    assert "MINT_RAY_GCS_ADDRESS" in additional_vars
     assert "RAY_ADDRESS" not in result
     assert "MINT_RAY_GCS_ADDRESS" in result
 
