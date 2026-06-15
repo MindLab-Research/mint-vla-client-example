@@ -37,11 +37,82 @@ _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS = (
 )
 
 
+def _is_ray_worker_bootstrap_process(argv: list[str] | tuple[str, ...] | None = None) -> bool:
+    args = sys.argv if argv is None else argv
+    for arg in args:
+        value = str(arg)
+        if value == "ray._private.workers.default_worker":
+            return True
+        if value.replace("\\", "/").endswith("/ray/_private/workers/default_worker.py"):
+            return True
+    return False
+
+
+def _is_ray_actor_or_worker_process_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+) -> bool:
+    target = os.environ if environ is None else environ
+    for key in (
+        "RAY_ACTOR_ID",
+        "RAY_JOB_ID",
+        "RAY_WORKER_ID",
+        "RAY_WORKER_MODE",
+        "RAY_RAYLET_PID",
+    ):
+        if str(target.get(key, "")).strip():
+            return True
+    return False
+
+
+def _is_vllm_worker_patch_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+) -> bool:
+    target = os.environ if environ is None else environ
+    return _env_flag_from_mapping(target, "MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False)
+
+
+def _should_sanitize_ray_worker_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    return (
+        _is_ray_worker_bootstrap_process(argv)
+        or _is_ray_actor_or_worker_process_environment(environ)
+        or _is_vllm_worker_patch_environment(environ)
+    )
+
+
+def _sanitize_ray_worker_bootstrap_process_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    if not _should_sanitize_ray_worker_environment(environ, argv):
+        return
+    target = os.environ if environ is None else environ
+    for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
+        target.pop(key, None)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_flag_from_mapping(
+    environ: os._Environ[str] | dict[str, str],
+    name: str,
+    *,
+    default: bool = False,
+) -> bool:
+    value = environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+_sanitize_ray_worker_bootstrap_process_environment()
 
 
 def _is_cv2_package_dir(path: object) -> bool:
@@ -458,19 +529,12 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     if getattr(original, "_mint_patched_explicit_cluster_address", False):
         return
 
-    def is_ray_worker_bootstrap_process() -> bool:
-        for arg in sys.argv:
-            value = str(arg)
-            if value == "ray._private.workers.default_worker":
-                return True
-            if value.replace("\\", "/").endswith("/ray/_private/workers/default_worker.py"):
-                return True
-        return False
-
     def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+        mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+        _sanitize_ray_worker_bootstrap_process_environment()
         addr = ray_address
         if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
-            env_addr = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            env_addr = mint_gcs_address
             if not env_addr:
                 ray_addr = os.environ.get("RAY_ADDRESS", "").strip()
                 if ray_addr and not ray_addr.startswith("ray://"):
@@ -488,7 +552,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
         import ray
         from mint_server.ray_utils import init_ray as mint_init_ray
 
-        if not ray.is_initialized() and not is_ray_worker_bootstrap_process():
+        if not ray.is_initialized() and not _is_ray_worker_bootstrap_process():
             mint_init_ray(
                 address=addr,
                 runtime_env=getattr(parallel_config, "ray_runtime_env", None),
@@ -1880,8 +1944,9 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
             additional_vars2 = set(extra)
         else:
             additional_vars2 = set(additional_vars) | set(extra)
+        exclude_vars2 = set(exclude_vars or set()) | set(_DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS)
         return orig(
-            exclude_vars=exclude_vars,
+            exclude_vars=exclude_vars2,
             additional_vars=additional_vars2,
             destination=destination,
         )

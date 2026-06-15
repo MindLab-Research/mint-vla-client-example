@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import importlib.util
+import sys
 import threading
+import types
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -19,6 +23,16 @@ from mint_server.backend.task_state_store import TaskStateStore, TaskStateStoreC
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_repo_sitecustomize() -> ModuleType:
+    path = REPO_ROOT / "sitecustomize.py"
+    spec = importlib.util.spec_from_file_location("_mint_sitecustomize_under_test", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _python_sources() -> list[Path]:
@@ -263,6 +277,151 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
         assert '"MINT_RAY_GCS_ADDRESS"' not in source
         assert ".pop(" not in source
         assert 'env_vars[key] = ""' in source
+
+
+def test_sitecustomize_sanitizes_ray_worker_bootstrap_env_without_dropping_gcs() -> None:
+    sitecustomize = _load_repo_sitecustomize()
+
+    environ = {
+        "MINT_RAY_TEMP_DIR": "/tmp/driver-ray",
+        "MINT_RAY_NODE_IP_ADDRESS": "192.168.40.99",
+        "RAY_TMPDIR": "/tmp/driver-ray",
+        "TMPDIR": "/tmp/driver",
+        "TMP": "/tmp/driver",
+        "TEMP": "/tmp/driver",
+        "RAY_ADDRESS": "192.168.40.99:6379",
+        "RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+        "PYTHONPATH": "/repo",
+    }
+
+    sitecustomize._sanitize_ray_worker_bootstrap_process_environment(
+        environ,
+        argv=["python", "-m", "ray._private.workers.default_worker"],
+    )
+
+    for key in (
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    ):
+        assert key not in environ
+    assert environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert environ["PYTHONPATH"] == "/repo"
+
+
+def test_sitecustomize_sanitizes_ray_actor_env_without_dropping_gcs() -> None:
+    sitecustomize = _load_repo_sitecustomize()
+
+    environ = {
+        "RAY_ACTOR_ID": "actor-1",
+        "RAY_JOB_ID": "job-1",
+        "RAY_ADDRESS": "192.168.40.99:6379",
+        "RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+    }
+
+    sitecustomize._sanitize_ray_worker_bootstrap_process_environment(
+        environ,
+        argv=["python", "-c", "import ray"],
+    )
+
+    assert "RAY_ADDRESS" not in environ
+    assert "RAY_CLIENT_ADDRESS" not in environ
+    assert "MINT_RAY_CLIENT_ADDRESS" not in environ
+    assert environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert environ["RAY_ACTOR_ID"] == "actor-1"
+    assert environ["RAY_JOB_ID"] == "job-1"
+
+
+def test_sitecustomize_sanitizes_vllm_worker_patch_env_without_dropping_gcs() -> None:
+    sitecustomize = _load_repo_sitecustomize()
+
+    environ = {
+        "MINT_ENABLE_VLLM_IMPORT_PATCHES": "1",
+        "VLLM_USE_V1": "1",
+        "RAY_ADDRESS": "192.168.40.99:6379",
+        "RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+    }
+
+    sitecustomize._sanitize_ray_worker_bootstrap_process_environment(
+        environ,
+        argv=["python", "-c", "from multiprocessing.spawn import spawn_main"],
+    )
+
+    assert "RAY_ADDRESS" not in environ
+    assert "RAY_CLIENT_ADDRESS" not in environ
+    assert "MINT_RAY_CLIENT_ADDRESS" not in environ
+    assert environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert environ["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"
+    assert environ["VLLM_USE_V1"] == "1"
+
+
+def test_sitecustomize_does_not_sanitize_non_ray_worker_process() -> None:
+    sitecustomize = _load_repo_sitecustomize()
+
+    environ = {
+        "RAY_ADDRESS": "192.168.40.99:6379",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+        "MINT_RAY_NAMESPACE": "tinker_nolanho_issue729",
+    }
+
+    sitecustomize._sanitize_ray_worker_bootstrap_process_environment(
+        environ,
+        argv=["python", "scripts/run_server.py"],
+    )
+
+    assert environ["RAY_ADDRESS"] == "192.168.40.99:6379"
+    assert environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert environ["MINT_RAY_NAMESPACE"] == "tinker_nolanho_issue729"
+
+
+def test_sitecustomize_vllm_ray_env_patch_excludes_ray_attach_hints(monkeypatch) -> None:
+    sitecustomize = _load_repo_sitecustomize()
+    captured: dict[str, object] = {}
+
+    def original_get_env_vars_to_copy(
+        exclude_vars=None,
+        additional_vars=None,
+        destination=None,
+    ):
+        captured["exclude_vars"] = set(exclude_vars or set())
+        captured["additional_vars"] = set(additional_vars or set())
+        captured["destination"] = destination
+        return set(additional_vars or set()) - set(exclude_vars or set())
+
+    ray_env = types.ModuleType("vllm.ray.ray_env")
+    ray_env.get_env_vars_to_copy = original_get_env_vars_to_copy  # type: ignore[attr-defined]
+    vllm_mod = types.ModuleType("vllm")
+    vllm_ray_mod = types.ModuleType("vllm.ray")
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setitem(sys.modules, "vllm.ray", vllm_ray_mod)
+    monkeypatch.setitem(sys.modules, "vllm.ray.ray_env", ray_env)
+
+    sitecustomize._patch_vllm_ray_env_carry_over_pythonpath()
+    result = ray_env.get_env_vars_to_copy(  # type: ignore[attr-defined]
+        additional_vars={"RAY_ADDRESS", "CUSTOM"},
+        destination="worker",
+    )
+
+    assert "RAY_ADDRESS" in captured["exclude_vars"]
+    assert "RAY_CLIENT_ADDRESS" in captured["exclude_vars"]
+    assert "MINT_RAY_CLIENT_ADDRESS" in captured["exclude_vars"]
+    assert "MINT_RAY_GCS_ADDRESS" not in captured["exclude_vars"]
+    assert "PYTHONPATH" in captured["additional_vars"]
+    assert "MINT_RAY_GCS_ADDRESS" in captured["additional_vars"]
+    assert "RAY_ADDRESS" not in result
+    assert "MINT_RAY_GCS_ADDRESS" in result
 
 
 def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -> None:

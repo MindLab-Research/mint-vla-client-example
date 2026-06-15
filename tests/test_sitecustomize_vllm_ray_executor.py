@@ -186,6 +186,69 @@ def test_initialize_ray_cluster_does_not_nested_init_in_ray_worker_bootstrap(mon
     }
 
 
+def test_initialize_ray_cluster_sanitizes_vllm_worker_env_before_upstream(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def original(parallel_config, ray_address=None):
+        calls["original"] = {
+            "parallel_config": parallel_config,
+            "ray_address": ray_address,
+            "ray_address_env": __import__("os").environ.get("RAY_ADDRESS"),
+            "ray_client_env": __import__("os").environ.get("RAY_CLIENT_ADDRESS"),
+            "mint_ray_client_env": __import__("os").environ.get("MINT_RAY_CLIENT_ADDRESS"),
+            "mint_ray_gcs_env": __import__("os").environ.get("MINT_RAY_GCS_ADDRESS"),
+        }
+        return "ok"
+
+    fake_vllm = _fake_package("vllm")
+    fake_vllm_v1 = _fake_package("vllm.v1")
+    fake_vllm_executor = _fake_package("vllm.v1.executor")
+    fake_ray_exec_mod = types.ModuleType("vllm.v1.executor.ray_executor")
+    fake_ray_utils_mod = types.ModuleType("vllm.v1.executor.ray_utils")
+    fake_ray_exec_mod.initialize_ray_cluster = original
+    fake_ray_utils_mod.initialize_ray_cluster = original
+    fake_vllm_v1.executor = fake_vllm_executor  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_executor = fake_ray_exec_mod  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_utils = fake_ray_utils_mod  # type: ignore[attr-defined]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor", fake_vllm_executor)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_executor", fake_ray_exec_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_utils", fake_ray_utils_mod)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", raising=False)
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_ray_executor_use_explicit_cluster_address()
+
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.39.87:6379")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.39.87:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
+
+    parallel_config = types.SimpleNamespace(ray_runtime_env=None)
+    out = fake_ray_utils_mod.initialize_ray_cluster(parallel_config, ray_address=None)
+
+    assert out == "ok"
+    assert calls["original"] == {
+        "parallel_config": parallel_config,
+        "ray_address": "192.168.39.87:6379",
+        "ray_address_env": None,
+        "ray_client_env": None,
+        "mint_ray_client_env": None,
+        "mint_ray_gcs_env": "192.168.39.87:6379",
+    }
+
+
 def test_runtime_env_to_dict_blanks_driver_attach_hints(monkeypatch):
     class FakeRuntimeEnv:
         def to_dict(self):
