@@ -106,6 +106,15 @@ elif [ ! -d "${MINT_CODE_ROOT}" ]; then
 fi
 cd "${MINT_CODE_ROOT}"
 
+mint_git_source="${MINT_DEV_SOURCE_CHECKOUT:-${MINT_CODE_ROOT}}"
+mint_git_sha="${MINT_GIT_SHA:-}"
+if [ -z "${mint_git_sha}" ] && command -v git >/dev/null 2>&1; then
+  mint_git_sha=$(git -C "${mint_git_source}" rev-parse HEAD 2>/dev/null || true)
+fi
+if [ -n "${mint_git_sha}" ]; then
+  export MINT_GIT_SHA="${mint_git_sha}"
+fi
+
 mint_user="${MINT_DEV_USER:-${USER:-$(id -un)}}"
 if [ -z "${mint_user}" ] || [ "${mint_user}" = "root" ]; then
   echo "error: cannot derive a non-root dev Ray namespace (user=${mint_user:-unset})." >&2
@@ -221,6 +230,7 @@ export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"
 echo "=== mint-dev launch contract ===" >&2
 echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
 echo "MINT_DEV_SOURCE_CHECKOUT  ${MINT_DEV_SOURCE_CHECKOUT:-<none>}" >&2
+echo "MINT_GIT_SHA             ${MINT_GIT_SHA:-<unknown>}" >&2
 echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
 echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
 echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2

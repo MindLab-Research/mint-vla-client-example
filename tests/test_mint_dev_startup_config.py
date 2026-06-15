@@ -31,6 +31,8 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     assert "MINT_VLLM_CHILD_PYTHON_EXECUTABLE" in text
     assert "MINT_DEV_SOURCE_CHECKOUT" in text
     assert "syncing dev checkout" in text
+    assert "git -C" in text
+    assert "MINT_GIT_SHA" in text
     assert "MINT_DEV_STOP_EXISTING_PORT_SERVER" in text
     assert '"scripts/run_server.py"' in text
     assert "scripts/tools/dev_ray_cleanup.py gc-stale-actors" in text
