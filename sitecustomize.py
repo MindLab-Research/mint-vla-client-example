@@ -12,6 +12,7 @@ propagated into vLLM worker processes.
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import multiprocessing.spawn as _mp_spawn
 import os
@@ -528,59 +529,99 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
     cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
 
 
+def _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+    ray_utils_module_name: str,
+    alias_module_names: tuple[str, ...],
+) -> bool:
+    try:
+        ray_utils_mod = importlib.import_module(ray_utils_module_name)
+    except Exception:
+        return False
+    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
+    if original is None:
+        return False
+    if getattr(original, "_mint_patched_explicit_cluster_address", False):
+        initialize_ray_cluster = original
+    else:
+
+        def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+            mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            _sanitize_ray_worker_bootstrap_process_environment()
+            _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config)
+            addr = ray_address
+            if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
+                env_addr = mint_gcs_address
+                if not env_addr:
+                    ray_addr = os.environ.get("RAY_ADDRESS", "").strip()
+                    if ray_addr and not ray_addr.startswith("ray://"):
+                        env_addr = ray_addr
+                if not env_addr:
+                    raise RuntimeError(
+                        "vLLM RayDistributedExecutor requires explicit MINT_RAY_GCS_ADDRESS; "
+                        "refusing to start nested local Ray inside EngineCore"
+                    )
+                addr = env_addr
+
+            # Reuse Mint's Ray init helper so EngineCore children inherit Ray Client
+            # attach hints and temp-dir/node-ip overrides instead of falling back to a
+            # fresh local-driver attach inside the worker process.
+            import ray
+            from mint_server.ray_utils import init_ray as mint_init_ray
+
+            if not ray.is_initialized() and not _is_ray_worker_bootstrap_process():
+                mint_init_ray(
+                    address=addr,
+                    runtime_env=getattr(parallel_config, "ray_runtime_env", None),
+                )
+            return original(parallel_config, ray_address=addr)
+
+        initialize_ray_cluster._mint_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    for alias_module_name in alias_module_names:
+        try:
+            alias_mod = importlib.import_module(alias_module_name)
+        except Exception:
+            continue
+        if hasattr(alias_mod, "initialize_ray_cluster"):
+            alias_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    return True
+
+
 def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
-    """Prevent vLLM Ray executor from silently starting a local Ray head.
+    """Prevent vLLM Ray executors from silently starting a local Ray head.
 
     In our server, multinode vLLM actors already run inside a managed Ray
     cluster. If vLLM initializes its Ray executor with no address, Ray starts a
     standalone local head inside EngineCore, which hides the real failure behind
     a nested cluster. Fail closed unless Mint's explicit GCS address is
     available, with legacy `RAY_ADDRESS` accepted only as a fallback.
+
+    vLLM chooses different executor modules depending on `VLLM_USE_V1`; patch
+    both the v1 and v0 layouts when present.
     """
 
-    import vllm.v1.executor.ray_executor as ray_exec_mod
-    import vllm.v1.executor.ray_utils as ray_utils_mod
-
-    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
-    if original is None:
-        raise RuntimeError("vLLM missing initialize_ray_cluster")
-    if getattr(original, "_mint_patched_explicit_cluster_address", False):
-        return
-
-    def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
-        mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
-        _sanitize_ray_worker_bootstrap_process_environment()
-        _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config)
-        addr = ray_address
-        if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
-            env_addr = mint_gcs_address
-            if not env_addr:
-                ray_addr = os.environ.get("RAY_ADDRESS", "").strip()
-                if ray_addr and not ray_addr.startswith("ray://"):
-                    env_addr = ray_addr
-            if not env_addr:
-                raise RuntimeError(
-                    "vLLM RayDistributedExecutor requires explicit MINT_RAY_GCS_ADDRESS; "
-                    "refusing to start nested local Ray inside EngineCore"
-                )
-            addr = env_addr
-
-        # Reuse Mint's Ray init helper so EngineCore children inherit Ray Client
-        # attach hints and temp-dir/node-ip overrides instead of falling back to a
-        # fresh local-driver attach inside the worker process.
-        import ray
-        from mint_server.ray_utils import init_ray as mint_init_ray
-
-        if not ray.is_initialized() and not _is_ray_worker_bootstrap_process():
-            mint_init_ray(
-                address=addr,
-                runtime_env=getattr(parallel_config, "ray_runtime_env", None),
-            )
-        return original(parallel_config, ray_address=addr)
-
-    initialize_ray_cluster._mint_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
-    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
-    ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    patched = False
+    patched = (
+        _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+            "vllm.v1.executor.ray_utils",
+            ("vllm.v1.executor.ray_executor",),
+        )
+        or patched
+    )
+    patched = (
+        _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+            "vllm.executor.ray_utils",
+            (
+                "vllm.executor.ray_distributed_executor",
+                "vllm.executor.ray_gpu_executor",
+            ),
+        )
+        or patched
+    )
+    if not patched:
+        raise RuntimeError(
+            "vLLM missing initialize_ray_cluster in supported Ray executor modules"
+        )
 
 
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:

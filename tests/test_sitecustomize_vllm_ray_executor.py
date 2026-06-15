@@ -77,7 +77,20 @@ def test_initialize_ray_cluster_uses_explicit_address_for_mint_init(monkeypatch)
     assert out == "ok"
     assert calls["mint_init_ray"] == {
         "address": "ray://192.168.39.87:10001",
-        "runtime_env": {"env_vars": {"A": "B"}},
+        "runtime_env": {
+            "env_vars": {
+                "A": "B",
+                "MINT_RAY_CLIENT_ADDRESS": "",
+                "MINT_RAY_NODE_IP_ADDRESS": "",
+                "MINT_RAY_TEMP_DIR": "",
+                "RAY_ADDRESS": "",
+                "RAY_CLIENT_ADDRESS": "",
+                "RAY_TMPDIR": "",
+                "TEMP": "",
+                "TMP": "",
+                "TMPDIR": "",
+            }
+        },
     }
     assert calls["original"] == {
         "parallel_config": parallel_config,
@@ -246,6 +259,95 @@ def test_initialize_ray_cluster_sanitizes_vllm_worker_env_before_upstream(monkey
         "ray_client_env": None,
         "mint_ray_client_env": None,
         "mint_ray_gcs_env": "192.168.39.87:6379",
+    }
+
+
+def test_initialize_ray_cluster_patches_v0_executor_layout(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def original(parallel_config, ray_address=None):
+        calls["original"] = {
+            "parallel_config": parallel_config,
+            "ray_address": ray_address,
+            "ray_address_env": __import__("os").environ.get("RAY_ADDRESS"),
+        }
+        return "ok"
+
+    fake_vllm = _fake_package("vllm")
+    fake_vllm_executor = _fake_package("vllm.executor")
+    fake_ray_utils_mod = types.ModuleType("vllm.executor.ray_utils")
+    fake_ray_distributed_mod = types.ModuleType("vllm.executor.ray_distributed_executor")
+    fake_ray_gpu_mod = types.ModuleType("vllm.executor.ray_gpu_executor")
+    fake_ray_utils_mod.initialize_ray_cluster = original
+    fake_ray_distributed_mod.initialize_ray_cluster = original
+    fake_ray_gpu_mod.initialize_ray_cluster = original
+    fake_vllm.executor = fake_vllm_executor  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_utils = fake_ray_utils_mod  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_distributed_executor = fake_ray_distributed_mod  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_gpu_executor = fake_ray_gpu_mod  # type: ignore[attr-defined]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.executor", fake_vllm_executor)
+    monkeypatch.setitem(sys.modules, "vllm.executor.ray_utils", fake_ray_utils_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.executor.ray_distributed_executor",
+        fake_ray_distributed_mod,
+    )
+    monkeypatch.setitem(sys.modules, "vllm.executor.ray_gpu_executor", fake_ray_gpu_mod)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_ray_executor_use_explicit_cluster_address()
+
+    assert getattr(
+        fake_ray_utils_mod.initialize_ray_cluster,
+        "_mint_patched_explicit_cluster_address",
+    )
+    assert (
+        fake_ray_distributed_mod.initialize_ray_cluster
+        is fake_ray_utils_mod.initialize_ray_cluster
+    )
+    assert fake_ray_gpu_mod.initialize_ray_cluster is fake_ray_utils_mod.initialize_ray_cluster
+
+    parallel_config = types.SimpleNamespace(
+        ray_runtime_env={
+            "env_vars": {
+                "PYTHONPATH": "/runtime:/repo",
+                "RAY_ADDRESS": "192.168.40.99:6379",
+                "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.40.99:10001",
+            }
+        }
+    )
+    out = fake_ray_distributed_mod.initialize_ray_cluster(
+        parallel_config,
+        ray_address=None,
+    )
+
+    assert out == "ok"
+    assert calls["original"] == {
+        "parallel_config": parallel_config,
+        "ray_address": "192.168.40.99:6379",
+        "ray_address_env": None,
+    }
+    assert parallel_config.ray_runtime_env["env_vars"] == {
+        "PYTHONPATH": "/runtime:/repo",
+        "RAY_ADDRESS": "",
+        "MINT_RAY_CLIENT_ADDRESS": "",
+        "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+        "MINT_RAY_TEMP_DIR": "",
+        "MINT_RAY_NODE_IP_ADDRESS": "",
+        "RAY_TMPDIR": "",
+        "TMPDIR": "",
+        "TMP": "",
+        "TEMP": "",
+        "RAY_CLIENT_ADDRESS": "",
     }
 
 
