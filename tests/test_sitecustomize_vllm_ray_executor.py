@@ -472,6 +472,41 @@ def test_vllm_ray_env_carries_mint_gcs_address_without_ray_address(monkeypatch):
     assert "MINT_RAY_CLIENT_ADDRESS" not in additional_vars
 
 
+def test_vllm_system_utils_spawn_hint_does_not_leave_ray_address(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def original_maybe_force_spawn():
+        import os
+
+        calls["original"] = True
+        os.environ["RAY_ADDRESS"] = "192.168.40.99:6379"
+        os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+    fake_vllm = _fake_package("vllm")
+    fake_utils = _fake_package("vllm.utils")
+    fake_system_utils = types.ModuleType("vllm.utils.system_utils")
+    fake_system_utils._maybe_force_spawn = original_maybe_force_spawn  # type: ignore[attr-defined]
+    fake_vllm.utils = fake_utils  # type: ignore[attr-defined]
+    fake_utils.system_utils = fake_system_utils  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "vllm.utils.system_utils", fake_system_utils)
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_system_utils_spawn_without_ray_address()
+
+    fake_system_utils._maybe_force_spawn()  # type: ignore[attr-defined]
+
+    assert calls == {"original": True}
+    assert "RAY_ADDRESS" not in __import__("os").environ
+    assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert __import__("os").environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+
+
 def test_qwen35_text_only_adapter_patch_runs_from_sitecustomize(monkeypatch):
     import torch
 

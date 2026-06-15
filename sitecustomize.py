@@ -2015,6 +2015,38 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
     ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
 
 
+def _patch_vllm_system_utils_spawn_without_ray_address() -> None:
+    """Keep vLLM's spawn fallback without leaking RAY_ADDRESS.
+
+    vLLM's `_maybe_force_spawn()` writes `ray.get_runtime_context().gcs_address`
+    into `RAY_ADDRESS` when it detects execution inside a Ray actor. That value
+    is then inherited by multiprocessing children and Ray default workers before
+    Mint's actor/runtime-env cleanup has a chance to run, causing nested
+    direct-attach attempts against stale node-local session paths. Mint uses
+    `MINT_RAY_GCS_ADDRESS` as the explicit direct-address hint instead.
+    """
+
+    try:
+        import vllm.utils.system_utils as system_utils  # type: ignore
+    except Exception:
+        return
+
+    original = getattr(system_utils, "_maybe_force_spawn", None)
+    if not callable(original) or getattr(original, "_mint_no_ray_address_spawn_hint", False):
+        return
+
+    def _maybe_force_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        result = original(*args, **kwargs)
+        ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+        if ray_address:
+            os.environ.setdefault("MINT_RAY_GCS_ADDRESS", ray_address)
+            os.environ.pop("RAY_ADDRESS", None)
+        return result
+
+    _maybe_force_spawn._mint_no_ray_address_spawn_hint = True  # type: ignore[attr-defined]
+    system_utils._maybe_force_spawn = _maybe_force_spawn  # type: ignore[method-assign]
+
+
 def _patch_ray_placement_group_bundle_cache() -> None:
     """Handle Ray state payloads that omit `bundles` for direct placement-group lookup."""
     try:
@@ -2185,6 +2217,7 @@ def _apply_vllm_worker_patches() -> None:
 
     _patch_ray_runtime_env_to_dict_drop_driver_attach_hints()
     _patch_vllm_ray_env_carry_over_pythonpath()
+    _patch_vllm_system_utils_spawn_without_ray_address()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
         _patch_vllm_pack_moe_sparse_ok()
         _patch_vllm_fused_moe_set_lora_sparse_shards()
