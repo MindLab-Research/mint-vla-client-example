@@ -298,6 +298,56 @@ def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
     assert offenders == []
 
 
+def test_ray_address_production_references_are_explicitly_owned() -> None:
+    allowed_files = {
+        "mint_server/config.py",  # actor env builder and driver address fallback.
+        "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
+        "mint_server/backend/model_actor_supervisor.py",  # fallback error text.
+        "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
+        "mint_server/backend/multinode_inference.py",  # no-attach runtime env key and diagnostics.
+        "mint_server/backend/node_placement.py",  # driver/state API fallback.
+        "mint_server/backend/verl_inference.py",  # fallback error text.
+        "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
+        "ops/backend/config.py",  # ops dashboard config fallback.
+        "scripts/run_server.py",  # launcher observability.
+        "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
+        "scripts/start_prod_server.sh",  # prod launcher contract.
+        "scripts/vllm_worker_python.py",  # subprocess cleanup wrapper.
+        "sitecustomize.py",  # worker/vLLM cleanup and compatibility patches.
+    }
+    ignored_prefixes = (
+        "tests/",
+        "scripts/tools/reproduce_issue_",
+        "scripts/tools/check_node_usage.py",
+        "scripts/tools/start_nvml_otel_probe.py",
+        "scripts/tools/validate_gpu_uuid_binding.py",
+    )
+    actual_files: set[str] = set()
+    for root in (REPO_ROOT / "mint_server", REPO_ROOT / "ops", REPO_ROOT / "scripts"):
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*")):
+            if path.suffix not in {".py", ".sh"}:
+                continue
+            rel = path.relative_to(REPO_ROOT).as_posix()
+            if rel.startswith(ignored_prefixes):
+                continue
+            if "RAY_ADDRESS" in path.read_text(encoding="utf-8"):
+                actual_files.add(rel)
+
+    sitecustomize_path = REPO_ROOT / "sitecustomize.py"
+    if "RAY_ADDRESS" in sitecustomize_path.read_text(encoding="utf-8"):
+        actual_files.add("sitecustomize.py")
+
+    assert actual_files == allowed_files
+
+
+def test_runtime_config_does_not_treat_ray_address_as_actor_bootstrap_env() -> None:
+    source = (REPO_ROOT / "mint_server" / "runtime_config.py").read_text(encoding="utf-8")
+    assert '"MINT_RAY_GCS_ADDRESS"' in source
+    assert '"RAY_ADDRESS"' not in source
+
+
 def test_model_engine_host_runtime_actor_uses_vllm_worker_wrapper() -> None:
     path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(path)

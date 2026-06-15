@@ -34,7 +34,7 @@ BOOTSTRAP_RUNTIME_ENV_KEYS = frozenset(
         "PFS_RUNTIME_ENV_ROOT",
         "MINT_CODE_ROOT",
         "PFS_HF_MODULES_PATH",
-        "RAY_ADDRESS",
+        "MINT_RAY_GCS_ADDRESS",
         "MINT_RAY_NAMESPACE",
         "MINT_CONFIG_PATH",
         "MINT_ACTOR_LD_LIBRARY_PATH",
