@@ -32,8 +32,8 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     # Optional deployment policy must not carry code root or namespace.
     assert "MINT_DEV_DEPLOYMENT_ENV" in text
     assert (
-        "MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|"
-        "MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE"
+        "MINT_CODE_ROOT|MINT_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|"
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"
     ) in text
     assert LEGACY_DEV_SECRETS_ENV not in text
     assert LEGACY_DEV_SECRETS_PATH not in text

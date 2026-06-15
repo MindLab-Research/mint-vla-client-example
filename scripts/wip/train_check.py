@@ -300,7 +300,6 @@ def preflight(base_url: str, api_key: str | None) -> None:
 def _checkpoint_pg_dsn() -> str:
     return (
         os.environ.get("MINT_CHECKPOINT_INDEX_PG_DSN")
-        or os.environ.get("TINKER_USAGE_PG_DSN")
         or os.environ.get("MINT_USAGE_PG_DSN")
         or ""
     ).strip()

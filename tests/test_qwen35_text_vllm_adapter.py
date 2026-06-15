@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 import types
@@ -205,8 +206,7 @@ def test_qwen35_text_adapter_dtype_prefers_text_config_without_autoconfig(monkey
     assert adapter.infer_hf_torch_dtype_str(str(model_dir)) == "bfloat16"
 
 
-@pytest.mark.asyncio
-async def test_qwen35_multinode_vllm_infers_lora_dtype_from_materialized_config(monkeypatch, tmp_path):
+def test_qwen35_model_vllm_infers_lora_dtype_from_materialized_config(monkeypatch, tmp_path):
     from mint_server.backend import multinode_inference as mni
 
     materialized_config_dir = str(tmp_path / "runtime" / "qwen35-text-vllm-config" / "abc123")
@@ -264,7 +264,7 @@ async def test_qwen35_multinode_vllm_infers_lora_dtype_from_materialized_config(
     )
     engine.get_kv_debug_info = lambda: {}
 
-    await engine.initialize()
+    asyncio.run(engine.initialize())
 
     assert install_calls == [True]
     assert dtype_inputs == [materialized_config_dir]

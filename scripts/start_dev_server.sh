@@ -36,7 +36,7 @@ set -eu
 
 reject_per_launch_keys() {
   env_file="$1"
-  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|TINKER_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE)=' "${env_file}"; then
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE)=' "${env_file}"; then
     echo "error: ${env_file} must not set MINT_CODE_ROOT, the Ray namespace," >&2
     echo "       MINT_RAY_HEAD_ADDRESS_PATH, or MINT_VLLM_CHILD_PYTHON_EXECUTABLE" >&2
     echo "       (those are per-launch inputs derived by the launcher)." >&2

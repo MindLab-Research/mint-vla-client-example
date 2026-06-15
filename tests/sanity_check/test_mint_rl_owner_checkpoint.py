@@ -156,7 +156,7 @@ def test_owner_checkpoint_sampling_client_accepts_mint_uri(monkeypatch):
     assert extra_body == {"owner_id": "0123456789abcdef01234567"}
 
 
-def test_owner_checkpoint_sampling_client_converts_tinker_uri(monkeypatch):
+def test_owner_checkpoint_sampling_client_uses_mint_uri(monkeypatch):
     helper = _load_helper()
     monkeypatch.setenv("MINT_TEST_CHECKPOINT_OWNER_ID", "0123456789abcdef01234567")
 
@@ -208,7 +208,7 @@ def test_owner_checkpoint_sampling_client_converts_tinker_uri(monkeypatch):
 
     out = helper(
         SimpleNamespace(holder=_Holder()),
-        model_path="tinker://run-1/sampler_weights/ckpt-1",
+        model_path="mint://run-1/sampler_weights/ckpt-1",
         base_model="Qwen/Qwen3-0.6B",
         retry_config="retry",
     )
@@ -271,7 +271,7 @@ def test_owner_checkpoint_sampling_client_uses_explicit_owner_without_env(monkey
 
     out = helper(
         SimpleNamespace(holder=_Holder()),
-        model_path="tinker://run-1/sampler_weights/ckpt-1",
+        model_path="mint://run-1/sampler_weights/ckpt-1",
         base_model="Qwen/Qwen3-0.6B",
         retry_config="retry",
         checkpoint_owner_id="anonymous",
