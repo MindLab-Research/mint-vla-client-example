@@ -7,6 +7,16 @@ from functools import lru_cache
 from typing import Any, Awaitable
 
 
+def control_plane_task_runtime_env() -> dict[str, object]:
+    from ..config import PFS_PYTHONPATH, actor_runtime_env
+
+    return actor_runtime_env(
+        pythonpath=PFS_PYTHONPATH,
+        include_config_snapshot=False,
+        include_ray_attach_hints=False,
+    )
+
+
 def _discard_late_result(fut: asyncio.Future) -> None:
     try:
         fut.result()
@@ -298,13 +308,13 @@ def _placement_group_table_remote():
 
 async def async_pending_gpu_pg_observation(*, timeout_s: float) -> dict[str, Any] | None:
     _ensure_ray_initialized()
-    ref = _pending_gpu_pg_observation_remote().remote()
+    ref = _pending_gpu_pg_observation_remote().options(runtime_env=control_plane_task_runtime_env()).remote()
     return await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
 
 
 async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, Any]:
     _ensure_ray_initialized()
-    ref = _placement_group_table_remote().remote()
+    ref = _placement_group_table_remote().options(runtime_env=control_plane_task_runtime_env()).remote()
     out = await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
     if not isinstance(out, dict):
         raise TypeError(f"placement_group_table returned non-dict: {type(out)}")
@@ -313,7 +323,10 @@ async def async_placement_group_table(*, timeout_s: float = 5.0) -> dict[str, An
 
 async def async_lookup_actor_handle(actor_name: str, namespace: str, *, timeout_s: float = 15.0):
     _ensure_ray_initialized()
-    ref = _lookup_actor_handle_remote().remote(str(actor_name), str(namespace))
+    ref = _lookup_actor_handle_remote().options(runtime_env=control_plane_task_runtime_env()).remote(
+        str(actor_name),
+        str(namespace),
+    )
     return await _await_ray_ref_with_timeout(ref, timeout_s=float(timeout_s))
 
 
@@ -328,7 +341,7 @@ async def async_kill_named_actor(
     timeout_s: float = 10.0,
 ) -> bool:
     _ensure_ray_initialized()
-    ref = _kill_named_actor_remote().remote(
+    ref = _kill_named_actor_remote().options(runtime_env=control_plane_task_runtime_env()).remote(
         actor_handle,
         str(actor_name),
         str(namespace),

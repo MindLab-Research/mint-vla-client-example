@@ -310,6 +310,29 @@ def test_model_engine_host_runtime_actor_uses_vllm_worker_wrapper() -> None:
     assert "include_ray_attach_hints=False" in source
 
 
+def test_control_plane_helper_tasks_use_no_attach_runtime_env() -> None:
+    expectations = {
+        "mint_server/backend/async_ray_control.py": [
+            "async_pending_gpu_pg_observation",
+            "async_placement_group_table",
+            "async_lookup_actor_handle",
+            "async_kill_named_actor",
+        ],
+        "mint_server/backend/model_actor_placement.py": [
+            "_default_gpu_actor_killer",
+        ],
+        "mint_server/checkpoints.py": [
+            "async_create_checkpoint_archive",
+        ],
+    }
+    for rel, function_names in expectations.items():
+        path = REPO_ROOT / rel
+        functions = _module_functions(path)
+        for function_name in function_names:
+            source = ast.get_source_segment(path.read_text(), functions[function_name]) or ""
+            assert "control_plane_task_runtime_env()" in source, f"{rel}:{function_name}"
+
+
 def test_sitecustomize_sanitizes_ray_worker_bootstrap_env_without_dropping_gcs() -> None:
     sitecustomize = _load_repo_sitecustomize()
 

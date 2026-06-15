@@ -466,6 +466,8 @@ def _default_gpu_actor_killer(actor_info: dict[str, Any], reason: str) -> bool:
         pid = actor_info.get("pid")
         if pid is None:
             return False
+        from .async_ray_control import control_plane_task_runtime_env
+
         options: dict[str, Any] = {}
         if actor_info.get("node_id"):
             from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -474,6 +476,7 @@ def _default_gpu_actor_killer(actor_info: dict[str, Any], reason: str) -> bool:
                 node_id=str(actor_info.get("node_id") or ""),
                 soft=False,
             )
+        options["runtime_env"] = control_plane_task_runtime_env()
         ref = _kill_actor_by_pid_remote().options(**options).remote(
             str(actor_info.get("node_id") or ""),
             str(actor_info.get("actor_id") or ""),

@@ -592,7 +592,7 @@ async def async_create_checkpoint_archive(
     *,
     timeout_s: float = 600.0,
 ) -> None:
-    from .backend.async_ray_control import _await_ray_ref, _ensure_ray_initialized
+    from .backend.async_ray_control import _await_ray_ref, _ensure_ray_initialized, control_plane_task_runtime_env
 
     import ray
 
@@ -604,7 +604,10 @@ async def async_create_checkpoint_archive(
         os.makedirs(archive_dir, exist_ok=True)
 
     _ensure_ray_initialized()
-    ref = _create_checkpoint_archive_remote().remote(str(checkpoint_dir), str(archive_path))
+    ref = _create_checkpoint_archive_remote().options(runtime_env=control_plane_task_runtime_env()).remote(
+        str(checkpoint_dir),
+        str(archive_path),
+    )
     try:
         await asyncio.wait_for(_await_ray_ref(ref), timeout=float(timeout_s))
     except asyncio.TimeoutError:
