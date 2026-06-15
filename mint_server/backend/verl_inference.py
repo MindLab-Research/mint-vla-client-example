@@ -37,7 +37,7 @@ from mint_server.logging_context import (
     restore_trace_id_from_traceparent,
     traced_async_from_traceparent,
 )
-from mint_server.ray_utils import init_ray
+from mint_server.ray_utils import init_ray, preferred_ray_gcs_address
 from mint_server.runtime_env import (
     host_only_pythonpath_entries,
     join_pythonpath,
@@ -2812,9 +2812,9 @@ class VerlInferenceEngine:
             return
 
         if not ray.is_initialized():
-            address = os.environ.get("RAY_ADDRESS", "").strip()
+            address = preferred_ray_gcs_address()
             if not address:
-                raise RuntimeError("RAY_ADDRESS must be set before initializing VerlInferenceEngine")
+                raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
             init_ray(
                 address=address,
                 namespace=RAY_NAMESPACE,

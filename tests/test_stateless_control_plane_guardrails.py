@@ -279,6 +279,25 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
         assert 'env_vars[key] = ""' in source
 
 
+def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
+    allowed = {
+        "mint_server/backend/multinode_inference.py",  # diagnostics only
+        "mint_server/backend/node_placement.py",  # state API fallback accepts driver aliases
+    }
+    offenders: list[str] = []
+    for path in sorted((REPO_ROOT / "mint_server" / "backend").rglob("*.py")):
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if rel in allowed:
+            continue
+        source = path.read_text(encoding="utf-8")
+        if 'os.environ.get("RAY_ADDRESS"' in source or "os.environ.get('RAY_ADDRESS'" in source:
+            offenders.append(rel)
+        if 'os.environ["RAY_ADDRESS"]' in source or "os.environ['RAY_ADDRESS']" in source:
+            offenders.append(rel)
+
+    assert offenders == []
+
+
 def test_model_engine_host_runtime_actor_uses_vllm_worker_wrapper() -> None:
     path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(path)
