@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Literal, Sequence
 
+from .models.types import SampledSequence
+
 StopReason = Literal["length", "stop", "eos"]
 
 # Default stop/EOS tokens:
@@ -9,7 +11,6 @@ StopReason = Literal["length", "stop", "eos"]
 # - Moonlight: <|im_end|>=163586, [EOS]=163585
 DEFAULT_EOS_TOKENS: frozenset[int] = frozenset({151645, 151643, 163586, 163585})
 
-from .models.types import SampledSequence
 
 
 def normalize_prompt_logprobs_for_tinker(

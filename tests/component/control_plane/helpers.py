@@ -5,7 +5,7 @@ import time
 from collections.abc import Callable, Coroutine
 from typing import Any, cast
 
-from mint_server.backend.control_plane_contracts import LeaseToken
+from mint_server.backend.contracts.control_plane_contracts import LeaseToken
 
 from .harness import SchedulerComponentWorld
 

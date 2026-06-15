@@ -8,7 +8,7 @@ import types
 import pytest
 import torch
 
-from mint_server.backend import qwen35_text_vllm_adapter as adapter
+from mint_server.backend.inference import qwen35_text_vllm_adapter as adapter
 
 
 def _raw_qwen35_config() -> dict[str, object]:
@@ -207,7 +207,7 @@ def test_qwen35_text_adapter_dtype_prefers_text_config_without_autoconfig(monkey
 
 
 def test_qwen35_model_vllm_infers_lora_dtype_from_materialized_config(monkeypatch, tmp_path):
-    from mint_server.backend import multinode_inference as mni
+    from mint_server.backend.inference import multinode_inference as mni
 
     materialized_config_dir = str(tmp_path / "runtime" / "qwen35-text-vllm-config" / "abc123")
     dtype_inputs: list[str] = []

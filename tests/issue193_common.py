@@ -17,9 +17,9 @@ pytest.importorskip("ray")
 
 import ray
 
-from mint_server.backend.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
-from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
+from mint_server.backend.training.megatron.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
+from mint_server.backend.training.training_session_manager import TrainingSession
+from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
 
 __all__ = [
     "asyncio",

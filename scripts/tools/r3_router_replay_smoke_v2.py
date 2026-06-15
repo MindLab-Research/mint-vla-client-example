@@ -320,7 +320,7 @@ def _plot_csv(paths: list[Path], labels: list[str], out_png: Path) -> None:
 
 def _pick_model(*, supported_models: list[str]) -> str:
     """Prefer DEFAULT_MODEL_CANDIDATES; fall back to smallest supported MoE model."""
-    from mint_server.backend.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
+    from mint_server.backend.core.model_registry import MODEL_CONFIGS, maybe_normalize_model_name
 
     normalized_supported: set[str] = set()
     for item in supported_models:

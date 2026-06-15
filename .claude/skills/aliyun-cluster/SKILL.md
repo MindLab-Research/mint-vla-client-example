@@ -237,9 +237,9 @@ Hardware differences matter for vLLM TP/PP/DP and overall GPU count:
 - Volcano: A800 80GB
 - Aliyun: H (SM90)
 
-For mint-server deployments on Aliyun, tune `mint_server/backend/model_registry.py` or set `MINT_MODEL_CONFIG_OVERRIDES_JSON` on the Aliyun server.
+For mint-server deployments on Aliyun, tune `mint_server/backend/core/model_registry.py` or set `MINT_MODEL_CONFIG_OVERRIDES_JSON` on the Aliyun server.
 
-Current 235B defaults in `mint_server/backend/model_registry.py` are tuned for 24xSM90-class Aliyun GPUs with concurrent prewarm:
+Current 235B defaults in `mint_server/backend/core/model_registry.py` are tuned for 24xSM90-class Aliyun GPUs with concurrent prewarm:
 - Inference: `inference_tp=8`, `inference_dp=1` (8 GPUs)
 - Training: `train_tp=4`, `train_pp=2`, `train_ep=2` (16 GPUs)
 

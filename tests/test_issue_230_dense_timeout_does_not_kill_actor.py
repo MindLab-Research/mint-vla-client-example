@@ -5,16 +5,16 @@ import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
-from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import VerlTrainingEngine
+from mint_server.backend.actors.model_actor_supervisor import ActorType, ModelActorSupervisor
+from mint_server.backend.training.training_session_manager import TrainingSession
+from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
 
 def _get_local_model_actor_inventory(monkeypatch: pytest.MonkeyPatch):
     pool = ModelActorSupervisor()
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.ray_keepalive as ray_keepalive
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.ray_keepalive as ray_keepalive
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(supervisor_module, "model_actor_supervisor", pool)
     monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: pool)
@@ -52,7 +52,7 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
 
     killed: list[dict] = []
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     def _fake_kill(*args, **kwargs):
         killed.append(dict(kwargs))
@@ -160,7 +160,7 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
     )
     discarded: list[str] = []
 
-    from mint_server.backend import async_ray_control
+    from mint_server.backend.ray_cluster import async_ray_control
 
     def _record_late_result(fut: asyncio.Future) -> None:
         try:
@@ -228,7 +228,7 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
         backend="peft",
     )
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     killed: list[dict] = []
 
@@ -288,7 +288,7 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
         backend="peft",
     )
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     killed: list[dict] = []
 

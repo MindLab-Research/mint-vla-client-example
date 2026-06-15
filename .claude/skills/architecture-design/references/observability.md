@@ -32,7 +32,7 @@ Relevant implementation:
 - `mint_server/logging_context.py`
 - `mint_server/config.py::otel_env_vars`
 - route middleware in `mint_server/app.py`
-- node and Ray/GCS metric push in `mint_server/backend/node_metrics_daemon.py`
+- node and Ray/GCS metric push in `mint_server/backend/ray_cluster/node_metrics_daemon.py`
 
 ## Identifier Semantics
 

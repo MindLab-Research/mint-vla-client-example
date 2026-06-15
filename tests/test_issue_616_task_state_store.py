@@ -8,9 +8,9 @@ from pathlib import Path
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import ConflictReason
-from mint_server.backend.task_payload_store import TaskPayloadStore
-from mint_server.backend.task_state_store import (
+from mint_server.backend.contracts.control_plane_contracts import ConflictReason
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore
+from mint_server.backend.stores.task_state_store import (
     TaskStateConflictError,
     TaskFutureService,
     TaskStateStore,
@@ -69,7 +69,7 @@ def test_duplicate_create_task_preserves_model_work_append_owner_marker() -> Non
 
 
 def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as module
+    import mint_server.backend.stores.task_state_store as module
     import ray
 
     calls: dict[str, object] = {}
@@ -102,7 +102,7 @@ def test_task_state_store_client_async_ensure_ready_can_create_actor(monkeypatch
 
 
 def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as module
+    import mint_server.backend.stores.task_state_store as module
     import ray
 
     captured: dict[str, object] = {}
@@ -198,7 +198,7 @@ def test_training_session_inflight_is_durable_metadata(tmp_path: Path) -> None:
 
 
 def test_task_state_store_client_async_cached_actor_survives_concurrent_reset(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as module
+    import mint_server.backend.stores.task_state_store as module
     import ray
 
     class _PingRemote:
@@ -289,7 +289,7 @@ def test_task_state_store_actor_future_store_init_is_singleton_under_concurrency
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.future_state_store as future_state_store_module
+    import mint_server.backend.stores.future_state_store as future_state_store_module
 
     actor = _TaskStateStoreActor(str(tmp_path / "task-state-concurrency.sqlite3"))
     created: list[object] = []
@@ -329,7 +329,7 @@ def test_task_state_store_actor_future_store_init_is_singleton_under_concurrency
 
 
 def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_path) -> None:
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
 
     task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
     task_state_store_module._FUTURE_TIMEOUT_METRICS.update(
@@ -412,7 +412,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
     import mint_server.logging_context as logging_context
 
     task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
@@ -505,7 +505,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
 
 
 def test_task_state_store_client_rpc_metrics_record_success_and_failure(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
 
     task_state_store_module._TASK_STATE_RPC_METRICS.clear()
     task_state_store_module._TASK_STATE_RPC_METRICS.update(
@@ -550,7 +550,7 @@ def test_task_state_store_client_rpc_metrics_record_success_and_failure(monkeypa
 
 
 def test_task_state_store_client_stats_exposes_client_process_rpc_metrics(monkeypatch) -> None:
-    import mint_server.backend.task_state_store as task_state_store_module
+    import mint_server.backend.stores.task_state_store as task_state_store_module
 
     task_state_store_module._TASK_STATE_RPC_METRICS.clear()
     task_state_store_module._TASK_STATE_RPC_METRICS.update(
@@ -2289,7 +2289,7 @@ def test_task_future_service_wait_status_falls_back_to_scheduler_task_state() ->
 
 
 def test_task_state_actor_future_success_preserves_billing_observations(tmp_path) -> None:
-    from mint_server.backend.future_state_store import FutureStateStore
+    from mint_server.backend.stores.future_state_store import FutureStateStore
 
     actor = _TaskStateStoreActor(str(tmp_path / "task-state.sqlite3"))
     actor._future_store = FutureStateStore.in_memory()

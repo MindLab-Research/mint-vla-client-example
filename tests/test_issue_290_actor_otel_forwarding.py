@@ -37,16 +37,16 @@ def test_issue_290_otel_env_vars_supports_legacy_apmplus_alias(monkeypatch):
 def test_issue_290_all_actor_runtime_env_call_otel_env_vars():
     repo_root = Path(__file__).resolve().parents[1]
     required = {
-        "mint_server/backend/multi_lora_engine.py": 1,
-        "mint_server/backend/multinode_inference.py": 1,
-        "mint_server/backend/megatron_distributed.py": 2,
-        "mint_server/backend/dense_trainer.py": 1,
-        "mint_server/backend/verl_inference.py": 1,
-        "mint_server/backend/model_engine_host.py": 1,
-        "mint_server/backend/model_work_scheduler.py": 1,
-        "mint_server/backend/node_metrics_daemon.py": 1,
-        "mint_server/backend/task_state_store.py": 1,
-        "mint_server/backend/config_actor.py": 1,
+        "mint_server/backend/inference/multi_lora_engine.py": 1,
+        "mint_server/backend/inference/multinode_inference.py": 1,
+        "mint_server/backend/training/megatron/megatron_distributed.py": 2,
+        "mint_server/backend/training/dense/dense_trainer.py": 1,
+        "mint_server/backend/training/verl/verl_inference.py": 1,
+        "mint_server/backend/actors/model_engine_host.py": 1,
+        "mint_server/backend/scheduling/model_work_scheduler.py": 1,
+        "mint_server/backend/ray_cluster/node_metrics_daemon.py": 1,
+        "mint_server/backend/stores/task_state_store.py": 1,
+        "mint_server/backend/core/config_actor.py": 1,
     }
 
     for rel_path, min_count in required.items():

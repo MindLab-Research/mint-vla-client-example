@@ -40,7 +40,7 @@ def main() -> int:
     )
 
     backend.gateway_session_store = stub_store
-    sys.modules["mint_server.backend.gateway_session_store"] = stub_store  # Defensive for import paths.
+    sys.modules["mint_server.backend.stores.gateway_session_store"] = stub_store  # Defensive for import paths.
 
     try:
         gw.register_remote_sampling_session(

@@ -10,26 +10,26 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-from mint_server.backend.model_actor_inventory import ActorType
-from mint_server.backend.cluster_placement_controller import (
+from mint_server.backend.actors.model_actor_inventory import ActorType
+from mint_server.backend.scheduling.cluster_placement_controller import (
     ClusterPlacementController,
     PlacementGroupCreateStatus,
 )
-from mint_server.backend.engine_adapter import (
+from mint_server.backend.contracts.engine_adapter import (
     EngineHealth,
     EngineHealthStatus,
     EngineObservability,
     GpuPerformanceSample,
 )
-from mint_server.backend.engine_liveness import EngineLivenessPush
-from mint_server.backend.model_actor_launchers import (
+from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
+from mint_server.backend.actors.model_actor_launchers import (
     ModelActorLauncherRegistry,
     _model_runtime_max_claim_for_spec,
     _model_runtime_token_budget_for_spec,
     launch_model_engine_host,
     placement_env_for_spec,
 )
-from mint_server.backend.model_actor_supervisor import (
+from mint_server.backend.actors.model_actor_supervisor import (
     ControlPlaneDependency,
     ModelActorSpec,
     ModelActorSupervisorClient,
@@ -39,14 +39,14 @@ from mint_server.backend.model_actor_supervisor import (
     domain_key_for_vllm_base_model,
     queue_id_for_replica,
 )
-from mint_server.backend import model_actor_placement as placement_module
-from mint_server.backend.model_actor_placement import ModelActorPlacementReconciler
-from mint_server.backend.supervisor_state_store import (
+from mint_server.backend.actors import model_actor_placement as placement_module
+from mint_server.backend.actors.model_actor_placement import ModelActorPlacementReconciler
+from mint_server.backend.stores.supervisor_state_store import (
     SupervisorMemoryStateStore,
     SupervisorSQLiteStateStore,
     SupervisorStateOwnerConflictError,
 )
-from mint_server.backend.topology import (
+from mint_server.backend.ray_cluster.topology import (
     ProviderTaskState,
     RayNodeState,
     TopologyConfig,
@@ -228,7 +228,7 @@ class _FakeRemoteActorClass:
 
 @pytest.mark.anyio
 async def test_issue_593_maybe_await_uses_ray_timeout_for_object_ref(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     calls: list[tuple[object, float | None]] = []
     ref = _FakeRayRef({"ok": True})
@@ -246,7 +246,7 @@ async def test_issue_593_maybe_await_uses_ray_timeout_for_object_ref(monkeypatch
 
 
 def test_issue_593_get_model_actor_supervisor_returns_client_facade() -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     assert isinstance(supervisor_module.get_model_actor_supervisor(), ModelActorSupervisorClient)
     assert supervisor_module.get_model_actor_supervisor() is supervisor_module.model_actor_supervisor
@@ -254,7 +254,7 @@ def test_issue_593_get_model_actor_supervisor_returns_client_facade() -> None:
 
 
 def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     actor = _FakeActorHandle()
     created = {"actor": actor, "remote_args": None, "remote_kwargs": None, "remote_decorator": None}
@@ -346,7 +346,7 @@ def test_issue_593_model_runtime_max_claim_uses_training_override_for_megatron(
 
 
 def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     calls = {"count": 0}
@@ -460,7 +460,7 @@ def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -517,8 +517,8 @@ def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_witho
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_inventory as inventory_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_inventory as inventory_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -590,7 +590,7 @@ def test_issue_638_supervisor_otel_reports_missing_gpu_uuid_without_high_cardina
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -637,8 +637,8 @@ def test_issue_638_supervisor_rss_snapshot_populates_otel_cache(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_inventory as inventory_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_inventory as inventory_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -684,7 +684,7 @@ def test_issue_638_supervisor_rss_snapshot_populates_otel_cache(
 
 
 def test_issue_638_supervisor_update_metadata_uses_sample_source() -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     supervisor = supervisor_module.ModelActorSupervisor(
         specs=[],
@@ -717,7 +717,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_supervisor_state(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -766,7 +766,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_topology_and_node_daemon_state
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.logging_context as logging_context
 
     gauges: dict[str, list] = {}
@@ -853,7 +853,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_topology_and_node_daemon_state
 def test_issue_593_supervisor_ensure_recreates_stale_code_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     old_actor = _FakeKillableActorHandle(code_identity="old-sha")
     new_actor = _FakeKillableActorHandle(code_identity=supervisor_module.CURRENT_CODE_IDENTITY)
@@ -891,7 +891,7 @@ def test_issue_593_supervisor_ensure_recreates_stale_code_identity(
 async def test_issue_593_supervisor_client_forwards_sync_and_async_methods(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
 
     actor = _FakeActorHandle()
     fake_ray = types.SimpleNamespace(
@@ -925,7 +925,7 @@ async def test_issue_593_supervisor_client_forwards_sync_and_async_methods(
 
 
 def test_issue_593_supervisor_exposes_explicit_inventory_contract(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("mint_server.backend.model_actor_inventory.ray.is_initialized", lambda: False)
+    monkeypatch.setattr("mint_server.backend.actors.model_actor_inventory.ray.is_initialized", lambda: False)
     supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
 
     entry = supervisor.register(
@@ -953,7 +953,7 @@ def test_issue_593_supervisor_exposes_explicit_inventory_contract(monkeypatch: p
 
 
 def test_bumblebee_actor_inventory_reports_bumblebee_backend(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("mint_server.backend.model_actor_inventory.ray.is_initialized", lambda: False)
+    monkeypatch.setattr("mint_server.backend.actors.model_actor_inventory.ray.is_initialized", lambda: False)
     supervisor = ModelActorSupervisor(**_disabled_control_plane_kwargs())
     actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
 
@@ -1265,9 +1265,9 @@ async def test_issue_648_launch_model_engine_host_passes_training_token_budget(
         captured.update(kwargs)
         return SimpleNamespace(ok=True)
 
-    runtime_module = types.ModuleType("mint_server.backend.model_engine_host")
+    runtime_module = types.ModuleType("mint_server.backend.actors.model_engine_host")
     runtime_module.get_or_create_model_engine_host = _fake_get_or_create_model_engine_host
-    monkeypatch.setitem(sys.modules, "mint_server.backend.model_engine_host", runtime_module)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.actors.model_engine_host", runtime_module)
     monkeypatch.setenv("MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET", "262144")
     monkeypatch.setenv("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "16")
 
@@ -3317,7 +3317,7 @@ async def test_issue_593_supervisor_blocks_when_controller_pg_create_blocks() ->
 
     class _BlockedPlacementController(ClusterPlacementController):
         async def create_pg(self, request):
-            from mint_server.backend.cluster_placement_controller import (
+            from mint_server.backend.scheduling.cluster_placement_controller import (
                 PlacementBlockReason,
                 PlacementGroupCreateResult,
             )

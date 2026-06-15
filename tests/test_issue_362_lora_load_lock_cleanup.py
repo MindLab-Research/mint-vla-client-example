@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from mint_server.backend.session_manager import SessionManager
+from mint_server.backend.sessions.session_manager import SessionManager
 from mint_server.routes import sampling as sampling_route
 
 

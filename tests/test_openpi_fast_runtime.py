@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend.openpi_fast_training import OPENPI_FAST_TRAINING_BACKEND
-from mint_server.backend.training_session_manager import TrainingSession
+from mint_server.backend.openpi.openpi_fast_training import OPENPI_FAST_TRAINING_BACKEND
+from mint_server.backend.training.training_session_manager import TrainingSession
 from mint_server.models.types import (
     AdamParams,
     Datum,
@@ -147,7 +147,7 @@ class _FakeRuntimeFactory:
 
 
 def test_openpi_fast_engine_create_training_session_starts_runtime() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -172,7 +172,7 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_training import _default_runtime_factory
+    from mint_server.backend.openpi.openpi_fast_training import _default_runtime_factory
 
     runtime_env = configure_runtime_env()
     calls: list[dict[str, object]] = []
@@ -195,12 +195,12 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(
         raise AssertionError(f"local subprocess path must not run: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_training.start_openpi_shared_ray_runtime",
+        "mint_server.backend.openpi.openpi_fast_training.start_openpi_shared_ray_runtime",
         _fake_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_runtime.OpenPIFastWorkerClient.start",
         _unexpected_local_start,
     )
 
@@ -216,7 +216,7 @@ def test_openpi_fast_default_runtime_factory_uses_shared_ray_runtime(
     assert calls == [
         {
             "model_id": "model-1",
-            "worker_module": "mint_server.backend.openpi_fast_worker",
+            "worker_module": "mint_server.backend.openpi.openpi_fast_worker",
             "python_executable": str(runtime_env["layout"].host_python),
             "pythonpath": runtime_env["pythonpath"],
             "config_name": "pi0_fast_libero_low_mem_finetune",
@@ -230,7 +230,7 @@ def test_openpi_fast_engine_create_training_session_surfaces_ray_start_failure_w
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     configure_runtime_env()
 
@@ -242,12 +242,12 @@ def test_openpi_fast_engine_create_training_session_surfaces_ray_start_failure_w
         raise AssertionError(f"local subprocess fallback must stay disabled: {spec.worker_module}")
 
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_training.start_openpi_shared_ray_runtime",
+        "mint_server.backend.openpi.openpi_fast_training.start_openpi_shared_ray_runtime",
         _failing_start_openpi_shared_ray_runtime,
         raising=False,
     )
     monkeypatch.setattr(
-        "mint_server.backend.openpi_fast_runtime.OpenPIFastWorkerClient.start",
+        "mint_server.backend.openpi.openpi_fast_runtime.OpenPIFastWorkerClient.start",
         _unexpected_local_start,
     )
 
@@ -259,7 +259,7 @@ def test_openpi_fast_engine_create_training_session_surfaces_ray_start_failure_w
 
 
 def test_openpi_fast_engine_forward_backward_builds_payload_and_updates_grad_state() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -283,7 +283,7 @@ def test_openpi_fast_engine_forward_backward_builds_payload_and_updates_grad_sta
 
 
 def test_openpi_fast_engine_rejects_unknown_loss_functions() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -299,7 +299,7 @@ def test_openpi_fast_engine_rejects_unknown_loss_functions() -> None:
 
 
 def test_openpi_fast_engine_importance_sampling_builds_rl_payload_and_updates_grad_state() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -331,7 +331,7 @@ def test_openpi_fast_engine_importance_sampling_builds_rl_payload_and_updates_gr
 
 
 def test_openpi_fast_engine_ppo_builds_rl_payload_and_updates_grad_state() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -366,7 +366,7 @@ def test_openpi_fast_engine_ppo_builds_rl_payload_and_updates_grad_state() -> No
 
 
 def test_openpi_fast_engine_train_step_composes_forward_backward_and_optim_step() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -389,7 +389,7 @@ def test_openpi_fast_engine_train_step_composes_forward_backward_and_optim_step(
 
 
 def test_openpi_fast_engine_save_load_and_shutdown_delegate_to_runtime() -> None:
-    from mint_server.backend.openpi_fast_training import OpenPIFastTrainingEngine
+    from mint_server.backend.openpi.openpi_fast_training import OpenPIFastTrainingEngine
 
     factory = _FakeRuntimeFactory()
     engine = OpenPIFastTrainingEngine(runtime_factory=factory)
@@ -416,7 +416,7 @@ def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     configure_runtime_env()
     monkeypatch.setenv("MINT_OPENPI_FAST_CREATE_SESSION_TIMEOUT_S", "900")
@@ -433,7 +433,7 @@ def test_openpi_fast_runtime_spec_reads_operation_specific_timeouts(
 def test_openpi_fast_runtime_spec_uses_runtime_env_contract(
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     runtime_env = configure_runtime_env()
 
@@ -454,7 +454,7 @@ def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     runtime_env = configure_runtime_env()
     monkeypatch.setenv(
@@ -471,7 +471,7 @@ def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
 def test_openpi_fast_runtime_spec_rejects_incomplete_runtime_env_layout(
     configure_runtime_env,
 ) -> None:
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     configure_runtime_env(with_host_python=False)
 
@@ -480,7 +480,7 @@ def test_openpi_fast_runtime_spec_rejects_incomplete_runtime_env_layout(
 
 
 def test_openpi_fast_runtime_init_overrides_accept_local_weight_path(monkeypatch) -> None:
-    from mint_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+    from mint_server.backend.openpi.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
 
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/local-params")
     monkeypatch.delenv("MINT_OPENPI_FAST_RANDOM_INIT", raising=False)
@@ -492,7 +492,7 @@ def test_openpi_fast_runtime_init_overrides_accept_local_weight_path(monkeypatch
 
 
 def test_openpi_fast_runtime_init_overrides_accept_random_init(monkeypatch) -> None:
-    from mint_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+    from mint_server.backend.openpi.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
 
     monkeypatch.delenv("MINT_OPENPI_FAST_WEIGHTS_PATH", raising=False)
     monkeypatch.setenv("MINT_OPENPI_FAST_RANDOM_INIT", "1")
@@ -504,7 +504,7 @@ def test_openpi_fast_runtime_init_overrides_accept_random_init(monkeypatch) -> N
 
 
 def test_openpi_fast_runtime_init_overrides_reject_conflicting_weight_sources(monkeypatch) -> None:
-    from mint_server.backend.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
+    from mint_server.backend.openpi.openpi_fast_worker import OpenPIFastRuntimeInitOverrides
 
     monkeypatch.setenv("MINT_OPENPI_FAST_WEIGHTS_PATH", "/tmp/local-params")
     monkeypatch.setenv("MINT_OPENPI_FAST_RANDOM_INIT", "1")

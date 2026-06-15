@@ -7,9 +7,9 @@ import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend import megatron_distributed as mg
-from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import VerlTrainingEngine
+from mint_server.backend.training.megatron import megatron_distributed as mg
+from mint_server.backend.training.training_session_manager import TrainingSession
+from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
 
 class _FakeRemoteMethod:
@@ -39,7 +39,7 @@ def test_issue_353_engine_optim_step_uses_training_remote_call_timeout(monkeypat
     request = SimpleNamespace(adam_params=SimpleNamespace(learning_rate=1e-4))
     seen: dict[str, object] = {}
 
-    monkeypatch.setattr("mint_server.backend.verl_training.server_config.training_remote_call_timeout_s", 123.0)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.server_config.training_remote_call_timeout_s", 123.0)
 
     async def fake_get_live_worker(session_arg, op):
         seen["get_live_worker"] = (session_arg.model_id, op)

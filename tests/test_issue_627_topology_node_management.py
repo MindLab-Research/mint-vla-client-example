@@ -7,10 +7,10 @@ import types
 import yaml
 import pytest
 
-from mint_server.backend.model_actor_supervisor import ModelActorSpec, ModelActorSupervisor, desired_specs_from_env
-from mint_server.backend.node_metrics_daemon import NodeMetricsDaemonSpec
-from mint_server.backend import node_metrics_daemon as node_metrics_daemon_module
-from mint_server.backend.topology import (
+from mint_server.backend.actors.model_actor_supervisor import ModelActorSpec, ModelActorSupervisor, desired_specs_from_env
+from mint_server.backend.ray_cluster.node_metrics_daemon import NodeMetricsDaemonSpec
+from mint_server.backend.ray_cluster import node_metrics_daemon as node_metrics_daemon_module
+from mint_server.backend.ray_cluster.topology import (
     ProviderTaskState,
     RayNodeState,
     TopologyManager,
@@ -232,7 +232,7 @@ def test_issue_627_ray_config_accepts_dashboard_and_head_ip_path(tmp_path) -> No
 
 
 def test_issue_627_non_volcano_provider_fails_loudly(tmp_path) -> None:
-    from mint_server.backend.topology import (
+    from mint_server.backend.ray_cluster.topology import (
         default_provider_task_lister_for_config,
         default_provider_task_submitter_for_config,
     )
@@ -263,8 +263,8 @@ def test_issue_627_default_volcano_provider_uses_sdk_region_not_cli_args(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from mint_server.backend import topology as topology_module
-    from mint_server.backend.topology import default_provider_task_lister_for_config
+    from mint_server.backend.ray_cluster import topology as topology_module
+    from mint_server.backend.ray_cluster.topology import default_provider_task_lister_for_config
 
     _install_fake_volcano_sdk(monkeypatch)
     config = load_topology_config(_write_topology_config(tmp_path))
@@ -315,7 +315,7 @@ def test_issue_627_sdk_client_can_bridge_legacy_volc_cli_credentials(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from mint_server.backend import topology as topology_module
+    from mint_server.backend.ray_cluster import topology as topology_module
 
     class _FakeConfiguration:
         def __init__(self) -> None:
@@ -370,7 +370,7 @@ def test_issue_627_volcano_sdk_import_falls_back_to_host_venv_site_packages(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from mint_server.backend import topology as topology_module
+    from mint_server.backend.ray_cluster import topology as topology_module
 
     sdk = _install_fake_volcano_sdk(monkeypatch)
     monkeypatch.delitem(sys.modules, "volcenginesdkmlplatform20240701")
@@ -414,7 +414,7 @@ def test_issue_627_sdk_client_prefers_modern_credential_chain_over_legacy_cli(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from mint_server.backend import topology as topology_module
+    from mint_server.backend.ray_cluster import topology as topology_module
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("VOLCENGINE_ACCESS_KEY", "modern-ak")
@@ -432,7 +432,7 @@ def test_issue_627_legacy_volc_cli_credentials_use_explicit_cli_home(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
-    from mint_server.backend import topology as topology_module
+    from mint_server.backend.ray_cluster import topology as topology_module
 
     monkeypatch.setenv("HOME", str(tmp_path / "not-root"))
     monkeypatch.setenv("VOLC_CLI_HOME", str(tmp_path / "cli-home"))
@@ -556,7 +556,7 @@ def test_issue_627_dashboard_node_lister_parses_ray_nodes(monkeypatch: pytest.Mo
         calls.append(f"{url} timeout={timeout}")
         return _Response()
 
-    monkeypatch.setattr("mint_server.backend.topology.urllib.request.urlopen", _urlopen)
+    monkeypatch.setattr("mint_server.backend.ray_cluster.topology.urllib.request.urlopen", _urlopen)
 
     nodes = list(ray_dashboard_node_lister(head_ip_path=head_ip_path, timeout_s=3))
 
@@ -609,7 +609,7 @@ def test_issue_627_topology_manager_can_use_dashboard_nodes_without_ray_init(
                 }
             ).encode("utf-8")
 
-    monkeypatch.setattr("mint_server.backend.topology.urllib.request.urlopen", lambda *_args, **_kwargs: _Response())
+    monkeypatch.setattr("mint_server.backend.ray_cluster.topology.urllib.request.urlopen", lambda *_args, **_kwargs: _Response())
     manager = TopologyManager(
         config,
         provider_task_lister=lambda _config: [
@@ -677,7 +677,7 @@ def test_issue_638_topology_marks_head_alias_from_head_ip_path(
                 }
             ).encode("utf-8")
 
-    monkeypatch.setattr("mint_server.backend.topology.urllib.request.urlopen", lambda *_args, **_kwargs: _Response())
+    monkeypatch.setattr("mint_server.backend.ray_cluster.topology.urllib.request.urlopen", lambda *_args, **_kwargs: _Response())
     manager = TopologyManager(
         config,
         provider_task_lister=lambda _config: [

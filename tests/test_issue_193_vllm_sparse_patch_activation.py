@@ -5,8 +5,8 @@ import pytest
 pytest.importorskip("verl")
 pytest.importorskip("vllm")
 
-from mint_server.backend import verl_inference
-from mint_server.backend.verl_inference import _create_extended_server_class
+from mint_server.backend.training.verl import verl_inference
+from mint_server.backend.training.verl.verl_inference import _create_extended_server_class
 
 
 def _make_server_instance():

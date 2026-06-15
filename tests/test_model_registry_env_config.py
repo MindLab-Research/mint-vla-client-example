@@ -22,7 +22,7 @@ def _write_model_topology(tmp_path, models):
 
 
 def test_list_supported_models_env(monkeypatch):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_SUPPORTED_MODELS",
@@ -33,7 +33,7 @@ def test_list_supported_models_env(monkeypatch):
 
 
 def test_list_supported_models_env_unknown_raises(monkeypatch):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "does/not-exist")
     try:
@@ -45,7 +45,7 @@ def test_list_supported_models_env_unknown_raises(monkeypatch):
 
 
 def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B, zai-org/GLM-5")
     monkeypatch.setenv(
@@ -70,7 +70,7 @@ def test_list_supported_models_env_accepts_gateway_routed_model(monkeypatch):
 
 
 def test_model_config_overrides_json(monkeypatch):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
@@ -82,7 +82,7 @@ def test_model_config_overrides_json(monkeypatch):
 
 
 def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
@@ -97,7 +97,7 @@ def test_model_config_overrides_json_unknown_field_raises(monkeypatch):
 
 
 def test_is_topology_desired_model_matches_hf_and_snapshot(monkeypatch, tmp_path):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_TOPOLOGY_CONFIG_PATH",
@@ -110,7 +110,7 @@ def test_is_topology_desired_model_matches_hf_and_snapshot(monkeypatch, tmp_path
 
 
 def test_is_topology_desired_model_accepts_snapshot_entries(monkeypatch, tmp_path):
-    from mint_server.backend import model_registry as mr
+    from mint_server.backend.core import model_registry as mr
 
     monkeypatch.setenv(
         "MINT_TOPOLOGY_CONFIG_PATH",
@@ -123,8 +123,8 @@ def test_is_topology_desired_model_accepts_snapshot_entries(monkeypatch, tmp_pat
 
 
 def test_qwen35_27b_registry_and_path(monkeypatch, tmp_path):
-    from mint_server.backend.model_registry import get_model_config
-    from mint_server.backend.multi_lora_engine import _resolve_model_path
+    from mint_server.backend.core.model_registry import get_model_config
+    from mint_server.backend.inference.multi_lora_engine import _resolve_model_path
 
     cfg = get_model_config("Qwen/Qwen3.5-27B")
     assert cfg.num_parameters == 27.0

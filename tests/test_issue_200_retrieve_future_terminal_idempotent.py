@@ -1,7 +1,7 @@
 import anyio
 from types import SimpleNamespace
 
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.stores.task_state_store import FutureStatus
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
@@ -176,7 +176,7 @@ def test_terminal_payload_evicted_is_served_as_known_future(monkeypatch):
     stub = _StubTaskFutureService(FutureStatus.DONE, result=None, error=None)
     monkeypatch.setattr(futures_route, "task_futures", stub)
     monkeypatch.setattr(futures_route, "_recent_get", lambda _request_id: None)
-    monkeypatch.setattr("mint_server.backend.task_state_store.task_state_store", _TaskStateTerminalStub(record))
+    monkeypatch.setattr("mint_server.backend.stores.task_state_store.task_state_store", _TaskStateTerminalStub(record))
 
     body = FutureRetrieveRequest(request_id="rid_evicted")
     response = _response_stub()

@@ -1,10 +1,10 @@
 import copy
 import pytest
 
-import mint_server.backend.session_heartbeat_store as session_heartbeat_store_module
-from mint_server.backend.session_heartbeat_store import SessionHeartbeatStore
-from mint_server.backend.session_manager import SessionManager
-from mint_server.backend.training_session_manager import TrainingSessionManager
+import mint_server.backend.stores.session_heartbeat_store as session_heartbeat_store_module
+from mint_server.backend.stores.session_heartbeat_store import SessionHeartbeatStore
+from mint_server.backend.sessions.session_manager import SessionManager
+from mint_server.backend.training.training_session_manager import TrainingSessionManager
 
 
 class _FakeTaskStateStore:

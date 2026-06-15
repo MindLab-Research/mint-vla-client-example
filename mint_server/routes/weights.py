@@ -29,7 +29,7 @@ from ..auth_identity import can_manage_system
 from ..auth_identity import can_write
 from ..auth_identity import get_user_data as _request_user_data
 from ..auth_identity import get_user_id as _request_user_id
-from ..backend.task_state_store import task_futures
+from mint_server.backend.stores.task_state_store import task_futures
 from ..checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
@@ -85,9 +85,9 @@ from ..queue_priority import merge_queue_priority_extra
 from ..webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
-    from ..backend.session_manager import SessionManager
-    from ..backend.training_session_manager import TrainingSessionManager
-    from ..backend.verl_training import VerlTrainingEngine
+    from mint_server.backend.sessions.session_manager import SessionManager
+    from mint_server.backend.training.training_session_manager import TrainingSessionManager
+    from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -100,7 +100,7 @@ inference_manager: SessionManager | None = None  # For multi-LoRA sampling regis
 
 def _current_training_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -112,7 +112,7 @@ def _current_training_manager():
 
 def _current_training_engine():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -124,7 +124,7 @@ def _current_training_engine():
 
 def _current_inference_manager():
     try:
-        from ..backend.execution_context import current_execution_context
+        from mint_server.backend.core.execution_context import current_execution_context
 
         context = current_execution_context()
         if context is not None:
@@ -186,7 +186,7 @@ def _loaded_training_session_lora_payload(lora_config: Any) -> dict[str, Any] | 
 
 
 def _next_loaded_training_session_metadata_version(session: Any) -> int:
-    from ..backend.training_session_manager import TRAINING_SESSION_METADATA_VERSION
+    from mint_server.backend.training.training_session_manager import TRAINING_SESSION_METADATA_VERSION
 
     current = max(
         int(getattr(session, "metadata_version")),
@@ -200,8 +200,8 @@ def _next_loaded_training_session_metadata_version(session: Any) -> int:
 async def _persist_loaded_training_session(
     session: Any, *, request_user_id: str | None
 ) -> None:
-    from ..backend.training_session_manager import MATERIALIZATION_STATE_READY
-    from ..backend.training_session_store import async_upsert_training_session
+    from mint_server.backend.training.training_session_manager import MATERIALIZATION_STATE_READY
+    from mint_server.backend.stores.training_session_store import async_upsert_training_session
     from ..config import RAY_NAMESPACE
 
     model_id = str(getattr(session, "model_id", "") or "")
@@ -313,7 +313,7 @@ def _require_write_access(request: Request) -> None:
 
 
 async def _mark_training_inflight(model_id: str, delta: int) -> None:
-    from ..backend.training_session_store import async_mark_training_session_inflight
+    from mint_server.backend.stores.training_session_store import async_mark_training_session_inflight
 
     await async_mark_training_session_inflight(model_id, delta)
 
@@ -333,8 +333,8 @@ async def _get_or_restore_training_session_for_weights(model_id: str):
     if session is not None:
         return session
 
-    from ..backend.async_ray_control import async_lookup_actor_handle
-    from ..backend.training_session_store import async_get_training_session_info
+    from mint_server.backend.ray_cluster.async_ray_control import async_lookup_actor_handle
+    from mint_server.backend.stores.training_session_store import async_get_training_session_info
     from ..config import RAY_NAMESPACE
 
     info = await async_get_training_session_info(model_id)
@@ -427,7 +427,7 @@ def _build_execution_serial_extra(*, model_id: str, extra: dict | None = None) -
 
 
 def _training_domain_key_from_store_info(store_info: dict, *, model_id: str) -> str:
-    from ..backend.model_actor_supervisor import domain_key_for_training_base_model
+    from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
     base_model = str(store_info.get("base_model") or "").strip()
     if base_model:
@@ -457,8 +457,8 @@ async def _enqueue_weights_model_work(
     domain_key: str,
     extra: dict | None = None,
 ) -> None:
-    from ..backend.model_work_admission import enqueue_model_work
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     affinity_group = f"training_session:{model_id}"
     await enqueue_model_work(

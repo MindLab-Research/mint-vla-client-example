@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from mint_server.backend.training_session_manager import (
+from mint_server.backend.training.training_session_manager import (
     MATERIALIZATION_STATE_READY,
     TRAINING_SESSION_METADATA_VERSION,
     TrainingSessionManager,
@@ -113,7 +113,7 @@ async def test_issue_364_training_route_restores_snapshot_from_detached_store(
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", engine)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -161,7 +161,7 @@ async def test_issue_364_training_route_refreshes_step_without_version_bump(
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(training_route, "_has_training_worker_binding", lambda _model_id: True)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -207,7 +207,7 @@ async def test_issue_364_owner_cleanup_respects_detached_training_last_activity(
         }
 
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -245,7 +245,7 @@ async def test_issue_364_training_route_drops_stale_local_snapshot_when_store_en
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -280,7 +280,7 @@ async def test_issue_364_get_model_info_rejects_stale_local_training_cache(
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -312,7 +312,7 @@ async def test_issue_364_list_training_runs_ignores_stale_local_training_cache(
 
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_list_training_sessions",
+        "mint_server.backend.stores.training_session_store.async_list_training_sessions",
         _async_list_training_sessions,
     )
 
@@ -358,7 +358,7 @@ async def test_issue_364_get_training_run_refreshes_read_only_metadata_from_stor
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -406,7 +406,7 @@ async def test_issue_364_list_training_runs_refreshes_local_stale_metadata(
     monkeypatch.setattr(training_route.time, "time", lambda: 200.0)
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_list_training_sessions",
+        "mint_server.backend.stores.training_session_store.async_list_training_sessions",
         _async_list_training_sessions,
     )
 
@@ -453,7 +453,7 @@ async def test_issue_364_get_model_info_refreshes_read_only_metadata_from_store(
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -498,7 +498,7 @@ async def test_issue_364_get_info_refreshes_read_only_metadata_from_store(
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
     monkeypatch.setattr(
@@ -549,7 +549,7 @@ async def test_issue_364_list_models_refreshes_read_only_metadata_from_store(
     monkeypatch.setattr(training_route.time, "time", lambda: 200.0)
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_list_training_sessions",
+        "mint_server.backend.stores.training_session_store.async_list_training_sessions",
         _async_list_training_sessions,
     )
 
@@ -594,7 +594,7 @@ async def test_issue_364_get_tokenizer_uses_detached_store_metadata(
     monkeypatch.setattr(training_route, "training_manager", None)
     monkeypatch.setattr(training_route, "training_engine", None)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
 
@@ -660,11 +660,11 @@ async def test_issue_364_get_tokenizer_backfills_detached_store_without_training
     monkeypatch.setattr(training_route, "training_engine", None)
     monkeypatch.setattr(training_route, "_build_local_tokenizer_metadata", _fake_build_local_tokenizer_metadata)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.stores.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
 
@@ -823,7 +823,7 @@ async def test_issue_364_cleanup_inactive_skips_session_when_store_unavailable(
         cleaned.append(model_id)
 
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_list_training_sessions",
+        "mint_server.backend.stores.training_session_store.async_list_training_sessions",
         _raise_store,
     )
     monkeypatch.setattr(manager, "_cleanup_session", _cleanup_session)
@@ -858,7 +858,7 @@ async def test_issue_364_cleanup_inactive_restores_detached_sessions_after_resta
         cleaned.append(model_id)
 
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_list_training_sessions",
+        "mint_server.backend.stores.training_session_store.async_list_training_sessions",
         _async_list_training_sessions,
     )
     monkeypatch.setattr(manager, "_cleanup_session", _cleanup_session)
@@ -939,11 +939,11 @@ async def test_issue_364_get_tokenizer_falls_back_to_local_metadata_when_worker_
     monkeypatch.setattr(training_route, "_build_local_tokenizer_metadata", _fake_build_local_tokenizer_metadata)
     monkeypatch.setattr(training_route, "_restore_training_session", _restore_none)
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_get_training_session_info",
+        "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
     )
     monkeypatch.setattr(
-        "mint_server.backend.training_session_store.async_upsert_training_session",
+        "mint_server.backend.stores.training_session_store.async_upsert_training_session",
         _async_upsert_training_session,
     )
 

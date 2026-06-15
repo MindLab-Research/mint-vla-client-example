@@ -110,7 +110,7 @@ def test_issue_445_queue_priority_normalization_and_aging():
 
 @pytest.mark.anyio
 async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
@@ -145,9 +145,9 @@ async def test_issue_445_asample_enqueues_normalized_priority(monkeypatch):
 async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch):
     import importlib
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -163,7 +163,7 @@ async def test_issue_445_internal_noop_enqueues_normalized_priority(monkeypatch)
 
 @pytest.mark.anyio
 async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_header(monkeypatch):
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(training_route, "training_engine", object())
@@ -204,8 +204,8 @@ async def test_issue_445_forward_backward_enqueues_default_priority_on_invalid_h
 
 @pytest.mark.anyio
 async def test_issue_445_compute_logprobs_enqueues_apikey_id(monkeypatch):
-    import mint_server.backend.model_registry as model_registry
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     scheduler = _CaptureModelWorkScheduler()
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())

@@ -133,7 +133,7 @@ class _StubModelWorkScheduler:
         self.calls: list[dict] = []
 
     async def append(self, **kwargs):
-        from mint_server.backend.model_work_scheduler import ModelWorkSchedulerConflictError
+        from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerConflictError
 
         request_id = kwargs["request_id"]
         if any(call["request_id"] == request_id for call in self.calls):
@@ -161,8 +161,8 @@ def _dummy_request(user_id: str | None = None):
 def _install_detached_sampling_store(monkeypatch):
     detached_sessions: dict[str, dict] = {}
 
-    import mint_server.backend.sampling_session_store as sss
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.sampling_session_store as sss
+    import mint_server.backend.stores.session_index_store as sis
 
     def _upsert_sampling_session(info: dict) -> None:
         detached_sessions[str(info["session_id"])] = dict(info)
@@ -250,7 +250,7 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
 
     monkeypatch.setattr(service_route, "session_manager", stub)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
     import mint_server.supported_models_gate as gate
     import mint_server.gateway as gw
 
@@ -318,8 +318,8 @@ def test_asample_deterministic_request_id_dedup(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import mint_server.backend.model_registry as model_registry
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
@@ -353,8 +353,8 @@ def test_asample_sets_deterministic_request_id_in_logging_context_first(monkeypa
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
     monkeypatch.setattr(sampling_route, "set_request_id", lambda rid: request_id_bindings.append(rid))
 
-    import mint_server.backend.model_registry as model_registry
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)
@@ -380,8 +380,8 @@ def test_asample_duplicate_payload_conflict(monkeypatch):
     monkeypatch.setattr(sampling_route, "session_manager", _StubSamplingSessionManager())
     monkeypatch.setattr(sampling_route, "task_futures", stub_fs)
 
-    import mint_server.backend.model_registry as model_registry
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.core.model_registry as model_registry
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(model_registry, "get_model_config", lambda _model: SimpleNamespace(max_model_len=4096))
     monkeypatch.setattr(mws, "model_work_scheduler", stub_scheduler)

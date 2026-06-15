@@ -1,4 +1,4 @@
-from mint_server.backend.queue_stage_timing import (
+from mint_server.backend.scheduling.queue_stage_timing import (
     attach_queue_stage_timing,
     build_queue_stage_timing,
 )

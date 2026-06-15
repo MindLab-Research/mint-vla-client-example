@@ -13,16 +13,38 @@ import pytest
 
 from typing import Any
 
-from mint_server.backend.control_plane_contracts import (
+from mint_server.backend.contracts.control_plane_contracts import (
     FinishResult,
     LeaseToken,
     as_task_ledger,
 )
-from mint_server.backend.model_work_scheduler import ModelWorkSchedulerClient
-from mint_server.backend.task_state_store import TaskStateStore, TaskStateStoreClient
+from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerClient
+from mint_server.backend.stores.task_state_store import TaskStateStore, TaskStateStoreClient
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+_BACKEND_SOURCE_PATHS = {
+    "bumblebee_distributed.py": "training/bumblebee/bumblebee_distributed.py",
+    "control_plane_contracts.py": "contracts/control_plane_contracts.py",
+    "dense_trainer.py": "training/dense/dense_trainer.py",
+    "execution_bindings.py": "ops/execution_bindings.py",
+    "execution_context.py": "core/execution_context.py",
+    "megatron_distributed.py": "training/megatron/megatron_distributed.py",
+    "model_engine_host.py": "actors/model_engine_host.py",
+    "model_work_scheduler.py": "scheduling/model_work_scheduler.py",
+    "multi_lora_engine.py": "inference/multi_lora_engine.py",
+    "multinode_inference.py": "inference/multinode_inference.py",
+    "openpi_ray_runtime.py": "openpi/openpi_ray_runtime.py",
+    "session_manager.py": "sessions/session_manager.py",
+    "task_state_store.py": "stores/task_state_store.py",
+    "training_session_manager.py": "training/training_session_manager.py",
+    "verl_inference.py": "training/verl/verl_inference.py",
+}
+
+
+def _backend_source(filename: str) -> Path:
+    return REPO_ROOT / "mint_server" / "backend" / _BACKEND_SOURCE_PATHS[filename]
 
 
 def _load_repo_sitecustomize() -> ModuleType:
@@ -58,7 +80,7 @@ def test_initialize_execution_bindings_is_runtime_actor_only() -> None:
                 ):
                     callers.append(str(path.relative_to(REPO_ROOT)))
 
-    assert callers == ["mint_server/backend/model_engine_host.py"]
+    assert callers == ["mint_server/backend/actors/model_engine_host.py"]
 
 
 def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
@@ -66,8 +88,8 @@ def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
     assert ".start_cleanup_task(" not in app_source
 
     manager_sources = [
-        REPO_ROOT / "mint_server" / "backend" / "session_manager.py",
-        REPO_ROOT / "mint_server" / "backend" / "training_session_manager.py",
+        _backend_source("session_manager.py"),
+        _backend_source("training_session_manager.py"),
     ]
     for path in manager_sources:
         source = path.read_text()
@@ -77,7 +99,7 @@ def test_api_startup_does_not_start_local_manager_cleanup_loops() -> None:
 
 def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
     source = (
-        REPO_ROOT / "mint_server" / "backend" / "execution_bindings.py"
+        _backend_source("execution_bindings.py")
     ).read_text()
     assert "from ..routes" not in source
     forbidden_assignments = [
@@ -93,10 +115,10 @@ def test_initialize_execution_bindings_does_not_mutate_route_globals() -> None:
 
 def test_model_engine_host_does_not_bind_legacy_route_globals() -> None:
     runtime_source = (
-        REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+        _backend_source("model_engine_host.py")
     ).read_text()
     context_source = (
-        REPO_ROOT / "mint_server" / "backend" / "execution_context.py"
+        _backend_source("execution_context.py")
     ).read_text()
 
     assert "bind_legacy_route_globals" not in runtime_source
@@ -106,7 +128,7 @@ def test_model_engine_host_does_not_bind_legacy_route_globals() -> None:
 
 def test_model_engine_host_terminal_commit_goes_through_scheduler_finish_surface() -> None:
     runtime_source = (
-        REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+        _backend_source("model_engine_host.py")
     ).read_text()
 
     assert "_commit_task_state_success" not in runtime_source
@@ -118,9 +140,9 @@ def test_model_engine_host_terminal_commit_goes_through_scheduler_finish_surface
 
 
 def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
-    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
-    contracts_path = REPO_ROOT / "mint_server" / "backend" / "control_plane_contracts.py"
-    scheduler_path = REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py"
+    runtime_path = _backend_source("model_engine_host.py")
+    contracts_path = _backend_source("control_plane_contracts.py")
+    scheduler_path = _backend_source("model_work_scheduler.py")
     runtime_tree = ast.parse(runtime_path.read_text(), filename=str(runtime_path))
     contracts_source = contracts_path.read_text()
     protocols = _class_methods(contracts_path)
@@ -148,7 +170,7 @@ def test_runtime_contract_does_not_expose_legacy_complete_surface() -> None:
 
 
 def test_runtime_queue_contract_is_lease_only_surface() -> None:
-    contracts_path = REPO_ROOT / "mint_server" / "backend" / "control_plane_contracts.py"
+    contracts_path = _backend_source("control_plane_contracts.py")
     contracts_source = contracts_path.read_text()
     protocols = _class_methods(contracts_path)
 
@@ -170,7 +192,7 @@ def test_runtime_queue_contract_is_lease_only_surface() -> None:
 
 
 def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor() -> None:
-    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    runtime_path = _backend_source("model_engine_host.py")
     functions = _module_functions(runtime_path)
     run_executor = functions["_run_executor"]
     source = ast.get_source_segment(runtime_path.read_text(), run_executor) or ""
@@ -181,7 +203,7 @@ def test_model_engine_host_does_not_classify_executor_exceptions_in_run_executor
 
 
 def test_model_engine_host_renew_wait_uses_asyncio_timeout_scope() -> None:
-    runtime_path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    runtime_path = _backend_source("model_engine_host.py")
     methods = _class_methods(runtime_path)["ModelEngineHost"]
     renew_until_done = methods["_renew_until_done"]
     source = ast.get_source_segment(runtime_path.read_text(), renew_until_done) or ""
@@ -192,10 +214,10 @@ def test_model_engine_host_renew_wait_uses_asyncio_timeout_scope() -> None:
 
 def test_backend_placement_group_creation_is_controller_owned() -> None:
     backend_paths = [
-        REPO_ROOT / "mint_server" / "backend" / "dense_trainer.py",
-        REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
-        REPO_ROOT / "mint_server" / "backend" / "megatron_distributed.py",
-        REPO_ROOT / "mint_server" / "backend" / "bumblebee_distributed.py",
+        _backend_source("dense_trainer.py"),
+        _backend_source("multinode_inference.py"),
+        _backend_source("megatron_distributed.py"),
+        _backend_source("bumblebee_distributed.py"),
     ]
     for path in backend_paths:
         source = path.read_text()
@@ -204,7 +226,7 @@ def test_backend_placement_group_creation_is_controller_owned() -> None:
 
 
 def test_model_work_scheduler_uses_lock_not_condition_for_mutex() -> None:
-    source = (REPO_ROOT / "mint_server" / "backend" / "model_work_scheduler.py").read_text()
+    source = _backend_source("model_work_scheduler.py").read_text()
     assert "asyncio.Condition(" not in source
     assert ".notify_all(" not in source
     assert "._cv.wait(" not in source
@@ -212,20 +234,20 @@ def test_model_work_scheduler_uses_lock_not_condition_for_mutex() -> None:
 
 
 def test_vllm_backend_attach_preserves_child_task_capture() -> None:
-    source = (REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py").read_text()
+    source = _backend_source("multinode_inference.py").read_text()
     assert "get_named_placement_group(" in source
     assert "placement_group_capture_child_tasks=True" in source
 
 
 def test_backend_nested_actor_runtime_env_does_not_export_ray_attach_hints() -> None:
     backend_paths = [
-        REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
-        REPO_ROOT / "mint_server" / "backend" / "multi_lora_engine.py",
-        REPO_ROOT / "mint_server" / "backend" / "verl_inference.py",
-        REPO_ROOT / "mint_server" / "backend" / "openpi_ray_runtime.py",
-        REPO_ROOT / "mint_server" / "backend" / "dense_trainer.py",
-        REPO_ROOT / "mint_server" / "backend" / "megatron_distributed.py",
-        REPO_ROOT / "mint_server" / "backend" / "bumblebee_distributed.py",
+        _backend_source("multinode_inference.py"),
+        _backend_source("multi_lora_engine.py"),
+        _backend_source("verl_inference.py"),
+        _backend_source("openpi_ray_runtime.py"),
+        _backend_source("dense_trainer.py"),
+        _backend_source("megatron_distributed.py"),
+        _backend_source("bumblebee_distributed.py"),
     ]
     missing: list[str] = []
     for path in backend_paths:
@@ -250,11 +272,11 @@ def test_backend_nested_actor_runtime_env_does_not_export_ray_attach_hints() -> 
 def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
     helper_specs = [
         (
-            REPO_ROOT / "mint_server" / "backend" / "multinode_inference.py",
+            _backend_source("multinode_inference.py"),
             "_prepare_mint_vllm_multinode_runtime_env",
         ),
         (
-            REPO_ROOT / "mint_server" / "backend" / "multi_lora_engine.py",
+            _backend_source("multi_lora_engine.py"),
             "_prepare_vllm_actor_runtime_env",
         ),
     ]
@@ -294,14 +316,14 @@ def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
 def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> None:
     expectations = {
         "mint_server/config.py": ["actor_runtime_env_vars"],
-        "mint_server/backend/model_engine_host.py": ["get_or_create_model_engine_host"],
-        "mint_server/backend/model_actor_supervisor.py": ["_create_ray_actor"],
-        "mint_server/backend/verl_inference.py": ["initialize"],
+        "mint_server/backend/actors/model_engine_host.py": ["get_or_create_model_engine_host"],
+        "mint_server/backend/actors/model_actor_supervisor.py": ["_create_ray_actor"],
+        "mint_server/backend/training/verl/verl_inference.py": ["initialize"],
     }
     for rel, function_names in expectations.items():
         path = REPO_ROOT / rel
         text = path.read_text(encoding="utf-8")
-        if rel == "mint_server/backend/verl_inference.py":
+        if rel == "mint_server/backend/training/verl/verl_inference.py":
             functions = _class_methods(path)["VerlInferenceEngine"]
         else:
             functions = _module_functions(path)
@@ -314,9 +336,9 @@ def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> Non
 def test_ray_address_production_references_are_explicitly_owned() -> None:
     allowed_files = {
         "mint_server/config.py",  # actor env builder and no-attach runtime env keys.
-        "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
-        "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
-        "mint_server/backend/multinode_inference.py",  # no-attach runtime env key.
+        "mint_server/backend/actors/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
+        "mint_server/backend/inference/multi_lora_engine.py",  # no-attach runtime env key.
+        "mint_server/backend/inference/multinode_inference.py",  # no-attach runtime env key.
         "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
         "ops/backend/config.py",  # explicit MINT_OPS_RAY_ADDRESS / MINT_RAY_GCS_ADDRESS config names.
         "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
@@ -354,7 +376,7 @@ def test_runtime_config_does_not_treat_ray_address_as_actor_bootstrap_env() -> N
 
 
 def test_model_engine_host_runtime_actor_does_not_use_vllm_wrapper_as_actor_python() -> None:
-    path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    path = _backend_source("model_engine_host.py")
     functions = _module_functions(path)
     helper = functions["get_or_create_model_engine_host"]
     source = ast.get_source_segment(path.read_text(), helper) or ""
@@ -368,9 +390,9 @@ def test_model_engine_host_runtime_actor_does_not_use_vllm_wrapper_as_actor_pyth
 
 def test_vllm_backend_actors_do_not_use_wrapper_as_actor_python() -> None:
     for rel_path in [
-        "mint_server/backend/multi_lora_engine.py",
-        "mint_server/backend/multinode_inference.py",
-        "mint_server/backend/verl_inference.py",
+        "mint_server/backend/inference/multi_lora_engine.py",
+        "mint_server/backend/inference/multinode_inference.py",
+        "mint_server/backend/training/verl/verl_inference.py",
     ]:
         source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
         assert '"py_executable"' not in source, rel_path
@@ -378,13 +400,13 @@ def test_vllm_backend_actors_do_not_use_wrapper_as_actor_python() -> None:
 
 def test_control_plane_helper_tasks_use_no_attach_runtime_env() -> None:
     expectations = {
-        "mint_server/backend/async_ray_control.py": [
+        "mint_server/backend/ray_cluster/async_ray_control.py": [
             "async_pending_gpu_pg_observation",
             "async_placement_group_table",
             "async_lookup_actor_handle",
             "async_kill_named_actor",
         ],
-        "mint_server/backend/model_actor_placement.py": [
+        "mint_server/backend/actors/model_actor_placement.py": [
             "_default_gpu_actor_killer",
         ],
         "mint_server/checkpoints.py": [
@@ -567,7 +589,7 @@ def test_sitecustomize_vllm_ray_env_patch_excludes_ray_attach_hints(monkeypatch)
 
 
 def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -> None:
-    task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
+    task_state_path = _backend_source("task_state_store.py")
     functions = _class_methods(task_state_path)["TaskStateStore"]
     expected_returns = {
         "acquire_scheduler_owner": "OwnerLeaseResult",
@@ -594,7 +616,7 @@ def test_task_state_store_scheduler_ledger_returns_typed_results_before_wire() -
 
 
 def test_task_state_store_actor_ledger_methods_wire_typed_results() -> None:
-    task_state_path = REPO_ROOT / "mint_server" / "backend" / "task_state_store.py"
+    task_state_path = _backend_source("task_state_store.py")
     source = task_state_path.read_text()
     functions = _class_methods(task_state_path)["_TaskStateStoreActor"]
     for name in (
@@ -770,7 +792,7 @@ def test_task_ledger_contract_forwards_finalize_runtime_generation() -> None:
 
 
 def test_model_work_scheduler_client_forwards_finish_surface(monkeypatch) -> None:
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     calls: list[tuple[str, dict[str, Any]]] = []
 
@@ -979,12 +1001,12 @@ def _function_source(path: Path, function_name: str) -> str:
     ("module_name", "client_factory", "call_client"),
     [
         (
-            "mint_server.backend.model_work_scheduler",
+            "mint_server.backend.scheduling.model_work_scheduler",
             ModelWorkSchedulerClient,
             lambda client: client.stats(timeout_s=1.0, create_if_missing=True),
         ),
         (
-            "mint_server.backend.task_state_store",
+            "mint_server.backend.stores.task_state_store",
             TaskStateStoreClient,
             lambda client: client.async_ensure_ready(timeout_s=1.0, create_if_missing=True),
         ),

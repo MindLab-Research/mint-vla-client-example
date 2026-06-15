@@ -5,8 +5,8 @@ import time
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import ExecutorOutcome
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.contracts.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.stores.task_state_store import FutureStatus
 
 from .harness import SchedulerComponentWorld
 from .invariants import assert_terminal_not_scheduled

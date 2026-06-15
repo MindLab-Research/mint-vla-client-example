@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, Iterable, cast
 
 from fastapi import Request, Response
-from mint_server.backend.control_plane_contracts import (
+from mint_server.backend.contracts.control_plane_contracts import (
     AsyncSchedulerControlPlane,
     AsyncSchedulerQueue,
     AsyncTaskLedger,
@@ -21,19 +21,19 @@ from mint_server.backend.control_plane_contracts import (
     SyncReplicasResult,
     WireCompatibleResult,
 )
-from mint_server.backend.model_work_admission import ModelWorkAdmissionResult
-from mint_server.backend.model_actor_supervisor import (
+from mint_server.backend.scheduling.model_work_admission import ModelWorkAdmissionResult
+from mint_server.backend.actors.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisorCore,
     consumer_id_for_replica,
     queue_id_for_replica,
 )
-from mint_server.backend.model_engine_host import ModelEngineHost
-from mint_server.backend.model_work_admission import enqueue_model_work
-from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
-from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
-from mint_server.backend.task_payload_store import TaskPayloadStore
-from mint_server.backend.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
+from mint_server.backend.actors.model_engine_host import ModelEngineHost
+from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+from mint_server.backend.scheduling.model_work_scheduler import _ModelWorkSchedulerActor
+from mint_server.backend.scheduling.model_work_task_gateway import SchedulerModelWorkTaskGateway
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
 from mint_server.models.types import FutureCancelRequest, FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
@@ -166,7 +166,7 @@ class LocalAsyncTaskStateClient:
         timeout_s: float,
         terminal_only: bool = False,
     ) -> dict[str, Any]:
-        from mint_server.backend.task_state_store import TERMINAL_TASK_STATUSES
+        from mint_server.backend.stores.task_state_store import TERMINAL_TASK_STATUSES
 
         deadline = time.time() + max(0.0, float(timeout_s))
         last_record: dict[str, Any] | None = None
@@ -449,8 +449,8 @@ class SchedulerComponentWorld:
         scheduler_override: Any | None = None,
     ) -> tuple[int, dict[str, Any]]:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)
-        import mint_server.backend.model_work_scheduler as scheduler_module
-        import mint_server.backend.model_work_task_gateway as gateway_module
+        import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+        import mint_server.backend.scheduling.model_work_task_gateway as gateway_module
 
         monkeypatch.setattr(scheduler_module, "model_work_scheduler", scheduler_override or self.scheduler)
         monkeypatch.setattr(
@@ -484,8 +484,8 @@ class SchedulerComponentWorld:
         scheduler_override: Any | None = None,
     ) -> CancelTaskResult:
         monkeypatch.setattr(futures_route, "task_futures", self.future_service)
-        import mint_server.backend.model_work_scheduler as scheduler_module
-        import mint_server.backend.model_work_task_gateway as gateway_module
+        import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+        import mint_server.backend.scheduling.model_work_task_gateway as gateway_module
 
         monkeypatch.setattr(scheduler_module, "model_work_scheduler", scheduler_override or self.scheduler)
         monkeypatch.setattr(

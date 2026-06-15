@@ -20,7 +20,7 @@ def _stub_sampling_last_activity(monkeypatch) -> None:
         return None
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_session_store.async_set_sampling_session_last_activity",
+        "mint_server.backend.stores.sampling_session_store.async_set_sampling_session_last_activity",
         _noop_async_set_last_activity,
     )
 
@@ -48,7 +48,7 @@ async def test_issue_437_root_heartbeat_touches_explicit_heartbeat_children(monk
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     _stub_sampling_last_activity(monkeypatch)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
@@ -92,7 +92,7 @@ async def test_issue_437_root_heartbeat_derives_training_checkpoint_children_onl
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     _stub_sampling_last_activity(monkeypatch)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
@@ -149,7 +149,7 @@ async def test_issue_437_root_heartbeat_ignores_missing_child_samplers(monkeypat
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     _stub_sampling_last_activity(monkeypatch)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
@@ -192,7 +192,7 @@ async def test_issue_437_root_heartbeat_skips_child_fanout_for_owner_mismatch(mo
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     _stub_sampling_last_activity(monkeypatch)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     monkeypatch.setattr(
         sis,
@@ -234,7 +234,7 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
     monkeypatch.setattr(service, "session_heartbeat_store", SimpleNamespace(update=updates.append))
     _stub_sampling_last_activity(monkeypatch)
 
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     async def _boom(_session_id: str):
         raise RuntimeError("session index offline")
@@ -254,7 +254,7 @@ async def test_issue_437_root_heartbeat_keeps_best_effort_on_index_failure(monke
 
 
 def test_issue_437_add_heartbeat_sampler_uses_task_state_store(monkeypatch) -> None:
-    import mint_server.backend.session_index_store as sis
+    import mint_server.backend.stores.session_index_store as sis
 
     calls: list[tuple[str, str, str | None, str | None]] = []
     monkeypatch.setattr(

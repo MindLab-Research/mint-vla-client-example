@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mint_server.backend.model_actor_supervisor import ActorType, _ModelActorInventoryState
+from mint_server.backend.actors.model_actor_supervisor import ActorType, _ModelActorInventoryState
 
 
 def test_issue_364_inventory_tracks_session_protection_and_inflight() -> None:

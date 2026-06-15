@@ -23,8 +23,8 @@ def test_issue_593_operator_routes_do_not_keep_api_v1_internal_aliases() -> None
 
 @pytest.mark.anyio
 async def test_issue_593_internal_model_visibility_endpoints(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
     class _FakeScheduler:
         async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
@@ -53,11 +53,11 @@ async def test_issue_593_internal_model_visibility_endpoints(monkeypatch: pytest
 
 @pytest.mark.anyio
 async def test_issue_593_internal_admission_stats_observes_without_creating(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.maintenance_cron_actor as cron_module
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.model_work_scheduler as scheduler_module
-    import mint_server.backend.session_heartbeat_store as heartbeat_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.ops.maintenance_cron_actor as cron_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+    import mint_server.backend.stores.session_heartbeat_store as heartbeat_module
+    import mint_server.backend.stores.task_state_store as task_state_module
 
     class _FakeScheduler:
         async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:

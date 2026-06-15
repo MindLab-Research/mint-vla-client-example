@@ -116,7 +116,7 @@ def test_mint_action_route_does_not_cleanup_gateway_owned_future_when_enqueue_fa
     monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
     monkeypatch.setattr(mint_routes, "action_session_manager", object(), raising=False)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -180,7 +180,7 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
     )
     _install_billing_user(monkeypatch, mint_routes)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -401,7 +401,7 @@ def test_mint_vla_train_step_route_enqueues_expected_request(monkeypatch) -> Non
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     _install_billing_user(monkeypatch, mint_routes)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
     from mint_server.routes import training as training_routes
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -548,7 +548,7 @@ def test_mint_vla_train_step_route_releases_durable_inflight_on_enqueue_failure(
     monkeypatch.setattr(mint_routes, "training_manager", _StubTrainingManager())
     _install_billing_user(monkeypatch, mint_routes)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
     from mint_server.routes import training as training_routes
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -789,7 +789,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
         mint_routes, "_get_route_training_store_info", _fake_route_session_info
     )
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -852,7 +852,7 @@ def test_mint_vla_train_step_route_uses_detached_session_info(monkeypatch) -> No
 
 
 def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
-    from mint_server.backend import model_work_dispatch as dispatch
+    from mint_server.backend.scheduling import model_work_dispatch as dispatch
     import ray
 
     captured: dict[str, object] = {}
@@ -931,7 +931,7 @@ def test_model_work_dispatch_executes_mint_vla_train_step(monkeypatch) -> None:
 
 
 def test_model_work_dispatch_executes_mint_action_with_billing(monkeypatch) -> None:
-    from mint_server.backend import model_work_dispatch as dispatch
+    from mint_server.backend.scheduling import model_work_dispatch as dispatch
     import ray
 
     captured: dict[str, object] = {}
@@ -1000,7 +1000,7 @@ def test_mint_interpolate_route_enqueues_expected_request(monkeypatch) -> None:
     monkeypatch.setattr(mint_routes, "training_manager", object())
     _install_billing_user(monkeypatch, mint_routes)
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
 
@@ -1074,7 +1074,7 @@ def test_mint_interpolate_do_path_claims_checkpoint_and_writes_ckpt_id(
 ) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
-    import mint_server.backend.mintx_ops as mintx_ops
+    import mint_server.backend.core.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
     written: dict[str, object] = {}
@@ -1207,7 +1207,7 @@ def test_mint_interpolate_do_path_marks_failed_checkpoint(
 ) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
-    import mint_server.backend.mintx_ops as mintx_ops
+    import mint_server.backend.core.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
     failed_marks: list[tuple[str | None, str]] = []
@@ -1262,7 +1262,7 @@ def test_mint_interpolate_do_path_mark_failed_error_does_not_mask_root_failure(
 ) -> None:
     from mint_server.models.mint_types import InterpolateCheckpointsRequest
     from mint_server.routes import mint as mint_routes
-    import mint_server.backend.mintx_ops as mintx_ops
+    import mint_server.backend.core.mintx_ops as mintx_ops
 
     task_futures = _StubTaskFutureService()
 
@@ -1393,7 +1393,7 @@ def test_mint_reverse_kl_route_and_background_path(monkeypatch) -> None:
         mint_routes, "_get_max_model_len", lambda _base_model: 2048, raising=False
     )
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -1532,7 +1532,7 @@ def test_mint_reverse_kl_route_uses_detached_training_info_without_route_runtime
         mint_routes, "_get_route_training_store_info", _get_training_route_session_info
     )
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -1630,7 +1630,7 @@ def test_mint_reverse_kl_route_releases_durable_inflight_on_enqueue_failure(
         mint_routes, "_get_route_training_store_info", _get_training_route_session_info
     )
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)
@@ -1759,7 +1759,7 @@ def test_mint_reverse_kl_route_refreshes_detached_enqueue_protection(
         mint_routes, "_get_route_training_store_info", _get_training_route_session_info
     )
 
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
     monkeypatch.setattr(training_routes, "_get_max_model_len", lambda _base_model: 2048)

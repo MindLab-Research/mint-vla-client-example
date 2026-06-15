@@ -68,7 +68,7 @@ turning the PR-blocking gate into a real runtime/e2e job.
 
 Current exception:
 
-- `mint_server/backend/model_actor_supervisor.py`: 65% floor. The CI harness
+- `mint_server/backend/actors/model_actor_supervisor.py`: 65% floor. The CI harness
   covers scheduler-visible supervisor semantics such as blocked/unhealthy
   claimability and liveness push consumption, while some process/Ray lifecycle
   branches remain outside the fake-Ray PR gate.

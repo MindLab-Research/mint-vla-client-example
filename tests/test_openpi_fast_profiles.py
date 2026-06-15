@@ -1,4 +1,4 @@
-from mint_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
+from mint_server.backend.core.model_registry import MODEL_CONFIGS, list_supported_models
 
 
 OPENPI_FAST_MODEL = "openpi/pi0-fast-libero-low-mem-finetune"

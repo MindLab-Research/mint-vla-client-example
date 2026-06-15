@@ -56,7 +56,7 @@ def test_issue_193_training_worker_load_checkpoint_without_optimizer_resets_stat
     monkeypatch.setitem(sys.modules, "peft.utils.save_and_load", fake_save_load)
 
     monkeypatch.setattr(
-        "mint_server.backend.verl_training._get_torch",
+        "mint_server.backend.training.verl.verl_training._get_torch",
         lambda: SimpleNamespace(load=lambda *args, **kwargs: {"unexpected": True}),
     )
 
@@ -126,7 +126,7 @@ def test_issue_193_training_worker_load_checkpoint_invalid_meta_preserves_step_a
     monkeypatch.setitem(sys.modules, "peft.utils.save_and_load", fake_save_load)
 
     monkeypatch.setattr(
-        "mint_server.backend.verl_training._get_torch",
+        "mint_server.backend.training.verl.verl_training._get_torch",
         lambda: SimpleNamespace(load=lambda *args, **kwargs: {"unexpected": True}),
     )
 
@@ -672,7 +672,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
         async_get_ray_ref_calls.append((ref, timeout_s))
         return {"status": "ok"}
 
-    monkeypatch.setattr("mint_server.backend.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
+    monkeypatch.setattr("mint_server.backend.training.verl.verl_training.async_get_ray_ref", fake_async_get_ray_ref)
 
     async def _run():
         await engine.load_weights(

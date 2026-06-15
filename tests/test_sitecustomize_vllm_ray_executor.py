@@ -1019,7 +1019,7 @@ def test_qwen35_linear_attention_packing_fails_fast_on_bad_shapes():
     import pytest
     import torch
 
-    from mint_server.backend.qwen35_text_vllm_adapter import (
+    from mint_server.backend.inference.qwen35_text_vllm_adapter import (
         _pack_qwen35_b_a,
         _pack_qwen35_qkv_z,
     )

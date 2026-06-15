@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend import verl_inference
+from mint_server.backend.training.verl import verl_inference
 
 
 def test_issue_593_verl_inference_builds_node_affinity_options(monkeypatch):

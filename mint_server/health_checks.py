@@ -51,8 +51,8 @@ def public_healthz_cache_age_seconds() -> float | None:
 
 
 async def _ping_public_dependencies(*, timeout_s: float) -> None:
-    from .backend.model_work_scheduler import model_work_scheduler
-    from .backend.task_state_store import task_state_store
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.stores.task_state_store import task_state_store
 
     scheduler_ping = getattr(model_work_scheduler, "async_ping", None)
     if scheduler_ping is None:
@@ -211,7 +211,7 @@ def _env_float(name: str, default: float) -> float:
 
 async def _billing_outbox_health_snapshot() -> dict[str, object]:
     try:
-        from .backend.task_state_store import task_futures
+        from mint_server.backend.stores.task_state_store import task_futures
 
         stats = await task_futures.async_billing_outbox_stats()
     except Exception as e:
@@ -267,7 +267,7 @@ async def _future_state_store_health_snapshot() -> dict[str, object]:
     )
     started = time.monotonic()
     try:
-        from .backend.task_state_store import task_futures
+        from mint_server.backend.stores.task_state_store import task_futures
 
         ping = await asyncio.wait_for(
             task_futures.async_ping(timeout_s=timeout_s),
@@ -300,7 +300,7 @@ async def internal_lightweight_healthz_response() -> dict:
     status = "ready"
 
     try:
-        from .backend.model_actor_supervisor import get_model_actor_supervisor
+        from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
         supervisor = get_model_actor_supervisor()
         supervisor_snapshot = supervisor.snapshot()

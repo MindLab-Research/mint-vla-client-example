@@ -73,7 +73,7 @@ def main() -> int:
     _ensure_ray_stubbed()
     _ensure_peft_stubbed()
 
-    dist = importlib.import_module("mint_server.backend.megatron_distributed")
+    dist = importlib.import_module("mint_server.backend.training.megatron.megatron_distributed")
     if hasattr(dist, "MegatronActorPool"):
         print("FAIL: megatron_distributed still exposes MegatronActorPool", file=sys.stderr)
         return 1
@@ -92,7 +92,7 @@ def main() -> int:
         )
         return 1
 
-    vt = importlib.import_module("mint_server.backend.verl_training")
+    vt = importlib.import_module("mint_server.backend.training.verl.verl_training")
     doc = (vt.VerlTrainingEngine.create_training_session.__doc__ or "")
     if "MegatronTrainingWorker" in doc:
         print(

@@ -22,8 +22,8 @@ def _ready_cached_health_snapshot() -> dict:
 
 @pytest.mark.anyio
 async def test_public_healthz_uses_ping_cache_and_minimal_payload(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_work_scheduler as scheduler_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     health_checks.reset_public_healthz_cache()
@@ -64,8 +64,8 @@ async def test_public_healthz_uses_ping_cache_and_minimal_payload(monkeypatch: p
 
 @pytest.mark.anyio
 async def test_public_healthz_failed_refresh_does_not_reuse_old_value(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_work_scheduler as scheduler_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     health_checks.reset_public_healthz_cache()
@@ -106,8 +106,8 @@ async def test_public_healthz_failed_refresh_does_not_reuse_old_value(monkeypatc
 async def test_public_healthz_records_timeout_result(monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 
-    import mint_server.backend.model_work_scheduler as scheduler_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     health_checks.reset_public_healthz_cache()
@@ -145,8 +145,8 @@ async def test_public_healthz_records_timeout_result(monkeypatch: pytest.MonkeyP
 async def test_public_healthz_single_flight_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 
-    import mint_server.backend.model_work_scheduler as scheduler_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     health_checks.reset_public_healthz_cache()
@@ -176,7 +176,7 @@ async def test_public_healthz_single_flight_refresh(monkeypatch: pytest.MonkeyPa
 
 @pytest.mark.anyio
 async def test_internal_healthz_degrades_on_stale_supervisor_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
 
     now = 1000.0
@@ -208,7 +208,7 @@ async def test_internal_healthz_degrades_on_stale_supervisor_snapshot(monkeypatc
 async def test_internal_healthz_uses_top_level_supervisor_snapshot_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
 
     now = 1000.0
@@ -240,7 +240,7 @@ async def test_internal_healthz_uses_top_level_supervisor_snapshot_timestamp(
 
 @pytest.mark.anyio
 async def test_internal_healthz_degrades_when_cron_unreachable(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
 
     now = 1000.0
@@ -274,7 +274,7 @@ async def test_internal_healthz_degrades_when_cron_unreachable(monkeypatch: pyte
 
 @pytest.mark.anyio
 async def test_internal_healthz_degrades_on_startup_control_plane_failure(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
     from mint_server.health_state import clear_startup_degraded_state, set_startup_degraded_state
 
@@ -314,8 +314,8 @@ async def test_internal_healthz_degrades_on_startup_control_plane_failure(monkey
 
 @pytest.mark.anyio
 async def test_internal_healthz_degrades_on_billing_outbox_backlog(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     now = 1000.0
@@ -361,8 +361,8 @@ async def test_internal_healthz_degrades_on_billing_outbox_backlog(monkeypatch: 
 async def test_internal_healthz_degrades_on_future_store_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     import asyncio
 
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.task_state_store as task_state_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.stores.task_state_store as task_state_module
     from mint_server import health_checks
 
     now = 1000.0
@@ -396,7 +396,7 @@ async def test_internal_healthz_degrades_on_future_store_timeout(monkeypatch: py
 
 @pytest.mark.anyio
 async def test_internal_healthz_unhealthy_when_supervisor_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
 
     def _raise() -> object:
@@ -410,7 +410,7 @@ async def test_internal_healthz_unhealthy_when_supervisor_unavailable(monkeypatc
 
 
 def test_task_state_store_ping_checks_sqlite() -> None:
-    from mint_server.backend.task_state_store import TaskStateStore
+    from mint_server.backend.stores.task_state_store import TaskStateStore
 
     store = TaskStateStore.in_memory()
     try:
@@ -420,7 +420,7 @@ def test_task_state_store_ping_checks_sqlite() -> None:
 
 
 def test_model_work_scheduler_actor_ping() -> None:
-    from mint_server.backend.model_work_scheduler import _ModelWorkSchedulerActor
+    from mint_server.backend.scheduling.model_work_scheduler import _ModelWorkSchedulerActor
 
     out = _ModelWorkSchedulerActor().ping()
     assert out["ok"] is True

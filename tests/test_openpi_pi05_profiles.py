@@ -1,4 +1,4 @@
-from mint_server.backend.model_registry import MODEL_CONFIGS, list_supported_models
+from mint_server.backend.core.model_registry import MODEL_CONFIGS, list_supported_models
 
 
 OPENPI_PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"

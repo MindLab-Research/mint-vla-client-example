@@ -9,7 +9,7 @@ def anyio_backend() -> str:
 
 
 def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _FakeTaskFutureService:
         async def async_ensure_started(self) -> dict:
@@ -28,7 +28,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
     import importlib
 
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
 
     monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
 
@@ -46,7 +46,7 @@ def test_issue_364_future_reaper_once_reaps_task_state(monkeypatch) -> None:
 
 
 def test_issue_630_billing_outbox_runner_proxies_task_state(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _FakeTaskFutureService:
         async def async_flush_billing_outbox(self, *, limit: int, lease_ttl_s: float):
@@ -56,7 +56,7 @@ def test_issue_630_billing_outbox_runner_proxies_task_state(monkeypatch) -> None
 
     import importlib
 
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
 
     monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
     monkeypatch.setenv("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "17")
@@ -67,7 +67,7 @@ def test_issue_630_billing_outbox_runner_proxies_task_state(monkeypatch) -> None
 
 @pytest.mark.anyio
 async def test_issue_640_billing_outbox_actor_runner_stays_on_actor_event_loop(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _FakeTaskFutureService:
         async def async_flush_billing_outbox(self, *, limit: int, lease_ttl_s: float):
@@ -75,7 +75,7 @@ async def test_issue_640_billing_outbox_actor_runner_stays_on_actor_event_loop(m
 
     import importlib
 
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
 
     monkeypatch.setattr(task_state_store_module, "task_futures", _FakeTaskFutureService())
     monkeypatch.setenv("MINT_BILLING_OUTBOX_FLUSH_BATCH_SIZE", "3")
@@ -89,7 +89,7 @@ async def test_issue_640_billing_outbox_actor_runner_stays_on_actor_event_loop(m
 def test_issue_640_billing_outbox_loop_spec_is_async_runner() -> None:
     import inspect
 
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     source = inspect.getsource(ors._get_or_create_actor)
 
@@ -99,7 +99,7 @@ def test_issue_640_billing_outbox_loop_spec_is_async_runner() -> None:
 
 
 def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     monkeypatch.setattr(ors, "reap_runtime_checkpoints", lambda: {"ephemeral": ["a"], "persistent_cache": [], "persistent": []})
     monkeypatch.setattr(ors, "process_pending_checkpoint_mirrors", lambda: {"mirrored": ["m1"], "failed": ["f1"]})
@@ -113,13 +113,13 @@ def test_issue_364_checkpoint_helpers_proxy_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     async def _fake_cleanup(*, stale_after_s=None):
         return ["model-a", "model-b"]
 
     monkeypatch.setattr(
-        "mint_server.backend.training_cleanup_executor.cleanup_stale_training_sessions_once_impl",
+        "mint_server.backend.training.training_cleanup_executor.cleanup_stale_training_sessions_once_impl",
         _fake_cleanup,
     )
 
@@ -127,7 +127,7 @@ def test_issue_364_training_cleanup_runner_proxies_results(monkeypatch) -> None:
 
 
 def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     monkeypatch.setenv("MINT_TRAINING_HEARTBEAT_STALE_S", "0")
 
@@ -135,13 +135,13 @@ def test_issue_364_training_cleanup_runner_respects_disable_env(monkeypatch) -> 
 
 
 def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     async def _fake_cleanup(*, stale_after_s=None):
         return ["sess-a", "sess-b"]
 
     monkeypatch.setattr(
-        "mint_server.backend.sampling_cleanup_executor.cleanup_stale_sampling_sessions_once_impl",
+        "mint_server.backend.inference.sampling_cleanup_executor.cleanup_stale_sampling_sessions_once_impl",
         _fake_cleanup,
     )
 
@@ -150,7 +150,7 @@ def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
 
 @pytest.mark.anyio
 async def test_issue_364_runtime_degraded_cron_is_internal_health_degraded(monkeypatch) -> None:
-    import mint_server.backend.model_actor_supervisor as supervisor_module
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
     from mint_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
 
@@ -202,7 +202,7 @@ async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> 
                 "timeout_s": float(timeout_s),
             }
 
-    monkeypatch.setattr("mint_server.backend.maintenance_cron_actor.maintenance_cron_actor", _FakeMaintenanceCronActor())
+    monkeypatch.setattr("mint_server.backend.ops.maintenance_cron_actor.maintenance_cron_actor", _FakeMaintenanceCronActor())
 
     out = await internal.maintenance_cron_actor_health()
 
@@ -213,7 +213,7 @@ async def test_issue_364_internal_maintenance_cron_actor_health(monkeypatch) -> 
 
 
 def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeypatch):
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     actor_cls_box = {}
     captured = {}
@@ -267,7 +267,7 @@ def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeyp
 
 
 def test_issue_593_maintenance_cron_does_not_own_model_reconcile_loops(monkeypatch):
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     actor_cls_box = {}
 
@@ -311,7 +311,7 @@ def test_issue_593_maintenance_cron_does_not_own_model_reconcile_loops(monkeypat
 
 @pytest.mark.anyio
 async def test_issue_364_maintenance_cron_recreates_dead_cached_handle(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _RemoteMethod:
         def __init__(self, value=None, exc: BaseException | None = None) -> None:
@@ -364,7 +364,7 @@ async def test_issue_364_maintenance_cron_recreates_dead_cached_handle(monkeypat
 
 @pytest.mark.anyio
 async def test_issue_364_maintenance_cron_health_recreates_dead_cached_handle(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _RemoteMethod:
         def __init__(self, value=None, exc: BaseException | None = None) -> None:
@@ -416,7 +416,7 @@ async def test_issue_364_maintenance_cron_health_recreates_dead_cached_handle(mo
 
 @pytest.mark.anyio
 async def test_issue_364_maintenance_cron_no_create_health_retries_dead_cached_handle(monkeypatch) -> None:
-    from mint_server.backend import maintenance_cron_actor as ors
+    from mint_server.backend.ops import maintenance_cron_actor as ors
 
     class _RemoteMethod:
         def __init__(self, value=None, exc: BaseException | None = None) -> None:

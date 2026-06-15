@@ -22,8 +22,8 @@ def _import_node_placement(monkeypatch: pytest.MonkeyPatch):
     ray_private.state = SimpleNamespace(available_resources_per_node=lambda: {})
     monkeypatch.setitem(sys.modules, "ray._private", ray_private)
 
-    sys.modules.pop("mint_server.backend.node_placement", None)
-    return importlib.import_module("mint_server.backend.node_placement")
+    sys.modules.pop("mint_server.backend.actors.node_placement", None)
+    return importlib.import_module("mint_server.backend.actors.node_placement")
 
 
 

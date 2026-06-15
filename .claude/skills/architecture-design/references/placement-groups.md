@@ -15,7 +15,7 @@ Mint uses placement groups for:
 
 ## Where they are created
 
-`mint_server/backend/megatron_distributed.py` (MoE training):
+`mint_server/backend/training/megatron/megatron_distributed.py` (MoE training):
 - `MegatronWorkerGroup._initialize()` creates a placement group:
   - bundles: `[{\"GPU\": 1, \"CPU\": 1}] * world_size`
   - strategy: `"PACK"`
@@ -26,7 +26,7 @@ Mint uses placement groups for:
 
 The key property is that Ray will not start the worker group unless it can reserve all bundles in the placement group.
 
-`mint_server/backend/multinode_inference.py` (multi-node vLLM):
+`mint_server/backend/inference/multinode_inference.py` (multi-node vLLM):
 - Creates a detached placement group named `{actor_name}_pg` with `total_required_gpus = worker_gpus` GPU bundles plus one CPU-only controller bundle.
 - Uses `strategy="PACK"` to keep 1-GPU workers from consuming 1 GPU on every node.
 - Schedules the controller actor into the controller bundle and enables `placement_group_capture_child_tasks=True` so vLLM worker actors land in the same group.
@@ -35,7 +35,7 @@ The key property is that Ray will not start the worker group unless it can reser
   group reserved; retrying the same desired topology should reuse that reservation
   rather than reporting that the actor is blocked by its own placement group.
 
-`mint_server/backend/verl_training.py` (DenseTrainerPool):
+`mint_server/backend/training/verl/verl_training.py` (DenseTrainerPool):
 - Creates a detached placement group named `{actor_name}_pg` for each pooled `TrainingWorker` actor.
 
 ## Why PACK (not STRICT_PACK)

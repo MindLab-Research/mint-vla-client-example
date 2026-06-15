@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import pytest
 
-from mint_server.backend.task_state_store import FutureStatus, TaskStateStore
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateStore
 
 from .harness import SchedulerComponentWorld
 from .helpers import finish_success_for_test, token

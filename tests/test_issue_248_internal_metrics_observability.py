@@ -341,15 +341,15 @@ def test_issue_248_internal_metrics_no_longer_exports_stale_actor_rss_state(monk
 
 
 def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_metadata(monkeypatch) -> None:
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
-    model_actor_supervisor_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
-    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
-    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.maintenance_cron_actor")
-    model_actor_inventory_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
-    session_heartbeat_store_module = importlib.import_module("mint_server.backend.session_heartbeat_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
+    model_actor_supervisor_module = importlib.import_module("mint_server.backend.actors.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.scheduling.model_work_scheduler")
+    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.ops.maintenance_cron_actor")
+    model_actor_inventory_module = importlib.import_module("mint_server.backend.actors.model_actor_supervisor")
+    session_heartbeat_store_module = importlib.import_module("mint_server.backend.stores.session_heartbeat_store")
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
-    dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
+    dense_session_state_module = importlib.import_module("mint_server.backend.training.dense.dense_session_state")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:
@@ -426,15 +426,15 @@ def test_issue_588_admission_stats_rss_path_preserves_model_actor_inventory_meta
 
 
 def test_issue_248_admission_stats_metrics_path_uses_cached_pool_snapshot(monkeypatch) -> None:
-    task_state_store_module = importlib.import_module("mint_server.backend.task_state_store")
-    model_actor_supervisor_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
-    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
-    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.maintenance_cron_actor")
-    model_actor_inventory_module = importlib.import_module("mint_server.backend.model_actor_supervisor")
-    session_heartbeat_store_module = importlib.import_module("mint_server.backend.session_heartbeat_store")
+    task_state_store_module = importlib.import_module("mint_server.backend.stores.task_state_store")
+    model_actor_supervisor_module = importlib.import_module("mint_server.backend.actors.model_actor_supervisor")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.scheduling.model_work_scheduler")
+    maintenance_cron_actor_module = importlib.import_module("mint_server.backend.ops.maintenance_cron_actor")
+    model_actor_inventory_module = importlib.import_module("mint_server.backend.actors.model_actor_supervisor")
+    session_heartbeat_store_module = importlib.import_module("mint_server.backend.stores.session_heartbeat_store")
     sampling_route = importlib.import_module("mint_server.routes.sampling")
     service_route = importlib.import_module("mint_server.routes.service")
-    dense_session_state_module = importlib.import_module("mint_server.backend.dense_session_state")
+    dense_session_state_module = importlib.import_module("mint_server.backend.training.dense.dense_session_state")
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0) -> dict:
             return {"depth": 0, "backlog_depth": 0, "replica_queues": {}, "leases": [], "counters": {}}
@@ -545,7 +545,7 @@ def test_issue_248_metrics_path_no_longer_exports_cached_scheduler_model_load(mo
 
 
 def test_issue_248_scheduler_decisions_debug_route_proxies_filters(monkeypatch) -> None:
-    model_work_scheduler_module = importlib.import_module("mint_server.backend.model_work_scheduler")
+    model_work_scheduler_module = importlib.import_module("mint_server.backend.scheduling.model_work_scheduler")
 
     class _FakeModelWorkScheduler:
         async def stats(self, *, timeout_s: float = 10.0, create_if_missing: bool = True) -> dict:

@@ -12,7 +12,7 @@ SCAN_PATHS = (
     REPO_ROOT / "mint_server/health_checks.py",
     REPO_ROOT / "mint_server/ray_cluster_health.py",
     REPO_ROOT / "mint_server/ray_gcs_metrics.py",
-    REPO_ROOT / "mint_server/backend/model_work_dispatch.py",
+    REPO_ROOT / "mint_server/backend/scheduling/model_work_dispatch.py",
 )
 
 BLOCKING_PATTERNS = (

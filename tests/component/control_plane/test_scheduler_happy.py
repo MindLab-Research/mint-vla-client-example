@@ -5,16 +5,16 @@ import time
 import pytest
 from typing import Any, cast
 
-from mint_server.backend.control_plane_contracts import (
+from mint_server.backend.contracts.control_plane_contracts import (
     AsyncSchedulerControlPlane,
     AsyncSchedulerQueue,
     AsyncTaskLedger,
     ModelWorkTaskGateway,
 )
-from mint_server.backend.engine_adapter import EngineHealth, EngineHealthStatus
-from mint_server.backend.engine_liveness import EngineLivenessPush
-from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHealthStatus
+from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
+from mint_server.backend.scheduling.model_work_task_gateway import SchedulerModelWorkTaskGateway
+from mint_server.backend.stores.task_state_store import FutureStatus
 
 from .harness import SchedulerComponentWorld
 

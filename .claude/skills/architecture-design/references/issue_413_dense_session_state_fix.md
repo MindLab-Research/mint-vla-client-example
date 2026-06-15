@@ -40,7 +40,7 @@
 
 ## 2. 增加统一的 dense session-state helper
 
-新增文件：`mint_server/backend/dense_session_state.py`
+新增文件：`mint_server/backend/training/dense/dense_session_state.py`
 
 职责集中到一个地方：
 
@@ -119,9 +119,9 @@ server 启动时会：
 
 核心代码：
 
-- `mint_server/backend/dense_session_state.py`
-- `mint_server/backend/verl_training.py`
-- `mint_server/backend/dense_trainer.py`
+- `mint_server/backend/training/dense/dense_session_state.py`
+- `mint_server/backend/training/verl/verl_training.py`
+- `mint_server/backend/training/dense/dense_trainer.py`
 - `mint_server/routes/training.py`
 - `mint_server/routes/internal.py`
 - `mint_server/app.py`

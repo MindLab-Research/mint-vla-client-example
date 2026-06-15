@@ -1,7 +1,7 @@
 import anyio
 from types import SimpleNamespace
 
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.stores.task_state_store import FutureStatus
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 

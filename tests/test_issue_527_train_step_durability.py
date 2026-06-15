@@ -2,7 +2,7 @@ from types import MethodType, SimpleNamespace
 
 import pytest
 
-from mint_server.backend.megatron_distributed import MegatronWorkerGroup
+from mint_server.backend.training.megatron.megatron_distributed import MegatronWorkerGroup
 
 
 def test_train_step_keeps_durability_fresh_until_optim_step() -> None:

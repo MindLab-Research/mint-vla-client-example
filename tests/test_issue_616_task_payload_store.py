@@ -3,7 +3,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 import pytest
 
-from mint_server.backend.task_payload_store import TaskPayloadStore, TaskPayloadStoreError
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore, TaskPayloadStoreError
 
 
 class _PayloadModel(BaseModel):

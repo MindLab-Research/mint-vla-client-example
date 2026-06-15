@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mint_server.backend.topology import (
+from mint_server.backend.ray_cluster.topology import (
     _create_volcano_mlplatform_client,
     _extract_instance_node_ip,
     _job_id,

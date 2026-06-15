@@ -4,8 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend.engine_lifecycle import ExecutionContextEngineLifecycle
-from mint_server.backend.execution_context import ExecutionContext
+from mint_server.backend.core.engine_lifecycle import ExecutionContextEngineLifecycle
+from mint_server.backend.core.execution_context import ExecutionContext
 
 
 class _ProbeEngine:

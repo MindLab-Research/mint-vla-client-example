@@ -77,7 +77,7 @@ PYTHONPATH=/root/mint_project/mint-server-issue-276 \
 MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
 MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
 {MINT_DEV_RUNTIME_ENV_ROOT}/host-venv/bin/python - <<'PY'
-from mint_server.backend import gateway_session_store
+from mint_server.backend.stores import gateway_session_store
 gateway_session_store.upsert_training_model(
     model_id={model_id!r},
     upstream_alias={UPSTREAM_ALIAS!r},

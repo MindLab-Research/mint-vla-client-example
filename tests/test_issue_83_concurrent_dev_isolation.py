@@ -23,8 +23,8 @@ def test_no_hardcoded_shared_code_root_in_worker_pythonpath():
     repo_root = Path(__file__).resolve().parents[1]
 
     for rel in (
-        "mint_server/backend/verl_inference.py",
-        "mint_server/backend/verl_training.py",
+        "mint_server/backend/training/verl/verl_inference.py",
+        "mint_server/backend/training/verl/verl_training.py",
     ):
         txt = (repo_root / rel).read_text(encoding="utf-8")
         assert "/vePFS-Mindverse/share/code/mint-server" not in txt
@@ -34,8 +34,8 @@ def test_no_hardcoded_literal_namespace_in_backends():
     repo_root = Path(__file__).resolve().parents[1]
 
     for rel in (
-        "mint_server/backend/verl_inference.py",
-        "mint_server/backend/verl_training.py",
+        "mint_server/backend/training/verl/verl_inference.py",
+        "mint_server/backend/training/verl/verl_training.py",
     ):
         txt = (repo_root / rel).read_text(encoding="utf-8")
         assert 'namespace="mint"' not in txt
@@ -48,7 +48,7 @@ def test_detached_store_actors_use_mint_ray_namespace(monkeypatch):
 
     import importlib
 
-    task_state_store_mod = importlib.import_module("mint_server.backend.task_state_store")
+    task_state_store_mod = importlib.import_module("mint_server.backend.stores.task_state_store")
 
     assert task_state_store_mod._ray_namespace() == "ns_mint"
 

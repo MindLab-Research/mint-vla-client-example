@@ -1,6 +1,6 @@
 import pytest
 
-from mint_server.backend.vllm_stop import vllm_stop_kwargs
+from mint_server.backend.inference.vllm_stop import vllm_stop_kwargs
 
 
 def test_vllm_stop_kwargs_defaults() -> None:

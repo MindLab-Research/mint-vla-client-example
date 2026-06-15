@@ -530,7 +530,7 @@ def validate_sampler_checkpoint_for_sampling(path: str) -> None:
         return
     if os.path.exists(os.path.join(path, "bumblebee_rank_sharded_adapter.json")):
         try:
-            from .backend.bumblebee_lora import prepare_lora_adapter_for_vllm
+            from mint_server.backend.training.bumblebee.bumblebee_lora import prepare_lora_adapter_for_vllm
 
             prepare_lora_adapter_for_vllm(path)
             return
@@ -592,7 +592,7 @@ async def async_create_checkpoint_archive(
     *,
     timeout_s: float = 600.0,
 ) -> None:
-    from .backend.async_ray_control import _await_ray_ref, _ensure_ray_initialized, control_plane_task_runtime_env
+    from mint_server.backend.ray_cluster.async_ray_control import _await_ray_ref, _ensure_ray_initialized, control_plane_task_runtime_env
 
     import ray
 

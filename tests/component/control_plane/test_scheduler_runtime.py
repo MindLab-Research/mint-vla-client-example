@@ -4,10 +4,10 @@ from typing import Any, cast
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import ExecutorOutcome
-from mint_server.backend.engine_liveness import EngineLivenessPush
-from mint_server.backend.model_engine_host import ModelEngineHost
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.contracts.control_plane_contracts import ExecutorOutcome
+from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
+from mint_server.backend.actors.model_engine_host import ModelEngineHost
+from mint_server.backend.stores.task_state_store import FutureStatus
 
 from .helpers import token
 from .harness import SchedulerComponentWorld

@@ -5,9 +5,9 @@ from typing import Any, cast
 
 import pytest
 
-from mint_server.backend.cluster_placement_controller import ClusterPlacementController
-from mint_server.backend.engine_adapter import EngineHealth, EngineHealthStatus
-from mint_server.backend.engine_liveness import EngineLivenessPush
+from mint_server.backend.scheduling.cluster_placement_controller import ClusterPlacementController
+from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHealthStatus
+from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
 
 from .harness import SchedulerComponentWorld
 

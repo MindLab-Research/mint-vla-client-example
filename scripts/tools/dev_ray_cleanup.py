@@ -351,7 +351,7 @@ def cmd_gc_stale_actors(args: argparse.Namespace) -> int:
 
 
 async def _active_task_probe() -> dict[str, int]:
-    from mint_server.backend.task_state_store import TaskStateStoreClient
+    from mint_server.backend.stores.task_state_store import TaskStateStoreClient
 
     client = TaskStateStoreClient()
     tasks = await client.async_list_active_tasks(limit=1000)

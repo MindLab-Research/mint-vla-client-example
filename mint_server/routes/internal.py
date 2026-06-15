@@ -30,8 +30,8 @@ from ..queue_priority import merge_queue_priority_extra
 from ..ray_cluster_health import get_ray_cluster_health_snapshot
 from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 from ..usage_store import get_usage_store
-from ..backend.actor_admin import KillActorsRequest
-from ..backend.task_state_store import task_futures
+from mint_server.backend.ops.actor_admin import KillActorsRequest
+from mint_server.backend.stores.task_state_store import task_futures
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -206,7 +206,7 @@ async def list_actors(
     ),
 ) -> dict:
     """List model actor inventory. Internal/admin endpoint."""
-    from ..backend.actor_admin import ActorListRequest, list_actor_inventory, require_admin
+    from mint_server.backend.ops.actor_admin import ActorListRequest, list_actor_inventory, require_admin
 
     require_admin(request)
     return await list_actor_inventory(
@@ -221,8 +221,8 @@ async def list_actors(
 @router.post("/actors/kill")
 async def kill_actors(request: Request, body: "KillActorsRequest") -> dict:
     """Kill model actors by type or exact name. Internal/admin endpoint."""
-    from ..backend.actor_admin import kill_actors as kill_actor_inventory
-    from ..backend.actor_admin import require_admin
+    from mint_server.backend.ops.actor_admin import kill_actors as kill_actor_inventory
+    from mint_server.backend.ops.actor_admin import require_admin
 
     require_admin(request)
     return await kill_actor_inventory(request, body)
@@ -239,7 +239,7 @@ def _self_rss_bytes() -> int:
 
 
 def _model_actor_inventory_local_snapshot() -> list[dict]:
-    from ..backend.model_actor_supervisor import get_model_actor_supervisor
+    from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
     pool = get_model_actor_supervisor()
     return pool.cached_snapshot()
@@ -247,11 +247,11 @@ def _model_actor_inventory_local_snapshot() -> list[dict]:
 
 @router.get("/admission_stats")
 async def admission_stats(*, include_actor_rss: bool = True) -> dict:
-    from ..backend.task_state_store import task_futures
-    from ..backend.model_actor_supervisor import model_actor_supervisor
-    from ..backend.model_work_scheduler import model_work_scheduler
-    from ..backend.maintenance_cron_actor import maintenance_cron_actor
-    from ..backend.session_heartbeat_store import session_heartbeat_store
+    from mint_server.backend.stores.task_state_store import task_futures
+    from mint_server.backend.actors.model_actor_supervisor import model_actor_supervisor
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
+    from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
     from ..routes import sampling as sampling_route
     from ..routes import service as service_route
 
@@ -295,7 +295,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
             actors["task_futures"] = {"error": f"{type(e).__name__}: {e}"}
 
         try:
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
+            from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
             pool = get_model_actor_supervisor()
             actors["model_actor_inventory"] = pool.rss_snapshot(timeout_s=timeout_s)
@@ -307,7 +307,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
         # Metrics scrapes must stay cheap. A single hung actor in rss_snapshot()
         # can otherwise block the API thread and stall unrelated routes.
         try:
-            from ..backend.model_actor_supervisor import get_model_actor_supervisor
+            from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
             pool = get_model_actor_supervisor()
             actors["model_actor_inventory"] = pool.cached_snapshot()
@@ -345,7 +345,7 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
             driver_state["sampling_sessions_error"] = f"{type(e).__name__}: {e}"
 
     try:
-        from ..backend.dense_session_state import collect_dense_session_state_stats
+        from mint_server.backend.training.dense.dense_session_state import collect_dense_session_state_stats
 
         driver_state.update(collect_dense_session_state_stats())
     except Exception as e:
@@ -388,21 +388,21 @@ async def admission_stats(*, include_actor_rss: bool = True) -> dict:
 
 @router.get("/maintenance_cron_actor")
 async def maintenance_cron_actor_health() -> dict:
-    from ..backend.maintenance_cron_actor import maintenance_cron_actor
+    from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
 
     return await maintenance_cron_actor.async_health_snapshot(timeout_s=10.0, create_if_missing=False)
 
 
 @router.get("/model_work_scheduler")
 async def model_work_scheduler_health() -> dict:
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     return await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
 
 
 @router.get("/model_actor_supervisor")
 async def model_actor_supervisor_health() -> dict:
-    from ..backend.model_actor_supervisor import model_actor_supervisor
+    from mint_server.backend.actors.model_actor_supervisor import model_actor_supervisor
 
     return await model_actor_supervisor.async_snapshot(timeout_s=10.0)
 
@@ -432,8 +432,8 @@ async def metrics() -> Response:
 
 @router.post("/model_work_scheduler/noop")
 async def model_work_scheduler_noop(http_request: Request) -> dict:
-    from ..backend.model_actor_supervisor import domain_key_for_internal_runtime
-    from ..backend.model_work_admission import enqueue_model_work
+    from mint_server.backend.actors.model_actor_supervisor import domain_key_for_internal_runtime
+    from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
 
     route_start_s = time.perf_counter()
     request_id = uuid.uuid4().hex
@@ -471,7 +471,7 @@ async def model_work_scheduler_noop(http_request: Request) -> dict:
 
 @router.get("/model_work_scheduler/debug_state")
 async def model_work_scheduler_debug_state() -> dict:
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     return await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
 
@@ -483,7 +483,7 @@ async def scheduler_decisions_debug(
     reason: str | None = None,
     since_seq: int | None = Query(default=None, ge=0),
 ) -> dict:
-    from ..backend.model_work_scheduler import model_work_scheduler
+    from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
 
     stats = await model_work_scheduler.stats(timeout_s=10.0, create_if_missing=False)
     domain_filter = scheduler_domain.strip() if isinstance(scheduler_domain, str) else None

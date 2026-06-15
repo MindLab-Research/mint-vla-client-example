@@ -858,7 +858,7 @@ def test_detached_actor_namespaces_respect_config_file(tmp_path):
             "-c",
             (
                 "import mint_server.config as c; "
-                "import mint_server.backend.task_state_store as s; "
+                "import mint_server.backend.stores.task_state_store as s; "
                 "print(c.RAY_NAMESPACE); "
                 "print(s._ray_namespace())"
             ),

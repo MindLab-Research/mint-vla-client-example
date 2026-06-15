@@ -174,7 +174,7 @@ def test_issue_18_no_legacy_fallback_resolution(tmp_path, monkeypatch) -> None:
 
 
 def test_issue_18_session_manager_rejects_checkpoint_uri() -> None:
-    from mint_server.backend.session_manager import SessionManager
+    from mint_server.backend.sessions.session_manager import SessionManager
 
     manager = SessionManager()
     try:

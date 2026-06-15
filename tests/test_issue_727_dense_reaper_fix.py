@@ -30,14 +30,14 @@ from unittest.mock import patch
 
 import pytest
 
-from mint_server.backend.model_actor_inventory import (
+from mint_server.backend.actors.model_actor_inventory import (
     ActorType,
 )
-from mint_server.backend.model_actor_placement import (
+from mint_server.backend.actors.model_actor_placement import (
     ModelActorPlacementReconciler,
     _undesired_gpu_actor_grace_s,
 )
-from mint_server.backend.model_actor_supervisor import (
+from mint_server.backend.actors.model_actor_supervisor import (
     ModelActorSupervisor,
 )
 
@@ -87,7 +87,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=60.0,
         ):
             cleaned = r._cleanup_undesired_mint_gpu_actors(keep_actor_names=set())
@@ -103,7 +103,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=60.0,
         ):
             r._cleanup_undesired_mint_gpu_actors(keep_actor_names=set())
@@ -122,7 +122,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=60.0,
         ):
             r._cleanup_undesired_mint_gpu_actors(keep_actor_names=set())
@@ -142,7 +142,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=60.0,
         ):
             # First pass: not in keep set → record grace start
@@ -164,7 +164,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=60.0,
         ):
             # Record first_seen for mint_dense_foo
@@ -185,7 +185,7 @@ class TestGracePeriod:
         r = _make_reconciler(killed=killed, actors=actors)
 
         with patch(
-            "mint_server.backend.model_actor_placement._undesired_gpu_actor_grace_s",
+            "mint_server.backend.actors.model_actor_placement._undesired_gpu_actor_grace_s",
             return_value=0.0,
         ):
             # First call: records first_seen at now
@@ -204,7 +204,7 @@ class TestGracePeriod:
 def _make_supervisor(monkeypatch: pytest.MonkeyPatch) -> ModelActorSupervisor:
     """Return a fresh in-process ModelActorSupervisor with empty inventory."""
     pool = ModelActorSupervisor()
-    import mint_server.backend.model_actor_supervisor as sup_mod
+    import mint_server.backend.actors.model_actor_supervisor as sup_mod
 
     monkeypatch.setattr(sup_mod, "model_actor_supervisor", pool)
     monkeypatch.setattr(sup_mod, "get_model_actor_supervisor", lambda: pool)
@@ -273,7 +273,7 @@ class TestAdoption:
         fake_actors = [_dense_actor("mint_dense_alpha", gpu=1.0)]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -293,7 +293,7 @@ class TestAdoption:
         fake_actors = [_dense_actor("mint_dense_beta")]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -311,7 +311,7 @@ class TestAdoption:
         fake_actors = [_dense_actor("mint_dense_gamma")]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -336,10 +336,10 @@ class TestAdoption:
         ]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ), patch(
-            "mint_server.backend.model_actor_supervisor._ray_namespace",
+            "mint_server.backend.actors.model_actor_supervisor._ray_namespace",
             return_value="mint",
         ):
             pool._adopt_surviving_gpu_actors()
@@ -357,7 +357,7 @@ class TestAdoption:
         ]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -374,7 +374,7 @@ class TestAdoption:
             raise RuntimeError("ray not available")
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             side_effect=_boom,
         ):
             # Must not raise
@@ -389,7 +389,7 @@ class TestAdoption:
         fake_actors = [_dense_actor("mint_dense_delta")]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -408,7 +408,7 @@ class TestAdoption:
         ]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -429,7 +429,7 @@ class TestAdoption:
         ]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -459,7 +459,7 @@ class TestAdoption:
         ]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -516,7 +516,7 @@ class TestAdoptedActorSurvivesReconcilerReaper:
         fake_lister_actors = [_dense_actor(actor_name, namespace="mint", gpu=8.0)]
 
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_lister_actors,
         ):
             pool._adopt_surviving_gpu_actors()
@@ -595,7 +595,7 @@ class TestReconcileOnceDoesNotReapAdoptedActor:
 
         # Inject the reconciler at construction so _reconcile_once_impl uses it.
         pool = ModelActorSupervisor(placement_reconciler=reconciler)
-        import mint_server.backend.model_actor_supervisor as sup_mod
+        import mint_server.backend.actors.model_actor_supervisor as sup_mod
 
         monkeypatch.setattr(sup_mod, "model_actor_supervisor", pool)
         monkeypatch.setattr(sup_mod, "get_model_actor_supervisor", lambda: pool)
@@ -603,7 +603,7 @@ class TestReconcileOnceDoesNotReapAdoptedActor:
 
         # Adopt the dense actor so it appears in _reconcile_protected_actor_names.
         with patch(
-            "mint_server.backend.model_actor_supervisor._default_gpu_actor_lister",
+            "mint_server.backend.actors.model_actor_supervisor._default_gpu_actor_lister",
             return_value=fake_lister_actors,
         ):
             pool._adopt_surviving_gpu_actors()

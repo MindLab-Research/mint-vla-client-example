@@ -11,7 +11,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _runtime_spec():
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastRuntimeSpec
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
         python_executable=sys.executable,
@@ -21,7 +21,7 @@ def _runtime_spec():
 
 
 def test_openpi_fast_worker_client_round_trips_json_payload() -> None:
-    from mint_server.backend.openpi_fast_runtime import OpenPIFastWorkerClient
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastWorkerClient
 
     async def _run() -> None:
         client = await OpenPIFastWorkerClient.start(_runtime_spec())
@@ -35,7 +35,7 @@ def test_openpi_fast_worker_client_round_trips_json_payload() -> None:
 
 
 def test_openpi_fast_worker_client_surfaces_remote_errors() -> None:
-    from mint_server.backend.openpi_fast_runtime import (
+    from mint_server.backend.openpi.openpi_fast_runtime import (
         OpenPIFastWorkerClient,
         OpenPIFastWorkerRemoteError,
     )
@@ -52,7 +52,7 @@ def test_openpi_fast_worker_client_surfaces_remote_errors() -> None:
 
 
 def test_openpi_fast_worker_client_rejects_mismatched_reply_ids() -> None:
-    from mint_server.backend.openpi_fast_runtime import (
+    from mint_server.backend.openpi.openpi_fast_runtime import (
         OpenPIFastWorkerClient,
         OpenPIFastWorkerProtocolError,
     )
@@ -69,7 +69,7 @@ def test_openpi_fast_worker_client_rejects_mismatched_reply_ids() -> None:
 
 
 def test_openpi_fast_worker_client_rejects_malformed_replies() -> None:
-    from mint_server.backend.openpi_fast_runtime import (
+    from mint_server.backend.openpi.openpi_fast_runtime import (
         OpenPIFastWorkerClient,
         OpenPIFastWorkerProtocolError,
     )
@@ -86,7 +86,7 @@ def test_openpi_fast_worker_client_rejects_malformed_replies() -> None:
 
 
 def test_openpi_fast_worker_client_supports_per_request_timeouts() -> None:
-    from mint_server.backend.openpi_fast_runtime import (
+    from mint_server.backend.openpi.openpi_fast_runtime import (
         OpenPIFastWorkerClient,
         OpenPIFastWorkerProtocolError,
     )

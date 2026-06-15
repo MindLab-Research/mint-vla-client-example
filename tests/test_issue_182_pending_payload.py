@@ -3,8 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.backend.control_plane_contracts import RetrieveTaskResult
-from mint_server.backend.task_state_store import FutureStatus
+from mint_server.backend.contracts.control_plane_contracts import RetrieveTaskResult
+from mint_server.backend.stores.task_state_store import FutureStatus
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
 
@@ -80,7 +80,7 @@ class _StubModelWorkScheduler:
 
 
 def _install_scheduler(monkeypatch, *, present: bool = True) -> _StubModelWorkScheduler:
-    import mint_server.backend.model_work_scheduler as mws
+    import mint_server.backend.scheduling.model_work_scheduler as mws
 
     scheduler = _StubModelWorkScheduler(present=present)
     monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
@@ -98,7 +98,7 @@ class _StubModelWorkTaskGateway:
 
 
 def _install_task_gateway(monkeypatch, result: RetrieveTaskResult) -> _StubModelWorkTaskGateway:
-    import mint_server.backend.model_work_task_gateway as gateway_module
+    import mint_server.backend.scheduling.model_work_task_gateway as gateway_module
 
     gateway = _StubModelWorkTaskGateway(result)
     monkeypatch.setattr(gateway_module, "model_work_task_gateway", gateway)

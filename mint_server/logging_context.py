@@ -185,7 +185,7 @@ def _driver_observability_snapshot() -> dict[str, object]:
         "driver_process_rss_bytes": int(_self_rss_bytes()),
     }
     try:
-        from .backend.session_heartbeat_store import session_heartbeat_store
+        from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
 
         size_fn = getattr(session_heartbeat_store, "size", None)
         if callable(size_fn):
@@ -211,7 +211,7 @@ def _driver_observability_snapshot() -> dict[str, object]:
     except Exception:
         pass
     try:
-        from .backend.dense_session_state import collect_dense_session_state_stats
+        from mint_server.backend.training.dense.dense_session_state import collect_dense_session_state_stats
 
         data = collect_dense_session_state_stats()
         if isinstance(data, dict):

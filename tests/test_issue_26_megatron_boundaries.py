@@ -69,7 +69,7 @@ def test_issue_26_megatron_distributed_no_longer_contains_megatron_actor_pool() 
     _ensure_ray_stubbed()
     _ensure_peft_stubbed()
 
-    dist = importlib.import_module("mint_server.backend.megatron_distributed")
+    dist = importlib.import_module("mint_server.backend.training.megatron.megatron_distributed")
     assert not hasattr(dist, "MegatronActorPool")
     assert not hasattr(dist, "MegatronActorEntry")
     assert not hasattr(dist, "get_megatron_actor_pool")
@@ -80,10 +80,10 @@ def test_issue_26_megatron_docstrings_do_not_reference_deprecated_worker_path() 
     _ensure_ray_stubbed()
     _ensure_peft_stubbed()
 
-    dist = importlib.import_module("mint_server.backend.megatron_distributed")
+    dist = importlib.import_module("mint_server.backend.training.megatron.megatron_distributed")
     assert "MegatronTrainingWorker" not in (dist.__doc__ or "")
 
-    vt = importlib.import_module("mint_server.backend.verl_training")
+    vt = importlib.import_module("mint_server.backend.training.verl.verl_training")
     doc = vt.VerlTrainingEngine.create_training_session.__doc__
     assert doc is not None
     assert "MegatronTrainingWorker" not in doc

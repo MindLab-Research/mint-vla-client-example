@@ -8,7 +8,7 @@ import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
+from mint_server.backend.training.megatron.megatron_distributed import MegatronSessionStateManager, MegatronWorkerGroup
 
 
 def _write_adapter(session_path: Path, *, size: int = 64) -> None:
@@ -700,7 +700,7 @@ def test_issue_414_reinit_lora_weights_invalidates_existing_external_checkpoint(
     group._bind_traceparent = lambda traceparent: None
     group._session_manager = manager
 
-    monkeypatch.setattr("mint_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: refs)
+    monkeypatch.setattr("mint_server.backend.training.megatron.megatron_distributed.ray.get", lambda refs, timeout=None: refs)
 
     out = group.reinit_lora_weights()
 
@@ -740,7 +740,7 @@ def test_issue_414_save_checkpoint_marks_external_checkpoint(monkeypatch: pytest
         },
     )()
 
-    monkeypatch.setattr("mint_server.backend.megatron_distributed.ray.get", lambda refs, timeout=None: [{}])
+    monkeypatch.setattr("mint_server.backend.training.megatron.megatron_distributed.ray.get", lambda refs, timeout=None: [{}])
 
     out = group.save_checkpoint("/checkpoints/alice/model_x/ckpt_7", session_id="sess-1")
 

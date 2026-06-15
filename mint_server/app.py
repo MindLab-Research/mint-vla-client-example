@@ -15,8 +15,8 @@ from fastapi.responses import JSONResponse
 
 from .auth_identity import get_apikey_id as get_request_apikey_id
 from .auth_identity import get_request_observability_context
-from .backend.task_state_store import TaskStateStoreUnavailableError
-from .backend.session_manager import SessionManager
+from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError
+from mint_server.backend.sessions.session_manager import SessionManager
 from .config import config
 from .compatibility import rewrite_legacy_tinker_uris
 from .gateway import close_http_clients
@@ -44,7 +44,7 @@ from .routes import action_sampling, futures, internal, openai_compat, sampling,
 from .server_info import _git_sha
 
 if TYPE_CHECKING:
-    from .backend.multi_lora_engine import MultiModelInferenceManager
+    from mint_server.backend.inference.multi_lora_engine import MultiModelInferenceManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,8 +113,8 @@ def _should_preload_openai_tokenizers() -> bool:
 
 
 async def _check_startup_control_plane() -> None:
-    from .backend.config_actor import async_ping as async_ping_config_actor
-    from .backend.model_actor_supervisor import model_actor_supervisor
+    from mint_server.backend.core.config_actor import async_ping as async_ping_config_actor
+    from mint_server.backend.actors.model_actor_supervisor import model_actor_supervisor
 
     checks: list[tuple[str, object]] = [
         ("config_actor", async_ping_config_actor(timeout_s=5.0)),
@@ -198,7 +198,7 @@ def _clear_local_execution_route_globals() -> None:
 
 async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
     """Restore TaskStateStore-backed sampling-session metadata into SessionManager."""
-    from .backend.sampling_session_store import async_list_sampling_sessions
+    from mint_server.backend.stores.sampling_session_store import async_list_sampling_sessions
 
     restored = 0
     for info in await async_list_sampling_sessions():
@@ -234,7 +234,7 @@ async def lifespan(app: FastAPI):
     # ==========================================================================
     clear_startup_degraded_state()
     clear_runtime_degraded_state()
-    from .backend.maintenance_cron_actor import maintenance_cron_actor
+    from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
     from .config import RAY_NAMESPACE
 
     init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
@@ -262,7 +262,7 @@ async def lifespan(app: FastAPI):
             details={},
         )
 
-    from .backend.action_session_manager import ActionSessionRouter
+    from mint_server.backend.openpi.action_session_manager import ActionSessionRouter
 
     action_manager = ActionSessionRouter()
     action_sampling.action_session_manager = action_manager

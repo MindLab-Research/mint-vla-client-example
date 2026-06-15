@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from mint_server.backend.engine_adapter import (
+from mint_server.backend.contracts.engine_adapter import (
     EngineHealth,
     EngineHealthStatus,
     EngineObservability,

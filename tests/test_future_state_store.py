@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 
-from mint_server.backend.model_work_admission import enqueue_model_work
-from mint_server.backend.future_state_store import FutureStateStore
-from mint_server.backend.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
+from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
+from mint_server.backend.stores.future_state_store import FutureStateStore
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
 
 
 class _LocalFutureStateClient:
@@ -221,7 +221,7 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
         task_state_client=_LocalTaskStateClient(task_store),
     )
     service._payload_store = __import__(
-        "mint_server.backend.task_payload_store",
+        "mint_server.backend.stores.task_payload_store",
         fromlist=["TaskPayloadStore"],
     ).TaskPayloadStore(root_dir=tmp_path)
 
@@ -248,7 +248,7 @@ def test_model_work_admission_delegates_durable_create_to_scheduler_gateway(tmp_
         task_state_client=_LocalTaskStateClient(task_store),
     )
     service._payload_store = __import__(
-        "mint_server.backend.task_payload_store",
+        "mint_server.backend.stores.task_payload_store",
         fromlist=["TaskPayloadStore"],
     ).TaskPayloadStore(root_dir=tmp_path)
 
@@ -293,7 +293,7 @@ def test_model_work_admission_does_not_cleanup_future_when_scheduler_append_fail
         task_state_client=_LocalTaskStateClient(task_store),
     )
     service._payload_store = __import__(
-        "mint_server.backend.task_payload_store",
+        "mint_server.backend.stores.task_payload_store",
         fromlist=["TaskPayloadStore"],
     ).TaskPayloadStore(root_dir=tmp_path)
 
@@ -330,7 +330,7 @@ def test_task_future_service_reads_legacy_sqlite_terminal_rows(tmp_path) -> None
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     payload_store = __import__(
-        "mint_server.backend.task_payload_store",
+        "mint_server.backend.stores.task_payload_store",
         fromlist=["TaskPayloadStore"],
     ).TaskPayloadStore(root_dir=tmp_path)
     payload = payload_store.write_json_payload(request_id="legacy-1", attempt_id="a", payload={"legacy": True})

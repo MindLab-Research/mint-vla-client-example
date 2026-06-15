@@ -8,11 +8,11 @@ import pytest
 
 pytest.importorskip("ray")
 
-from mint_server.backend import dense_session_state as dense_state_module
-import mint_server.backend.model_actor_inventory as model_actor_inventory_module
-from mint_server.backend.model_actor_supervisor import ActorType, ModelActorSupervisor
-from mint_server.backend.training_session_manager import TrainingSession
-from mint_server.backend.verl_training import TrainingWorker, VerlTrainingEngine
+from mint_server.backend.training.dense import dense_session_state as dense_state_module
+import mint_server.backend.actors.model_actor_inventory as model_actor_inventory_module
+from mint_server.backend.actors.model_actor_supervisor import ActorType, ModelActorSupervisor
+from mint_server.backend.training.training_session_manager import TrainingSession
+from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.config import config as server_config
 
 
@@ -85,8 +85,8 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     monkeypatch.setattr(config_module, "PFS_PYTHONPATH", str((tmp_path / "runtime_py").resolve()))
     monkeypatch.setattr(model_actor_inventory_module.ray, "is_initialized", lambda: False)
     pool = ModelActorSupervisor()
-    import mint_server.backend.model_actor_supervisor as supervisor_module
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(supervisor_module, "model_actor_supervisor", pool)
     monkeypatch.setattr(supervisor_module, "get_model_actor_supervisor", lambda: pool)
@@ -122,7 +122,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
         backend="peft",
     )
 
-    import mint_server.backend.verl_training as verl_training
+    import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(verl_training.ray, "get", lambda value, timeout=None: value)
 
@@ -164,14 +164,14 @@ def test_issue_413_otel_metrics_include_dense_session_state(monkeypatch: pytest.
     monkeypatch.setattr(logging_context, "_OTEL_INITIALIZED", False)
     monkeypatch.setattr(logging_context, "_API_PROCESS_OBSERVABLES_REGISTERED", False)
     monkeypatch.setattr(
-        "mint_server.backend.dense_session_state.collect_dense_session_state_stats",
+        "mint_server.backend.training.dense.dense_session_state.collect_dense_session_state_stats",
         lambda: {
             "dense_session_state_bytes": 1234,
             "dense_session_state_dirs": 5,
             "dense_session_state_oldest_age_s": 67.5,
         },
     )
-    monkeypatch.setattr("mint_server.backend.session_heartbeat_store.session_heartbeat_store.size", lambda: 0)
+    monkeypatch.setattr("mint_server.backend.stores.session_heartbeat_store.session_heartbeat_store.size", lambda: 0)
     monkeypatch.setattr("mint_server.routes.sampling._lora_load_lock_count_sync", lambda: 0)
     monkeypatch.setattr("mint_server.routes.service.session_manager", None)
 

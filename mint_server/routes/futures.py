@@ -15,9 +15,9 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
-from ..backend.queue_stage_timing import build_queue_stage_timing
-from ..backend.task_payload_store import TaskPayloadStore
-from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
+from mint_server.backend.scheduling.queue_stage_timing import build_queue_stage_timing
+from mint_server.backend.stores.task_payload_store import TaskPayloadStore
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..logging_context import record_retrieve_future_wait_metric
 from ..models.types import FutureCancelRequest, FutureRetrieveRequest
@@ -172,7 +172,7 @@ def _is_model_work_scheduler_meta(meta: Any) -> bool:
 
 
 async def _present_gateway_terminal_result(result: Any, http_request: Request) -> Any:
-    from ..backend.task_payload_presenter import present_terminal_retrieve_result
+    from mint_server.backend.scheduling.task_payload_presenter import present_terminal_retrieve_result
 
     payload = await present_terminal_retrieve_result(
         result,
@@ -189,7 +189,7 @@ async def _retrieve_model_work_via_gateway(
     wait_timeout_s: float,
     http_request: Request,
 ) -> Any:
-    from ..backend.model_work_task_gateway import model_work_task_gateway
+    from mint_server.backend.scheduling.model_work_task_gateway import model_work_task_gateway
 
     result = await model_work_task_gateway.retrieve_task(
         request_id=request_id,
@@ -206,7 +206,7 @@ async def _retrieve_model_work_via_gateway(
 
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
-        from ..backend.model_work_task_gateway import model_work_task_gateway
+        from mint_server.backend.scheduling.model_work_task_gateway import model_work_task_gateway
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup unavailable request_id=%s", request_id)
         return None
@@ -237,7 +237,7 @@ async def cancel_future(body: FutureCancelRequest) -> dict:
     except TaskStateStoreUnavailableError:
         raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
     if _is_model_work_scheduler_meta(meta):
-        from ..backend.model_work_task_gateway import model_work_task_gateway
+        from mint_server.backend.scheduling.model_work_task_gateway import model_work_task_gateway
 
         result = await model_work_task_gateway.cancel_task(
             request_id=request_id,
@@ -560,7 +560,7 @@ async def retrieve_future(
             tracked_session_id = meta.get("model_id")
             if actor_name:
                 try:
-                    from ..backend.model_actor_supervisor import get_model_actor_supervisor
+                    from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
                     rp = get_model_actor_supervisor()
                     await rp.async_touch(actor_name)
