@@ -2,7 +2,18 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_sys_argv():
+    original = list(sys.argv)
+    yield
+    sys.argv[:] = original
 
 
 def _load_wrapper():
@@ -12,6 +23,31 @@ def _load_wrapper():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_worker_wrapper_script_uses_portable_shebang_and_runs_as_executable():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "vllm_worker_python.py"
+
+    assert path.read_text(encoding="utf-8").splitlines()[0] == "#!/usr/bin/env python3"
+
+    out = subprocess.run(
+        [
+            str(path),
+            "-c",
+            "import os; print(os.environ.get('RAY_ADDRESS'))",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={
+            **os.environ,
+            "RAY_ADDRESS": "192.168.40.99:6379",
+            "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+        },
+    )
+
+    assert out.stdout == "None\n"
 
 
 def test_default_worker_bootstrap_clears_driver_temp_hints(monkeypatch, tmp_path):
