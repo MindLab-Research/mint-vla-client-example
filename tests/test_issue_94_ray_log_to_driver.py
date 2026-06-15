@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 
-_BLANKED_ATTACH_HINTS = {
+_REMOVED_ATTACH_HINTS = {
     "MINT_RAY_CLIENT_ADDRESS",
     "MINT_RAY_NODE_IP_ADDRESS",
     "MINT_RAY_TEMP_DIR",
@@ -40,11 +40,11 @@ def _isolate_ray_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(config, "MINT_CODE_ROOT", "", raising=False)
 
 
-def _assert_blanked_attach_hints(env_vars: dict[str, str]) -> None:
+def _assert_removed_attach_hints(env_vars: dict[str, str]) -> None:
     assert "RAY_ADDRESS" not in env_vars
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars
-    for key in _BLANKED_ATTACH_HINTS:
-        assert env_vars[key] == ""
+    for key in _REMOVED_ATTACH_HINTS:
+        assert key not in env_vars
 
 
 def _install_ray_stub(calls: list[dict], monkeypatch) -> None:
@@ -122,8 +122,8 @@ def test_issue_94_init_ray_does_not_package_shared_mint_code_root(monkeypatch) -
     assert calls[-1]["address"] == "ray://192.168.38.143:10001"
     runtime_env = calls[-1]["runtime_env"]
     assert set(runtime_env) == {"env_vars"}
-    assert set(runtime_env["env_vars"]) == {"PYTHONPATH", *_BLANKED_ATTACH_HINTS}
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    assert set(runtime_env["env_vars"]) == {"PYTHONPATH"}
+    _assert_removed_attach_hints(runtime_env["env_vars"])
     assert "/vePFS-Mindverse/share/code/conley/mint-server" in runtime_env["env_vars"]["PYTHONPATH"]
 
 
@@ -142,7 +142,7 @@ def test_issue_94_init_ray_merges_runtime_env_without_overriding_working_dir(mon
     runtime_env = calls[-1]["runtime_env"]
     assert runtime_env["working_dir"] == "/tmp/custom"
     assert runtime_env["env_vars"]["A"] == "1"
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_init_ray_prefers_mint_client_address(monkeypatch) -> None:
@@ -168,7 +168,7 @@ def test_issue_94_init_ray_preserves_explicit_runtime_env(monkeypatch) -> None:
     init_ray(namespace="ns", ignore_reinit_error=True, runtime_env={"py_modules": ["x"]})
     runtime_env = calls[-1]["runtime_env"]
     assert runtime_env["py_modules"] == ["x"]
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_init_ray_requires_explicit_address(monkeypatch) -> None:
@@ -200,7 +200,7 @@ def test_issue_94_init_ray_prefers_client_address(monkeypatch, tmp_path: Path) -
     assert calls[-1]["address"] == "ray://192.168.39.23:10002"
     runtime_env = calls[-1]["runtime_env"]
     assert runtime_env["working_dir"] == str(tmp_path)
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_init_ray_prefers_configured_head_address_path(monkeypatch, tmp_path: Path) -> None:
@@ -257,7 +257,7 @@ def test_issue_94_client_job_runtime_env_uses_working_dir(monkeypatch, tmp_path:
 
     runtime_env = client_job_runtime_env()
     assert runtime_env["working_dir"] == str(tmp_path)
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_client_job_runtime_env_uses_pythonpath_without_packaging_code_root(monkeypatch, tmp_path: Path) -> None:
@@ -272,9 +272,22 @@ def test_issue_94_client_job_runtime_env_uses_pythonpath_without_packaging_code_
 
     assert isinstance(runtime_env, dict)
     assert set(runtime_env) == {"env_vars"}
-    assert set(runtime_env["env_vars"]) == {"PYTHONPATH", *_BLANKED_ATTACH_HINTS}
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    assert set(runtime_env["env_vars"]) == {"PYTHONPATH"}
+    _assert_removed_attach_hints(runtime_env["env_vars"])
     assert str(tmp_path) in runtime_env["env_vars"]["PYTHONPATH"]
+
+
+def test_issue_94_client_job_runtime_env_allows_explicit_short_pythonpath(monkeypatch) -> None:
+    from mint_server.ray_utils import client_job_runtime_env
+
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/shared/full-runtime-path-should-not-win")
+    monkeypatch.setenv("MINT_RAY_JOB_PYTHONPATH", "/shared/mint-code")
+
+    runtime_env = client_job_runtime_env()
+
+    assert runtime_env["env_vars"]["PYTHONPATH"] == "/shared/mint-code"
+    _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_init_ray_uses_explicit_client_working_dir(monkeypatch, tmp_path: Path) -> None:
@@ -288,4 +301,4 @@ def test_issue_94_init_ray_uses_explicit_client_working_dir(monkeypatch, tmp_pat
     init_ray(namespace="ns", ignore_reinit_error=True)
     runtime_env = calls[-1]["runtime_env"]
     assert runtime_env["working_dir"] == str(tmp_path)
-    _assert_blanked_attach_hints(runtime_env["env_vars"])
+    _assert_removed_attach_hints(runtime_env["env_vars"])

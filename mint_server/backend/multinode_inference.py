@@ -2660,7 +2660,6 @@ class MultiNodeInferenceEngine:
                 actor_ld_library_path,
                 actor_runtime_env_vars,
                 otel_env_vars,
-                preferred_vllm_python_executable,
             )
             worker_pythonpath = join_pythonpath(
                 "/vllm",
@@ -2790,9 +2789,6 @@ class MultiNodeInferenceEngine:
                 tensor_parallel_size=self.tensor_parallel_size,
             )
             runtime_env = {"env_vars": env_vars}
-            preferred_python = (preferred_vllm_python_executable() or "").strip()
-            if preferred_python:
-                runtime_env["py_executable"] = preferred_python
 
             self.engine = MultiNodeVLLMEngine.options(
                 name=self.actor_name,

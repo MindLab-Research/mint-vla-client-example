@@ -1465,7 +1465,7 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
     assert "py_modules" not in data
 
 
-def test_actor_runtime_env_without_attach_hints_sets_worker_wrapper(tmp_path):
+def test_actor_runtime_env_without_attach_hints_does_not_set_actor_python(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
     repo = tmp_path / "repo"
@@ -1501,7 +1501,7 @@ def test_actor_runtime_env_without_attach_hints_sets_worker_wrapper(tmp_path):
     )
     data = json.loads(out.stdout)
     env_vars = data["env_vars"]
-    assert data["py_executable"] == str(wrapper)
+    assert "py_executable" not in data
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
     assert "RAY_ADDRESS" not in env_vars
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""

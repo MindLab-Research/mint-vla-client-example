@@ -462,7 +462,6 @@ class MultiLoRAInferenceEngine:
                 actor_ld_library_path,
                 actor_runtime_env_vars,
                 otel_env_vars,
-                preferred_vllm_python_executable,
             )
             worker_pythonpath = join_pythonpath(
                 "/vllm",
@@ -490,7 +489,6 @@ class MultiLoRAInferenceEngine:
             if total_gpus >= 16:
                 env_vars["MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE"] = "1"
             _prepare_vllm_actor_runtime_env(env_vars)
-            preferred_python = (preferred_vllm_python_executable() or "").strip()
 
             actor_options: dict[str, object] = {
                 "num_gpus": total_gpus,
@@ -504,8 +502,6 @@ class MultiLoRAInferenceEngine:
                     }
                 },
             }
-            if preferred_python:
-                actor_options["runtime_env"]["py_executable"] = preferred_python
             if self.pinned_node_ip:
                 actor_options["resources"] = {f"node:{self.pinned_node_ip}": 0.001}
                 node_map = {

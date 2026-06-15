@@ -353,16 +353,27 @@ def test_runtime_config_does_not_treat_ray_address_as_actor_bootstrap_env() -> N
     assert '"RAY_ADDRESS"' not in source
 
 
-def test_model_engine_host_runtime_actor_uses_vllm_worker_wrapper() -> None:
+def test_model_engine_host_runtime_actor_does_not_use_vllm_wrapper_as_actor_python() -> None:
     path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
     functions = _module_functions(path)
     helper = functions["get_or_create_model_engine_host"]
     source = ast.get_source_segment(path.read_text(), helper) or ""
 
     assert "preferred_vllm_python_executable" in source
-    assert '"py_executable"' in source
+    assert "MINT_VLLM_CHILD_PYTHON_EXECUTABLE" in source
+    assert '"py_executable"' not in source
     assert "actor_runtime_env_vars" in source
     assert "include_ray_attach_hints=False" in source
+
+
+def test_vllm_backend_actors_do_not_use_wrapper_as_actor_python() -> None:
+    for rel_path in [
+        "mint_server/backend/multi_lora_engine.py",
+        "mint_server/backend/multinode_inference.py",
+        "mint_server/backend/verl_inference.py",
+    ]:
+        source = (REPO_ROOT / rel_path).read_text(encoding="utf-8")
+        assert '"py_executable"' not in source, rel_path
 
 
 def test_control_plane_helper_tasks_use_no_attach_runtime_env() -> None:

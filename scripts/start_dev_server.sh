@@ -48,6 +48,17 @@ set -eu
 #                             set to auto/force/1 to run reset-control-plane
 #                             before bootstrap. Names and paths come from
 #                             MINT_DEV_RESET_* env values.
+#   MINT_DEV_BOOTSTRAP_TIMEOUT_S
+#                             per-step timeout for bootstrap_control_plane.py.
+#                             Defaults to 180s because first detached actor
+#                             startup can be slow on a busy shared Ray Client.
+#   MINT_DEV_RESET_SKIP_RAY_WHEN_NO_ALIVE
+#                             when set, force reset may skip Ray Client cleanup
+#                             after the dashboard shows no ALIVE actors or
+#                             active reset placement groups in this namespace.
+#   MINT_DEV_TOPOLOGY_SOURCE_DIR
+#                             optional packet-owned topology YAML directory to
+#                             sync into dirname(MINT_TOPOLOGY_CONFIG_PATH).
 
 reject_per_launch_keys() {
   env_file="$1"
@@ -236,12 +247,29 @@ echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
 echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2
 echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS}" >&2
 echo "MINT_RAY_GCS_ADDRESS      ${MINT_RAY_GCS_ADDRESS:-<unset>}" >&2
+echo "MINT_CONTROL_PLANE_NODE   ${MINT_CONTROL_PLANE_NODE_IP:-<auto>}" >&2
 echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2
 echo "ray head ip source        ${ray_head_ip_path}" >&2
 echo "MINT_TMP_ROOT             ${MINT_TMP_ROOT}" >&2
 echo "MINT_DEV_DEPLOYMENT_ENV   ${deployment_env:-<none, code defaults>}" >&2
 echo "MINT_DEV_RUN_ENV          ${run_env:-<none>}" >&2
 echo "================================" >&2
+
+if [ -n "${MINT_DEV_TOPOLOGY_SOURCE_DIR:-}" ]; then
+  if [ -z "${MINT_TOPOLOGY_CONFIG_PATH:-}" ]; then
+    echo "error: MINT_DEV_TOPOLOGY_SOURCE_DIR requires MINT_TOPOLOGY_CONFIG_PATH" >&2
+    exit 1
+  fi
+  if [ ! -d "${MINT_DEV_TOPOLOGY_SOURCE_DIR}" ]; then
+    echo "error: MINT_DEV_TOPOLOGY_SOURCE_DIR does not exist: ${MINT_DEV_TOPOLOGY_SOURCE_DIR}" >&2
+    exit 1
+  fi
+  topology_target_dir=$(dirname "${MINT_TOPOLOGY_CONFIG_PATH}")
+  mkdir -p "${topology_target_dir}"
+  echo "syncing topology env ${MINT_DEV_TOPOLOGY_SOURCE_DIR} -> ${topology_target_dir}" >&2
+  rsync -a --delete --include '*/' --include '*.yaml' --exclude '*' \
+    "${MINT_DEV_TOPOLOGY_SOURCE_DIR}/" "${topology_target_dir}/"
+fi
 
 "${py}" - <<'PY' >&2
 import json
@@ -295,5 +323,6 @@ case "${MINT_DEV_RESET_CONTROL_PLANE:-0}" in
     ;;
 esac
 
-"${py}" scripts/bootstrap_control_plane.py
+bootstrap_timeout_s="${MINT_DEV_BOOTSTRAP_TIMEOUT_S:-180}"
+"${py}" scripts/bootstrap_control_plane.py --timeout-s "${bootstrap_timeout_s}"
 exec "${py}" scripts/run_server.py

@@ -184,6 +184,8 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
 
     assert captured["enable_sleep_mode"] is False
     assert actor_env_calls[-1]["include_ray_attach_hints"] is False
+    assert actor_env_calls[-1]["extra"]["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"
+    assert actor_env_calls[-1]["extra"]["VLLM_USE_V1"] == "1"
     assert init_ray_calls == [
         {
             "address": "192.168.40.99:6379",

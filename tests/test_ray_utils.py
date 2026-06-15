@@ -197,8 +197,8 @@ def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch)
     env_vars = calls[0]["runtime_env"]["env_vars"]
     assert "RAY_ADDRESS" not in env_vars
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars
-    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
-    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "RAY_CLIENT_ADDRESS" not in env_vars
+    assert "MINT_RAY_CLIENT_ADDRESS" not in env_vars
 
 
 def test_init_ray_does_not_promote_legacy_ray_address_to_job_gcs_hint(monkeypatch):
@@ -220,11 +220,11 @@ def test_init_ray_does_not_promote_legacy_ray_address_to_job_gcs_hint(monkeypatc
     assert calls[0]["address"] == "ray://192.168.38.184:10001"
     env_vars = calls[0]["runtime_env"]["env_vars"]
     assert "RAY_ADDRESS" not in env_vars
-    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "MINT_RAY_CLIENT_ADDRESS" not in env_vars
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars
 
 
-def test_init_ray_sets_job_py_executable_for_ray_client_workers(monkeypatch, tmp_path):
+def test_init_ray_does_not_set_job_py_executable_for_ray_client_workers(monkeypatch, tmp_path):
     calls: list[dict[str, object]] = []
     wrapper = tmp_path / "repo" / "scripts" / "vllm_worker_python.py"
     wrapper.parent.mkdir(parents=True)
@@ -245,7 +245,8 @@ def test_init_ray_sets_job_py_executable_for_ray_client_workers(monkeypatch, tmp
 
     assert out == {"ok": True}
     assert calls[0]["address"] == "ray://192.168.38.184:10001"
-    assert calls[0]["runtime_env"]["py_executable"] == str(wrapper)
+    assert "py_executable" not in calls[0]["runtime_env"]
+    assert "MINT_VLLM_CHILD_PYTHON_EXECUTABLE" not in calls[0]["runtime_env"]["env_vars"]
 
 
 def test_init_ray_blanks_attach_hints_without_dropping_existing_ray_client_runtime_env(monkeypatch):
@@ -273,7 +274,7 @@ def test_init_ray_blanks_attach_hints_without_dropping_existing_ray_client_runti
     assert env_vars["PYTHONPATH"] == "/shared/code"
     assert "RAY_ADDRESS" not in env_vars
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars
-    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "MINT_RAY_CLIENT_ADDRESS" not in env_vars
 
 
 def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):

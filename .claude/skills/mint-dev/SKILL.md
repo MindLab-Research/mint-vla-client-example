@@ -167,10 +167,12 @@ scripts/start_dev_server.sh
 
 ## Issue-Scoped Cleanup
 
-Clean up detached Ray actors you created for issue-scoped dev/API validation
-when they are no longer needed. Only clean namespaces that are clearly yours,
-for example a prefix containing the issue/PR and your user name. Never clean
-shared namespaces such as `tinker_leixiang` or another user's namespace.
+Cleanup is a required closeout step, not an optional courtesy. After finishing
+or abandoning dev/API validation, remove zombie Ray actors and namespaces that
+you created before handing the environment back. Only clean namespaces that are
+clearly yours, for example a prefix containing the issue/PR and your user name.
+Never clean shared namespaces such as `tinker_leixiang` or another user's
+namespace.
 
 Also stop local issue-scoped API servers or TermDeck-backed tasks that you
 started once the validation is finished or blocked. Before stopping a process,
@@ -213,6 +215,11 @@ If every target is from the issue-scoped namespace you created and the task is
 finished, kill those actors with `ray.kill(..., no_restart=True)` and re-list to
 confirm `remaining=[]`. Remove only placement groups that are named for the same
 issue-scoped actors/namespace. Do not use local `ray` CLI commands.
+
+If cleanup cannot complete because Ray Client, dashboard, or the cluster is
+unavailable, record the namespace, actor names, error, and follow-up owner in the
+task evidence before stopping. Do not leave a dev task marked complete while
+known owned zombie actors or placement groups remain unreported.
 
 ## Health And Logs
 
@@ -332,3 +339,5 @@ credential files, signed requests, or process environments.
   or is otherwise unavailable, ask the user.
 - Do not install packages until the runtime root (`PFS_RUNTIME_ENV_ROOT`) and the
   resolved `PYTHONPATH` have been verified.
+- Do not finish dev validation without cleaning owned zombie namespaces, actors,
+  and placement groups, or recording why cleanup was blocked.

@@ -224,6 +224,20 @@ def _patch_ray_init_drop_worker_attach_hints() -> None:
 
     def init(*args, **kwargs):  # type: ignore[no-untyped-def]
         _sanitize_ray_worker_bootstrap_process_environment()
+        if (
+            not _is_ray_worker_bootstrap_process()
+            and _is_vllm_worker_patch_environment()
+            and not args
+        ):
+            address = kwargs.get("address")
+            if address is None or (isinstance(address, str) and address.strip() in {"", "auto"}):
+                mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+                if not mint_gcs_address:
+                    raise RuntimeError(
+                        "vLLM worker ray.init requires explicit MINT_RAY_GCS_ADDRESS; "
+                        "refusing to start nested local Ray inside a Mint vLLM worker"
+                    )
+                kwargs["address"] = mint_gcs_address
         return original(*args, **kwargs)
 
     init._mint_drops_worker_attach_hints = True  # type: ignore[attr-defined]
@@ -2267,10 +2281,27 @@ def _patch_vllm_qwen35_text_only_adapter() -> None:
     install_vllm_qwen35_text_only_adapter_patches()
 
 
+def _vllm_is_available() -> bool:
+    if "vllm" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("vllm") is not None
+    except (ImportError, ModuleNotFoundError, ValueError):
+        return False
+
+
+def _apply_optional_vllm_patch(patch) -> None:  # type: ignore[no-untyped-def]
+    try:
+        patch()
+    except (ImportError, ModuleNotFoundError, AttributeError):
+        return
+
+
 def _apply_vllm_worker_patches() -> None:
     if not _env_flag("MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False):
         return
-    if "VLLM_USE_V1" not in os.environ:
+
+    if _is_ray_worker_bootstrap_process():
         return
 
     # Prevent vLLM workers from spawning repeated optional builds of Torch C DLPack
@@ -2282,24 +2313,25 @@ def _apply_vllm_worker_patches() -> None:
     _patch_ray_init_drop_worker_attach_hints()
     _patch_vllm_ray_env_carry_over_pythonpath()
     _patch_vllm_system_utils_spawn_without_ray_address()
+    if _vllm_is_available():
+        _patch_vllm_ray_executor_use_explicit_cluster_address()
+        _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
-        _patch_vllm_pack_moe_sparse_ok()
-        _patch_vllm_fused_moe_set_lora_sparse_shards()
-    _patch_vllm_lora_from_tensors_disable_pin_memory()
+        _apply_optional_vllm_patch(_patch_vllm_pack_moe_sparse_ok)
+        _apply_optional_vllm_patch(_patch_vllm_fused_moe_set_lora_sparse_shards)
+    _apply_optional_vllm_patch(_patch_vllm_lora_from_tensors_disable_pin_memory)
     if _env_flag("MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE", default=False):
-        _patch_vllm_worker_lora_load_to_device()
-    _patch_vllm_lora_optimize_overlap_safe()
-    _patch_vllm_lora_pin_memory_overlap_safe()
-    _patch_vllm_ray_executor_use_explicit_cluster_address()
-    _patch_vllm_ray_executor_sample_tokens_no_compiled_dag()
+        _apply_optional_vllm_patch(_patch_vllm_worker_lora_load_to_device)
+    _apply_optional_vllm_patch(_patch_vllm_lora_optimize_overlap_safe)
+    _apply_optional_vllm_patch(_patch_vllm_lora_pin_memory_overlap_safe)
     _patch_vllm_gpu_worker_kv_debug_info()
-    _patch_vllm_qwen35_text_only_adapter()
+    _apply_optional_vllm_patch(_patch_vllm_qwen35_text_only_adapter)
     # Keep worker/runtime LoRA fixes, but do not alter vLLM's native startup
     # profiling path. Knob sizing depends on upstream accounting:
     # `weights_memory + peak_activation_memory + non_torch_increase`.
     if _env_flag("MINT_VLLM_FULLY_SHARDED_LORAS", default=False):
-        _patch_vllm_fused_moe_slice_for_fully_sharded_loras()
-        _patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives()
+        _apply_optional_vllm_patch(_patch_vllm_fused_moe_slice_for_fully_sharded_loras)
+        _apply_optional_vllm_patch(_patch_vllm_fused_moe_lora_use_torch_dist_tp_collectives)
 
 
 _patch_torch_ld_library_path()

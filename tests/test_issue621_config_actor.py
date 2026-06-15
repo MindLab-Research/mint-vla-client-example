@@ -311,7 +311,7 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
                 "PYTHONPATH": pythonpath,
                 **(extra or {}),
                 **({"MINT_CONFIG_ACTOR_HYDRATE": "1"} if include_config_snapshot else {}),
-            }
+            },
         }
 
     monkeypatch.setattr(config_actor, "actor_runtime_env", _fake_actor_runtime_env)
@@ -329,7 +329,34 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
             "MINT_CONFIG_ACTOR_SELF": "1",
         }
     }
+    assert "py_executable" not in options["runtime_env"]
     assert captured["include_ray_attach_hints"] is False
+
+
+def test_config_actor_options_honor_control_plane_node_pin(monkeypatch) -> None:
+    from mint_server.backend import config_actor
+
+    class FakeRay:
+        @staticmethod
+        def cluster_resources():
+            return {
+                "node:__internal_head__": 1.0,
+                "node:192.168.42.8": 1.0,
+            }
+
+    monkeypatch.setenv("MINT_CONTROL_PLANE_NODE_IP", "192.168.42.8")
+    monkeypatch.setattr(config_actor, "RAY_NAMESPACE", "mint-ns")
+    monkeypatch.setattr(config_actor, "PFS_PYTHONPATH", "/pythonpath")
+    monkeypatch.setattr(config_actor, "ray", FakeRay)
+    monkeypatch.setattr(
+        config_actor,
+        "actor_runtime_env",
+        lambda **_kwargs: {"env_vars": {"PYTHONPATH": "/pythonpath"}},
+    )
+
+    options = config_actor._actor_options(actor_name="mint_config")
+
+    assert options["resources"] == {"node:192.168.42.8": 0.001}
 
 
 def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:

@@ -8,6 +8,9 @@ import os
 import shutil
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -143,6 +146,97 @@ def _json_write(path: str | None, payload: Mapping[str, Any]) -> None:
         json.dump(dict(payload), handle, sort_keys=True, indent=2)
 
 
+def _env_flag(name: str, *, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _dashboard_base_url() -> str | None:
+    explicit = os.environ.get("MINT_RAY_DASHBOARD_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
+    for key in ("MINT_RAY_GCS_ADDRESS", "MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
+        raw = os.environ.get(key, "").strip()
+        if not raw:
+            continue
+        parsed = urllib.parse.urlparse(raw if "://" in raw else f"ray://{raw}")
+        host = parsed.hostname
+        if host:
+            return f"http://{host}:8265"
+    return None
+
+
+def _dashboard_result(path: str, *, timeout_s: float = 10.0) -> list[dict[str, Any]]:
+    base_url = _dashboard_base_url()
+    if not base_url:
+        raise RuntimeError("MINT_RAY_DASHBOARD_URL or Ray head address is required")
+    url = f"{base_url}{path}"
+    with urllib.request.urlopen(url, timeout=timeout_s) as response:
+        payload = json.load(response)
+    result = payload.get("data", {}).get("result", {}).get("result")
+    if not isinstance(result, list):
+        raise RuntimeError(f"unexpected Ray dashboard response shape for {url}")
+    return [dict(row) for row in result if isinstance(row, Mapping)]
+
+
+def _dashboard_no_alive_reset_snapshot(namespace: str, pg_names: Sequence[str]) -> dict[str, Any] | None:
+    if not _env_flag("MINT_DEV_RESET_SKIP_RAY_WHEN_NO_ALIVE"):
+        return None
+    try:
+        encoded_namespace = urllib.parse.quote(namespace, safe="")
+        actors = _dashboard_result(
+            "/api/v0/actors?"
+            "limit=10000&filter_keys=ray_namespace&filter_predicates=%3D"
+            f"&filter_values={encoded_namespace}"
+        )
+        active_actors = [
+            row
+            for row in actors
+            if str(row.get("state") or "").upper() not in {"", "DEAD"}
+        ]
+        placement_groups = _dashboard_result("/api/v0/placement_groups?limit=10000")
+    except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError) as exc:
+        return {
+            "fast_reset_available": False,
+            "fast_reset_error": f"{type(exc).__name__}: {exc}",
+        }
+
+    pg_name_set = set(pg_names)
+    active_pgs = [
+        row
+        for row in placement_groups
+        if str(row.get("state") or "") != "REMOVED" and str(row.get("name") or "") in pg_name_set
+    ]
+    return {
+        "fast_reset_available": not active_actors and not active_pgs,
+        "dashboard_actor_count": len(actors),
+        "dashboard_alive_actor_count": len(
+            [row for row in actors if str(row.get("state") or "").upper() == "ALIVE"]
+        ),
+        "dashboard_active_actor_count": len(active_actors),
+        "dashboard_active_actors": [
+            {
+                "name": row.get("name"),
+                "state": row.get("state"),
+                "actor_id": row.get("actor_id"),
+                "class_name": row.get("class_name"),
+            }
+            for row in active_actors[:20]
+        ],
+        "dashboard_active_reset_pg_count": len(active_pgs),
+        "dashboard_active_reset_pgs": [
+            {
+                "name": row.get("name"),
+                "state": row.get("state"),
+                "placement_group_id": row.get("placement_group_id"),
+            }
+            for row in active_pgs
+        ],
+    }
+
+
 def _ensure_repo_on_path() -> None:
     repo = os.environ.get("MINT_CODE_ROOT", "").strip()
     if repo and repo not in sys.path:
@@ -182,8 +276,17 @@ def cmd_gc_stale_actors(args: argparse.Namespace) -> int:
     results_path = args.results or os.environ.get("MINT_DEV_ACTOR_GC_RESULTS")
     max_age_s = float(args.max_age_s)
     limit = int(args.limit)
-    ray = _init_ray(namespace)
-    rows, list_error = _list_alive_actors(limit)
+    ray = None
+    if _env_flag("MINT_DEV_GC_DASHBOARD_LIST", default=True):
+        try:
+            rows: list[Any] = _dashboard_result(f"/api/v0/actors?limit={limit}")
+            list_error = None
+        except (OSError, urllib.error.URLError, RuntimeError, json.JSONDecodeError) as exc:
+            rows = []
+            list_error = f"{type(exc).__name__}: {exc}"
+    else:
+        ray = _init_ray(namespace)
+        rows, list_error = _list_alive_actors(limit)
     candidates = stale_actor_candidates(
         rows,
         driver_namespace=namespace,
@@ -195,6 +298,8 @@ def cmd_gc_stale_actors(args: argparse.Namespace) -> int:
     results_handle = open(results_path, "w", encoding="utf-8") if results_path else None
     try:
         for index, data in enumerate(candidates, 1):
+            if ray is None:
+                ray = _init_ray(namespace)
             name = str(data.get("name") or "")
             row_namespace = str(data.get("ray_namespace") or "")
             record = {
@@ -277,8 +382,19 @@ def _expected_config_snapshot(namespace: str) -> Any:
 
 
 def _probe_should_reset(ray: Any, namespace: str, mode: str) -> dict[str, Any]:
+    if mode not in {"auto", ""}:
+        return {
+            "expected_config_actor": None,
+            "expected_fingerprint": None,
+            "actual_fingerprint": None,
+            "actual_snapshot_error": None,
+            "active_task_probe": None,
+            "active_task_probe_error": None,
+            "should_reset": True,
+        }
+
     expected = _expected_config_snapshot(namespace)
-    should_reset = mode not in {"auto", ""}
+    should_reset = False
     actual_fingerprint = None
     actual_snapshot_error = None
     active_task_probe = None
@@ -372,6 +488,41 @@ def cmd_reset_control_plane(args: argparse.Namespace) -> int:
     namespace = args.namespace or os.environ["MINT_RAY_NAMESPACE"]
     mode = args.mode
     summary_path = args.summary or os.environ.get("MINT_DEV_RESET_SUMMARY")
+    pg_names = split_csv(os.environ.get("MINT_DEV_RESET_PLACEMENT_GROUP_NAMES"))
+
+    fast_snapshot = _dashboard_no_alive_reset_snapshot(namespace, pg_names)
+    if mode not in {"auto", ""} and fast_snapshot is not None:
+        summary: dict[str, Any] = {
+            "namespace": namespace,
+            "reset_mode": mode,
+            "expected_config_actor": None,
+            "expected_fingerprint": None,
+            "actual_fingerprint": None,
+            "actual_snapshot_error": None,
+            "active_task_probe": None,
+            "active_task_probe_error": None,
+            "should_reset": True,
+            "actors": [],
+            "placement_groups": [],
+            "persistent_state": {"status": "not_configured"},
+            **fast_snapshot,
+        }
+        if fast_snapshot.get("fast_reset_available") is True:
+            task_state_dir = os.environ.get("MINT_DEV_RESET_TASK_STATE_DIR")
+            safe_root = os.environ.get("MINT_DEV_RESET_TASK_STATE_SAFE_ROOT")
+            if task_state_dir:
+                if not safe_root:
+                    raise RuntimeError(
+                        "MINT_DEV_RESET_TASK_STATE_SAFE_ROOT is required when task state reset is enabled"
+                    )
+                summary["persistent_state"] = clear_task_state_dir(
+                    Path(task_state_dir),
+                    Path(safe_root),
+                )
+            _json_write(summary_path, summary)
+            print(json.dumps(summary, sort_keys=True), file=sys.stderr)
+            return 0
+
     ray = _init_ray(namespace)
     _ensure_repo_on_path()
     probe = _probe_should_reset(ray, namespace, mode)
@@ -397,7 +548,7 @@ def cmd_reset_control_plane(args: argparse.Namespace) -> int:
             _json_write(summary_path, summary)
             raise RuntimeError(f"actor still exists after kill: {actor_name}")
 
-    for pg_name in split_csv(os.environ.get("MINT_DEV_RESET_PLACEMENT_GROUP_NAMES")):
+    for pg_name in pg_names:
         summary["placement_groups"].append(_remove_named_placement_group(pg_name))
 
     task_state_dir = os.environ.get("MINT_DEV_RESET_TASK_STATE_DIR")
