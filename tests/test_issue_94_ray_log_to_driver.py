@@ -18,6 +18,28 @@ _BLANKED_ATTACH_HINTS = {
 }
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ray_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "MINT_CODE_ROOT",
+        "MINT_RAY_CLIENT_ADDRESS",
+        "MINT_RAY_GCS_ADDRESS",
+        "MINT_RAY_HEAD_ADDRESS_PATH",
+        "MINT_RAY_JOB_WORKING_DIR",
+        "MINT_RAY_WORKING_DIR",
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    ray_utils = sys.modules.get("mint_server.ray_utils")
+    if ray_utils is not None:
+        monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None, raising=False)
+    config = sys.modules.get("mint_server.config")
+    if config is not None:
+        monkeypatch.setattr(config, "MINT_CODE_ROOT", "", raising=False)
+
+
 def _assert_blanked_attach_hints(env_vars: dict[str, str]) -> None:
     assert "RAY_ADDRESS" not in env_vars
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars

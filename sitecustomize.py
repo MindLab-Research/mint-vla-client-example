@@ -2053,9 +2053,48 @@ def _patch_vllm_system_utils_spawn_without_ray_address() -> None:
         return
 
     def _maybe_force_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
-        result = original(*args, **kwargs)
         os.environ.pop("RAY_ADDRESS", None)
-        return result
+        if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+            return None
+
+        reasons = []
+        is_in_ray_actor = getattr(system_utils, "is_in_ray_actor", None)
+        if callable(is_in_ray_actor) and is_in_ray_actor():
+            try:
+                import ray  # type: ignore
+
+                gcs_address = str(ray.get_runtime_context().gcs_address).strip()
+            except Exception:
+                gcs_address = ""
+            if gcs_address and not os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip():
+                os.environ["MINT_RAY_GCS_ADDRESS"] = gcs_address
+            reasons.append("In a Ray actor and can only be spawned")
+
+        cuda_is_initialized = getattr(system_utils, "cuda_is_initialized", None)
+        if callable(cuda_is_initialized) and cuda_is_initialized():
+            reasons.append("CUDA is initialized")
+        else:
+            xpu_is_initialized = getattr(system_utils, "xpu_is_initialized", None)
+            if callable(xpu_is_initialized) and xpu_is_initialized():
+                reasons.append("XPU is initialized")
+
+        in_wsl = getattr(system_utils, "in_wsl", None)
+        if callable(in_wsl) and in_wsl():
+            reasons.append("WSL is detected and NVML is not compatible with fork")
+
+        if reasons:
+            logger = getattr(system_utils, "logger", None)
+            if logger is not None:
+                logger.warning(
+                    "We must use the `spawn` multiprocessing start method. "
+                    "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
+                    "See https://docs.vllm.ai/en/latest/usage/"
+                    "troubleshooting.html#python-multiprocessing "
+                    "for more information. Reasons: %s",
+                    "; ".join(reasons),
+                )
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        return None
 
     _maybe_force_spawn._mint_no_ray_address_spawn_hint = True  # type: ignore[attr-defined]
     system_utils._maybe_force_spawn = _maybe_force_spawn  # type: ignore[method-assign]

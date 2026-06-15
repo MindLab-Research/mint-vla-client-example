@@ -8,7 +8,33 @@ import time
 from queue import Empty
 from types import SimpleNamespace
 
+import pytest
+
 from mint_server import ray_utils
+
+
+def _clear_ray_env(monkeypatch) -> None:
+    for key in (
+        "MINT_RAY_CLIENT_ADDRESS",
+        "MINT_RAY_GCS_ADDRESS",
+        "MINT_RAY_HEAD_ADDRESS_PATH",
+        "MINT_RAY_JOB_WORKING_DIR",
+        "MINT_RAY_WORKING_DIR",
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE",
+        "RAY_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None)
+
+
+def setup_function() -> None:
+    ray_utils._RAY_LAST_INIT_ADDRESS = None
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ray_env(monkeypatch):
+    _clear_ray_env(monkeypatch)
 
 
 def _holder_proc(lock_path: str, acquired_evt: mp.synchronize.Event, release_evt: mp.synchronize.Event, out_q: mp.Queue) -> None:

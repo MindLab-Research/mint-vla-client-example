@@ -511,23 +511,40 @@ def test_vllm_ray_env_carries_mint_gcs_address_without_ray_address(monkeypatch):
     assert "MINT_RAY_CLIENT_ADDRESS" not in additional_vars
 
 
-def test_vllm_system_utils_spawn_hint_does_not_convert_ray_address(monkeypatch):
+def test_vllm_system_utils_spawn_hint_does_not_call_upstream_ray_address_writer(monkeypatch):
     calls: dict[str, object] = {}
 
     def original_maybe_force_spawn():
         import os
 
-        calls["original"] = True
+        calls["original_called"] = True
         os.environ["RAY_ADDRESS"] = "192.168.40.99:6379"
         os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
+    warnings: list[tuple[str, tuple[object, ...]]] = []
+
+    class FakeLogger:
+        def warning(self, message: str, *args: object) -> None:
+            warnings.append((message, args))
+
+    class FakeRuntimeContext:
+        gcs_address = "192.168.40.99:6379"
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.get_runtime_context = lambda: FakeRuntimeContext()  # type: ignore[attr-defined]
     fake_vllm = _fake_package("vllm")
     fake_utils = _fake_package("vllm.utils")
     fake_system_utils = types.ModuleType("vllm.utils.system_utils")
     fake_system_utils._maybe_force_spawn = original_maybe_force_spawn  # type: ignore[attr-defined]
+    fake_system_utils.is_in_ray_actor = lambda: True  # type: ignore[attr-defined]
+    fake_system_utils.cuda_is_initialized = lambda: False  # type: ignore[attr-defined]
+    fake_system_utils.xpu_is_initialized = lambda: False  # type: ignore[attr-defined]
+    fake_system_utils.in_wsl = lambda: False  # type: ignore[attr-defined]
+    fake_system_utils.logger = FakeLogger()  # type: ignore[attr-defined]
     fake_vllm.utils = fake_utils  # type: ignore[attr-defined]
     fake_utils.system_utils = fake_system_utils  # type: ignore[attr-defined]
 
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
     monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
     monkeypatch.setitem(sys.modules, "vllm.utils", fake_utils)
     monkeypatch.setitem(sys.modules, "vllm.utils.system_utils", fake_system_utils)
@@ -540,10 +557,42 @@ def test_vllm_system_utils_spawn_hint_does_not_convert_ray_address(monkeypatch):
 
     fake_system_utils._maybe_force_spawn()  # type: ignore[attr-defined]
 
-    assert calls == {"original": True}
+    assert calls == {}
     assert "RAY_ADDRESS" not in __import__("os").environ
-    assert "MINT_RAY_GCS_ADDRESS" not in __import__("os").environ
+    assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert __import__("os").environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert warnings
+
+
+def test_vllm_system_utils_spawn_hint_cleans_ray_address_when_spawn_already_forced(monkeypatch):
+    def original_maybe_force_spawn():
+        raise AssertionError("patched _maybe_force_spawn must not call upstream")
+
+    fake_vllm = _fake_package("vllm")
+    fake_utils = _fake_package("vllm.utils")
+    fake_system_utils = types.ModuleType("vllm.utils.system_utils")
+    fake_system_utils._maybe_force_spawn = original_maybe_force_spawn  # type: ignore[attr-defined]
+    fake_vllm.utils = fake_utils  # type: ignore[attr-defined]
+    fake_utils.system_utils = fake_system_utils  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.utils", fake_utils)
+    monkeypatch.setitem(sys.modules, "vllm.utils.system_utils", fake_system_utils)
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_system_utils_spawn_without_ray_address()
+
+    fake_system_utils._maybe_force_spawn()  # type: ignore[attr-defined]
+
+    assert __import__("os").environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    assert "RAY_ADDRESS" not in __import__("os").environ
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    fake_system_utils._maybe_force_spawn()  # type: ignore[attr-defined]
+
+    assert "RAY_ADDRESS" not in __import__("os").environ
 
 
 def test_ray_init_patch_drops_runtime_ray_address_reintroduced_by_worker(monkeypatch):
