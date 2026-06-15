@@ -1330,7 +1330,7 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert synced[0][0]["domain_key"] == "vllm:model-a"
     assert synced[0][0]["status"] == "starting"
     assert synced[0][0]["generation"] == 0
-    assert synced[1][0]["status"] == "healthy"
+    assert synced[1][0]["status"] == "starting"
     assert synced[1][0]["generation"] >= 1
     assert synced[1][0]["consumer_id"].endswith(f"generation::{synced[1][0]['generation']}")
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
@@ -1354,7 +1354,7 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
 
 
 @pytest.mark.anyio
-async def test_issue_593_supervisor_keeps_runtime_claimable_when_start_times_out() -> None:
+async def test_issue_593_supervisor_keeps_pending_start_unclaimable_when_start_times_out() -> None:
     created: list[_FakeStartTimeoutRuntimeActor] = []
     synced: list[list[dict]] = []
 
@@ -1395,7 +1395,7 @@ async def test_issue_593_supervisor_keeps_runtime_claimable_when_start_times_out
     assert replica["state"] == "starting"
     assert replica["last_action"] == "start_pending:missing"
     assert "GetTimeoutError" in replica["last_error"]
-    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "starting"
     assert synced[-1][0]["generation"] == replica["generation"]
 
 
@@ -1579,7 +1579,7 @@ async def test_issue_593_supervisor_does_not_keep_claimable_status_after_start_f
 
     label = "vllm:model-a::replica-0"
     assert out["ok"] is True
-    assert synced[1][0]["status"] == "healthy"
+    assert synced[1][0]["status"] == "starting"
     assert synced[-1][0]["status"] == "dead"
     assert out["snapshot"]["replicas"][label]["state"] == "dead"
     assert "runtime start failed" in out["snapshot"]["replicas"][label]["last_error"]
@@ -1888,7 +1888,7 @@ async def test_issue_593_supervisor_ignores_stale_generation_health_failure() ->
         "state": "starting",
         "generation": next_generation,
         "consumer_id": "vllm:model-a::replica-0::generation::next",
-        "scheduler_status": "healthy",
+        "scheduler_status": "starting",
         "last_action": "reserve:dead",
     }
     supervisor._actors[stale_actor.domain_key, stale_actor.replica_id] = _OpaqueRuntimeHandle(stale_actor)
