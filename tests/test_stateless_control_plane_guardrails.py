@@ -282,7 +282,6 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
 def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
     allowed = {
         "mint_server/backend/multinode_inference.py",  # diagnostics only
-        "mint_server/backend/node_placement.py",  # state API fallback accepts driver aliases
     }
     offenders: list[str] = []
     for path in sorted((REPO_ROOT / "mint_server" / "backend").rglob("*.py")):
@@ -324,14 +323,13 @@ def test_ray_address_production_references_are_explicitly_owned() -> None:
         "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
         "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
         "mint_server/backend/multinode_inference.py",  # no-attach runtime env key and diagnostics.
-        "mint_server/backend/node_placement.py",  # driver/state API fallback.
         "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
         "ops/backend/config.py",  # ops dashboard config fallback.
         "scripts/run_server.py",  # launcher observability.
         "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
         "scripts/start_prod_server.sh",  # prod launcher contract.
         "scripts/vllm_worker_python.py",  # subprocess cleanup wrapper.
-        "sitecustomize.py",  # worker/vLLM cleanup and compatibility patches.
+        "sitecustomize.py",  # worker/vLLM cleanup patches.
     }
     ignored_prefixes = (
         "tests/",
@@ -437,6 +435,24 @@ def test_sitecustomize_sanitizes_ray_worker_bootstrap_env_without_dropping_gcs()
         assert key not in environ
     assert environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert environ["PYTHONPATH"] == "/repo"
+
+
+def test_sitecustomize_sanitizer_does_not_convert_legacy_ray_address_to_gcs() -> None:
+    sitecustomize = _load_repo_sitecustomize()
+
+    environ = {
+        "RAY_ACTOR_ID": "actor-1",
+        "RAY_ADDRESS": "192.168.40.99:6379",
+    }
+
+    sitecustomize._sanitize_ray_worker_bootstrap_process_environment(
+        environ,
+        argv=["python", "-c", "import ray"],
+    )
+
+    assert "RAY_ADDRESS" not in environ
+    assert "MINT_RAY_GCS_ADDRESS" not in environ
+    assert environ["RAY_ACTOR_ID"] == "actor-1"
 
 
 def test_sitecustomize_sanitizes_ray_actor_env_without_dropping_gcs() -> None:

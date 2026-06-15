@@ -727,7 +727,7 @@ def test_list_alive_gpu_nodes_uses_actor_state_fallback_when_private_state_unava
 ) -> None:
     vp = _import_node_placement(monkeypatch)
 
-    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
     monkeypatch.setattr(
         vp.ray,
         "nodes",
@@ -764,7 +764,7 @@ def test_list_alive_gpu_nodes_actor_state_fallback_accounts_alive_gpu_actors(
 ) -> None:
     vp = _import_node_placement(monkeypatch)
 
-    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
     monkeypatch.setattr(
         vp.ray,
         "nodes",
@@ -810,7 +810,7 @@ def test_actor_state_fallback_omits_address_when_ray_is_already_initialized(
 ) -> None:
     vp = _import_node_placement(monkeypatch)
 
-    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
 
     seen: dict[str, object] = {}
 
@@ -834,7 +834,7 @@ def test_actor_state_fallback_does_not_spawn_after_direct_lookup_failure(
 ) -> None:
     vp = _import_node_placement(monkeypatch)
 
-    monkeypatch.setenv("RAY_ADDRESS", "ray://192.168.39.87:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.87:10001")
 
     calls: list[dict[str, object]] = []
 

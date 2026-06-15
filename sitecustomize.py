@@ -90,9 +90,6 @@ def _sanitize_ray_worker_bootstrap_process_environment(
     if not _should_sanitize_ray_worker_environment(environ, argv):
         return
     target = os.environ if environ is None else environ
-    ray_address = str(target.get("RAY_ADDRESS", "") or "").strip()
-    if ray_address and not ray_address.startswith("ray://"):
-        target.setdefault("MINT_RAY_GCS_ADDRESS", ray_address)
     for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
         target.pop(key, None)
 
@@ -573,10 +570,6 @@ def _patch_vllm_ray_executor_module_use_explicit_cluster_address(
             if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
                 env_addr = mint_gcs_address
                 if not env_addr:
-                    ray_addr = os.environ.get("RAY_ADDRESS", "").strip()
-                    if ray_addr and not ray_addr.startswith("ray://"):
-                        env_addr = ray_addr
-                if not env_addr:
                     raise RuntimeError(
                         "vLLM RayDistributedExecutor requires explicit MINT_RAY_GCS_ADDRESS; "
                         "refusing to start nested local Ray inside EngineCore"
@@ -615,7 +608,7 @@ def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
     cluster. If vLLM initializes its Ray executor with no address, Ray starts a
     standalone local head inside EngineCore, which hides the real failure behind
     a nested cluster. Fail closed unless Mint's explicit GCS address is
-    available, with legacy `RAY_ADDRESS` accepted only as a fallback.
+    available.
 
     vLLM chooses different executor modules depending on `VLLM_USE_V1`; patch
     both the v1 and v0 layouts when present.
@@ -2058,10 +2051,7 @@ def _patch_vllm_system_utils_spawn_without_ray_address() -> None:
 
     def _maybe_force_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
         result = original(*args, **kwargs)
-        ray_address = os.environ.get("RAY_ADDRESS", "").strip()
-        if ray_address:
-            os.environ.setdefault("MINT_RAY_GCS_ADDRESS", ray_address)
-            os.environ.pop("RAY_ADDRESS", None)
+        os.environ.pop("RAY_ADDRESS", None)
         return result
 
     _maybe_force_spawn._mint_no_ray_address_spawn_hint = True  # type: ignore[attr-defined]

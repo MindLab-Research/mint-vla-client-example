@@ -117,12 +117,12 @@ def test_init_ray_prefers_ray_client_over_gcs_address(monkeypatch):
     assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
 
 
-def test_strict_ray_gcs_address_ignores_legacy_ray_address(monkeypatch):
+def test_gcs_address_helpers_ignore_legacy_ray_address(monkeypatch):
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
     monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
     monkeypatch.delenv("MINT_RAY_HEAD_ADDRESS_PATH", raising=False)
 
-    assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
+    assert ray_utils.preferred_ray_gcs_address() is None
     assert ray_utils.strict_ray_gcs_address() is None
 
 
@@ -149,6 +149,29 @@ def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch)
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
+
+
+def test_init_ray_does_not_promote_legacy_ray_address_to_job_gcs_hint(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "ray://192.168.38.184:10001"
+    env_vars = calls[0]["runtime_env"]["env_vars"]
+    assert env_vars["RAY_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "MINT_RAY_GCS_ADDRESS" not in env_vars
 
 
 def test_init_ray_sets_job_py_executable_for_ray_client_workers(monkeypatch, tmp_path):

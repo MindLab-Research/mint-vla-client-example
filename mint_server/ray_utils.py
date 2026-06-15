@@ -71,15 +71,6 @@ def _read_configured_ray_head_address(path: Path) -> str:
     return _normalize_ray_address(raw)
 
 
-def ray_address_source_configured() -> bool:
-    if _configured_ray_head_address_path() is not None:
-        return True
-    return any(
-        bool(os.environ.get(name, "").strip())
-        for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", _RAY_GCS_ADDRESS_ENV, "RAY_ADDRESS")
-    )
-
-
 def ray_reconnect_poll_s() -> float:
     raw = os.environ.get(_RAY_RECONNECT_POLL_ENV, "").strip()
     if not raw:
@@ -109,13 +100,6 @@ def ray_client_working_dir() -> str | None:
     return working_dir or None
 
 
-def require_ray_address() -> str:
-    addr = os.environ.get("RAY_ADDRESS", "").strip()
-    if not addr:
-        raise MissingRayAddressError("RAY_ADDRESS must be set before initializing Ray")
-    return _normalize_ray_address(addr)
-
-
 def preferred_ray_gcs_address() -> str | None:
     addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
     if addr:
@@ -123,9 +107,6 @@ def preferred_ray_gcs_address() -> str | None:
     configured_path = _configured_ray_head_address_path()
     if configured_path is not None:
         return _read_configured_ray_head_address(configured_path)
-    addr = os.environ.get("RAY_ADDRESS", "").strip()
-    if addr and not addr.startswith("ray://"):
-        return _normalize_ray_address(addr)
     return None
 
 

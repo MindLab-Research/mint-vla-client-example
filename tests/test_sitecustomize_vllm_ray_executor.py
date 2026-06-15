@@ -141,6 +141,49 @@ def test_initialize_ray_cluster_prefers_mint_gcs_address_env_for_original(monkey
     assert calls["ray_address"] == "192.168.39.87:6379"
 
 
+def test_initialize_ray_cluster_ignores_legacy_ray_address_without_mint_gcs(monkeypatch):
+    calls: dict[str, object] = {}
+
+    def original(parallel_config, ray_address=None):
+        calls["ray_address"] = ray_address
+        return "ok"
+
+    fake_vllm = _fake_package("vllm")
+    fake_vllm_v1 = _fake_package("vllm.v1")
+    fake_vllm_executor = _fake_package("vllm.v1.executor")
+    fake_ray_exec_mod = types.ModuleType("vllm.v1.executor.ray_executor")
+    fake_ray_utils_mod = types.ModuleType("vllm.v1.executor.ray_utils")
+    fake_ray_exec_mod.initialize_ray_cluster = original
+    fake_ray_utils_mod.initialize_ray_cluster = original
+    fake_vllm_v1.executor = fake_vllm_executor  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_executor = fake_ray_exec_mod  # type: ignore[attr-defined]
+    fake_vllm_executor.ray_utils = fake_ray_utils_mod  # type: ignore[attr-defined]
+
+    fake_ray = types.ModuleType("ray")
+    fake_ray.is_initialized = lambda: True  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "vllm", fake_vllm)
+    monkeypatch.setitem(sys.modules, "vllm.v1", fake_vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor", fake_vllm_executor)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_executor", fake_ray_exec_mod)
+    monkeypatch.setitem(sys.modules, "vllm.v1.executor.ray_utils", fake_ray_utils_mod)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.39.87:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+
+    module = _load_repo_sitecustomize()
+    module._patch_vllm_ray_executor_use_explicit_cluster_address()
+
+    patched = fake_ray_utils_mod.initialize_ray_cluster
+    try:
+        patched(types.SimpleNamespace(ray_runtime_env=None), ray_address=None)
+    except RuntimeError as e:
+        assert "explicit MINT_RAY_GCS_ADDRESS" in str(e)
+    else:
+        raise AssertionError("legacy RAY_ADDRESS must not satisfy vLLM Ray address contract")
+    assert calls == {}
+
+
 def test_initialize_ray_cluster_does_not_nested_init_in_ray_worker_bootstrap(monkeypatch):
     calls: dict[str, object] = {}
 
@@ -473,7 +516,7 @@ def test_vllm_ray_env_carries_mint_gcs_address_without_ray_address(monkeypatch):
     assert "MINT_RAY_CLIENT_ADDRESS" not in additional_vars
 
 
-def test_vllm_system_utils_spawn_hint_does_not_leave_ray_address(monkeypatch):
+def test_vllm_system_utils_spawn_hint_does_not_convert_ray_address(monkeypatch):
     calls: dict[str, object] = {}
 
     def original_maybe_force_spawn():
@@ -504,12 +547,11 @@ def test_vllm_system_utils_spawn_hint_does_not_leave_ray_address(monkeypatch):
 
     assert calls == {"original": True}
     assert "RAY_ADDRESS" not in __import__("os").environ
-    assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert "MINT_RAY_GCS_ADDRESS" not in __import__("os").environ
     assert __import__("os").environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
-    os.environ.pop("MINT_RAY_GCS_ADDRESS", None)
 
 
-def test_ray_init_patch_cleans_runtime_ray_address_reintroduced_by_worker(monkeypatch):
+def test_ray_init_patch_drops_runtime_ray_address_reintroduced_by_worker(monkeypatch):
     calls: list[dict[str, object]] = []
 
     fake_ray = types.ModuleType("ray")
@@ -550,12 +592,11 @@ def test_ray_init_patch_cleans_runtime_ray_address_reintroduced_by_worker(monkey
             "ray_address_env": None,
             "ray_client_env": None,
             "mint_ray_client_env": None,
-            "mint_ray_gcs_env": "192.168.40.99:6379",
+            "mint_ray_gcs_env": None,
         }
     ]
     assert "RAY_ADDRESS" not in __import__("os").environ
-    assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
-    os.environ.pop("MINT_RAY_GCS_ADDRESS", None)
+    assert "MINT_RAY_GCS_ADDRESS" not in __import__("os").environ
 
 
 def test_ray_init_patch_leaves_driver_ray_address_outside_worker_env(monkeypatch):
