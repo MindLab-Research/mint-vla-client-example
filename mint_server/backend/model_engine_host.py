@@ -290,17 +290,21 @@ def get_or_create_model_engine_host(
     if resolved_ray_address is None:
         raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
 
+    preferred_python = (preferred_vllm_python_executable() or "").strip()
+    runtime_env_extra_payload = {
+        **otel_env_vars(),
+        **(runtime_env_extra or {}),
+    }
+    if preferred_python:
+        runtime_env_extra_payload.setdefault("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", preferred_python)
+        runtime_env_extra_payload.setdefault("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
     runtime_env: dict[str, Any] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=PFS_PYTHONPATH,
-            extra={
-                **otel_env_vars(),
-                **(runtime_env_extra or {}),
-            },
+            extra=runtime_env_extra_payload,
             include_ray_attach_hints=False,
         )
     }
-    preferred_python = (preferred_vllm_python_executable() or "").strip()
     if preferred_python:
         runtime_env["py_executable"] = preferred_python
 
