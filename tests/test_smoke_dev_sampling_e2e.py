@@ -46,3 +46,9 @@ def test_smoke_script_does_not_read_dotenv_files():
     assert "os.environ.update" not in text
     assert "MINT_DEV_SECRETS_ENV" not in text
     assert "secrets.env" not in text
+
+
+def test_smoke_script_ignores_proxy_environment_for_local_dev_server():
+    text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    assert "trust_env=False" in text

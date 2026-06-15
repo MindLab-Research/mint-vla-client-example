@@ -285,7 +285,7 @@ async def run(args: argparse.Namespace, events: EventWriter) -> int:
         max_tokens=args.max_tokens,
     )
     limits = httpx.Limits(max_connections=4, max_keepalive_connections=4)
-    async with httpx.AsyncClient(http2=False, limits=limits) as client:
+    async with httpx.AsyncClient(http2=False, limits=limits, trust_env=False) as client:
         sampling_session_id = await create_sampling_session(client, args, events)
         request_id = await submit_sample(client, args, sampling_session_id=sampling_session_id, tokens=tokens, events=events)
         result = await poll_future(client, args, request_id=request_id, events=events)

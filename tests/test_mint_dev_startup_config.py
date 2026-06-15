@@ -29,11 +29,17 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     assert 'vllm_worker_python="${MINT_CODE_ROOT}/scripts/vllm_worker_python.py"' in text
     assert 'export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"' in text
     assert "MINT_VLLM_CHILD_PYTHON_EXECUTABLE" in text
+    assert "MINT_DEV_SOURCE_CHECKOUT" in text
+    assert "syncing dev checkout" in text
+    assert "MINT_DEV_STOP_EXISTING_PORT_SERVER" in text
+    assert '"scripts/run_server.py"' in text
+    assert "scripts/tools/dev_ray_cleanup.py gc-stale-actors" in text
+    assert "scripts/tools/dev_ray_cleanup.py reset-control-plane" in text
     # Optional deployment policy must not carry code root or namespace.
     assert "MINT_DEV_DEPLOYMENT_ENV" in text
     assert (
         "MINT_CODE_ROOT|MINT_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|"
-        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"
+        "MINT_VLLM_CHILD_PYTHON_EXECUTABLE|MINT_DEV_SOURCE_CHECKOUT"
     ) in text
     assert LEGACY_DEV_SECRETS_ENV not in text
     assert LEGACY_DEV_SECRETS_PATH not in text

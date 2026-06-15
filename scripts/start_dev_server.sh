@@ -15,8 +15,8 @@ set -eu
 #                    Do NOT use: local paths (Ray head can't see them),
 #                    /vePFS-Mindverse/user/... (not mounted on Ray nodes), or
 #                    /vePFS-Mindverse/share/mint/dev/mint-server (shared, affects everyone).
-#                    Sync your checkout first, e.g.:
-#                    rsync -a --delete <your-checkout>/ /vePFS-Mindverse/share/<your-path>/
+#                    If validating a local worktree, set MINT_DEV_SOURCE_CHECKOUT
+#                    and this launcher will sync it into MINT_CODE_ROOT first.
 #
 # Derived (override only if needed):
 #   MINT_RAY_NAMESPACE        mint_<user>; refuses root/empty.
@@ -30,15 +30,31 @@ set -eu
 #   MINT_DEV_DEPLOYMENT_ENV   extra deployment policy (model list, placement,
 #                             prewarm, OTEL). Must NOT set MINT_CODE_ROOT or
 #                             MINT_RAY_NAMESPACE; those are rejected below.
+#   MINT_DEV_SOURCE_CHECKOUT  optional local/source checkout to rsync into
+#                             MINT_CODE_ROOT before launching. Use this when
+#                             MINT_CODE_ROOT is the worker-visible mirror of a
+#                             local worktree.
 #   MINT_DEV_RUN_ENV          per-run overrides (port, run-local task DB,
 #                             placement, debug knobs). Same identity keys are
-#                             rejected; set them in the launching shell/script.
+#                             rejected; set them in the launching shell or
+#                             packet-owned launch env.
+#   MINT_DEV_GC_OLD_ACTORS    set to 1 to run scripts/tools/dev_ray_cleanup.py
+#                             gc-stale-actors before bootstrap.
+#   MINT_DEV_STOP_EXISTING_PORT_SERVER
+#                             set to 1 to kill an existing scripts/run_server.py
+#                             listener on MINT_PORT before launch. Refuses to
+#                             kill non-Mint processes.
+#   MINT_DEV_RESET_CONTROL_PLANE
+#                             set to auto/force/1 to run reset-control-plane
+#                             before bootstrap. Names and paths come from
+#                             MINT_DEV_RESET_* env values.
 
 reject_per_launch_keys() {
   env_file="$1"
-  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE)=' "${env_file}"; then
+  if grep -Eq '^[[:space:]]*(export[[:space:]]+)?(MINT_CODE_ROOT|MINT_RAY_NAMESPACE|MINT_RAY_HEAD_ADDRESS_PATH|MINT_VLLM_CHILD_PYTHON_EXECUTABLE|MINT_DEV_SOURCE_CHECKOUT)=' "${env_file}"; then
     echo "error: ${env_file} must not set MINT_CODE_ROOT, the Ray namespace," >&2
-    echo "       MINT_RAY_HEAD_ADDRESS_PATH, or MINT_VLLM_CHILD_PYTHON_EXECUTABLE" >&2
+    echo "       MINT_RAY_HEAD_ADDRESS_PATH, MINT_VLLM_CHILD_PYTHON_EXECUTABLE," >&2
+    echo "       or MINT_DEV_SOURCE_CHECKOUT" >&2
     echo "       (those are per-launch inputs derived by the launcher)." >&2
     exit 1
   fi
@@ -66,7 +82,25 @@ if [ -z "${MINT_CODE_ROOT:-}" ]; then
   echo "       Ask which checkout to use; do not default to the shared dev tree." >&2
   exit 1
 fi
-if [ ! -d "${MINT_CODE_ROOT}" ]; then
+if [ -n "${MINT_DEV_SOURCE_CHECKOUT:-}" ]; then
+  if [ ! -d "${MINT_DEV_SOURCE_CHECKOUT}" ]; then
+    echo "error: MINT_DEV_SOURCE_CHECKOUT does not exist: ${MINT_DEV_SOURCE_CHECKOUT}" >&2
+    exit 1
+  fi
+  mkdir -p "${MINT_CODE_ROOT}"
+  if [ "$(cd "${MINT_DEV_SOURCE_CHECKOUT}" && pwd -P)" != "$(cd "${MINT_CODE_ROOT}" && pwd -P)" ]; then
+    echo "syncing dev checkout ${MINT_DEV_SOURCE_CHECKOUT} -> ${MINT_CODE_ROOT}" >&2
+    rsync -a --delete \
+      --exclude '.git' \
+      --exclude '.venv' \
+      --exclude '.pytest_cache' \
+      --exclude '.ruff_cache' \
+      --exclude '__pycache__' \
+      --exclude 'htmlcov' \
+      --exclude '.coverage' \
+      "${MINT_DEV_SOURCE_CHECKOUT}/" "${MINT_CODE_ROOT}/"
+  fi
+elif [ ! -d "${MINT_CODE_ROOT}" ]; then
   echo "error: MINT_CODE_ROOT does not exist: ${MINT_CODE_ROOT}" >&2
   exit 1
 fi
@@ -107,6 +141,33 @@ source_env_file "MINT_DEV_DEPLOYMENT_ENV" "${deployment_env}"
 
 run_env="${MINT_DEV_RUN_ENV:-}"
 source_env_file "MINT_DEV_RUN_ENV" "${run_env}"
+
+if [ "${MINT_DEV_STOP_EXISTING_PORT_SERVER:-0}" = "1" ]; then
+  port="${MINT_PORT:-8000}"
+  if command -v ss >/dev/null 2>&1; then
+    port_pids=$(
+      ss -ltnp "sport = :${port}" 2>/dev/null \
+        | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' \
+        | sort -u
+    )
+    for previous_pid in ${port_pids}; do
+      cmd=$(ps -p "${previous_pid}" -o args= 2>/dev/null || true)
+      case "${cmd}" in
+        *"scripts/run_server.py"*)
+          echo "stopping previous mint dev server on port ${port} pid=${previous_pid}" >&2
+          kill "${previous_pid}" 2>/dev/null || true
+          sleep 2
+          ;;
+        *)
+          echo "error: port ${port} is occupied by non-Mint process pid=${previous_pid} cmd=${cmd}" >&2
+          exit 1
+          ;;
+      esac
+    done
+  else
+    echo "warning: ss not available; cannot preflight existing listener on port ${port}" >&2
+  fi
+fi
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${mint_user}"
 api_tmp_link="/tmp/mda"
@@ -159,6 +220,7 @@ export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"
 
 echo "=== mint-dev launch contract ===" >&2
 echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
+echo "MINT_DEV_SOURCE_CHECKOUT  ${MINT_DEV_SOURCE_CHECKOUT:-<none>}" >&2
 echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
 echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
 echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2
@@ -206,6 +268,22 @@ print("=== mint-dev python/ray preflight ===")
 print(json.dumps(summary, sort_keys=True))
 print("=====================================")
 PY
+
+if [ "${MINT_DEV_GC_OLD_ACTORS:-0}" = "1" ]; then
+  echo "=== mint-dev stale actor cleanup ===" >&2
+  "${py}" scripts/tools/dev_ray_cleanup.py gc-stale-actors
+  echo "====================================" >&2
+fi
+
+case "${MINT_DEV_RESET_CONTROL_PLANE:-0}" in
+  0|false|False|FALSE|no|No|NO|"")
+    ;;
+  *)
+    echo "=== mint-dev control-plane reset ===" >&2
+    "${py}" scripts/tools/dev_ray_cleanup.py reset-control-plane
+    echo "====================================" >&2
+    ;;
+esac
 
 "${py}" scripts/bootstrap_control_plane.py
 exec "${py}" scripts/run_server.py
