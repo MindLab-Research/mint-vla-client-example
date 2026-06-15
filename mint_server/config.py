@@ -230,7 +230,6 @@ _RAY_ATTACH_RUNTIME_ENV_KEYS = frozenset(
         "TMPDIR",
         "TMP",
         "TEMP",
-        "RAY_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     }
@@ -250,9 +249,11 @@ def actor_runtime_env_vars(
         raise RuntimeError("MINT_CODE_ROOT is required")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
-    ray_address = _env_nonempty(os.environ, "RAY_ADDRESS")
-    if include_ray_attach_hints and ray_address is None:
-        raise RuntimeError("RAY_ADDRESS is required")
+    from .ray_utils import strict_ray_gcs_address
+
+    direct_ray_address = strict_ray_gcs_address()
+    if include_ray_attach_hints and direct_ray_address is None:
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 
     out = {
         "MINT_RAY_NAMESPACE": RAY_NAMESPACE,
@@ -261,8 +262,8 @@ def actor_runtime_env_vars(
         "MINT_CODE_ROOT": MINT_CODE_ROOT,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
     }
-    if include_ray_attach_hints and ray_address is not None:
-        out["RAY_ADDRESS"] = ray_address
+    if direct_ray_address is not None:
+        out["MINT_RAY_GCS_ADDRESS"] = direct_ray_address
     config_actor_name = _env_nonempty(os.environ, "MINT_CONFIG_ACTOR_NAME")
     if config_actor_name is not None:
         out["MINT_CONFIG_ACTOR_NAME"] = config_actor_name
@@ -275,8 +276,6 @@ def actor_runtime_env_vars(
     for key in (
         "MINT_ACTOR_LD_LIBRARY_PATH",
         "MINT_RAY_HEAD_ADDRESS_PATH",
-        "MINT_RAY_CLIENT_ADDRESS",
-        "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_CONTROL_PLANE_NODE_IP",
         "MINT_RAY_TEMP_DIR",
@@ -290,14 +289,22 @@ def actor_runtime_env_vars(
     ):
         if not include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
             continue
+        if include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
+            continue
         value = _env_nonempty(os.environ, key)
         if value is not None:
             out[key] = value
     if extra:
         out.update(extra)
+    out.pop("RAY_ADDRESS", None)
     if not include_ray_attach_hints:
         for key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
-            out.pop(key, None)
+            # Ray runtime_env env_vars overlay the job/worker environment; they
+            # do not reliably delete inherited variables. Empty values make
+            # env_nonempty()/Ray attach helpers treat these as absent inside
+            # detached actor workers. RAY_ADDRESS is intentionally not emitted;
+            # worker entry wrappers delete any inherited value before bootstrap.
+            out[key] = ""
     if include_config_snapshot:
         out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out
@@ -308,7 +315,7 @@ def _runtime_env_value_is_uri(value: str) -> bool:
 
 
 def _actor_runtime_env_allows_local_paths() -> bool:
-    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
         value = _env_nonempty(os.environ, name)
         if value and value.startswith("ray://"):
             return False
@@ -344,6 +351,10 @@ def actor_runtime_env(
     # Ray Client accepts local-path working_dir only at ray.init(job) level.
     if working_dir and (allow_local_paths or _runtime_env_value_is_uri(working_dir)):
         runtime_env["working_dir"] = working_dir
+    if not include_ray_attach_hints:
+        preferred_python = (preferred_vllm_python_executable() or "").strip()
+        if preferred_python:
+            runtime_env["py_executable"] = preferred_python
     return runtime_env
 
 
@@ -505,6 +516,8 @@ class ServerConfig:
     sampling_max_pending_asample_per_apikey: int = 64
     sampling_max_inflight_per_principal_domain: int = 1024
     sampling_max_inflight_per_domain: int = 10240
+    sampling_max_inflight_tokens_per_principal_domain: int = 0
+    sampling_max_inflight_tokens_per_domain: int = 0
     sampling_inflight_admission_mode: str = "observe"
     sampling_max_concurrent_samples_per_request: int = 8
     sampling_sample_coalesce: bool = True
@@ -776,6 +789,18 @@ class ServerConfig:
                 "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
                 getattr(file_sampling, "max_inflight_per_domain", None) if file_sampling is not None else None,
                 10240,
+            ),
+            sampling_max_inflight_tokens_per_principal_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
+                getattr(file_sampling, "max_inflight_tokens_per_principal_domain", None)
+                if file_sampling is not None
+                else None,
+                0,
+            ),
+            sampling_max_inflight_tokens_per_domain=_pick_int(
+                "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
+                getattr(file_sampling, "max_inflight_tokens_per_domain", None) if file_sampling is not None else None,
+                0,
             ),
             sampling_inflight_admission_mode=_pick_str(
                 "MINT_SAMPLING_INFLIGHT_ADMISSION_MODE",

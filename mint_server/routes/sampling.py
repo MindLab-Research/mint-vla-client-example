@@ -1329,9 +1329,8 @@ async def _asample_impl(
                 "suppress_billing": bool(suppress_billing),
             },
             queued_meta=queued_meta,
-            create_future=True,
             payload_hash=payload_hash,
-            task_futures_client=task_futures,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -1340,8 +1339,9 @@ async def _asample_impl(
             },
         )
     except ModelWorkAdmissionRejectedError as e:
-        result = dict(e.scheduler_result)
-        reason = str(result.get("reason") or "sampling_inflight_limit_exceeded")
+        result = e.scheduler_result
+        extra = dict(result.extra)
+        reason = str(result.reason or "sampling_inflight_limit_exceeded")
         record_sampling_admission_metric(
             route=_ASAMPLE_ROUTE,
             decision="rejected",
@@ -1352,13 +1352,13 @@ async def _asample_impl(
         detail = {
             "error": "sampling_backpressure",
             "reason": reason,
-            "domain": str(result.get("domain_key") or domain_key),
+            "domain": str(result.domain_key or domain_key),
             "principal": str(
-                result.get("principal") or throttle_principal or "anonymous"
+                extra.get("principal") or throttle_principal or "anonymous"
             ),
-            "current": int(result.get("current") or 0),
-            "limit": int(result.get("limit") or 0),
-            "retry_after_s": int(result.get("retry_after_s") or 5),
+            "current": int(extra.get("current") or 0),
+            "limit": int(extra.get("limit") or 0),
+            "retry_after_s": int(result.retry_after_s or 5),
         }
         return JSONResponse(
             status_code=429,
@@ -1422,7 +1422,7 @@ async def _asample_impl(
             status_code=503, detail=f"Failed to enqueue sampling request: {e}"
         )
 
-    sampling_admission = admission.scheduler_result.get("sampling_inflight_admission")
+    sampling_admission = admission.scheduler_result.extra.get("sampling_inflight_admission")
     if isinstance(sampling_admission, dict) and bool(
         sampling_admission.get("would_reject")
     ):
@@ -2338,8 +2338,8 @@ async def compute_logprobs(
                 "domain_key": domain_key,
                 "affinity_group": affinity_group,
             },
-            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_sampling_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,

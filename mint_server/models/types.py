@@ -293,6 +293,13 @@ class FutureRetrieveRequest(BaseModel):
     model_id: str | None = None
 
 
+class FutureCancelRequest(BaseModel):
+    """Request to cancel an async operation."""
+
+    request_id: str
+    reason: str | None = None
+
+
 # =============================================================================
 # Training Types
 # =============================================================================

@@ -12,11 +12,17 @@ propagated into vLLM worker processes.
 from __future__ import annotations
 
 import importlib.util
+import importlib
 import json
 import multiprocessing.spawn as _mp_spawn
 import os
 import sys
 import sysconfig
+import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
 
 
 _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS = (
@@ -32,11 +38,82 @@ _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS = (
 )
 
 
+def _is_ray_worker_bootstrap_process(argv: list[str] | tuple[str, ...] | None = None) -> bool:
+    args = sys.argv if argv is None else argv
+    for arg in args:
+        value = str(arg)
+        if value == "ray._private.workers.default_worker":
+            return True
+        if value.replace("\\", "/").endswith("/ray/_private/workers/default_worker.py"):
+            return True
+    return False
+
+
+def _is_ray_actor_or_worker_process_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+) -> bool:
+    target = os.environ if environ is None else environ
+    for key in (
+        "RAY_ACTOR_ID",
+        "RAY_JOB_ID",
+        "RAY_WORKER_ID",
+        "RAY_WORKER_MODE",
+        "RAY_RAYLET_PID",
+    ):
+        if str(target.get(key, "")).strip():
+            return True
+    return False
+
+
+def _is_vllm_worker_patch_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+) -> bool:
+    target = os.environ if environ is None else environ
+    return _env_flag_from_mapping(target, "MINT_ENABLE_VLLM_IMPORT_PATCHES", default=False)
+
+
+def _should_sanitize_ray_worker_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> bool:
+    return (
+        _is_ray_worker_bootstrap_process(argv)
+        or _is_ray_actor_or_worker_process_environment(environ)
+        or _is_vllm_worker_patch_environment(environ)
+    )
+
+
+def _sanitize_ray_worker_bootstrap_process_environment(
+    environ: os._Environ[str] | dict[str, str] | None = None,
+    argv: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    if not _should_sanitize_ray_worker_environment(environ, argv):
+        return
+    target = os.environ if environ is None else environ
+    for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
+        target.pop(key, None)
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     value = os.environ.get(name)
     if value is None:
         return default
     return value.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _env_flag_from_mapping(
+    environ: os._Environ[str] | dict[str, str],
+    name: str,
+    *,
+    default: bool = False,
+) -> bool:
+    value = environ.get(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+_sanitize_ray_worker_bootstrap_process_environment()
 
 
 def _is_cv2_package_dir(path: object) -> bool:
@@ -88,9 +165,30 @@ def _sanitize_vllm_ray_runtime_env_dict(payload: object) -> object:
     if isinstance(env_vars, dict):
         cleaned = dict(env_vars)
         for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
-            cleaned.pop(key, None)
+            if key == "RAY_ADDRESS":
+                cleaned.pop(key, None)
+            else:
+                cleaned[key] = ""
         out["env_vars"] = cleaned
     return out
+
+
+def _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config: object) -> object:
+    runtime_env = getattr(parallel_config, "ray_runtime_env", None)
+    if not isinstance(runtime_env, dict):
+        return runtime_env
+    sanitized = _sanitize_vllm_ray_runtime_env_dict(runtime_env)
+    if isinstance(sanitized, dict):
+        env_vars = sanitized.get("env_vars")
+        if isinstance(env_vars, dict):
+            mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            if mint_gcs_address:
+                env_vars["MINT_RAY_GCS_ADDRESS"] = mint_gcs_address
+        preferred_executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip()
+        if preferred_executable:
+            sanitized["py_executable"] = preferred_executable
+        setattr(parallel_config, "ray_runtime_env", sanitized)
+    return sanitized
 
 
 def _patch_ray_runtime_env_to_dict_drop_driver_attach_hints() -> None:
@@ -112,6 +210,24 @@ def _patch_ray_runtime_env_to_dict_drop_driver_attach_hints() -> None:
 
     to_dict._mint_drops_driver_attach_hints = True  # type: ignore[attr-defined]
     RuntimeEnv.to_dict = to_dict  # type: ignore[method-assign]
+
+
+def _patch_ray_init_drop_worker_attach_hints() -> None:
+    try:
+        import ray
+    except Exception:
+        return
+
+    original = getattr(ray, "init", None)
+    if not callable(original) or getattr(original, "_mint_drops_worker_attach_hints", False):
+        return
+
+    def init(*args, **kwargs):  # type: ignore[no-untyped-def]
+        _sanitize_ray_worker_bootstrap_process_environment()
+        return original(*args, **kwargs)
+
+    init._mint_drops_worker_attach_hints = True  # type: ignore[attr-defined]
+    ray.init = init  # type: ignore[method-assign]
 
 
 def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
@@ -434,51 +550,95 @@ def _patch_vllm_ray_executor_sample_tokens_no_compiled_dag() -> None:
     cls.sample_tokens = sample_tokens  # type: ignore[method-assign]
 
 
+def _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+    ray_utils_module_name: str,
+    alias_module_names: tuple[str, ...],
+) -> bool:
+    try:
+        ray_utils_mod = importlib.import_module(ray_utils_module_name)
+    except Exception:
+        return False
+    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
+    if original is None:
+        return False
+    if getattr(original, "_mint_patched_explicit_cluster_address", False):
+        initialize_ray_cluster = original
+    else:
+
+        def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
+            mint_gcs_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
+            _sanitize_ray_worker_bootstrap_process_environment()
+            _sanitize_vllm_parallel_config_ray_runtime_env(parallel_config)
+            addr = ray_address
+            if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
+                env_addr = mint_gcs_address
+                if not env_addr:
+                    raise RuntimeError(
+                        "vLLM RayDistributedExecutor requires explicit MINT_RAY_GCS_ADDRESS; "
+                        "refusing to start nested local Ray inside EngineCore"
+                    )
+                addr = env_addr
+
+            # Reuse Mint's Ray init helper so EngineCore children inherit Ray Client
+            # attach hints and temp-dir/node-ip overrides instead of falling back to a
+            # fresh local-driver attach inside the worker process.
+            import ray
+            from mint_server.ray_utils import init_ray as mint_init_ray
+
+            if not ray.is_initialized() and not _is_ray_worker_bootstrap_process():
+                mint_init_ray(
+                    address=addr,
+                    runtime_env=getattr(parallel_config, "ray_runtime_env", None),
+                )
+            return original(parallel_config, ray_address=addr)
+
+        initialize_ray_cluster._mint_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
+    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    for alias_module_name in alias_module_names:
+        try:
+            alias_mod = importlib.import_module(alias_module_name)
+        except Exception:
+            continue
+        if hasattr(alias_mod, "initialize_ray_cluster"):
+            alias_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    return True
+
+
 def _patch_vllm_ray_executor_use_explicit_cluster_address() -> None:
-    """Prevent vLLM Ray executor from silently starting a local Ray head.
+    """Prevent vLLM Ray executors from silently starting a local Ray head.
 
     In our server, multinode vLLM actors already run inside a managed Ray
     cluster. If vLLM initializes its Ray executor with no address, Ray starts a
     standalone local head inside EngineCore, which hides the real failure behind
-    a nested cluster. Fail closed unless `RAY_ADDRESS` is explicitly available.
+    a nested cluster. Fail closed unless Mint's explicit GCS address is
+    available.
+
+    vLLM chooses different executor modules depending on `VLLM_USE_V1`; patch
+    both the v1 and v0 layouts when present.
     """
 
-    import vllm.v1.executor.ray_executor as ray_exec_mod
-    import vllm.v1.executor.ray_utils as ray_utils_mod
-
-    original = getattr(ray_utils_mod, "initialize_ray_cluster", None)
-    if original is None:
-        raise RuntimeError("vLLM missing initialize_ray_cluster")
-    if getattr(original, "_mint_patched_explicit_cluster_address", False):
-        return
-
-    def initialize_ray_cluster(parallel_config, ray_address=None):  # type: ignore[no-untyped-def]
-        addr = ray_address
-        if addr is None or (isinstance(addr, str) and addr.strip() in {"", "auto"}):
-            env_addr = os.environ.get("RAY_ADDRESS", "").strip()
-            if not env_addr:
-                raise RuntimeError(
-                    "vLLM RayDistributedExecutor requires explicit RAY_ADDRESS; "
-                    "refusing to start nested local Ray inside EngineCore"
-                )
-            addr = env_addr
-
-        # Reuse Mint's Ray init helper so EngineCore children inherit Ray Client
-        # attach hints and temp-dir/node-ip overrides instead of falling back to a
-        # fresh local-driver attach inside the worker process.
-        import ray
-        from mint_server.ray_utils import init_ray as mint_init_ray
-
-        if not ray.is_initialized():
-            mint_init_ray(
-                address=addr,
-                runtime_env=getattr(parallel_config, "ray_runtime_env", None),
-            )
-        return original(parallel_config, ray_address=addr)
-
-    initialize_ray_cluster._mint_patched_explicit_cluster_address = True  # type: ignore[attr-defined]
-    ray_utils_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
-    ray_exec_mod.initialize_ray_cluster = initialize_ray_cluster  # type: ignore[assignment]
+    patched = False
+    patched = (
+        _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+            "vllm.v1.executor.ray_utils",
+            ("vllm.v1.executor.ray_executor",),
+        )
+        or patched
+    )
+    patched = (
+        _patch_vllm_ray_executor_module_use_explicit_cluster_address(
+            "vllm.executor.ray_utils",
+            (
+                "vllm.executor.ray_distributed_executor",
+                "vllm.executor.ray_gpu_executor",
+            ),
+        )
+        or patched
+    )
+    if not patched:
+        raise RuntimeError(
+            "vLLM missing initialize_ray_cluster in supported Ray executor modules"
+        )
 
 
 def _patch_vllm_skip_dummy_lora_setup_when_inactive() -> None:
@@ -1222,7 +1382,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
 
         n_experts = len(loras) // 3
 
-        base_any = next((l for l in loras if l is not None), None)
+        base_any = next((lora for lora in loras if lora is not None), None)
         if base_any is None:
             raise RuntimeError(
                 f"MoE LoRA pack_moe got all-None loras for module={module_name!r}"
@@ -1313,7 +1473,7 @@ def _patch_vllm_pack_moe_sparse_ok() -> None:
                 scaling=[1.0, 1.0, 1.0],
             )
 
-        if all(l is not None for l in loras):
+        if all(lora is not None for lora in loras):
             # Dense checkpoints can still be block-shared across contiguous expert
             # ranges. If so, keep only one representative per contiguous block and
             # reuse the sparse-shard set_lora path to avoid materializing the full
@@ -1849,6 +2009,7 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
             "PYTHONPATH",
             "LD_LIBRARY_PATH",
             "MINT_ENABLE_VLLM_IMPORT_PATCHES",
+            "MINT_RAY_GCS_ADDRESS",
             "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE",
             "VLLM_USE_V1",
             "MINT_VLLM_DISABLE_MOE_LORA_PACKING",
@@ -1860,14 +2021,93 @@ def _patch_vllm_ray_env_carry_over_pythonpath() -> None:
             additional_vars2 = set(extra)
         else:
             additional_vars2 = set(additional_vars) | set(extra)
+        exclude_vars2 = set(exclude_vars or set()) | set(_DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS)
         return orig(
-            exclude_vars=exclude_vars,
+            exclude_vars=exclude_vars2,
             additional_vars=additional_vars2,
             destination=destination,
         )
 
     get_env_vars_to_copy._mint_pythonpath_carryover = True  # type: ignore[attr-defined]
     ray_env.get_env_vars_to_copy = get_env_vars_to_copy  # type: ignore[method-assign]
+
+
+def _patch_vllm_system_utils_spawn_without_ray_address() -> None:
+    """Keep vLLM's spawn fallback without leaking RAY_ADDRESS.
+
+    vLLM's `_maybe_force_spawn()` writes `ray.get_runtime_context().gcs_address`
+    into `RAY_ADDRESS` when it detects execution inside a Ray actor. That value
+    is then inherited by multiprocessing children and Ray default workers before
+    Mint's actor/runtime-env cleanup has a chance to run, causing nested
+    direct-attach attempts against stale node-local session paths. Mint uses
+    `MINT_RAY_GCS_ADDRESS` as the explicit direct-address hint instead.
+    """
+
+    try:
+        import vllm.utils.system_utils as system_utils  # type: ignore
+    except Exception:
+        return
+
+    original = getattr(system_utils, "_maybe_force_spawn", None)
+    if not callable(original) or getattr(original, "_mint_no_ray_address_spawn_hint", False):
+        return
+
+    def _maybe_force_spawn(*args, **kwargs):  # type: ignore[no-untyped-def]
+        os.environ.pop("RAY_ADDRESS", None)
+        if os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == "spawn":
+            return None
+
+        reasons = []
+        is_in_ray_actor = getattr(system_utils, "is_in_ray_actor", None)
+        if callable(is_in_ray_actor) and is_in_ray_actor():
+            try:
+                import ray  # type: ignore
+
+                gcs_address = str(ray.get_runtime_context().gcs_address).strip()
+            except Exception:
+                gcs_address = ""
+            if gcs_address and not os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip():
+                os.environ["MINT_RAY_GCS_ADDRESS"] = gcs_address
+            reasons.append("In a Ray actor and can only be spawned")
+
+        cuda_is_initialized = getattr(system_utils, "cuda_is_initialized", None)
+        if callable(cuda_is_initialized) and cuda_is_initialized():
+            reasons.append("CUDA is initialized")
+        else:
+            xpu_is_initialized = getattr(system_utils, "xpu_is_initialized", None)
+            if callable(xpu_is_initialized) and xpu_is_initialized():
+                reasons.append("XPU is initialized")
+
+        in_wsl = getattr(system_utils, "in_wsl", None)
+        if callable(in_wsl) and in_wsl():
+            reasons.append("WSL is detected and NVML is not compatible with fork")
+
+        if reasons:
+            logger = getattr(system_utils, "logger", None)
+            if logger is not None:
+                logger.warning(
+                    "We must use the `spawn` multiprocessing start method. "
+                    "Overriding VLLM_WORKER_MULTIPROC_METHOD to 'spawn'. "
+                    "See https://docs.vllm.ai/en/latest/usage/"
+                    "troubleshooting.html#python-multiprocessing "
+                    "for more information. Reasons: %s",
+                    "; ".join(reasons),
+                )
+            os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+        return None
+
+    _maybe_force_spawn._mint_no_ray_address_spawn_hint = True  # type: ignore[attr-defined]
+    system_utils._maybe_force_spawn = _maybe_force_spawn  # type: ignore[method-assign]
+    for module_name in (
+        # vLLM imports the function into module globals in these executor paths.
+        # Patch already-imported aliases so they do not keep the upstream
+        # RAY_ADDRESS-writing implementation.
+        "vllm.v1.executor.multiproc_executor",
+        "vllm.executor.multiproc_executor",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "_maybe_force_spawn"):
+            setattr(module, "_maybe_force_spawn", _maybe_force_spawn)
 
 
 def _patch_ray_placement_group_bundle_cache() -> None:
@@ -2039,7 +2279,9 @@ def _apply_vllm_worker_patches() -> None:
     os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
 
     _patch_ray_runtime_env_to_dict_drop_driver_attach_hints()
+    _patch_ray_init_drop_worker_attach_hints()
     _patch_vllm_ray_env_carry_over_pythonpath()
+    _patch_vllm_system_utils_spawn_without_ray_address()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
         _patch_vllm_pack_moe_sparse_ok()
         _patch_vllm_fused_moe_set_lora_sparse_shards()

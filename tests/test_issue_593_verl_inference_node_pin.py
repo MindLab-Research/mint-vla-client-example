@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import mint_server.config as server_config_module
 from mint_server.backend import verl_inference
 
 
@@ -80,6 +79,8 @@ def test_issue_593_verl_inference_uses_replica_env_for_node_affinity(monkeypatch
 @pytest.mark.anyio
 async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypatch):
     captured = {}
+    init_ray_calls = []
+    actor_env_calls = []
 
     class _FakeRolloutConfig:
         def __init__(self, **kwargs):
@@ -122,7 +123,8 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
         max_num_batched_tokens = 128
 
     monkeypatch.delenv("MINT_VLLM_ENABLE_SLEEP_MODE", raising=False)
-    monkeypatch.setenv("RAY_ADDRESS", "ray://test")
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
     monkeypatch.setenv("PFS_RUNTIME_ENV_ROOT", "/tmp/runtime")
     monkeypatch.setenv("MINT_CODE_ROOT", "/tmp/repo")
     monkeypatch.setenv("PFS_HF_MODULES_PATH", "/tmp/hf")
@@ -136,11 +138,24 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
     monkeypatch.setattr(verl_inference, "get_model_config", lambda _model: _FakeCfg())
     monkeypatch.setattr(verl_inference, "_create_extended_server_class", lambda **_kwargs: _FakeServer)
     monkeypatch.setattr(verl_inference, "_vllm_actor_pin_options_for_model", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(verl_inference, "init_ray", lambda **_kwargs: None)
+    monkeypatch.setattr(verl_inference, "init_ray", lambda **kwargs: init_ray_calls.append(kwargs))
     monkeypatch.setattr(
             config_module,
             "actor_runtime_env_vars",
-            lambda *, pythonpath, extra=None: {"PYTHONPATH": pythonpath, **(extra or {})},
+            lambda *, pythonpath, extra=None, include_ray_attach_hints=True: actor_env_calls.append(
+                {
+                    "pythonpath": pythonpath,
+                    "extra": extra or {},
+                    "include_ray_attach_hints": include_ray_attach_hints,
+                }
+            )
+            or {
+                "PYTHONPATH": pythonpath,
+                **(extra or {}),
+                "RAY_CLIENT_ADDRESS": "" if not include_ray_attach_hints else "should-not-be-used",
+                "MINT_RAY_CLIENT_ADDRESS": "" if not include_ray_attach_hints else "should-not-be-used",
+                "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
+            },
         )
     monkeypatch.setattr(config_module, "actor_ld_library_path", lambda: "")
     monkeypatch.setattr(config_module, "preferred_vllm_python_executable", lambda: "")
@@ -168,6 +183,14 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
     await engine.initialize()
 
     assert captured["enable_sleep_mode"] is False
+    assert actor_env_calls[-1]["include_ray_attach_hints"] is False
+    assert init_ray_calls == [
+        {
+            "address": "192.168.40.99:6379",
+            "namespace": verl_inference.RAY_NAMESPACE,
+            "ignore_reinit_error": True,
+        }
+    ]
 
 
 def test_issue_593_verl_inference_sleep_mode_env_override(monkeypatch):

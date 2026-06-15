@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 
-def test_issue_439_megatron_pg_recreates_incompatible_named_group(monkeypatch) -> None:
+
+def test_issue_439_megatron_pg_attaches_named_group_without_fallback_create(monkeypatch) -> None:
     from mint_server.backend import megatron_distributed as dist
     from mint_server.backend.ray_placement_groups import PlacementGroupMismatchError
 
     old_pg = object()
-    new_pg = object()
-    removed: list[object] = []
 
     def _raise_mismatch(pg_name: str, namespace: str, expected_bundles):
         assert pg_name == "megatron_qwen_pg"
@@ -18,16 +18,24 @@ def test_issue_439_megatron_pg_recreates_incompatible_named_group(monkeypatch) -
         raise PlacementGroupMismatchError(old_pg, "mismatch")
 
     monkeypatch.setattr(dist, "get_named_placement_group", _raise_mismatch)
-    monkeypatch.setattr(dist.ray.util, "remove_placement_group", lambda pg: removed.append(pg), raising=False)
-    monkeypatch.setattr(dist.ray.util, "placement_group", lambda *args, **kwargs: new_pg, raising=False)
-
-    out = dist._get_or_create_megatron_placement_group(
-        pg_name="megatron_qwen_pg",
-        bundles=[{"GPU": 1, "CPU": 1, "node:192.168.38.175": 0.001}],
+    monkeypatch.setattr(
+        dist.ray.util,
+        "remove_placement_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backend must not remove controller-owned PG")),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        dist.ray.util,
+        "placement_group",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("backend must not create PG")),
+        raising=False,
     )
 
-    assert removed == [old_pg]
-    assert out is new_pg
+    with pytest.raises(PlacementGroupMismatchError):
+        dist._get_or_create_megatron_placement_group(
+            pg_name="megatron_qwen_pg",
+            bundles=[{"GPU": 1, "CPU": 1, "node:192.168.38.175": 0.001}],
+        )
 
 
 def test_issue_439_node_affinity_resources_follow_bundle_pin() -> None:

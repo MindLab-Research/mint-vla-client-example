@@ -32,7 +32,7 @@ These values remain explicit actor bootstrap inputs because the actor cannot que
 - `PFS_RUNTIME_ENV_ROOT`
 - `MINT_CODE_ROOT`
 - `PFS_HF_MODULES_PATH`
-- `RAY_ADDRESS`
+- `MINT_RAY_GCS_ADDRESS`
 - `MINT_RAY_NAMESPACE`
 - `MINT_CONFIG_PATH`
 - Ray Client packaging inputs such as `MINT_RAY_JOB_WORKING_DIR`, `MINT_RAY_WORKING_DIR`, and `MINT_RAY_PY_MODULES_CSV`

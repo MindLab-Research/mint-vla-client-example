@@ -45,7 +45,6 @@ rsync -avz --dry-run \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.env' \
-  --exclude='.secrets.env' \
   --exclude='.venv' \
   --exclude='.venv*/' \
   --exclude='.venv_cpu/' \
@@ -99,7 +98,8 @@ ssh mint-prod-aliyun 'apt-get update && apt-get install -y ca-certificates'
 
 ### Credentials source (mint-prod-aliyun)
 
-For this project, credentials are stored in the repo-root `.env`:
+Credentials must come from an operator-managed env file outside the repo or
+from the launching shell:
 - `ALI_ACCESSKEY_ID`
 - `ALI_ACCESSKEY_SECRET`
 
@@ -107,7 +107,7 @@ Workflow:
 ```bash
 cd /path/to/mint-server-prod
 set -a
-source .env
+. /path/to/operator/aliyun.env
 set +a
 ```
 
@@ -222,11 +222,11 @@ ssh mint-prod-aliyun 'dlc logs <WORKER_JOB_ID> <POD_ID> --max_events_num 200'
 Run from `mint-prod-aliyun`:
 ```bash
 ssh mint-prod-aliyun "cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
-  RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 PYTHONPATH=$PWD .venv_cpu/bin/python - <<'PY'
+  MINT_RAY_GCS_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 PYTHONPATH=$PWD .venv_cpu/bin/python - <<'PY'
 import os
 import ray
 
-ray.init(address=os.environ['RAY_ADDRESS'])
+ray.init(address=os.environ['MINT_RAY_GCS_ADDRESS'])
 print(ray.cluster_resources())
 PY"
 ```
@@ -257,7 +257,7 @@ Invariants:
 ### Start mint-server on mint-prod-aliyun
 
 Key env vars:
-- `RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379`
+- `MINT_RAY_GCS_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379`
 - `MINT_SUPPORTED_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507`
 - `MINT_PERSISTENT_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507`
 - `MINT_CHECKPOINT_DIR=/vePFS-Mindverse/share/mint_checkpoints`
@@ -267,10 +267,10 @@ Key env vars:
 Start (uses project-owned `.venv_cpu`; logs to `/tmp/mint_server_auth.log`):
 ```bash
 ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
-  set -a && source .secrets.env && set +a && \
+  set -a && . /path/to/operator/mint-prod-aliyun.env && set +a && \
   pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true; \
   nohup bash -c "PYTHONPATH=$PWD:$PYTHONPATH HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
-    PYTHONDONTWRITEBYTECODE=1 RAY_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 MINT_PORT=18000 \
+    PYTHONDONTWRITEBYTECODE=1 MINT_RAY_GCS_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 MINT_PORT=18000 \
     MINT_SUPPORTED_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507 \
     MINT_PERSISTENT_MODELS=Qwen/Qwen3-235B-A22B-Instruct-2507 \
     MINT_PERSISTENT_TRAIN_LORA_RANK=16 MINT_PERSISTENT_TRAIN_LR=5e-5 \
@@ -319,9 +319,9 @@ $py -m pip install -q --target "$target" ninja packaging nvidia-ml-py rich tqdm 
 
 Sanity check on a GPU worker (forces execution on a GPU pod):
 ```bash
-ssh mint-prod-aliyun 'RAY_ADDRESS=<HEAD_IP>:6379 /vePFS-Mindverse/share/code/mint-server-aliyun/.venv/bin/python - <<'"'"'PY'"'"'
+ssh mint-prod-aliyun 'MINT_RAY_GCS_ADDRESS=<HEAD_IP>:6379 /vePFS-Mindverse/share/code/mint-server-aliyun/.venv/bin/python - <<'"'"'PY'"'"'
 import os, ray
-ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
+ray.init(address=os.environ["MINT_RAY_GCS_ADDRESS"], ignore_reinit_error=True)
 
 @ray.remote(num_gpus=1)
 def probe():

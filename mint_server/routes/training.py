@@ -422,8 +422,8 @@ async def _enqueue_training_model_work_route(
             ),
         },
         queued_meta=queued_meta,
-        task_futures_client=task_futures,
         scheduler_client=model_work_scheduler,
+        future_service_client=task_futures,
         trace_enqueue=_enqueue_training_request_with_trace,
         trace_kwargs={
             "route_start_s": route_start_s,
@@ -432,7 +432,7 @@ async def _enqueue_training_model_work_route(
             "backend": backend,
         },
     )
-    return result.scheduler_result
+    return result.scheduler_result.to_wire()
 
 
 def _get_webhook_url(request: Request) -> str | None:
@@ -1959,7 +1959,6 @@ async def _enqueue_internal_serialized_model_op(
     from ..backend.model_work_scheduler import model_work_scheduler
 
     request_id = uuid.uuid4().hex
-    created = False
     inflight_marked = False
     try:
         await _mark_training_inflight(model_id, +1)
@@ -1977,15 +1976,12 @@ async def _enqueue_internal_serialized_model_op(
             ordering_key=f"training_session:{model_id}",
             extra=dict(extra),
             queued_meta=_build_training_queued_meta(op=op, model_id=model_id),
-            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
         )
-        created = True
     except Exception as e:
         if inflight_marked:
             await _mark_training_inflight(model_id, -1)
-        if created:
-            await task_futures.async_cleanup(request_id)
         raise HTTPException(
             status_code=503, detail=f"Failed to enqueue {op} request: {e}"
         ) from e
@@ -2125,8 +2121,8 @@ async def create_model(
             queued_meta=_build_training_queued_meta(
                 op="create_model", model_id=model_id
             ),
-            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,
@@ -2596,8 +2592,8 @@ async def create_model_from_state(
             queued_meta=_build_training_queued_meta(
                 op="create_model_from_state", model_id=model_id
             ),
-            task_futures_client=task_futures,
             scheduler_client=model_work_scheduler,
+            future_service_client=task_futures,
             trace_enqueue=_enqueue_training_request_with_trace,
             trace_kwargs={
                 "route_start_s": route_start_s,

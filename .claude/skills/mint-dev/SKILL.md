@@ -30,7 +30,7 @@ update the skill instead of reviving old deployment paths.
 | API port | `8000` (code default) |
 | Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` (launcher default) |
 | Ray namespace | `mint_${USER}` with a non-root user name |
-| Private config | `/vePFS-Mindverse/share/mint/dev/config/secrets.env` |
+| Auth mode | `no-auth` by default; exceptional auth env must come from the explicit launch environment |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
 
 The dev Ray head is reachable only as a Ray Client endpoint. Do not use
@@ -41,9 +41,8 @@ historical `ssh mint-dev` commands.
 `scripts/start_dev_server.sh` is the dev launcher. It takes the smallest
 possible input set and lets everything else fall back to code defaults
 (host/port, `LD_LIBRARY_PATH`, vLLM child python, HF modules, supported-model
-list). It does NOT source a shared `common.env`; that historical file hardcodes
-a fixed code checkout and a shared Ray namespace, which the per-launch contract
-forbids.
+list). It does NOT source ambient shared env files: code checkout and Ray
+namespace are per-launch identity inputs.
 
 | Variable | Role | Source |
 |----------|------|--------|
@@ -75,7 +74,7 @@ Sync your local checkout to your chosen share path before starting:
 ```bash
 rsync -a --delete <your-local-checkout>/ /vePFS-Mindverse/share/<your-path>/
 MINT_CODE_ROOT=/vePFS-Mindverse/share/<your-path> MINT_DEV_USER=<you> \
-  MINT_DEV_DEPLOYMENT_ENV=/share/mint/dev/config/common.env \
+  MINT_DEV_DEPLOYMENT_ENV=/path/to/explicit/deployment.env \
   nohup scripts/start_dev_server.sh >> /tmp/mint_dev.log 2>&1 &
 ```
 
@@ -88,8 +87,9 @@ the namespace cannot be derived (for example you run as root), ask the user**
 for `MINT_RAY_NAMESPACE` or `MINT_DEV_USER` instead of inventing one. Do not
 hard-code shared namespaces such as `tinker_leixiang`.
 
-`secrets.env` holds private values (API keys, credentials). Source it only when
-needed; never print it, commit it, or paste its contents into logs.
+Dev runs should not use a default `secrets.env`. Keep per-run values in the
+explicit launch environment or `MINT_DEV_DEPLOYMENT_ENV`, and never print,
+commit, or paste private values into logs.
 
 ## Code Versioning
 
@@ -191,13 +191,13 @@ Before killing anything, list exact targets and verify the namespace prefix:
 ```bash
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
 export CLEANUP_NAMESPACE_PREFIX="mint_pr668_"
-RAY_ADDRESS="ray://${HEAD_IP}:10001" \
+MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
 /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'
 import os
 import ray
 
 prefix = os.environ["CLEANUP_NAMESPACE_PREFIX"]
-ray.init(address=os.environ["RAY_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
+ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
 targets = []
 for actor in ray.util.list_named_actors(all_namespaces=True):
     namespace = str(actor.get("namespace") or actor.get("ray_namespace") or "")
@@ -234,16 +234,14 @@ ray.shutdown()
 PY
 ```
 
-For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured,
-`/internal/*` also requires platform-forwarded identity headers. A plain
-`X-API-Key` request can return `401 {"error":"Missing platform auth headers"}`.
-When auth is enabled, source the dev secrets without printing values and send
-the internal token plus a synthetic operator identity:
+For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured
+through an explicit launch environment, `/internal/*` also requires
+platform-forwarded identity headers. A plain `X-API-Key` request can return
+`401 {"error":"Missing platform auth headers"}`. When auth is enabled, pass the
+internal token through the process environment without printing values and send
+the token plus a synthetic operator identity:
 
 ```bash
-set -a
-. /vePFS-Mindverse/share/mint/dev/config/secrets.env
-set +a
 /usr/bin/curl -s \
   -H "X-Internal-Token: ${MINT_INTERNAL_API_TOKEN:-}" \
   -H "X-MinT-User-Id: 000000000000000000000001" \
@@ -280,14 +278,14 @@ the project runtime Python and Ray Client:
 ```bash
 PY=/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-export RAY_ADDRESS="ray://${HEAD_IP}:10001"
+export MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001"
 export MINT_RAY_NAMESPACE="mint_${USER}"
 $PY - <<'PY'
 import os
 import ray
 
 namespace = os.environ["MINT_RAY_NAMESPACE"]
-ray.init(address=os.environ["RAY_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
+ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
 actor = ray.get_actor("mint_config", namespace=namespace)
 ray.kill(actor, no_restart=True)
 print(f"killed mint_config namespace={namespace}")
@@ -312,7 +310,6 @@ attaches through Ray Client using the current head-address file:
 
 ```bash
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-RAY_ADDRESS="ray://${HEAD_IP}:10001" \
 MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
 /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200
 ```

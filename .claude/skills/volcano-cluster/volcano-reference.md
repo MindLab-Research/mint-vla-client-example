@@ -36,7 +36,7 @@ Storages:
 
 | Path | Purpose |
 |------|---------|
-| `/vePFS-Mindverse/share/mint/dev/mint-server/` | Dev server git checkout |
+| `/vePFS-Mindverse/share/<owner>/mint-server/` | Explicit dev server checkout passed as `MINT_CODE_ROOT` |
 | `/vePFS-Mindverse/share/mint/prod/mint-server/` | Prod server git checkout |
 | `/vePFS-Mindverse/share/mint/dev/runtime/` | Dev runtime symlink |
 | `/vePFS-Mindverse/share/mint/prod/runtime/` | Prod runtime symlink |

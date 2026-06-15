@@ -43,7 +43,7 @@ def _env() -> Env:
     port = int(os.environ.get("MINT_PORT", "10238"))
     base_url = os.environ.get("MINT_BASE_URL", f"http://localhost:{port}")
     api_key = _coalesce(os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"), "dummy") or "dummy"
-    ray_address = _require_env("RAY_ADDRESS")
+    ray_address = _require_env("MINT_RAY_GCS_ADDRESS")
     ray_namespace = _coalesce(os.environ.get("MINT_RAY_NAMESPACE"), os.environ.get("MINT_RAY_NAMESPACE"))
     if not ray_namespace:
         raise SystemExit("error: missing env MINT_RAY_NAMESPACE or MINT_RAY_NAMESPACE")
@@ -129,7 +129,7 @@ def _wait_ready(env: Env, *, timeout_s: float) -> None:
 def _kill_namespace_actors(env: Env) -> None:
     out = _ssh(
         env,
-        "RAY_ADDRESS="
+        "MINT_RAY_GCS_ADDRESS="
         + json.dumps(env.ray_address)
         + " MINT_RAY_NAMESPACE="
         + json.dumps(env.ray_namespace)
@@ -138,7 +138,7 @@ def _kill_namespace_actors(env: Env) -> None:
         + " python - <<'PY'\n"
         "import os\n"
         "import ray\n"
-        "ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)\n"
+        "ray.init(address=os.environ['MINT_RAY_GCS_ADDRESS'], ignore_reinit_error=True)\n"
         "ns = os.environ['MINT_RAY_NAMESPACE']\n"
         "actors = ray.util.list_named_actors(all_namespaces=True)\n"
         "killed = 0\n"
@@ -163,12 +163,12 @@ def _kill_namespace_actors(env: Env) -> None:
 def _get_server_job_id(env: Env, pid: int) -> str:
     out = _ssh(
         env,
-        "RAY_ADDRESS="
+        "MINT_RAY_GCS_ADDRESS="
         + json.dumps(env.ray_address)
         + " python - <<'PY'\n"
         "import os\n"
         "import ray\n"
-        "ray.init(address=os.environ['RAY_ADDRESS'], ignore_reinit_error=True)\n"
+        "ray.init(address=os.environ['MINT_RAY_GCS_ADDRESS'], ignore_reinit_error=True)\n"
         "from ray._private.state import jobs\n"
         f"pid = int({int(pid)})\n"
         "for j in jobs():\n"

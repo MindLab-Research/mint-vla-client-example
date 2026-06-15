@@ -362,7 +362,7 @@ async def lifespan(app: FastAPI):
         weights.training_engine = None
         weights.inference_manager = None
         logger.info(
-            "Training route globals left unbound in API process; ModelWorkScheduler and ModelRuntimeActor own scheduled training execution state"
+            "Training route globals left unbound in API process; ModelWorkScheduler and ModelEngineHost own scheduled training execution state"
         )
 
         # ==========================================================================

@@ -17,9 +17,22 @@ _RAY_INIT_THREAD_LOCK = threading.Lock()
 _RAY_INIT_LOCK_PATH_ENV = "MINT_RAY_INIT_LOCK_PATH"
 _RAY_INIT_LOCK_TIMEOUT_ENV = "MINT_RAY_INIT_LOCK_TIMEOUT_S"
 _RAY_INIT_LOCK_POLL_ENV = "MINT_RAY_INIT_LOCK_POLL_S"
+_RAY_GCS_ADDRESS_ENV = "MINT_RAY_GCS_ADDRESS"
 _RAY_HEAD_ADDRESS_PATH_ENV = "MINT_RAY_HEAD_ADDRESS_PATH"
 _RAY_RECONNECT_POLL_ENV = "MINT_RAY_RECONNECT_POLL_S"
 _DEFAULT_RAY_GCS_PORT = 6379
+_RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS = frozenset(
+    {
+        "MINT_RAY_TEMP_DIR",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "RAY_TMPDIR",
+        "TMPDIR",
+        "TMP",
+        "TEMP",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_CLIENT_ADDRESS",
+    }
+)
 _RAY_LAST_INIT_ADDRESS: str | None = None
 _RAY_CONNECTION_EPOCH = 0
 _RAY_RECONNECT_INVALIDATORS: list[Callable[[], None]] = []
@@ -57,15 +70,6 @@ def _read_configured_ray_head_address(path: Path) -> str:
     return _normalize_ray_address(raw)
 
 
-def ray_address_source_configured() -> bool:
-    if _configured_ray_head_address_path() is not None:
-        return True
-    return any(
-        bool(os.environ.get(name, "").strip())
-        for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS")
-    )
-
-
 def ray_reconnect_poll_s() -> float:
     raw = os.environ.get(_RAY_RECONNECT_POLL_ENV, "").strip()
     if not raw:
@@ -88,32 +92,48 @@ def ray_log_to_driver_kwargs() -> dict[str, Any]:
 
 
 def ray_client_working_dir() -> str | None:
-    addr = os.environ.get("RAY_ADDRESS", "").strip()
-    if not addr.startswith("ray://"):
+    if not any(os.environ.get(name, "").strip().startswith("ray://") for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS")):
         return None
     working_dir = os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
     return working_dir or None
 
 
-def require_ray_address() -> str:
-    addr = os.environ.get("RAY_ADDRESS", "").strip()
-    if not addr:
-        raise MissingRayAddressError("RAY_ADDRESS must be set before initializing Ray")
-    return _normalize_ray_address(addr)
-
-
-def preferred_driver_ray_address() -> str:
+def preferred_ray_gcs_address() -> str | None:
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
     configured_path = _configured_ray_head_address_path()
     if configured_path is not None:
         return _read_configured_ray_head_address(configured_path)
-    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+    return None
+
+
+def strict_ray_gcs_address() -> str | None:
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
+    configured_path = _configured_ray_head_address_path()
+    if configured_path is not None:
+        return _read_configured_ray_head_address(configured_path)
+    return None
+
+
+def preferred_driver_ray_address() -> str:
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
         addr = os.environ.get(name, "").strip()
         if addr:
             return _normalize_ray_address(addr)
+    configured_path = _configured_ray_head_address_path()
+    if configured_path is not None:
+        return _read_configured_ray_head_address(configured_path)
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
     raise MissingRayAddressError(
-        "RAY_ADDRESS must be set before initializing Ray "
+        "explicit Ray address is required before initializing Ray "
         f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
-        "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
+        "set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver, "
+        f"or {_RAY_GCS_ADDRESS_ENV} for direct attach)"
     )
 
 
@@ -181,9 +201,17 @@ def _driver_runtime_env() -> dict[str, Any]:
     # fails with ModuleNotFoundError. Pass PFS_PYTHONPATH as env_vars so the
     # head node can resolve mint_server without an upload.
     if not working_dir:
-        from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
-        if PFS_PYTHONPATH:
-            runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = PFS_PYTHONPATH
+        pfs_pythonpath = ""
+        try:
+            from mint_server.config import PFS_PYTHONPATH  # noqa: PLC0415
+
+            pfs_pythonpath = str(PFS_PYTHONPATH or "")
+        except Exception:
+            pfs_pythonpath = ""
+        if not pfs_pythonpath:
+            pfs_pythonpath = os.environ.get("MINT_CODE_ROOT", "").strip()
+        if pfs_pythonpath:
+            runtime_env.setdefault("env_vars", {})["PYTHONPATH"] = pfs_pythonpath
 
     py_modules_csv = os.environ.get("MINT_RAY_PY_MODULES_CSV", "").strip()
     py_modules: list[str] = []
@@ -213,6 +241,16 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
     if not addr or not addr.startswith("ray://"):
         return None
     runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
+    runtime_env = _blank_ray_worker_bootstrap_attach_env(addr, runtime_env)
+    if isinstance(runtime_env, dict):
+        try:
+            from mint_server.config import preferred_vllm_python_executable  # noqa: PLC0415
+
+            preferred_python = (preferred_vllm_python_executable() or "").strip()
+        except Exception:
+            preferred_python = ""
+        if preferred_python:
+            runtime_env.setdefault("py_executable", preferred_python)
     return runtime_env or None
 
 
@@ -306,6 +344,32 @@ def _job_level_runtime_env(address: str, existing: Any) -> dict[str, Any] | Any:
     return runtime_env or existing
 
 
+def _blank_ray_worker_bootstrap_attach_env(address: str, existing: Any) -> dict[str, Any] | Any:
+    if not isinstance(address, str) or not address.startswith("ray://"):
+        return existing
+    if existing is None:
+        runtime_env: dict[str, Any] = {}
+    elif isinstance(existing, dict):
+        runtime_env = dict(existing)
+    else:
+        return existing
+    env_vars_raw = runtime_env.get("env_vars")
+    env_vars = dict(env_vars_raw) if isinstance(env_vars_raw, dict) else {}
+    # Keep Ray Client job-level worker bootstrap free of direct cluster attach
+    # hints. Mint actors that need the GCS address receive it through
+    # actor_runtime_env_vars(); Ray default workers must register with the
+    # raylet-provided bootstrap flags instead of observing a direct-attach env.
+    env_vars.pop(_RAY_GCS_ADDRESS_ENV, None)
+    # Do not put RAY_ADDRESS into Ray runtime_env at all. Empty env values can be
+    # dropped or merged inconsistently by Ray; worker entry wrappers delete any
+    # inherited value before Ray's Python bootstrap starts.
+    env_vars.pop("RAY_ADDRESS", None)
+    for key in _RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS:
+        env_vars[key] = ""
+    runtime_env["env_vars"] = env_vars
+    return runtime_env
+
+
 def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
@@ -328,9 +392,10 @@ def init_ray(**kwargs: Any) -> Any:
             if ray.is_initialized():
                 return None
             raise MissingRayAddressError(
-                "RAY_ADDRESS must be set before initializing Ray "
+                "explicit Ray address is required before initializing Ray "
                 f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
-                "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
+                "set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver, "
+                f"or {_RAY_GCS_ADDRESS_ENV} for direct attach)"
             )
         desired_address: Any = configured_address
     elif isinstance(current, str):
@@ -344,6 +409,7 @@ def init_ray(**kwargs: Any) -> Any:
         runtime_env = client_job_runtime_env(address=desired_address)
     else:
         runtime_env = _job_level_runtime_env(desired_address, existing_runtime_env)
+        runtime_env = _blank_ray_worker_bootstrap_attach_env(desired_address, runtime_env)
     if runtime_env is not None:
         kwargs["runtime_env"] = runtime_env
 

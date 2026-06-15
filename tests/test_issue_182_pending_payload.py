@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from mint_server.backend.control_plane_contracts import RetrieveTaskResult
 from mint_server.backend.task_state_store import FutureStatus
 from mint_server.models.types import FutureRetrieveRequest
 from mint_server.routes import futures as futures_route
@@ -86,6 +87,32 @@ def _install_scheduler(monkeypatch, *, present: bool = True) -> _StubModelWorkSc
     return scheduler
 
 
+class _StubModelWorkTaskGateway:
+    def __init__(self, result: RetrieveTaskResult) -> None:
+        self.result = result
+        self.calls: list[dict] = []
+
+    async def retrieve_task(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        return self.result
+
+
+def _install_task_gateway(monkeypatch, result: RetrieveTaskResult) -> _StubModelWorkTaskGateway:
+    import mint_server.backend.model_work_task_gateway as gateway_module
+
+    gateway = _StubModelWorkTaskGateway(result)
+    monkeypatch.setattr(gateway_module, "model_work_task_gateway", gateway)
+    return gateway
+
+
+@pytest.fixture(autouse=True)
+def _install_default_pending_task_gateway(monkeypatch):
+    _install_task_gateway(
+        monkeypatch,
+        RetrieveTaskResult(status="pending", request_id="stub_pending", retry_after_s=1.0),
+    )
+
+
 def _request_stub():
     return SimpleNamespace(state=SimpleNamespace(user_data={"user_id": "admin"}), headers={})
 
@@ -122,9 +149,7 @@ def test_issue_182_pending_payload_model_work_scheduler_queued(monkeypatch):
     assert payload.get("ordering_key") == "session:session-a"
     assert payload.get("estimated_wait_s") is None
     assert response.headers.get("X-Queue-ETA-S") is None
-    assert scheduler.contains_calls == [
-        {"request_id": "rid_model_work_scheduler_queued", "hydrate_task_state": False}
-    ]
+    assert scheduler.contains_calls == []
 
 
 def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monkeypatch):
@@ -143,9 +168,7 @@ def test_issue_182_pending_payload_defaults_queued_to_model_work_scheduler(monke
     assert payload.get("queue_position") is None
     assert payload.get("queue_depth") is None
     assert response.headers.get("Retry-After") == "1"
-    assert scheduler.contains_calls == [
-        {"request_id": "rid_queue_default", "hydrate_task_state": False}
-    ]
+    assert scheduler.contains_calls == []
 
 
 def test_issue_182_pending_payload_reason_null_when_not_queued(monkeypatch):
@@ -359,7 +382,7 @@ def test_issue_182_scheduled_alias_is_normalized_to_model_work_scheduler(monkeyp
     assert response.headers.get("X-Queue-Scheduler-Domain") == "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
 
 
-def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
+def test_issue_593_model_work_scheduler_orphan_stays_pending_on_retrieve(monkeypatch):
     meta = {
         "queue_state": "queued",
         "stage": "queued",
@@ -375,10 +398,42 @@ def test_issue_593_model_work_scheduler_orphan_fails_on_retrieve(monkeypatch):
     response = _response_stub()
     payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
 
+    assert response.status_code == 408
+    assert payload.get("request_id") == "rid_orphaned_model_work"
+    assert payload.get("type") == "try_again"
+    assert payload.get("queue_kind") == "model_work_scheduler"
+    assert scheduler.contains_calls == []
+
+
+def test_issue_182_pending_model_work_terminal_uses_gateway_result(monkeypatch):
+    meta = {
+        "queue_state": "queued",
+        "stage": "queued",
+        "op": "sampling.asample",
+        "queue_kind": "model_work_scheduler",
+    }
+    monkeypatch.setattr(futures_route, "task_futures", _StubTaskFutureService(meta))
+    gateway = _install_task_gateway(
+        monkeypatch,
+        RetrieveTaskResult(
+            status="failed",
+            request_id="rid_gateway_failed",
+            error={"message": "gateway terminal failure"},
+        ),
+    )
+
+    body = FutureRetrieveRequest(request_id="rid_gateway_failed")
+    response = _response_stub()
+    payload = asyncio.run(futures_route.retrieve_future(body, _request_stub(), response))
+
     assert response.status_code == 200
-    assert payload.get("error") == "model work scheduler recovered without this request; request must be retried"
-    assert scheduler.contains_calls == [
-        {"request_id": "rid_orphaned_model_work", "hydrate_task_state": False}
+    assert payload == {"error": "gateway terminal failure", "category": "system"}
+    assert gateway.calls == [
+        {
+            "request_id": "rid_gateway_failed",
+            "wait_timeout_s": 0.0,
+            "privileged": True,
+        }
     ]
 
 

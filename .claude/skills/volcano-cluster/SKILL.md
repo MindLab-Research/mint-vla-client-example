@@ -121,7 +121,7 @@ providers:
       mode: default_chain
     templates:
       a800-8gpu-c1:
-        template_path: /vePFS-Mindverse/share/mint/dev/mint-server/.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml
+        template_path: /vePFS-Mindverse/share/<owner>/mint-server/.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml
         resource_queue_id: q-20251126180002-26lwz
         gpu_count: 8
 nodes:

@@ -8,7 +8,6 @@ import pytest
 from mint_server.config import ServerConfig
 from mint_server.runtime_config import (
     CONFIG_ACTOR_DEFAULT_NAME,
-    CONFIG_CLASS_ACTOR_CREATION_INPUT,
     CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV,
     CONFIG_CLASS_OBSERVABILITY,
     CONFIG_CLASS_SNAPSHOT_CONFIG,
@@ -35,6 +34,8 @@ def test_config_actor_uses_stable_namespace_local_name_by_default() -> None:
 def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observability() -> None:
     assert classify_env_key("PFS_RUNTIME_ENV_ROOT") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
     assert classify_env_key("MINT_RAY_JOB_WORKING_DIR") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
+    assert classify_env_key("MINT_RAY_GCS_ADDRESS") == CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV
+    assert classify_env_key("RAY_ADDRESS") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_MODEL_PLACEMENT_JSON") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_MODEL_ACTOR_REPLICA_ID") == CONFIG_CLASS_UNCLASSIFIED
     assert classify_env_key("MINT_VLLM_MAX_NUM_SEQS") == CONFIG_CLASS_SNAPSHOT_CONFIG
@@ -294,19 +295,26 @@ def test_config_actor_detects_existing_snapshot_mismatch(monkeypatch) -> None:
 def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
     from mint_server.backend import config_actor
 
+    captured: dict[str, object] = {}
     monkeypatch.setattr(config_actor, "RAY_NAMESPACE", "mint-ns")
     monkeypatch.setattr(config_actor, "PFS_PYTHONPATH", "/pythonpath")
-    monkeypatch.setattr(
-        config_actor,
-        "actor_runtime_env",
-        lambda *, pythonpath, extra=None, include_config_snapshot=True: {
+    def _fake_actor_runtime_env(
+        *,
+        pythonpath,
+        extra=None,
+        include_config_snapshot=True,
+        include_ray_attach_hints=True,
+    ):
+        captured["include_ray_attach_hints"] = include_ray_attach_hints
+        return {
             "env_vars": {
                 "PYTHONPATH": pythonpath,
                 **(extra or {}),
                 **({"MINT_CONFIG_ACTOR_HYDRATE": "1"} if include_config_snapshot else {}),
             }
-        },
-    )
+        }
+
+    monkeypatch.setattr(config_actor, "actor_runtime_env", _fake_actor_runtime_env)
     monkeypatch.setattr(config_actor, "apply_detached_actor_resources", lambda options, ray_module: None)
 
     options = config_actor._actor_options(actor_name="mint_config")
@@ -321,6 +329,7 @@ def test_config_actor_options_are_detached_namespace_local(monkeypatch) -> None:
             "MINT_CONFIG_ACTOR_SELF": "1",
         }
     }
+    assert captured["include_ray_attach_hints"] is False
 
 
 def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:
@@ -330,7 +339,7 @@ def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(m
     monkeypatch.setattr(server_config, "MINT_CODE_ROOT", "/repo")
     monkeypatch.setattr(server_config, "PFS_HF_MODULES_PATH", "/hf")
     monkeypatch.setattr(server_config, "RAY_NAMESPACE", "mint-test")
-    monkeypatch.setenv("RAY_ADDRESS", "ray://127.0.0.1:10001")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "127.0.0.1:6379")
 
     env_vars = server_config.actor_runtime_env_vars(
         pythonpath="/runtime/pythonpath",
@@ -350,6 +359,10 @@ def test_only_config_actor_disables_config_actor_hydration() -> None:
                 matches.append((str(path.relative_to(repo_root)), line.strip()))
 
     assert matches == [
+        (
+            "mint_server/backend/async_ray_control.py",
+            "include_config_snapshot=False,",
+        ),
         (
             "mint_server/backend/config_actor.py",
             "include_config_snapshot=False,",

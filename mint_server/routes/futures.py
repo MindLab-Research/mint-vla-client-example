@@ -16,13 +16,15 @@ from fastapi import APIRouter, HTTPException, Request, Response
 
 from ..auth_identity import can_view_internal_errors
 from ..backend.queue_stage_timing import build_queue_stage_timing
+from ..backend.task_payload_store import TaskPayloadStore
 from ..backend.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
 from ..futures_utils import pending_future_http_response
 from ..logging_context import record_retrieve_future_wait_metric
-from ..models.types import FutureRetrieveRequest
+from ..models.types import FutureCancelRequest, FutureRetrieveRequest
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+task_payload_store = TaskPayloadStore()
 
 
 def _retrieve_grace_s() -> float:
@@ -74,6 +76,15 @@ def _apply_cached_response(cached: Any, response: Response) -> Any:
     if isinstance(headers, dict):
         response.headers.update(headers)
     return cached["__cached_body__"]
+
+
+def _apply_local_cached_response(cached: Any, request: Request, response: Response) -> Any:
+    body = _apply_cached_response(cached, response)
+    if isinstance(body, dict) and "error" in body and not _is_privileged(request):
+        masked = dict(body)
+        masked["error"] = _public_error(masked.get("error"))
+        return masked
+    return body
 
 
 def _local_hot_ttl_s() -> float:
@@ -149,49 +160,105 @@ def _record_retrieve_wait(*, path: str, outcome: str, waited: bool) -> None:
     record_retrieve_future_wait_metric(path=path, outcome=outcome, waited=waited)
 
 
+def _is_model_work_scheduler_meta(meta: Any) -> bool:
+    if not isinstance(meta, dict):
+        return False
+    queue_kind = meta.get("queue_kind")
+    if queue_kind in {"model_work_scheduler", "scheduled"}:
+        return True
+    op = meta.get("op")
+    queue_state = meta.get("queue_state")
+    return isinstance(op, str) and op.startswith("sampling.") and queue_state in {"queued", "running"}
+
+
+async def _present_gateway_terminal_result(result: Any, http_request: Request) -> Any:
+    from ..backend.task_payload_presenter import present_terminal_retrieve_result
+
+    payload = await present_terminal_retrieve_result(
+        result,
+        error_presenter=lambda error: _failed_payload(error, http_request),
+        payload_store=task_payload_store,
+    )
+    _recent_put(result.request_id, payload, ttl_s=_local_hot_ttl_s())
+    return payload
+
+
+async def _retrieve_model_work_via_gateway(
+    *,
+    request_id: str,
+    wait_timeout_s: float,
+    http_request: Request,
+) -> Any:
+    from ..backend.model_work_task_gateway import model_work_task_gateway
+
+    result = await model_work_task_gateway.retrieve_task(
+        request_id=request_id,
+        wait_timeout_s=wait_timeout_s,
+        privileged=_is_privileged(http_request),
+    )
+    if result.status in {"ready", "failed"}:
+        _pending_hint_clear(request_id)
+        return await _present_gateway_terminal_result(result, http_request)
+    if result.status == "unavailable":
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    return None
+
+
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
-        from ..backend.task_payload_store import TaskPayloadStore
-        from ..backend.task_state_store import TaskStateNotFoundError, task_state_store
+        from ..backend.model_work_task_gateway import model_work_task_gateway
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup unavailable request_id=%s", request_id)
         return None
     try:
-        record = await task_state_store.async_get_task(request_id)
-    except (KeyError, TaskStateNotFoundError):
-        return None
+        result = await model_work_task_gateway.retrieve_task(request_id=request_id)
     except Exception:
         logger.exception("[retrieve_future] legacy task_state_store terminal lookup failed request_id=%s", request_id)
         return None
 
-    status = str(record.get("status") or "")
-    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    if status in {"done", "retrieved"}:
-        result_path = record.get("result_path")
-        terminal_status = str(meta.get("terminal_status") or status)
-        if terminal_status == "failed" or record.get("error") is not None:
-            error = str(record.get("error") or "Task failed")
-            payload = _failed_payload(error, http_request)
-            _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
-            return payload
-        if isinstance(result_path, str) and result_path:
-            try:
-                result = await TaskPayloadStore().async_read_json_payload(
-                    path=result_path,
-                    expected_checksum=record.get("result_checksum"),
-                )
-            except Exception:
-                logger.exception("[retrieve_future] legacy task_state_store payload read failed request_id=%s", request_id)
-                return _terminal_evicted_payload(record)
-            _recent_put(request_id, result, ttl_s=_local_hot_ttl_s())
-            return result
-        return _terminal_evicted_payload(record)
-    if status == "failed":
-        error = str(record.get("error") or "Task failed")
-        payload = _failed_payload(error, http_request)
-        _recent_put(request_id, payload, ttl_s=_local_hot_ttl_s())
-        return payload
-    return None
+    if result.status not in {"ready", "failed"}:
+        return None
+    return await _present_gateway_terminal_result(result, http_request)
+
+
+@router.post("/cancel_future")
+async def cancel_future(body: FutureCancelRequest) -> dict:
+    """Cancel an async operation.
+
+    Model-work lifecycle cancellation is owned by the scheduler gateway. Legacy
+    non-model-work futures keep the existing best-effort TaskFutureService path.
+    """
+    request_id = str(body.request_id)
+    reason = str(body.reason or "cancelled")
+    try:
+        meta = await task_futures.async_get_meta(request_id)
+    except KeyError:
+        meta = None
+    except TaskStateStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    if _is_model_work_scheduler_meta(meta):
+        from ..backend.model_work_task_gateway import model_work_task_gateway
+
+        result = await model_work_task_gateway.cancel_task(
+            request_id=request_id,
+            reason=reason,
+        )
+        return result.to_wire()
+    try:
+        await task_futures.async_fail(request_id, reason)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Future not found")
+    except TaskStateStoreUnavailableError:
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
+    _pending_hint_clear(request_id)
+    _RECENT.pop(request_id, None)
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "cancelled": True,
+        "was_terminal": False,
+        "reason": reason,
+    }
 
 
 async def _wait_until_not_pending(request_id: str, http_request: Request) -> FutureStatus | None:
@@ -243,28 +310,6 @@ def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
     if _is_privileged(request):
         return {"error": error, "category": "system"}
     return {"error": _public_error(error), "category": "system"}
-
-
-def _terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
-    meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-    done_at = meta.get("done_at") or meta.get("failed_at") or record.get("updated_at")
-    retrieved_at = record.get("updated_at") if str(record.get("status") or "") == "retrieved" else None
-    try:
-        done_at_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(done_at)))
-    except Exception:
-        done_at_s = None
-    try:
-        retrieved_at_s = None if retrieved_at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(retrieved_at)))
-    except Exception:
-        retrieved_at_s = None
-    return {
-        "error": "Known terminal future evicted",
-        "category": "system",
-        "request_id": str(record.get("request_id") or ""),
-        "op": str(meta.get("op") or record.get("op") or ""),
-        "done_at": done_at_s,
-        "retrieved_at": retrieved_at_s,
-    }
 
 
 @router.post("/retrieve_future")
@@ -417,7 +462,7 @@ async def retrieve_future(
     if cached is not None:
         logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
         _record_retrieve_wait(path="local", outcome="ready", waited=False)
-        return _apply_cached_response(cached, response)
+        return _apply_local_cached_response(cached, http_request, response)
 
     try:
         status = await task_futures.async_get_status(body.request_id)
@@ -472,12 +517,44 @@ async def retrieve_future(
             _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
             raise HTTPException(status_code=404, detail=detail)
 
-    if status == FutureStatus.PENDING:
+    meta = None
+    try:
+        meta = await task_futures.async_get_meta(body.request_id)
+    except Exception:
         meta = None
+    if _is_model_work_scheduler_meta(meta):
         try:
-            meta = await task_futures.async_get_meta(body.request_id)
+            payload = await _retrieve_model_work_via_gateway(
+                request_id=body.request_id,
+                wait_timeout_s=0.0 if waited_for_status_change else _retrieve_wait_timeout_s(),
+                http_request=http_request,
+            )
+        except HTTPException:
+            raise
         except Exception:
-            meta = None
+            logger.exception(
+                "[retrieve_future] model-work retrieve gateway failed request_id=%s",
+                body.request_id,
+            )
+            if status != FutureStatus.PENDING:
+                raise
+        else:
+            if payload is not None:
+                logger.info(
+                    "[retrieve_future] request_id=%s status=%s served=model_work_gateway",
+                    body.request_id,
+                    status.value,
+                )
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                return payload
+            if status != FutureStatus.PENDING:
+                pending = pending_future_http_response(retry_after_s=1)
+                response.status_code = pending.status_code
+                response.headers.update(pending.headers)
+                _record_retrieve_wait(path="local", outcome="timeout", waited=waited_for_status_change)
+                return pending.body
+
+    if status == FutureStatus.PENDING:
         if isinstance(meta, dict):
             actor_name = meta.get("actor_name")
             tracked_session_id = meta.get("model_id")
@@ -626,34 +703,6 @@ async def retrieve_future(
         if not isinstance(ordering_key, str) or not ordering_key:
             ordering_key = None
 
-        if status_field == "queued" and queue_kind == "model_work_scheduler":
-            try:
-                from ..backend.model_work_scheduler import model_work_scheduler
-
-                contains = await model_work_scheduler.contains_request(
-                    request_id=body.request_id,
-                    hydrate_task_state=False,
-                )
-                if not bool(contains.get("present")):
-                    await task_futures.async_fail(
-                        body.request_id,
-                        "model work scheduler recovered without this request; request must be retried",
-                    )
-                    error = await task_futures.async_get_error(body.request_id)
-                    payload = _failed_payload(error, http_request)
-                    _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
-                    logger.warning(
-                        "[retrieve_future] request_id=%s status=model_work_orphan_failed",
-                        body.request_id,
-                    )
-                    _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-                    return payload
-            except Exception:
-                logger.exception(
-                    "[retrieve_future] model_work_scheduler orphan probe failed request_id=%s",
-                    body.request_id,
-                )
-
         if queue_state_reason is None and status_field == "queued":
             if queue_kind == "model_work_scheduler":
                 queue_state_reason = "model_work_scheduler"
@@ -791,7 +840,7 @@ async def retrieve_future(
         if cached is not None:
             logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
-            return _apply_cached_response(cached, response)
+            return _apply_local_cached_response(cached, http_request, response)
         try:
             result = await task_futures.async_get_result(body.request_id)
         except Exception:

@@ -6,6 +6,7 @@ import time
 from typing import Any
 
 from ..logging_context import run_async_with_otel_span
+from .control_plane_contracts import ExecutorOutcome
 
 logger = logging.getLogger(__name__)
 
@@ -43,10 +44,46 @@ def _ensure_ray_context_for_dispatch() -> None:
     raise RuntimeError("Ray is not initialized")
 
 
+def _looks_like_dead_actor_error(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    text = str(exc).lower()
+    return (
+        name in {"ActorDiedError", "ActorUnavailableError", "RayActorError"}
+        or "actor died" in text
+        or "actor is dead" in text
+        or "actor is temporarily unavailable" in text
+    )
+
+
+def _classify_dispatch_exception(exc: BaseException) -> ExecutorOutcome:
+    if _looks_like_dead_actor_error(exc):
+        return ExecutorOutcome(kind="fatal_backend_death", error=str(exc))
+    if isinstance(exc, (KeyError, TypeError, ValueError)):
+        return ExecutorOutcome(kind="user_error", error=str(exc))
+    return ExecutorOutcome(kind="retryable_failure", error=str(exc))
+
+
 async def execute_model_work_item(
     item: Any, *, component: str = "model_work_dispatch"
-) -> None:
+) -> ExecutorOutcome:
     _ensure_ray_context_for_dispatch()
+    try:
+        await _execute_model_work_item_unclassified(item, component=component)
+    except Exception as exc:
+        logger.warning(
+            "[%s] model work dispatch classified failure request_id=%s error_type=%s error=%s",
+            component,
+            str(getattr(item, "request_id", "unknown")),
+            type(exc).__name__,
+            exc,
+        )
+        return _classify_dispatch_exception(exc)
+    return ExecutorOutcome(kind="success")
+
+
+async def _execute_model_work_item_unclassified(
+    item: Any, *, component: str = "model_work_dispatch"
+) -> None:
     from ..models.mint_types import (
         ForwardBackwardReverseKLRequest,
         InterpolateCheckpointsRequest,

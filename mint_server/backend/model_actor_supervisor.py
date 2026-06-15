@@ -21,6 +21,13 @@ from ..config import (
 from ..runtime_env import env_nonempty
 from ..server_info import _git_sha
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .cluster_placement_controller import (
+    ClusterPlacementController,
+    PlacementGroupCreateStatus,
+    PlacementReconcileRequest,
+    PlacementReconcileResult,
+)
+from .engine_liveness import EngineLivenessPush
 from .model_actor_inventory import (
     ActorEntry,
     ActorType,
@@ -117,6 +124,11 @@ def _reconcile_interval_s_from_env() -> float:
         )
         return 5.0
     return max(0.1, value)
+
+
+def _adopt_surviving_gpu_actors_enabled() -> bool:
+    raw = str(os.environ.get("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _otel_metric_attrs() -> dict[str, str]:
@@ -432,6 +444,7 @@ OrphanPlacementGroupCleaner = Callable[[dict[tuple[str, str], ModelActorSpec]], 
 PlacementReconciler = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 TopologyResolver = Callable[[dict[tuple[str, str], ModelActorSpec]], Any | Awaitable[dict[str, Any]]]
 NodeMetricsFactory = Callable[[NodeMetricsDaemonSpec], Any | Awaitable[Any]]
+PlacementController = ClusterPlacementController
 SupervisorStateStore = SupervisorMemoryStateStore | SupervisorSQLiteStateStore
 
 
@@ -892,6 +905,31 @@ def _is_ray_get_timeout_error(exc: BaseException) -> bool:
     return False
 
 
+def _observed_free_gpus_by_node() -> dict[str, int]:
+    try:
+        from .node_placement import _list_alive_gpu_nodes
+
+        return {
+            str(node.node_ip): max(0, int(node.available_gpus))
+            for node in _list_alive_gpu_nodes()
+            if str(node.node_ip).strip()
+        }
+    except Exception:
+        logger.debug("[model_actor_supervisor] observed GPU lookup failed", exc_info=True)
+        return {}
+
+
+def _placement_group_table() -> dict[str, Any]:
+    try:
+        import ray
+
+        table = ray.util.placement_group_table()
+        return table if isinstance(table, dict) else {}
+    except Exception:
+        logger.debug("[model_actor_supervisor] placement group table lookup failed", exc_info=True)
+        return {}
+
+
 class ModelActorSupervisorCore:
     def __init__(
         self,
@@ -903,6 +941,7 @@ class ModelActorSupervisorCore:
         scheduler_sync: SchedulerSync | None = None,
         scheduler_stats: SchedulerStats | None = None,
         orphan_pg_cleaner: OrphanPlacementGroupCleaner | None = None,
+        placement_controller: PlacementController | None = None,
         placement_reconciler: PlacementReconciler | None = None,
         topology_resolver: TopologyResolver | None = None,
         topology_manager: TopologyManager | None = None,
@@ -920,9 +959,11 @@ class ModelActorSupervisorCore:
         state_event_limit: int | None = None,
         ray_address: str | None = None,
     ) -> None:
-        ray_address_value = str(ray_address or "").strip()
-        if ray_address_value:
-            os.environ["RAY_ADDRESS"] = ray_address_value
+        # Detached control-plane actors already run inside a Ray worker context.
+        # Do not write a driver/direct Ray address into the actor process env:
+        # downstream control-plane calls must reuse that worker context instead
+        # of attempting a nested ray.init()/direct attach from inside Ray.
+        self._ray_address = str(ray_address or "").strip() or None
         try:
             from ..logging_context import init_actor_observability
 
@@ -937,9 +978,17 @@ class ModelActorSupervisorCore:
         self._scheduler_sync = scheduler_sync
         self._scheduler_stats = scheduler_stats
         self._orphan_pg_cleaner = orphan_pg_cleaner
-        self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._topology_manager = topology_manager if topology_manager is not None else TopologyManager()
         self._topology_resolver = topology_resolver or self._resolve_topology_placements
+        if placement_controller is not None:
+            self._placement_controller = placement_controller
+            self._placement_reconciler = None
+        elif placement_reconciler is None and runtime_factory is None:
+            self._placement_controller = self._default_placement_controller()
+            self._placement_reconciler = None
+        else:
+            self._placement_controller = None
+            self._placement_reconciler = placement_reconciler or model_actor_placement_reconciler
         self._node_metrics_factory = node_metrics_factory
         self._node_metrics_enabled = (
             _node_metrics_enabled_by_default()
@@ -964,6 +1013,7 @@ class ModelActorSupervisorCore:
         self._actor_generations: dict[tuple[str, str], int] = {}
         self._generations: dict[tuple[str, str], int] = {}
         self._states: dict[tuple[str, str], dict[str, Any]] = {}
+        self._latest_push: dict[tuple[str, str], EngineLivenessPush] = {}
         self._reconcile_total = 0
         self._created_total = 0
         self._restarted_total = 0
@@ -974,6 +1024,7 @@ class ModelActorSupervisorCore:
         self._placement_reconcile_failures_total = 0
         self._topology_reconcile_failures_total = 0
         self._placement_reclaimed_total = 0
+        self._placement_groups_created_total = 0
         self._last_reconcile_at: float | None = None
         self._last_scheduler_sync_at: float | None = None
         self._last_placement_reconcile: dict[str, Any] | None = None
@@ -1013,6 +1064,13 @@ class ModelActorSupervisorCore:
         self._otel_enabled = False
         self._otel_error: str | None = None
         self._init_otel_metrics()
+
+    def _default_placement_controller(self) -> ClusterPlacementController:
+        return ClusterPlacementController(
+            observed_free_gpus_by_node=_observed_free_gpus_by_node,
+            placement_group_table=_placement_group_table,
+            placement_reconciler=model_actor_placement_reconciler,
+        )
 
     @staticmethod
     def _default_owner_id() -> str:
@@ -1887,6 +1945,26 @@ class ModelActorSupervisorCore:
             raise TypeError(f"runtime actor health_snapshot returned non-dict: {type(out)}")
         return out
 
+    async def push_liveness(self, payload: EngineLivenessPush | dict[str, Any]) -> dict[str, Any]:
+        push = payload if isinstance(payload, EngineLivenessPush) else EngineLivenessPush.from_wire(dict(payload))
+        key = push.key
+        current_generation = int(self._generations.get(key, 0) or 0)
+        if current_generation > 0 and int(push.actor_generation) < current_generation:
+            return {
+                "ok": False,
+                "domain_key": push.domain_key,
+                "replica_id": push.replica_id,
+                "actor_generation": int(push.actor_generation),
+                "reason": "stale_generation",
+            }
+        self._latest_push[key] = push
+        return {
+            "ok": True,
+            "domain_key": push.domain_key,
+            "replica_id": push.replica_id,
+            "actor_generation": int(push.actor_generation),
+        }
+
     def _actor_generation_matches_current(
         self,
         key: tuple[str, str],
@@ -1930,6 +2008,7 @@ class ModelActorSupervisorCore:
         key = spec.key
         generation = self._next_generation(key)
         self._generations[key] = generation
+        started_at = time.time()
         self._states[key] = {
             **self._states.get(key, {}),
             "domain_key": spec.domain_key,
@@ -1941,18 +2020,24 @@ class ModelActorSupervisorCore:
             "generation": generation,
             "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
             "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+            "started_at": started_at,
             "last_error": None,
             "last_action": f"reserve:{reason}",
-            "last_action_at": time.time(),
+            "last_action_at": started_at,
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
-            "scheduler_status": "healthy",
+            "scheduler_status": "starting",
         }
         await self._sync_scheduler(raise_on_error=True)
         if self._runtime_factory is not None:
             actor = await _maybe_await(self._runtime_factory(spec, generation))
         else:
-            actor = await self._launcher_registry.launch(spec, generation, launcher_key=spec.launcher_key)
+            actor = await self._launcher_registry.launch(
+                spec,
+                generation,
+                launcher_key=spec.launcher_key,
+                ray_address=self._ray_address,
+            )
         try:
             start_result = await _invoke_actor(actor, "start")
         except Exception as e:
@@ -1974,12 +2059,13 @@ class ModelActorSupervisorCore:
                 "generation": generation,
                 "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
                 "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+                "started_at": started_at,
                 "last_error": f"{type(e).__name__}: {e}",
                 "last_action": f"start_pending:{reason}",
                 "last_action_at": time.time(),
                 "node_pins": spec.normalized_node_pins(),
                 "gpu_count": spec.gpu_count,
-                "scheduler_status": "healthy",
+                "scheduler_status": "starting",
             }
             try:
                 await self._sync_scheduler(raise_on_error=True)
@@ -2023,17 +2109,19 @@ class ModelActorSupervisorCore:
             "domain_key": spec.domain_key,
             "replica_id": spec.replica_id,
             "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-            "state": "healthy",
+            "state": "starting",
             "actor_name": spec.normalized_actor_name(),
             "launcher_key": spec.launcher_key,
             "generation": generation,
             "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
             "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
+            "started_at": started_at,
             "last_error": None,
-            "last_action": f"create:{reason}",
+            "last_action": f"create_pending_liveness:{reason}",
             "last_action_at": time.time(),
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
+            "scheduler_status": "starting",
         }
         try:
             await self._sync_scheduler(raise_on_error=True)
@@ -2051,6 +2139,62 @@ class ModelActorSupervisorCore:
             raise
         return actor
 
+    async def _ensure_runtime_placement_group(self, spec: ModelActorSpec) -> dict[str, Any] | None:
+        controller = self._placement_controller
+        if controller is None:
+            return None
+        try:
+            from .cluster_placement_controller import placement_group_bundle_request_for_spec
+
+            create_request = placement_group_bundle_request_for_spec(spec).to_create_request()
+        except ValueError:
+            return None
+        result = await controller.create_pg(create_request)
+        if result.status is PlacementGroupCreateStatus.READY:
+            self._placement_groups_created_total += 1
+            return {
+                "ok": True,
+                "placement_group_name": result.placement_group_name,
+            }
+        return {
+            "ok": False,
+            "placement_group_name": result.placement_group_name,
+            "reason": None if result.reason is None else result.reason.value,
+            "message": result.message,
+            "retry_at": result.retry_at,
+        }
+
+    def _runtime_placement_blocked_state(
+        self,
+        spec: ModelActorSpec,
+        *,
+        original_spec: ModelActorSpec,
+        resolved_node_pins: list[str],
+        pg_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        message = str(pg_result.get("message") or pg_result.get("reason") or "placement group create blocked")
+        placement_group_name = str(pg_result.get("placement_group_name") or "")
+        if placement_group_name:
+            message = f"{placement_group_name}: {message}"
+        return {
+            **self._states.get(spec.key, {}),
+            "domain_key": spec.domain_key,
+            "replica_id": spec.replica_id,
+            "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+            "state": "blocked",
+            "actor_name": spec.normalized_actor_name(),
+            "launcher_key": spec.launcher_key,
+            "node_pins": resolved_node_pins,
+            "worker_aliases": original_spec.normalized_worker_aliases(),
+            "gpu_count": spec.gpu_count,
+            "last_error": f"placement group blocked: {message}",
+            "last_action": "blocked:placement_group",
+            "last_action_at": time.time(),
+            "placement_group_name": placement_group_name or None,
+            "placement_retry_at": pg_result.get("retry_at"),
+            "scheduler_status": "blocked",
+        }
+
     def _replica_registration_for_state(
         self,
         spec: ModelActorSpec,
@@ -2058,9 +2202,6 @@ class ModelActorSupervisorCore:
     ) -> ModelReplicaRegistration:
         generation = int(state.get("generation") or self._generations.get(spec.key, 0) or 0)
         status = str(state.get("state") or "starting")
-        scheduler_status = str(state.get("scheduler_status") or "").strip()
-        if scheduler_status and status == "starting":
-            status = scheduler_status
         if status == "running":
             status = "healthy"
         if status in {"blocked", "disabled", "dead", "unhealthy"}:
@@ -2192,7 +2333,32 @@ class ModelActorSupervisorCore:
                     placement_slices=topology_placement_slices.get(label),
                 )
         placement_out: dict[str, Any] = {}
-        if self._placement_reconciler is not None:
+        if self._placement_controller is not None:
+            try:
+                protected_actor_names = self._reconcile_protected_actor_names(resolved_desired)
+                candidate = await self._placement_controller.reconcile(
+                    PlacementReconcileRequest(
+                        desired=dict(resolved_desired),
+                        protected_actor_names=frozenset(protected_actor_names),
+                    )
+                )
+                if isinstance(candidate, PlacementReconcileResult):
+                    placement_out = candidate.to_legacy_dict()
+                elif isinstance(candidate, dict):
+                    placement_out = candidate
+                else:
+                    placement_out = {"ok": True, "result": candidate}
+                self._last_placement_reconcile = dict(placement_out)
+            except Exception as e:
+                self._placement_reconcile_failures_total += 1
+                placement_out = {"ok": False, "error": f"{type(e).__name__}: {e}", "blocked": {}}
+                self._last_placement_reconcile = dict(placement_out)
+                logger.warning(
+                    "[model_actor_supervisor] placement controller reconcile failed: %s: %s",
+                    type(e).__name__,
+                    e,
+                )
+        elif self._placement_reconciler is not None:
             try:
                 protected_actor_names = self._reconcile_protected_actor_names(resolved_desired)
                 try:
@@ -2307,6 +2473,17 @@ class ModelActorSupervisorCore:
 
             actor = self._actors.get(key)
             if actor is None:
+                pg_result = await self._ensure_runtime_placement_group(spec)
+                if pg_result is not None and not bool(pg_result.get("ok")):
+                    self._blocked_total += 1
+                    self._states[key] = self._runtime_placement_blocked_state(
+                        spec,
+                        original_spec=original_spec,
+                        resolved_node_pins=resolved_node_pins,
+                        pg_result=pg_result,
+                    )
+                    results[label] = self._states[key]
+                    continue
                 try:
                     await self._create_runtime(spec, reason="missing")
                 except Exception as e:
@@ -2332,145 +2509,94 @@ class ModelActorSupervisorCore:
                 results[label] = self._states[key]
                 continue
 
-            try:
-                health = await self._actor_health(actor)
-                if not self._actor_generation_matches_current(key, actor, health):
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    results[label] = self._states.get(key, {})
-                    continue
-                runtime_last_error = str(health.get("last_error") or "").strip()
-                runtime_failed_total = int(health.get("failed_total") or 0)
-                runtime_completed_total = int(health.get("completed_total") or 0)
-                runtime_processed_total = int(health.get("processed_total") or 0)
-                health_error_unrecovered = bool(
-                    _runtime_error_requires_recreate(runtime_last_error)
-                    and runtime_failed_total > 0
-                    and runtime_completed_total <= 0
-                    and runtime_processed_total <= runtime_failed_total
+            now = time.time()
+            latest_push = self._latest_push.get(key)
+            if latest_push is not None and not self._actor_generation_matches_current(
+                key,
+                actor,
+                latest_push.to_wire(),
+            ):
+                self._latest_push.pop(key, None)
+                latest_push = None
+
+            stale_after_s = _liveness_stale_after_s(self._reconcile_interval_s)
+            push_stale = _liveness_push_is_stale(
+                latest_push,
+                now=now,
+                stale_after_s=stale_after_s,
+            )
+            gpu_busy = _liveness_push_gpu_busy(
+                latest_push,
+                threshold_percent=_liveness_gpu_busy_threshold_percent(),
+            )
+            previous = self._states.get(key, {})
+            started_at = float(previous.get("started_at") or previous.get("last_action_at") or now)
+            starting_age_s = max(0.0, now - started_at)
+            initial_grace_s = _liveness_initial_grace_s(stale_after_s)
+            push_ready = latest_push is not None and bool(latest_push.running) and bool(latest_push.engine_ready)
+            push_startup_error = _liveness_push_requires_recreate(latest_push)
+            if (
+                str(previous.get("state") or "") == "starting"
+                and not push_ready
+                and not push_startup_error
+                and (latest_push is None or bool(latest_push.running))
+                and starting_age_s <= initial_grace_s
+            ):
+                generation = int(
+                    getattr(latest_push, "actor_generation", None)
+                    or self._generations.get(key, 0)
+                    or previous.get("generation")
+                    or 0
                 )
-                state = (
-                    "healthy"
-                    if bool(health.get("running", True)) and not health_error_unrecovered
-                    else "unhealthy"
-                )
-                if state == "unhealthy":
-                    previous = self._states.get(key, {})
-                    crash_count = int(previous.get("crash_count", 0)) + 1
-                    last_error = (
-                        runtime_last_error
-                        if health_error_unrecovered
-                        else "runtime actor not running"
-                    )
-                    self._states[key] = {
-                        **previous,
-                        "domain_key": spec.domain_key,
-                        "replica_id": spec.replica_id,
-                        "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-                        "state": "unhealthy",
-                        "actor_name": spec.normalized_actor_name(),
-                        "launcher_key": spec.launcher_key,
-                        "generation": int(self._generations.get(key, 0)),
-                        "consumer_id": consumer_id_for_replica(
-                            spec.domain_key,
-                            spec.replica_id,
-                            int(self._generations.get(key, 0)),
-                        ),
-                        "health": health,
-                        "crash_count": crash_count,
-                        "last_error": last_error,
-                        "last_action": "health_unhealthy",
-                        "last_action_at": time.time(),
-                        "node_pins": resolved_node_pins,
-                        "worker_aliases": original_spec.normalized_worker_aliases(),
-                        "gpu_count": spec.gpu_count,
-                    }
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    try:
-                        await self._create_runtime(spec, reason="unhealthy")
-                        self._states[key]["crash_count"] = crash_count
-                    except Exception as e:
-                        self._states[key] = {
-                            **self._states.get(key, {}),
-                            "domain_key": spec.domain_key,
-                            "replica_id": spec.replica_id,
-                            "state": "dead",
-                            "actor_name": spec.normalized_actor_name(),
-                            "crash_count": crash_count,
-                            "last_error": f"{type(e).__name__}: {e}",
-                            "last_action": "create_failed:unhealthy",
-                            "last_action_at": time.time(),
-                            "node_pins": resolved_node_pins,
-                            "worker_aliases": original_spec.normalized_worker_aliases(),
-                            "gpu_count": spec.gpu_count,
-                        }
-                    results[label] = self._states[key]
-                    continue
                 self._states[key] = {
-                    **self._states.get(key, {}),
+                    **previous,
                     "domain_key": spec.domain_key,
                     "replica_id": spec.replica_id,
                     "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-                    "state": state,
+                    "state": "starting",
                     "actor_name": spec.normalized_actor_name(),
                     "launcher_key": spec.launcher_key,
-                    "generation": int(self._generations.get(key, 0)),
-                    "consumer_id": consumer_id_for_replica(
-                        spec.domain_key,
-                        spec.replica_id,
-                        int(self._generations.get(key, 0)),
+                    "generation": generation,
+                    "consumer_id": str(
+                        getattr(latest_push, "consumer_id", None)
+                        or previous.get("consumer_id")
+                        or consumer_id_for_replica(
+                            spec.domain_key,
+                            spec.replica_id,
+                            generation,
+                        )
                     ),
-                    "health": health,
-                    "last_error": None if state == "healthy" else "runtime actor not running",
-                    "last_action": "health_check",
-                    "last_action_at": time.time(),
+                    "health": latest_push.to_wire() if latest_push is not None else previous.get("health"),
+                    "started_at": started_at,
+                    "last_error": None if latest_push is None else (latest_push.last_error or latest_push.engine_health.last_error),
+                    "last_action": "awaiting_liveness" if latest_push is None else "awaiting_engine_ready",
+                    "last_action_at": now,
+                    "liveness_stale": bool(push_stale),
+                    "liveness_stale_after_s": stale_after_s,
+                    "liveness_startup_grace_s": initial_grace_s,
+                    "liveness_startup_age_s": starting_age_s,
                     "node_pins": resolved_node_pins,
                     "worker_aliases": original_spec.normalized_worker_aliases(),
                     "gpu_count": spec.gpu_count,
+                    "scheduler_status": "starting",
                 }
                 results[label] = self._states[key]
-            except Exception as e:
-                if not self._actor_generation_matches_current(key, actor):
-                    self._actors.pop(key, None)
-                    self._actor_generations.pop(key, None)
-                    results[label] = self._states.get(key, {})
-                    continue
-                if _is_ray_get_timeout_error(e):
-                    # A health-probe timeout means the actor is still alive but
-                    # busy (e.g. executing a long save_weights_for_sampler that
-                    # starves the snapshot call). Killing/recreating it here would
-                    # abort an in-flight lease, flip the scheduler registration to
-                    # unclaimable, and re-queue the same request onto a fresh actor
-                    # that promptly times out again. Preserve the prior healthy
-                    # registration and wait for the next reconcile instead.
-                    self._health_timeout_preserved_total += 1
-                    previous = self._states.get(key, {})
-                    self._states[key] = {
-                        **previous,
-                        "domain_key": spec.domain_key,
-                        "replica_id": spec.replica_id,
-                        "actor_name": spec.normalized_actor_name(),
-                        "last_action": "health_timeout_preserved",
-                        "last_action_at": time.time(),
-                        "node_pins": resolved_node_pins,
-                        "worker_aliases": original_spec.normalized_worker_aliases(),
-                        "gpu_count": spec.gpu_count,
-                    }
-                    logger.warning(
-                        "[model_actor_supervisor] health probe timed out; runtime "
-                        "assumed busy, not recreating domain=%s replica=%s actor=%s "
-                        "error_type=%s error=%s",
-                        spec.domain_key,
-                        spec.replica_id,
-                        spec.normalized_actor_name(),
-                        type(e).__name__,
-                        e,
-                    )
-                    results[label] = self._states[key]
-                    continue
-                previous = self._states.get(key, {})
+                continue
+            health = latest_push.to_wire() if latest_push is not None else {}
+            generation = int(
+                getattr(latest_push, "actor_generation", None)
+                or self._generations.get(key, 0)
+                or 0
+            )
+            consumer_id = str(
+                getattr(latest_push, "consumer_id", None)
+                or consumer_id_for_replica(spec.domain_key, spec.replica_id, generation)
+            )
+            if push_stale and not gpu_busy:
                 crash_count = int(previous.get("crash_count", 0)) + 1
+                stale_age_s = None
+                if latest_push is not None and latest_push.pushed_at is not None:
+                    stale_age_s = max(0.0, now - float(latest_push.pushed_at))
                 self._states[key] = {
                     **previous,
                     "domain_key": spec.domain_key,
@@ -2478,9 +2604,15 @@ class ModelActorSupervisorCore:
                     "state": "dead",
                     "actor_name": spec.normalized_actor_name(),
                     "crash_count": crash_count,
-                    "last_error": f"{type(e).__name__}: {e}",
-                    "last_action": "health_failed",
-                    "last_action_at": time.time(),
+                    "last_error": (
+                        "runtime liveness push missing"
+                        if latest_push is None
+                        else f"runtime liveness push stale age_s={stale_age_s:.1f}"
+                    ),
+                    "last_action": "liveness_stale_dead",
+                    "last_action_at": now,
+                    "liveness_stale_after_s": stale_after_s,
+                    "liveness_stale_age_s": stale_age_s,
                     "node_pins": resolved_node_pins,
                     "worker_aliases": original_spec.normalized_worker_aliases(),
                     "gpu_count": spec.gpu_count,
@@ -2488,6 +2620,17 @@ class ModelActorSupervisorCore:
                 self._actors.pop(key, None)
                 self._actor_generations.pop(key, None)
                 try:
+                    pg_result = await self._ensure_runtime_placement_group(spec)
+                    if pg_result is not None and not bool(pg_result.get("ok")):
+                        self._blocked_total += 1
+                        self._states[key] = self._runtime_placement_blocked_state(
+                            spec,
+                            original_spec=original_spec,
+                            resolved_node_pins=resolved_node_pins,
+                            pg_result=pg_result,
+                        )
+                        results[label] = self._states[key]
+                        continue
                     await self._create_runtime(spec, reason="dead")
                     self._states[key]["crash_count"] = crash_count
                 except Exception as create_error:
@@ -2506,6 +2649,52 @@ class ModelActorSupervisorCore:
                         "gpu_count": spec.gpu_count,
                     }
                 results[label] = self._states[key]
+                continue
+
+            if push_stale and gpu_busy:
+                state = "healthy"
+                last_action = "liveness_stale_gpu_busy"
+                last_error = None
+            elif latest_push is not None and bool(latest_push.running) and bool(latest_push.engine_ready):
+                state = "healthy"
+                last_action = "liveness_push"
+                last_error = None
+            else:
+                state = "unhealthy"
+                last_action = "liveness_unhealthy"
+                last_error = (
+                    "runtime actor not running"
+                    if latest_push is None or not bool(latest_push.running)
+                    else (latest_push.last_error or latest_push.engine_health.reason or "engine not ready")
+                )
+
+            crash_count = int(previous.get("crash_count", 0))
+            if state == "unhealthy":
+                crash_count += 1
+            self._states[key] = {
+                **previous,
+                "domain_key": spec.domain_key,
+                "replica_id": spec.replica_id,
+                "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+                "state": state,
+                "actor_name": spec.normalized_actor_name(),
+                "launcher_key": spec.launcher_key,
+                "generation": generation,
+                "consumer_id": consumer_id,
+                "health": health,
+                "crash_count": crash_count,
+                "last_error": last_error,
+                "last_action": last_action,
+                "last_action_at": now,
+                "liveness_stale": bool(push_stale),
+                "liveness_gpu_busy": bool(gpu_busy),
+                "liveness_stale_after_s": stale_after_s,
+                "node_pins": resolved_node_pins,
+                "worker_aliases": original_spec.normalized_worker_aliases(),
+                "gpu_count": spec.gpu_count,
+                "scheduler_status": state,
+            }
+            results[label] = self._states[key]
 
         await self._sync_scheduler()
         return {"ok": True, "replicas": results, "snapshot": self.snapshot()}
@@ -2522,9 +2711,12 @@ class ModelActorSupervisorCore:
         self._reconcile_loop_starting = True
         try:
             # Fix D (#727): re-adopt still-alive mint GPU workers into inventory
-            # BEFORE the first reconcile fires the reaper, so they appear in
-            # _reconcile_protected_actor_names and are never reaped on restart.
-            await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+            # BEFORE the first reconcile fires the reaper. The Ray state API can
+            # crash large shared clusters when actor history is huge, so keep
+            # startup adoption opt-in and leave the explicit method available
+            # for controlled restart flows.
+            if _adopt_surviving_gpu_actors_enabled():
+                await asyncio.to_thread(self._adopt_surviving_gpu_actors)
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         finally:
             self._reconcile_loop_starting = False
@@ -2776,6 +2968,7 @@ class ModelActorSupervisorCore:
             "control_plane_ensure_failures_total": int(self._control_plane_ensure_failures_total),
             "state_store_failures_total": int(self._state_store_failures_total),
             "placement_reclaimed_total": int(self._placement_reclaimed_total),
+            "placement_groups_created_total": int(self._placement_groups_created_total),
             "last_reconcile_at": self._last_reconcile_at,
             "reconcile_inflight": bool(self._reconcile_inflight),
             "reconcile_inflight_started_at": self._reconcile_inflight_started_at,
@@ -2785,6 +2978,10 @@ class ModelActorSupervisorCore:
             "last_scheduler_sync_at": self._last_scheduler_sync_at,
             "last_placement_reconcile": self._last_placement_reconcile,
             "last_topology_reconcile": self._last_topology_reconcile,
+            "liveness_pushes": {
+                _label(key): push.to_wire()
+                for key, push in sorted(self._latest_push.items())
+            },
             "topology": topology_snapshot,
             "state_store": {
                 "backend": self._state_store.backend,
@@ -2837,6 +3034,82 @@ def _runtime_error_requires_recreate(error: str) -> bool:
             "consumer_id mismatch",
         )
     )
+
+
+def _liveness_stale_after_s(reconcile_interval_s: float) -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_LIVENESS_STALE_AFTER_S") or "").strip()
+    if raw:
+        try:
+            return max(1.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_LIVENESS_STALE_AFTER_S=%r; using default",
+                raw,
+            )
+    return max(30.0, float(reconcile_interval_s) * 3.0)
+
+
+def _liveness_initial_grace_s(stale_after_s: float) -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_INITIAL_LIVENESS_GRACE_S") or "").strip()
+    if raw:
+        try:
+            return max(float(stale_after_s), float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_INITIAL_LIVENESS_GRACE_S=%r; using default",
+                raw,
+            )
+    return max(300.0, float(stale_after_s))
+
+
+def _liveness_push_requires_recreate(push: EngineLivenessPush | None) -> bool:
+    if push is None:
+        return False
+    return any(
+        value is not None and _runtime_error_requires_recreate(str(value))
+        for value in (
+            push.last_error,
+            push.engine_health.last_error,
+            push.engine_health.reason,
+        )
+    )
+
+
+def _liveness_gpu_busy_threshold_percent() -> float:
+    raw = str(os.environ.get("MINT_MODEL_RUNTIME_LIVENESS_GPU_BUSY_THRESHOLD_PERCENT") or "").strip()
+    if raw:
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "[model_actor_supervisor] invalid MINT_MODEL_RUNTIME_LIVENESS_GPU_BUSY_THRESHOLD_PERCENT=%r; using default",
+                raw,
+            )
+    return 5.0
+
+
+def _liveness_push_is_stale(
+    push: EngineLivenessPush | None,
+    *,
+    now: float,
+    stale_after_s: float,
+) -> bool:
+    if push is None:
+        return True
+    if push.pushed_at is None:
+        return True
+    return now - float(push.pushed_at) > float(stale_after_s)
+
+
+def _liveness_push_gpu_busy(push: EngineLivenessPush | None, *, threshold_percent: float) -> bool:
+    if push is None:
+        return False
+    samples = push.observability.gpu_performance
+    for sample in samples:
+        util = sample.utilization_percent
+        if util is not None and float(util) >= float(threshold_percent):
+            return True
+    return False
 
 
 def queue_id_for_replica(domain_key: str, replica_id: str) -> str:
@@ -2903,9 +3176,11 @@ def _create_ray_actor(*, require_ready: bool = True):
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
     if "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" in os.environ:
         extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
-    ray_address = env_nonempty(os.environ, "RAY_ADDRESS")
+    from ..ray_utils import strict_ray_gcs_address
+
+    ray_address = strict_ray_gcs_address()
     if ray_address is None:
-        raise RuntimeError("RAY_ADDRESS is required")
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 
     options: dict[str, Any] = {
         "name": actor_name,
@@ -3253,6 +3528,13 @@ class ModelActorSupervisorClient:
         )
         if not isinstance(out, dict):
             raise TypeError(f"ModelActorSupervisor.recycle returned non-dict: {type(out)}")
+        return out
+
+    async def push_liveness(self, payload: EngineLivenessPush | dict[str, Any]) -> dict[str, Any]:
+        wire = payload.to_wire() if isinstance(payload, EngineLivenessPush) else dict(payload)
+        out = await self._call_async("push_liveness", wire)
+        if not isinstance(out, dict):
+            raise TypeError(f"ModelActorSupervisor.push_liveness returned non-dict: {type(out)}")
         return out
 
     def snapshot(self, *, timeout_s: float = 10.0) -> dict[str, Any]:

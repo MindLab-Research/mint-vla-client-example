@@ -18,10 +18,11 @@
 
 ## Code Deployment
 
-Development and production hosts use git checkouts under `/share/mint`, not
-background file sync.
+Development and production hosts use explicit worker-visible git checkouts, not
+hidden local env files or shared dev defaults.
 
-- Development checkout: `/share/mint/dev/mint-server`
+- Development checkout: pass your personal checkout with `MINT_CODE_ROOT`
+  under `/vePFS-Mindverse/share/<owner>/...`; do not use the shared dev tree.
 - Production checkout: `/share/mint/prod/mint-server`
 - Keep each checkout on the intended branch and use `git pull --ff-only`.
 - Runtime/config/logs come from the matching `/share/mint/{dev,prod}` tree.

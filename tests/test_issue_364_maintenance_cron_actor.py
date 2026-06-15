@@ -216,6 +216,7 @@ def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeyp
     from mint_server.backend import maintenance_cron_actor as ors
 
     actor_cls_box = {}
+    captured = {}
 
     class _FakeRemoteActorClass:
         def __init__(self, cls):
@@ -242,7 +243,11 @@ def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeyp
     monkeypatch.setattr(ors, "run_checkpoint_reaper_once", lambda: (_ for _ in ()).throw(RuntimeError("checkpoint boom")))
     monkeypatch.setattr(ors, "apply_detached_actor_resources", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(ors, "otel_env_vars", lambda: {})
-    monkeypatch.setattr(ors, "actor_runtime_env", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        ors,
+        "actor_runtime_env",
+        lambda **kwargs: captured.setdefault("runtime_env_kwargs", kwargs) or {},
+    )
 
     try:
         ors._get_or_create_actor()
@@ -255,6 +260,7 @@ def test_issue_364_maintenance_cron_loop_snapshot_includes_error_details(monkeyp
     loop = snapshot["loops"]["checkpoint_reaper"]
 
     assert out["error_type"] == "RuntimeError"
+    assert captured["runtime_env_kwargs"]["include_ray_attach_hints"] is False
     assert loop["last_error"] == "RuntimeError: checkpoint boom"
     assert loop["last_error_type"] == "RuntimeError"
     assert "last_error_traceback" not in loop

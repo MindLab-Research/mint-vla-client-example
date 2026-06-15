@@ -252,7 +252,7 @@ def main():
         ray.init(address=args.ray_address, ignore_reinit_error=True)
     except Exception as e:
         print(f"Error: Failed to connect to Ray cluster: {e}", file=sys.stderr)
-        print(f"Make sure RAY_ADDRESS is set or pass --ray-address", file=sys.stderr)
+        print("Make sure MINT_RAY_GCS_ADDRESS is set or pass --ray-address", file=sys.stderr)
         sys.exit(1)
 
     try:

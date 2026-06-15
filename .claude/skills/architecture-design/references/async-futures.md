@@ -102,7 +102,7 @@ Async endpoints that require model-runtime scheduling go through `ModelWorkSched
 - `ModelActorSupervisor` observes active scheduler domains and reconciles the matching desired runtime actors from config and placement JSON. A queued training domain can therefore create the runtime needed to claim it.
 - Runtime actors claim from their scheduler-owned subqueue. Claiming is independent of `retrieve_future`; result polling reads `TaskStateStore` future state.
 - Scheduler backlog and replica subqueues are rebuildable indexes over `TaskStateStore`, not durable authority. If a queue head no longer matches its durable task state during claim, the scheduler must reconcile that stale index entry instead of blocking later work in the same replica queue.
-- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelRuntimeActor` owns terminal commit to `TaskStateStore` future state and lease completion/failure. Route-level `_do_*` functions may still use `TaskFutureService.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
+- Scheduler leases must include `attempt_id` and `scheduler_epoch`. `ModelEngineHost` owns terminal commit to `TaskStateStore` future state and lease completion/failure. Route-level `_do_*` functions may still use `TaskFutureService.async_resolve/async_fail` as an executor-local completion signal, but those calls are buffered while running under a model-work execution context and do not write terminal state directly. There is no scheduler-work fallback that writes terminal state through the facade.
 
 On admission failure, the API must return HTTP 429 with a structured overload reason. V1 does not enforce a hard active-task cap; add one only if the active-task index becomes a measured bottleneck.
 
@@ -160,17 +160,29 @@ The training route tags these requests with `extra` metadata:
 - `scheduler_enabled`
 - `scheduler_domain` (typically `"{backend}:{base_model}"`)
 - `scheduler_session_key` (uses server-side `model_id`)
+- `execution_serial_key` / `ordering_key` (uses
+  `"training_session:{model_id}"` for model-bound training work)
 
 Tagged requests are grouped by scheduler domain and assigned into runtime-owned subqueues. Scheduling semantics:
 
 - Same session preserves FIFO order.
-- Each scheduler domain is single-flight: only one scheduled request from that domain can be leased to a worker at a time. This is intentional for shared training actors where overlapping requests against the same actor would violate session-state invariants.
-- Across sessions, selection is fairness-based (`MINT_SCHEDULER_FAIRNESS=oldest|rr`) with starvation guard (`MINT_SCHEDULER_STARVATION_S`).
-- Sticky bursts are bounded by `MINT_SCHEDULER_MAX_CONSECUTIVE`.
-- Optional coalescing window (`MINT_SCHEDULER_COALESCE_MS`) briefly waits for another chunk from the previous session before switching.
+- Active leases are mutually exclusive by `ordering_key`, so the scheduler
+  enforces same-session serialization for both sampling
+  (`"session:{session_id}"`) and model-bound training
+  (`"training_session:{model_id}"`).
+- Affinity is the scheduler's sticky placement primitive. Work with the same
+  affinity group prefers the same runtime replica when that replica is
+  claimable, but it must still respect lease and ordering constraints.
+- Legacy API-work-queue knobs such as `MINT_SCHEDULER_FAIRNESS`,
+  `MINT_SCHEDULER_MAX_CONSECUTIVE`, `MINT_SCHEDULER_STARVATION_S`, and
+  `MINT_SCHEDULER_COALESCE_MS` may remain in old env files or metadata for
+  compatibility/historical diagnostics. They are not the authoritative
+  scheduling algorithm in the `ModelWorkScheduler` architecture.
 - There is no follow-up hold window anymore. A session only keeps the domain lease while its claimed request is still live; stale consumer generations release those leases during restart reconciliation.
 
-This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for these tagged training ops to reduce cross-session thrash, while preserving per-session ordering and bounded fairness.
+This is a deliberate tradeoff: global strict FIFO across sessions is relaxed for
+these tagged training ops to reduce cross-session thrash, while preserving
+per-session ordering through scheduler leases.
 
 ## Reaping and cleanup
 
@@ -221,7 +233,7 @@ Future reaper metrics:
 ## Detached actor hygiene
 
 Detached actors do not hot-reload. Changes to `TaskStateStore`,
-`ModelRuntimeActor`, or persistent storage code still require the matching
+`ModelEngineHost`, or persistent storage code still require the matching
 owner-specific restart or reconcile path. `ModelWorkScheduler` publishes
 `code_identity`; the supervisor dependency ensure path may recreate a stale
 scheduler via `stats(create_if_missing=True)`, while API request paths only
@@ -284,6 +296,8 @@ Initial V1 limits are intentionally generous operator defaults:
 
 - `MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN=1024`
 - `MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN=10240`
+- `MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN=0` (disabled)
+- `MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN=0` (disabled)
 - `MINT_SAMPLING_INFLIGHT_ADMISSION_MODE=observe`
 
 The admission mode should support an observe-first rollout:
@@ -298,6 +312,8 @@ In `observe` and `enforce`, emit low-cardinality default metrics:
 
 - `mint_sampling_inflight_by_domain{domain_key}`
 - `mint_sampling_inflight_principal_domain_max{domain_key}`
+- `mint_sampling_inflight_tokens_by_domain{domain_key}`
+- `mint_sampling_inflight_principal_domain_token_max{domain_key}`
 - `mint_sampling_admission_would_reject_total{reason,domain_key}`
 - `mint_sampling_admission_reject_total{reason,domain_key}`
 
@@ -325,6 +341,8 @@ Allowed durable inflight rejection reasons:
 
 - `principal_domain_inflight_limit_exceeded`
 - `domain_inflight_limit_exceeded`
+- `principal_domain_token_budget_exceeded`
+- `domain_token_budget_exceeded`
 
 The legacy local executor 429 body remains plain and retryable:
 `{"detail": "Sampling backpressure: server overloaded"}`. Server-side tests

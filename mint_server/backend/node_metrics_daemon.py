@@ -863,6 +863,7 @@ def get_or_create_node_metrics_collector_actor(spec: NodeMetricsDaemonSpec) -> A
                 **({"MINT_DEPLOYMENT_ENV": spec.deployment_env} if spec.deployment_env else {}),
                 **({"MINT_CLUSTER_ID": spec.cluster_id} if spec.cluster_id else {}),
             },
+            include_ray_attach_hints=False,
         ),
     }
     return remote_cls.options(**options).remote(

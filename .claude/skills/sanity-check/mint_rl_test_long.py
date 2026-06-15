@@ -676,8 +676,6 @@ def _checkpoint_owner_id_from_save_result(save_result: Any) -> str:
 def _mint_checkpoint_uri(model_path: str) -> str:
     if model_path.startswith("mint://"):
         return model_path
-    if model_path.startswith("tinker://"):
-        return "mint://" + model_path[len("tinker://") :]
     raise ValueError(f"checkpoint model_path must start with 'mint://', got {model_path!r}")
 
 

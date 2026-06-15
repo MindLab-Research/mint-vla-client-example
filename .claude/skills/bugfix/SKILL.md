@@ -86,7 +86,8 @@ curl http://localhost:8000/api/v1/healthz
 ```
 
 If dev server is not running, use the `mint-dev` skill to start it. Dev code is
-updated through the git checkout at `/share/mint/dev/mint-server`, not file sync.
+the explicit `MINT_CODE_ROOT` checkout selected for that launch; do not default
+to the shared dev checkout.
 
 ### 2.1.1 Path-Based Checkpoint Repros On Dev
 

@@ -114,6 +114,17 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         lease_ttl_s=30.0,
         now=103.0,
     )
+    renewed = store.renew_lease(
+        request_id="req-1",
+        lease_id="lease-1",
+        attempt_id="attempt-1",
+        scheduler_epoch=owner["epoch"],
+        runtime_generation=1,
+        lease_ttl_s=60.0,
+        now=104.0,
+    )
+    assert renewed["record"]["status"] == "leased"
+    assert renewed["record"]["lease_expires_at"] == 164.0
     store.begin_finalize(
         request_id="req-1",
         lease_id="lease-1",
@@ -122,7 +133,7 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         runtime_generation=1,
         finalize_ttl_s=30.0,
         staged_payload_path="/tmp/payload.json",
-        now=104.0,
+        now=105.0,
     )
     out = store.commit_finalize_success(
         request_id="req-1",
@@ -134,7 +145,7 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         result_checksum="sha256:abc",
         result_size_bytes=12,
         metadata={"billing_status": "outboxed"},
-        now=105.0,
+        now=106.0,
     )
 
     assert out["record"]["status"] == "done"
@@ -229,7 +240,7 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
     assert future_store.get_task("req-2")["status"] == "retrieved"
 
 
-def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -> None:
+def test_model_work_admission_delegates_durable_create_to_scheduler_gateway(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -244,12 +255,14 @@ def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -
     class _Scheduler:
         def __init__(self) -> None:
             self.seen_status: FutureStatus | None = None
+            self.seen_metadata: dict | None = None
 
-        async def append(self, **kwargs):
+        async def append_work(self, **kwargs):
             try:
                 self.seen_status = await service.async_get_status(kwargs["request_id"])
             except KeyError:
                 self.seen_status = None
+            self.seen_metadata = dict(kwargs.get("extra") or {})
             return {"ok": True, "request_id": kwargs["request_id"]}
 
     scheduler = _Scheduler()
@@ -261,17 +274,18 @@ def test_model_work_admission_creates_future_before_scheduler_append(tmp_path) -
             request_json=b'{"base_model":"Qwen/Test"}',
             domain_key="megatron:Qwen/Test",
             queued_meta={"op": "training.create_model"},
-            task_futures_client=service,
             scheduler_client=scheduler,
+            future_service_client=service,
         )
     )
 
     assert scheduler.seen_status == FutureStatus.PENDING
+    assert scheduler.seen_metadata is not None
+    assert scheduler.seen_metadata["op"] == "training.create_model"
     assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
-    assert future_store.get_task("req-admission")["op"] == "training.create_model"
 
 
-def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path) -> None:
+def test_model_work_admission_does_not_cleanup_future_when_scheduler_append_fails(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -284,7 +298,7 @@ def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path
     ).TaskPayloadStore(root_dir=tmp_path)
 
     class _Scheduler:
-        async def append(self, **kwargs):
+        async def append_work(self, **kwargs):
             raise RuntimeError("scheduler append failed")
 
     async def _run() -> None:
@@ -295,8 +309,8 @@ def test_model_work_admission_cleans_future_when_scheduler_append_fails(tmp_path
                 request_json=b'{"base_model":"Qwen/Test"}',
                 domain_key="megatron:Qwen/Test",
                 queued_meta={"op": "training.create_model"},
-                task_futures_client=service,
                 scheduler_client=_Scheduler(),
+                future_service_client=service,
             )
         except RuntimeError as e:
             assert str(e) == "scheduler append failed"

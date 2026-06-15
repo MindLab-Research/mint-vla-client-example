@@ -314,7 +314,7 @@ def _launcher_observability(*, target: object, kwargs: dict[str, object], enviro
         "target": target if isinstance(target, str) else "inproc:app",
         "timeout_worker_healthcheck": kwargs.get("timeout_worker_healthcheck"),
         "namespace": _env_get(env, "MINT_RAY_NAMESPACE"),
-        "ray_address": env.get("RAY_ADDRESS", ""),
+        "mint_ray_gcs_address": env.get("MINT_RAY_GCS_ADDRESS", ""),
         "ray_client_address": env.get("MINT_RAY_CLIENT_ADDRESS") or env.get("RAY_CLIENT_ADDRESS") or "",
         "env_normalized": _env_get(env, "MINT_SERVER_ENV_NORMALIZED") == "1",
         "pythonpath_changed": _env_get(env, "MINT_SERVER_PYTHONPATH_CHANGED") == "1",
@@ -326,7 +326,7 @@ def _launcher_observability(*, target: object, kwargs: dict[str, object], enviro
 def _log_launcher_observability(*, target: object, kwargs: dict[str, object], environ: dict[str, str] | None = None) -> None:
     meta = _launcher_observability(target=target, kwargs=kwargs, environ=environ)
     logging.getLogger("mint_server.launcher").info(
-        "launcher mode=%s workers=%s host=%s port=%s target=%r timeout_worker_healthcheck=%r namespace=%r ray_address=%r ray_client_address=%r env_normalized=%s pythonpath_changed=%s ld_library_path_changed=%s pythonpath_entries=%s",
+        "launcher mode=%s workers=%s host=%s port=%s target=%r timeout_worker_healthcheck=%r namespace=%r mint_ray_gcs_address=%r ray_client_address=%r env_normalized=%s pythonpath_changed=%s ld_library_path_changed=%s pythonpath_entries=%s",
         meta["mode"],
         meta["workers"],
         meta["host"],
@@ -334,7 +334,7 @@ def _log_launcher_observability(*, target: object, kwargs: dict[str, object], en
         meta["target"],
         meta["timeout_worker_healthcheck"],
         meta["namespace"],
-        meta["ray_address"],
+        meta["mint_ray_gcs_address"],
         meta["ray_client_address"],
         meta["env_normalized"],
         meta["pythonpath_changed"],

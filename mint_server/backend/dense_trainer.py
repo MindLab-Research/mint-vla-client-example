@@ -21,7 +21,7 @@ from ray.exceptions import GetTimeoutError, RayActorError
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from . import ray_kill
-from .ray_placement_groups import PlacementGroupMismatchError, get_named_placement_group
+from .ray_placement_groups import get_named_placement_group
 from .model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
 from .model_actor_supervisor import ActorType, get_model_actor_supervisor
 from .node_placement import parse_model_gpu_placement
@@ -177,36 +177,18 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
 
 
 def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> Any:
-    """Ensure a detached 1-GPU placement group exists for this actor."""
+    """Attach the controller-created detached 1-GPU placement group for this actor."""
     pg_name = _pg_name(actor_name)
     bundle: dict[str, float] = {"GPU": 1.0, "CPU": 1.0}
     preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
     if preferred_ip:
         bundle[f"node:{preferred_ip}"] = 0.001
         logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
-    try:
-        pg = get_named_placement_group(
-            pg_name,
-            namespace=PERSISTENT_DENSE_NAMESPACE,
-            expected_bundles=[bundle],
-        )
-    except PlacementGroupMismatchError as e:
-        ray.util.remove_placement_group(e.pg)
-        pg = ray.util.placement_group(
-            [bundle],
-            strategy="PACK",
-            name=pg_name,
-            lifetime="detached",
-        )
-    except Exception:
-        pg = ray.util.placement_group(
-            [bundle],
-            strategy="PACK",
-            name=pg_name,
-            lifetime="detached",
-        )
-    ray.get(pg.ready())
-    return pg
+    return get_named_placement_group(
+        pg_name,
+        namespace=PERSISTENT_DENSE_NAMESPACE,
+        expected_bundles=[bundle],
+    )
 
 
 def _remove_pg(actor_name: str) -> None:
@@ -540,16 +522,17 @@ def get_or_create_dense_trainer(
                     "env_vars": actor_runtime_env_vars(
                         pythonpath=PFS_PYTHONPATH_DENSE,
                         extra={
-                        "USE_TORCH": "1",
-                        "USE_TF": "0",
-                        "USE_FLAX": "0",
-                        "HF_HOME": "/vePFS-Mindverse/share/huggingface",
-                        "HF_HUB_OFFLINE": "1",
-                        "TRANSFORMERS_OFFLINE": "1",
-                        "PYTHONDONTWRITEBYTECODE": "1",
-                        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-                        **otel_env_vars(),
+                            "USE_TORCH": "1",
+                            "USE_TF": "0",
+                            "USE_FLAX": "0",
+                            "HF_HOME": "/vePFS-Mindverse/share/huggingface",
+                            "HF_HUB_OFFLINE": "1",
+                            "TRANSFORMERS_OFFLINE": "1",
+                            "PYTHONDONTWRITEBYTECODE": "1",
+                            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                            **otel_env_vars(),
                         },
+                        include_ray_attach_hints=False,
                     )
                 }
                 pg = _get_or_create_pg(actor_name, model_key=name_key, base_model=base_model)

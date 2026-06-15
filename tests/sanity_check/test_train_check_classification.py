@@ -357,7 +357,6 @@ def test_main_cleans_up_after_full_matrix_pass(monkeypatch, tmp_path):
         ),
     )
     monkeypatch.setattr(train_check, "ensure_runner_exists", lambda: None)
-    monkeypatch.setattr(train_check, "load_env_file", lambda path: None)
     monkeypatch.setattr(train_check, "build_runs", lambda args, run_root, create_dirs=True: [])
 
     def ok_result(model):
@@ -430,7 +429,6 @@ def test_main_returns_failure_when_checkpoint_cleanup_fails(monkeypatch, tmp_pat
         ),
     )
     monkeypatch.setattr(train_check, "ensure_runner_exists", lambda: None)
-    monkeypatch.setattr(train_check, "load_env_file", lambda path: None)
     monkeypatch.setattr(train_check, "build_runs", lambda args, run_root, create_dirs=True: [])
 
     def ok_result(model):

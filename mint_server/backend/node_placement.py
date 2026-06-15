@@ -149,7 +149,7 @@ def _is_ray_client_mode() -> bool:
 
 
 def _ray_state_api_address() -> str | None:
-    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
         raw = str(os.environ.get(name) or "").strip()
         if not raw:
             continue
@@ -159,7 +159,12 @@ def _ray_state_api_address() -> str | None:
                 return f"{parsed.hostname}:6379"
             continue
         return raw
-    return None
+    try:
+        from ..ray_utils import strict_ray_gcs_address
+
+        return strict_ray_gcs_address()
+    except Exception:
+        return None
 
 
 def _actor_used_gpus_by_node_from_state_api(*, context: str) -> tuple[dict[str, float], bool]:

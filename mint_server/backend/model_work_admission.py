@@ -3,19 +3,25 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+from .control_plane_contracts import AppendWorkResult, SubmitTaskResult
+from .model_work_task_gateway import SchedulerModelWorkTaskGateway
+
 TraceEnqueue = Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True)
 class ModelWorkAdmissionResult:
     request_id: str
-    scheduler_result: dict[str, Any]
+    scheduler_result: AppendWorkResult
+    submit_result: SubmitTaskResult | None = None
 
 
 class ModelWorkAdmissionRejectedError(RuntimeError):
-    def __init__(self, scheduler_result: dict[str, Any]) -> None:
-        self.scheduler_result = dict(scheduler_result)
-        reason = str(self.scheduler_result.get("reason") or "admission_rejected")
+    def __init__(self, scheduler_result: AppendWorkResult | dict[str, Any]) -> None:
+        if isinstance(scheduler_result, dict):
+            scheduler_result = AppendWorkResult.from_wire(scheduler_result)
+        self.scheduler_result = scheduler_result
+        reason = str(scheduler_result.reason or "admission_rejected")
         self.reason = reason
         super().__init__(reason)
 
@@ -37,10 +43,10 @@ async def enqueue_model_work(
     token_cost: int = 1,
     assign: bool = True,
     assign_max_items: int | None = 1,
-    create_future: bool = True,
     payload_hash: str | None = None,
-    task_futures_client: Any | None = None,
     scheduler_client: Any | None = None,
+    gateway_client: Any | None = None,
+    future_service_client: Any | None = None,
     trace_enqueue: TraceEnqueue | None = None,
     trace_kwargs: dict[str, Any] | None = None,
 ) -> ModelWorkAdmissionResult:
@@ -54,11 +60,6 @@ async def enqueue_model_work(
     if ordering_key is not None:
         enqueue_extra["ordering_key"] = str(ordering_key)
 
-    scheduler_confirmed = False
-    if scheduler_client is None:
-        from .model_work_scheduler import model_work_scheduler as scheduler
-    else:
-        scheduler = scheduler_client
     scheduler_extra = {
         **enqueue_extra,
         **dict(queued_meta),
@@ -68,35 +69,19 @@ async def enqueue_model_work(
     }
     if payload_hash is not None:
         scheduler_extra["payload_hash"] = str(payload_hash)
-    future_created = False
-    if create_future and task_futures_client is not None:
-        create_task = getattr(task_futures_client, "async_create_model_work_with_id", None)
-        if callable(create_task):
-            await create_task(
-                request_id,
-                op=op,
-                domain_key=domain_key,
-                request_json=request_json,
-                meta=scheduler_extra,
-                payload_hash=payload_hash,
-            )
-            future_created = True
-        else:
-            create_task = getattr(task_futures_client, "async_create_task", None)
-            if callable(create_task):
-                await create_task(
-                    request_id=request_id,
-                    op=op,
-                    domain_key=domain_key,
-                    request_json=request_json,
-                    metadata=scheduler_extra,
-                )
-                future_created = True
+    if gateway_client is None:
+        gateway = SchedulerModelWorkTaskGateway(
+            scheduler_client=scheduler_client,
+            future_service_client=future_service_client,
+        )
+    else:
+        gateway = gateway_client
     try:
-        append_coro = scheduler.append(
+        submit_coro = gateway.submit_task(
             request_id=request_id,
             op=op,
             request_json=request_json,
+            metadata=scheduler_extra,
             user_id=user_id,
             apikey_id=apikey_id,
             throttle_principal=throttle_principal,
@@ -107,41 +92,46 @@ async def enqueue_model_work(
             token_cost=token_cost,
             assign=assign,
             assign_max_items=assign_max_items,
-            extra=scheduler_extra,
+            payload_hash=payload_hash,
         )
         if trace_enqueue is None:
-            out = await append_coro
+            submit = await submit_coro
         else:
-            out = await trace_enqueue(
+            submit = await trace_enqueue(
                 **dict(trace_kwargs or {}),
                 request_id=request_id,
                 op=op,
-                enqueue_coro=append_coro,
+                enqueue_coro=submit_coro,
             )
-        scheduler_confirmed = isinstance(out, dict) and bool(out.get("ok"))
-        if isinstance(out, dict) and not scheduler_confirmed:
-            reason = str(out.get("reason") or "")
+        if isinstance(submit, dict):
+            submit = SubmitTaskResult.from_wire(submit)
+        if not isinstance(submit, SubmitTaskResult):
+            raise TypeError(f"model work gateway returned non-SubmitTaskResult: {type(submit)}")
+        scheduler_result = submit.extra.get("scheduler_result")
+        if isinstance(scheduler_result, dict):
+            scheduler_result = AppendWorkResult.from_wire(scheduler_result)
+        if not isinstance(scheduler_result, AppendWorkResult):
+            scheduler_result = AppendWorkResult(
+                ok=submit.ok,
+                request_id=submit.request_id,
+                assigned={"ok": True, "assigned": int(submit.assigned), "skipped_domains": []},
+                idempotent=not submit.created,
+                reason=submit.reason,
+                extra=dict(submit.extra),
+            )
+        if not scheduler_result.ok:
+            reason = str(scheduler_result.reason or "")
             if reason in {
                 "principal_domain_inflight_limit_exceeded",
                 "domain_inflight_limit_exceeded",
+                "principal_domain_token_budget_exceeded",
+                "domain_token_budget_exceeded",
             }:
-                raise ModelWorkAdmissionRejectedError(out)
+                raise ModelWorkAdmissionRejectedError(scheduler_result)
         return ModelWorkAdmissionResult(
             request_id=request_id,
-            scheduler_result=out if isinstance(out, dict) else {},
+            scheduler_result=scheduler_result,
+            submit_result=submit,
         )
     except Exception:
-        if scheduler_confirmed:
-            try:
-                await scheduler.cancel_request(
-                    request_id=request_id,
-                    reason="admission_failed",
-                )
-            except Exception:
-                pass
-        if future_created and task_futures_client is not None:
-            try:
-                await task_futures_client.async_cleanup(request_id)
-            except Exception:
-                pass
         raise

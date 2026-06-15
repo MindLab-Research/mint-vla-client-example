@@ -97,7 +97,7 @@ Avoid repeated identical `ERROR` lines in retry loops. One failure should have
 one primary incident-actionable error at the owning boundary.
 
 Never log secrets, full prompts/responses, logits, vectors, process
-environments, raw auth headers, or full `.secrets.env` contents.
+environments, raw auth headers, or full local secret-file contents.
 
 ## Metrics Standards
 

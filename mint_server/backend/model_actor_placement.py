@@ -297,21 +297,21 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
             rows = ray_state.list_actors(
                 detail=True,
                 limit=10000,
+                raise_on_missing_output=False,
                 filters=[("ray_namespace", "=", namespace)],
             )
             return _gpu_actor_records_from_rows(rows, node_id_to_ip=node_id_to_ip)
-        except Exception:
-            from ray._private import state as private_state
-
-            table = private_state.actors()
-            rows = table.values() if isinstance(table, dict) else table
-            return _gpu_actor_records_from_rows(
-                rows,
-                node_id_to_ip=node_id_to_ip,
-                include_mint_named_without_resource=True,
+        except Exception as exc:
+            logger.warning(
+                "[model_actor_placement] GPU actor state listing failed"
+                " namespace=%s error_type=%s error=%s; skipping surviving actor adoption",
+                namespace,
+                type(exc).__name__,
+                exc,
             )
     except Exception:
-        return []
+        logger.debug("[model_actor_placement] GPU actor lister unavailable", exc_info=True)
+    return []
 
 def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]]:
     if isinstance(bundles, dict):
@@ -366,7 +366,7 @@ def _default_placement_group_lister() -> Iterable[dict[str, Any]]:
         gpu_by_node_ip: dict[str, float] = {}
         for bundle_key, bundle in _iter_pg_bundle_items(info.get("bundles") or {}):
             try:
-                bundle_gpu = float(bundle.get("GPU", 0) or 0)
+                bundle_gpu = float(str(bundle.get("GPU", 0) or 0))
             except Exception:
                 bundle_gpu = 0.0
             if bundle_gpu <= 0:
@@ -388,7 +388,7 @@ def _default_placement_group_lister() -> Iterable[dict[str, Any]]:
                 if not isinstance(key, str) or not key.startswith("node:"):
                     continue
                 try:
-                    pinned = float(value or 0) > 0
+                    pinned = float(str(value or 0)) > 0
                 except Exception:
                     pinned = False
                 if not pinned:
@@ -466,6 +466,8 @@ def _default_gpu_actor_killer(actor_info: dict[str, Any], reason: str) -> bool:
         pid = actor_info.get("pid")
         if pid is None:
             return False
+        from .async_ray_control import control_plane_task_runtime_env
+
         options: dict[str, Any] = {}
         if actor_info.get("node_id"):
             from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -474,6 +476,7 @@ def _default_gpu_actor_killer(actor_info: dict[str, Any], reason: str) -> bool:
                 node_id=str(actor_info.get("node_id") or ""),
                 soft=False,
             )
+        options["runtime_env"] = control_plane_task_runtime_env()
         ref = _kill_actor_by_pid_remote().options(**options).remote(
             str(actor_info.get("node_id") or ""),
             str(actor_info.get("actor_id") or ""),

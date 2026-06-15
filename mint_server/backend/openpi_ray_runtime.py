@@ -35,7 +35,11 @@ def _openpi_runtime_env_vars() -> dict[str, str]:
         value = os.environ.get(key, "").strip()
         if value:
             extra[key] = value
-    return actor_runtime_env_vars(pythonpath=PFS_PYTHONPATH, extra=extra)
+    return actor_runtime_env_vars(
+        pythonpath=PFS_PYTHONPATH,
+        extra=extra,
+        include_ray_attach_hints=False,
+    )
 
 
 def _action_session_state_root(actor_name: str) -> str:

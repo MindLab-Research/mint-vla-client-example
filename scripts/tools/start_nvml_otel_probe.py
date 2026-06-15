@@ -434,7 +434,7 @@ def _probe_runtime_env() -> dict[str, object] | None:
     for key in (
         "MINT_APMPLUS_APP_KEY",
         "OTEL_APMPLUS_APP_KEY",
-        "RAY_ADDRESS",
+        "MINT_RAY_GCS_ADDRESS",
         "PFS_RUNTIME_ENV_ROOT",
         "MINT_CODE_ROOT",
         "PFS_HF_MODULES_PATH",

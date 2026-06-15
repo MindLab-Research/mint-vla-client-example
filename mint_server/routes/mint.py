@@ -226,13 +226,9 @@ async def _enqueue_mint_model_work(
             assign_max_items=1,
             extra=merge_queue_priority_extra(extra, request=http_request),
             queued_meta=queued_meta,
-            task_futures_client=task_futures,
+            future_service_client=task_futures,
         )
     except Exception:
-        try:
-            await task_futures.async_cleanup(request_id)
-        except Exception:
-            pass
         raise
 
 

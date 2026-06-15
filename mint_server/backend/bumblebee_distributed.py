@@ -1973,11 +1973,6 @@ class BumblebeeWorkerGroup:
             except Exception:
                 pass
         self.workers = []
-        if self.placement_group is not None:
-            try:
-                ray.util.remove_placement_group(self.placement_group)
-            except Exception:
-                pass
         self.placement_group = None
 
     def _ensure_initialized(self) -> None:
@@ -2022,7 +2017,6 @@ class BumblebeeWorkerGroup:
             pg_name=_make_bumblebee_pg_name(self.base_model),
             bundles=bundles,
         )
-        ray.get(self.placement_group.ready())
         bundle_ips = [_bundle_node_ip(bundle) for bundle in bundles]
 
         runtime_pythonpath = _bumblebee_runtime_pythonpath(self.base_model)
@@ -2044,6 +2038,7 @@ class BumblebeeWorkerGroup:
                     "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
         runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(self.base_model))
@@ -2617,6 +2612,7 @@ def get_or_create_bumblebee_worker_group(
                     "BUMBLEBEE_TE_SDPA_FALLBACK": "1",
                     **otel_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
         runtime_env["env_vars"].update(_bumblebee_runtime_env_defaults(base_model))

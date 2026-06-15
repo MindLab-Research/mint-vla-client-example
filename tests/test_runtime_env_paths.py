@@ -50,7 +50,12 @@ def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
     layout = checkout_runtime_env_layout(str(root))
     host_python = Path(layout.host_python)
     host_python.unlink()
-    host_python.symlink_to(Path(sys.executable))
+    host_python.write_text(
+        "#!/bin/sh\n"
+        f'exec "{sys.executable}" "$@"\n',
+        encoding="utf-8",
+    )
+    host_python.chmod(0o755)
 
 
 def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, str]]:
@@ -108,7 +113,7 @@ def test_config_prepends_actor_extra_pythonpath(tmp_path):
         "PFS_RUNTIME_ENV_ROOT": str(env_root),
         "MINT_CODE_ROOT": "/repo",
         "PFS_HF_MODULES_PATH": "/hf",
-        "RAY_ADDRESS": "local",
+        "MINT_RAY_GCS_ADDRESS": "local",
         "MINT_ACTOR_EXTRA_PYTHONPATH": str(extra),
     }
 
@@ -1079,6 +1084,7 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_VLLM_SERIALIZE_ADD_LORA_UNTIL_IDLE": "1",
             "MINT_VLLM_REQUEST_TIMING": "0",
             "MINT_VLLM_ENABLE_SLEEP_MODE": "1",
@@ -1142,6 +1148,7 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_CONFIG_PATH": str(cfg),
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "issue440-model-work-scheduler",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "issue440-task-state-store",
@@ -1149,14 +1156,15 @@ def test_actor_runtime_env_vars_forwards_config_path(tmp_path):
     )
     data = payload["runtime_env"]
     actor_env = payload["actor_env"]
-    assert data["RAY_ADDRESS"] == "ray://cfg-test"
+    assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert "RAY_ADDRESS" not in data
     assert data["MINT_CONFIG_PATH"] == str(cfg)
     assert data["MINT_RAY_NAMESPACE"] == "cfg_ns"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "issue440-model-work-scheduler"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "issue440-task-state-store"
 
 
-def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
+def test_actor_runtime_env_vars_requires_direct_ray_address(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
     out = subprocess.run(
@@ -1178,7 +1186,68 @@ def test_actor_runtime_env_vars_requires_ray_address(tmp_path):
         },
     )
     assert out.returncode != 0
-    assert "RAY_ADDRESS is required" in (out.stdout + out.stderr)
+    assert "MINT_RAY_GCS_ADDRESS is required" in (out.stdout + out.stderr)
+
+
+def test_actor_runtime_env_vars_rejects_legacy_ray_address_as_attach_hint(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from mint_server.config import actor_runtime_env_vars; "
+                "actor_runtime_env_vars(pythonpath='X')"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+        },
+    )
+    assert out.returncode != 0
+    combined = out.stdout + out.stderr
+    assert "MINT_RAY_GCS_ADDRESS is required" in combined
+    assert "RAY_ADDRESS" not in combined
+
+
+def test_actor_runtime_env_vars_prefers_explicit_gcs_attach_hint(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert "RAY_ADDRESS" not in data
+    assert "MINT_RAY_CLIENT_ADDRESS" not in data
+    assert "RAY_CLIENT_ADDRESS" not in data
 
 
 def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
@@ -1190,7 +1259,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
-            "MINT_RAY_NAMESPACE": "mint-test-ns",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
@@ -1217,6 +1286,7 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
             "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_USAGE_BACKEND": "postgres",
             "MINT_USAGE_PG_DSN": "postgresql://mint:test@db/usage",
             "MINT_USAGE_PG_TABLE": "mint_platform.usage_event",
@@ -1230,7 +1300,7 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     assert actor_env["MINT_USAGE_PG_TABLE"] == "mint_platform.usage_event"
 
 
-def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
+def test_actor_runtime_env_vars_forwards_only_explicit_gcs_attach_hint(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
     out = subprocess.run(
@@ -1251,19 +1321,64 @@ def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "MINT_CODE_ROOT": str(tmp_path / 'repo'),
             "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
-            "RAY_ADDRESS": "192.168.39.87:6379",
+            "RAY_ADDRESS": "192.168.39.88:6379",
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
             "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
             "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
         },
     )
     data = json.loads(out.stdout)
-    assert data["RAY_ADDRESS"] == "192.168.39.87:6379"
-    assert data["MINT_RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
-    assert data["RAY_CLIENT_ADDRESS"] == "ray://192.168.39.87:10001"
-    assert data["MINT_RAY_NODE_IP_ADDRESS"] == "192.168.33.190"
-    assert data["MINT_RAY_TEMP_DIR"] == "/tmp/mdw/t"
+    assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert "RAY_ADDRESS" not in data
+    assert "MINT_RAY_CLIENT_ADDRESS" not in data
+    assert "RAY_CLIENT_ADDRESS" not in data
+    assert "MINT_RAY_NODE_IP_ADDRESS" not in data
+    assert "MINT_RAY_TEMP_DIR" not in data
+
+
+def test_actor_runtime_env_vars_blanks_ray_attach_hints_when_disabled(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars("
+                "pythonpath='X', include_ray_attach_hints=False)))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / "repo"),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
+            "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
+        },
+    )
+    data = json.loads(out.stdout)
+
+    for key in (
+        "MINT_RAY_CLIENT_ADDRESS",
+        "RAY_CLIENT_ADDRESS",
+        "MINT_RAY_NODE_IP_ADDRESS",
+        "MINT_RAY_TEMP_DIR",
+    ):
+        assert data[key] == ""
+    assert "RAY_ADDRESS" not in data
+    assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
 
 
 def test_actor_runtime_env_vars_forwards_state_store_paths(tmp_path):
@@ -1275,6 +1390,7 @@ def test_actor_runtime_env_vars_forwards_state_store_paths(tmp_path):
             "MINT_CODE_ROOT": str(tmp_path / "repo"),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_TASK_STATE_STORE_DB_PATH": ":memory:",
             "MINT_FUTURE_STATE_STORE_DB_PATH": str(tmp_path / "future.rocksdb"),
         },
@@ -1308,6 +1424,7 @@ def test_actor_runtime_env_skips_local_working_dir_in_ray_client_mode(tmp_path):
             "MINT_CODE_ROOT": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_RAY_WORKING_DIR": str(local_repo),
         },
@@ -1339,12 +1456,56 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "MINT_CODE_ROOT": str(tmp_path / "repo"),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
-            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_PY_MODULES_CSV": str(repo_pkg),
         },
     )
     data = json.loads(out.stdout)
     assert "py_modules" not in data
+
+
+def test_actor_runtime_env_without_attach_hints_sets_worker_wrapper(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    repo = tmp_path / "repo"
+    wrapper = repo / "scripts" / "vllm_worker_python.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env("
+                "pythonpath='X', include_ray_attach_hints=False)))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(repo),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+        },
+    )
+    data = json.loads(out.stdout)
+    env_vars = data["env_vars"]
+    assert data["py_executable"] == str(wrapper)
+    assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert "RAY_ADDRESS" not in env_vars
+    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
 
 
 def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
@@ -1371,6 +1532,7 @@ def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
             "MINT_CODE_ROOT": str(local_repo),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
             "RAY_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_WORKING_DIR": str(local_repo),
         },
     )

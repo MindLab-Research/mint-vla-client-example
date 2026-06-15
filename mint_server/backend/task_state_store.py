@@ -15,6 +15,17 @@ from typing import Any, Iterator
 from ..config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
 from ..runtime_env import env_nonempty
 from .async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from .control_plane_contracts import (
+    BeginFinalizeResult,
+    ClaimTaskResult,
+    CommitFinalizeResult,
+    ConflictReason,
+    CreateTaskResult,
+    OwnerLeaseResult,
+    RequeueTaskResult,
+    TaskMutationResult,
+    WireCompatibleResult,
+)
 from .model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
 from .task_hot_kv_store import TaskHotKVStore
 
@@ -78,6 +89,12 @@ class TaskStateNotFoundError(TaskStateStoreError, KeyError):
 
 class TaskStateStoreUnavailableError(TaskStateStoreError):
     pass
+
+
+def _wire_result(value: Any) -> Any:
+    if isinstance(value, WireCompatibleResult):
+        return value.to_wire()
+    return value
 
 
 def _task_state_cause_from_ray_error(exc: BaseException) -> TaskStateStoreError | None:
@@ -1244,7 +1261,7 @@ class TaskStateStore:
         ttl_s: float,
         name: str = "model_work_scheduler",
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> OwnerLeaseResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(ttl_s))
         owner_id = str(owner_id)
@@ -1255,13 +1272,13 @@ class TaskStateStore:
                 (name,),
             ).fetchone()
             if row is not None and str(row["owner_id"]) != owner_id and float(row["expires_at"]) > ts:
-                return {
-                    "ok": False,
-                    "reason": "owner_active",
-                    "owner_id": str(row["owner_id"]),
-                    "epoch": int(row["epoch"]),
-                    "expires_at": float(row["expires_at"]),
-                }
+                return OwnerLeaseResult(
+                    ok=False,
+                    reason=ConflictReason.OWNER_ACTIVE,
+                    owner_id=str(row["owner_id"]),
+                    epoch=int(row["epoch"]),
+                    expires_at=float(row["expires_at"]),
+                )
             epoch = 1 if row is None else int(row["epoch"]) + (0 if str(row["owner_id"]) == owner_id else 1)
             fencing_token = f"{name}:{epoch}:{owner_id}"
             conn.execute(
@@ -1277,13 +1294,13 @@ class TaskStateStore:
                 """,
                 (name, owner_id, epoch, ts, expires_at, fencing_token),
             )
-            return {
-                "ok": True,
-                "owner_id": owner_id,
-                "epoch": epoch,
-                "expires_at": expires_at,
-                "fencing_token": fencing_token,
-            }
+            return OwnerLeaseResult(
+                ok=True,
+                owner_id=owner_id,
+                epoch=epoch,
+                expires_at=expires_at,
+                fencing_token=fencing_token,
+            )
 
     def renew_scheduler_owner(
         self,
@@ -1293,7 +1310,7 @@ class TaskStateStore:
         ttl_s: float,
         name: str = "model_work_scheduler",
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> OwnerLeaseResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(ttl_s))
         with self._transaction() as conn:
@@ -1306,8 +1323,8 @@ class TaskStateStore:
                 (ts, expires_at, str(name), str(owner_id), int(epoch)),
             )
             if cur.rowcount != 1:
-                return {"ok": False, "reason": "stale_owner"}
-            return {"ok": True, "owner_id": str(owner_id), "epoch": int(epoch), "expires_at": expires_at}
+                return OwnerLeaseResult(ok=False, reason=ConflictReason.STALE_OWNER)
+            return OwnerLeaseResult(ok=True, owner_id=str(owner_id), epoch=int(epoch), expires_at=expires_at)
 
     def assert_scheduler_owner(
         self,
@@ -1335,7 +1352,7 @@ class TaskStateStore:
         payload_hash: str | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> CreateTaskResult:
         ts = _now(now)
         with self._transaction() as conn:
             existing = conn.execute(
@@ -1348,7 +1365,11 @@ class TaskStateStore:
                     raise TaskStateConflictError("duplicate request_id with different payload hash")
                 if str(existing["op"]) != str(op) or str(existing["domain_key"]) != str(domain_key):
                     raise TaskStateConflictError("duplicate request_id with different task identity")
-                merged = {**_json_loads(existing["metadata_json"]), **dict(metadata or {})}
+                existing_metadata = _json_loads(existing["metadata_json"])
+                append_attempt_key = "model_work_scheduler_append_attempt_id"
+                if append_attempt_key in existing_metadata:
+                    return CreateTaskResult(ok=True, created=False, record=self._row_to_record(existing))
+                merged = {**existing_metadata, **dict(metadata or {})}
                 if existing_hash is None and payload_hash is not None:
                     conn.execute(
                         """
@@ -1367,7 +1388,11 @@ class TaskStateStore:
                         """,
                         (bytes(request_json), _json_dumps(merged), ts, str(request_id)),
                     )
-                return {"ok": True, "created": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                return CreateTaskResult(
+                    ok=True,
+                    created=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
             conn.execute(
                 """
                 INSERT INTO tasks(
@@ -1394,7 +1419,11 @@ class TaskStateStore:
                 payload={"status": "pending"},
                 now=ts,
             )
-            return {"ok": True, "created": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return CreateTaskResult(
+                ok=True,
+                created=True,
+                record=self._row_to_record(self._get_row(conn, request_id)),
+            )
 
     def ensure_task(
         self,
@@ -1461,7 +1490,7 @@ class TaskStateStore:
         metadata: dict[str, Any] | None = None,
         status: str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
@@ -1491,7 +1520,7 @@ class TaskStateStore:
                 payload={"status": status, "metadata": dict(metadata or {})},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def complete_task_success(
         self,
@@ -1514,7 +1543,7 @@ class TaskStateStore:
             metadata=metadata,
             billing_observations=billing_observations,
             now=now,
-        )
+        ).to_wire()
 
     def stage_payload(
         self,
@@ -1581,7 +1610,7 @@ class TaskStateStore:
         result_size_bytes: int | None = None,
         metadata: dict[str, Any] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._complete_task_direct(
             request_id=request_id,
             status="failed",
@@ -1614,11 +1643,11 @@ class TaskStateStore:
             self._record_event(conn, request_id=str(request_id), event_type="task_retrieved", payload={}, now=ts)
             return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
 
-    def forget_task(self, *, request_id: str) -> dict[str, Any]:
+    def forget_task(self, *, request_id: str) -> TaskMutationResult:
         with self._transaction() as conn:
             conn.execute("DELETE FROM task_events WHERE request_id = ?", (str(request_id),))
             cur = conn.execute("DELETE FROM tasks WHERE request_id = ?", (str(request_id),))
-            return {"ok": True, "deleted": cur.rowcount > 0}
+            return TaskMutationResult(ok=True, deleted=cur.rowcount > 0)
 
     def expire_active_tasks(
         self,
@@ -1991,6 +2020,8 @@ class TaskStateStore:
             return fallback
         try:
             updated = self.update_task_metadata(request_id=request_id, metadata=metadata, now=now)
+            if isinstance(updated, TaskMutationResult) and isinstance(updated.record, dict):
+                return updated.record
             if isinstance(updated, dict) and isinstance(updated.get("record"), dict):
                 return updated["record"]
         except Exception:
@@ -2101,9 +2132,9 @@ class TaskStateStore:
         metadata: dict[str, Any] | None,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
-        out: dict[str, Any]
+        out: TaskMutationResult
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -2114,7 +2145,7 @@ class TaskStateStore:
                     and row["result_size_bytes"] == result_size_bytes
                     and row["error"] == error
                 ):
-                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                    out = TaskMutationResult(ok=True, idempotent=True, record=self._row_to_record(row))
                 else:
                     raise TaskStateConflictError("terminal task commit payload mismatch")
             else:
@@ -2164,18 +2195,29 @@ class TaskStateStore:
                     },
                     now=ts,
                 )
-                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                out = TaskMutationResult(
+                    ok=True,
+                    idempotent=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
         if status == "done" and billing_observations:
             billing_metadata = self._append_billing_outbox_after_terminal_success(
                 observations=billing_observations,
                 source="task_terminal",
                 now=ts,
             )
-            out["record"] = self._best_effort_update_billing_metadata(
-                request_id=request_id,
-                metadata=billing_metadata,
-                now=ts,
-                fallback=dict(out["record"]),
+            out = TaskMutationResult(
+                ok=out.ok,
+                record=self._best_effort_update_billing_metadata(
+                    request_id=request_id,
+                    metadata=billing_metadata,
+                    now=ts,
+                    fallback=dict(out.record or {}),
+                ),
+                reason=out.reason,
+                idempotent=out.idempotent,
+                retry_required=out.retry_required,
+                deleted=out.deleted,
             )
         return out
 
@@ -2186,7 +2228,7 @@ class TaskStateStore:
         subqueue_id: str,
         scheduler_epoch: int,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
@@ -2211,7 +2253,7 @@ class TaskStateStore:
                 payload={"subqueue_id": str(subqueue_id), "scheduler_epoch": int(scheduler_epoch)},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def claim_task(
         self,
@@ -2225,7 +2267,7 @@ class TaskStateStore:
         runtime_generation: int,
         lease_ttl_s: float,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         expires_at = ts + max(1.0, float(lease_ttl_s))
         with self._transaction() as conn:
@@ -2277,7 +2319,56 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return ClaimTaskResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
+
+    def renew_lease(
+        self,
+        *,
+        request_id: str,
+        lease_id: str,
+        attempt_id: str,
+        scheduler_epoch: int,
+        runtime_generation: int,
+        lease_ttl_s: float,
+        now: float | None = None,
+    ) -> TaskMutationResult:
+        ts = _now(now)
+        expires_at = ts + max(1.0, float(lease_ttl_s))
+        with self._transaction() as conn:
+            self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
+            row = self._get_row(conn, request_id)
+            status = str(row["status"])
+            if status in TERMINAL_TASK_STATUSES:
+                return TaskMutationResult(
+                    ok=False,
+                    reason=ConflictReason.TERMINAL,
+                    record=self._row_to_record(row),
+                )
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                SET lease_expires_at = ?,
+                    updated_at = ?
+                WHERE request_id = ?
+                  AND status IN ('leased', 'running')
+                  AND lease_id = ?
+                  AND attempt_id = ?
+                  AND scheduler_epoch = ?
+                  AND runtime_generation = ?
+                """,
+                (
+                    expires_at,
+                    ts,
+                    str(request_id),
+                    str(lease_id),
+                    str(attempt_id),
+                    int(scheduler_epoch),
+                    int(runtime_generation),
+                ),
+            )
+            if cur.rowcount != 1:
+                self._raise_task_transition_error(conn, request_id, "renew lease")
+            return TaskMutationResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def begin_finalize(
         self,
@@ -2290,7 +2381,7 @@ class TaskStateStore:
         finalize_ttl_s: float,
         staged_payload_path: str | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         finalizing_until = ts + max(1.0, float(finalize_ttl_s))
         with self._transaction() as conn:
@@ -2343,7 +2434,7 @@ class TaskStateStore:
                 },
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return BeginFinalizeResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def commit_finalize_success(
         self,
@@ -2358,7 +2449,7 @@ class TaskStateStore:
         result_size_bytes: int,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._commit_finalize(
             request_id=request_id,
             lease_id=lease_id,
@@ -2387,7 +2478,7 @@ class TaskStateStore:
         result_checksum: str | None = None,
         result_size_bytes: int | None = None,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         return self._commit_finalize(
             request_id=request_id,
             lease_id=lease_id,
@@ -2409,13 +2500,17 @@ class TaskStateStore:
         scheduler_epoch: int,
         reason: str,
         now: float | None = None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._transaction() as conn:
             self.assert_scheduler_owner(conn, scheduler_epoch=scheduler_epoch, now=ts)
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
-                return {"ok": False, "reason": "terminal", "record": self._row_to_record(row)}
+                return RequeueTaskResult(
+                    ok=False,
+                    reason=ConflictReason.TERMINAL,
+                    record=self._row_to_record(row),
+                )
             merged = _merge_metadata_with_abandoned_staged_payload(row)
             cur = conn.execute(
                 """
@@ -2450,7 +2545,7 @@ class TaskStateStore:
                 payload={"reason": str(reason), "scheduler_epoch": int(scheduler_epoch)},
                 now=ts,
             )
-            return {"ok": True, "record": self._row_to_record(self._get_row(conn, request_id))}
+            return RequeueTaskResult(ok=True, record=self._row_to_record(self._get_row(conn, request_id)))
 
     def _commit_finalize(
         self,
@@ -2467,9 +2562,9 @@ class TaskStateStore:
         error: str | None,
         billing_observations: list[dict[str, Any]] | None = None,
         now: float | None,
-    ) -> dict[str, Any]:
+    ) -> TaskMutationResult:
         ts = _now(now)
-        out: dict[str, Any]
+        out: TaskMutationResult
         with self._transaction() as conn:
             row = self._get_row(conn, request_id)
             if str(row["status"]) in TERMINAL_TASK_STATUSES:
@@ -2482,7 +2577,7 @@ class TaskStateStore:
                     and (row["result_size_bytes"] == result_size_bytes)
                     and (row["error"] == error)
                 ):
-                    out = {"ok": True, "idempotent": True, "record": self._row_to_record(row)}
+                    out = CommitFinalizeResult(ok=True, idempotent=True, record=self._row_to_record(row))
                 else:
                     raise TaskStateConflictError("terminal task commit payload mismatch")
             else:
@@ -2542,18 +2637,29 @@ class TaskStateStore:
                     },
                     now=ts,
                 )
-                out = {"ok": True, "idempotent": False, "record": self._row_to_record(self._get_row(conn, request_id))}
+                out = CommitFinalizeResult(
+                    ok=True,
+                    idempotent=False,
+                    record=self._row_to_record(self._get_row(conn, request_id)),
+                )
         if status == "done" and billing_observations:
             billing_metadata = self._append_billing_outbox_after_terminal_success(
                 observations=billing_observations,
                 source="model_work_terminal",
                 now=ts,
             )
-            out["record"] = self._best_effort_update_billing_metadata(
-                request_id=request_id,
-                metadata=billing_metadata,
-                now=ts,
-                fallback=dict(out["record"]),
+            out = CommitFinalizeResult(
+                ok=out.ok,
+                record=self._best_effort_update_billing_metadata(
+                    request_id=request_id,
+                    metadata=billing_metadata,
+                    now=ts,
+                    fallback=dict(out.record or {}),
+                ),
+                reason=out.reason,
+                idempotent=out.idempotent,
+                retry_required=out.retry_required,
+                deleted=out.deleted,
             )
         return out
 
@@ -3211,6 +3317,9 @@ class _TaskStateStoreActor:
     def future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("claim_task", **kwargs)
 
+    def future_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return self._future_call_and_notify("renew_lease", **kwargs)
+
     def future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("begin_finalize", **kwargs)
 
@@ -3534,15 +3643,15 @@ class _TaskStateStoreActor:
         return self._store.integrity_check()
 
     def acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.acquire_scheduler_owner(**kwargs)
+        return _wire_result(self._store.acquire_scheduler_owner(**kwargs))
 
     def renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
-        return self._store.renew_scheduler_owner(**kwargs)
+        return _wire_result(self._store.renew_scheduler_owner(**kwargs))
 
     def create_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.create_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def ensure_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.ensure_task(**kwargs)
@@ -3552,7 +3661,7 @@ class _TaskStateStoreActor:
     def update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.update_task_metadata(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.complete_task_success(**kwargs)
@@ -3562,7 +3671,7 @@ class _TaskStateStoreActor:
     def complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.complete_task_failure(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.mark_task_retrieved(**kwargs)
@@ -3572,7 +3681,7 @@ class _TaskStateStoreActor:
     def forget_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.forget_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def expire_active_tasks(self, **kwargs: Any) -> list[str]:
         out = self._store.expire_active_tasks(**kwargs)
@@ -3641,17 +3750,22 @@ class _TaskStateStoreActor:
     def assign_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.assign_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def claim_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.claim_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
+
+    def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        out = self._store.renew_lease(**kwargs)
+        self._notify_task_changed(kwargs.get("request_id"))
+        return _wire_result(out)
 
     def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.begin_finalize(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def stage_payload(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.stage_payload(**kwargs)
@@ -3661,17 +3775,17 @@ class _TaskStateStoreActor:
     def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_success(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_failure(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.requeue_task(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
-        return out
+        return _wire_result(out)
 
     def list_active_tasks(self, **kwargs: Any) -> list[dict[str, Any]]:
         return self._store.list_active_tasks(**kwargs)
@@ -3794,7 +3908,7 @@ class _TaskStateStoreActor:
         return self._store.prune_session_heartbeats(**kwargs)
 
 
-def _create_ray_actor(*, require_ready: bool = True):
+def _create_ray_actor_handle():
     try:
         import ray
     except Exception as e:
@@ -3821,12 +3935,30 @@ def _create_ray_actor(*, require_ready: bool = True):
         "namespace": namespace,
         "lifetime": "detached",
         "get_if_exists": True,
-        "runtime_env": actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()),
+        "runtime_env": actor_runtime_env(
+            pythonpath=PFS_PYTHONPATH,
+            extra=otel_env_vars(),
+            include_ray_attach_hints=False,
+        ),
     }
     apply_detached_actor_resources(options, ray)
     actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
+    return actor
+
+
+def _create_ray_actor(*, require_ready: bool = True):
+    actor = _create_ray_actor_handle()
     if require_ready:
         out = sync_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
+        if not isinstance(out, dict):
+            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+    return actor
+
+
+async def _create_ray_actor_async(*, require_ready: bool = True):
+    actor = await asyncio.to_thread(_create_ray_actor_handle)
+    if require_ready:
+        out = await async_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
     return actor
@@ -3907,7 +4039,7 @@ class TaskStateStoreClient:
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
                 )
             try:
-                actor = _create_ray_actor(require_ready=require_ready)
+                actor = await _create_ray_actor_async(require_ready=require_ready)
             except Exception as e:
                 raise TaskStateStoreUnavailableError(
                     "Failed to get/create detached Ray TaskStateStore actor"
@@ -4051,8 +4183,14 @@ class TaskStateStoreClient:
     async def async_acquire_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("acquire_scheduler_owner", **kwargs)
 
+    async def async_acquire_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.async_acquire_scheduler_owner(**kwargs)
+
     async def async_renew_scheduler_owner(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("renew_scheduler_owner", **kwargs)
+
+    async def async_renew_owner(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.async_renew_scheduler_owner(**kwargs)
 
     async def async_create_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("create_task", **kwargs)
@@ -4137,6 +4275,9 @@ class TaskStateStoreClient:
 
     async def async_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("claim_task", **kwargs)
+
+    async def async_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("renew_lease", **kwargs)
 
     async def async_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("begin_finalize", **kwargs)
@@ -4255,6 +4396,9 @@ class TaskStateStoreClient:
 
     async def async_future_claim_task(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_claim_task", **kwargs)
+
+    async def async_future_renew_lease(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_renew_lease", **kwargs)
 
     async def async_future_begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_begin_finalize", **kwargs)
@@ -4671,21 +4815,35 @@ class TaskStateStoreClient:
 
     async def _dict_call(self, method: str, **kwargs: Any) -> dict[str, Any]:
         out = await self._call(method, **kwargs)
+        out = _wire_result(out)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.{method} returned non-dict: {type(out)}")
         return out
 
 
 class _FutureStateAccess:
-    """Map future-state calls onto TaskStateStore future methods.
-
-    Tests may inject a local object with the old async_* method names; in that
-    case this adapter falls back to the injected methods without creating any
-    Ray actor.
-    """
+    """Map future-state contract calls onto TaskStateStore future methods."""
 
     def __init__(self, client: Any) -> None:
         self._client = client
+
+    async def _call(self, future_method: str, **kwargs: Any) -> Any:
+        method = getattr(self._client, f"async_future_{future_method}", None)
+        if callable(method):
+            return await method(**kwargs)
+        raise AttributeError(f"future-state client missing async_future_{future_method}")
+
+    async def _dict_call(self, future_method: str, **kwargs: Any) -> dict[str, Any]:
+        out = await self._call(future_method, **kwargs)
+        if not isinstance(out, dict):
+            raise TypeError(f"FutureState.{future_method} returned non-dict: {type(out)}")
+        return out
+
+    async def _list_call(self, future_method: str, **kwargs: Any) -> list[Any]:
+        out = await self._call(future_method, **kwargs)
+        if not isinstance(out, list):
+            raise TypeError(f"FutureState.{future_method} returned non-list: {type(out)}")
+        return out
 
     async def async_ensure_started(self) -> None:
         ensure_started = getattr(self._client, "async_ensure_started", None)
@@ -4705,21 +4863,61 @@ class _FutureStateAccess:
         return await self.async_ping(timeout_s=timeout_s)
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
-        future_ping = getattr(self._client, "async_future_ping", None)
-        if callable(future_ping):
-            return await future_ping(timeout_s=timeout_s)
-        ping = getattr(self._client, "async_ping", None)
-        if callable(ping):
-            return await ping(timeout_s=timeout_s)
-        return {"ok": True, "store": "future_state_store"}
+        return await self._dict_call("ping", timeout_s=timeout_s)
 
-    def __getattr__(self, name: str) -> Any:
-        if name.startswith("async_"):
-            future_name = f"async_future_{name[len('async_'):]}"
-            future_method = getattr(self._client, future_name, None)
-            if callable(future_method):
-                return future_method
-        return getattr(self._client, name)
+    async def async_ensure_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("ensure_task", **kwargs)
+
+    async def async_update_task_metadata(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("update_task_metadata", **kwargs)
+
+    async def async_stage_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("stage_payload", **kwargs)
+
+    async def async_complete_task_success(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_success", **kwargs)
+
+    async def async_complete_task_failure(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("complete_task_failure", **kwargs)
+
+    async def async_mark_task_retrieved(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_task_retrieved", **kwargs)
+
+    async def async_forget_task(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("forget_task", **kwargs)
+
+    async def async_get_task(self, request_id: str) -> dict[str, Any]:
+        return await self._dict_call("get_task", request_id=str(request_id))
+
+    async def async_wait_task_status_change(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("wait_task_status_change", **kwargs)
+
+    async def async_stats(self) -> dict[str, Any]:
+        return await self._dict_call("stats")
+
+    async def async_expire_active_tasks(self, **kwargs: Any) -> list[str]:
+        return [str(x) for x in await self._list_call("expire_active_tasks", **kwargs)]
+
+    async def async_list_terminal_payloads_for_eviction(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_terminal_payloads_for_eviction", **kwargs)
+
+    async def async_mark_payload_evicted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_payload_evicted", **kwargs)
+
+    async def async_delete_expired_tombstones(self, **kwargs: Any) -> list[str]:
+        return [str(x) for x in await self._list_call("delete_expired_tombstones", **kwargs)]
+
+    async def async_record_payload_evict_error(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("record_payload_evict_error", **kwargs)
+
+    async def async_list_staged_payloads_for_gc(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_staged_payloads_for_gc", **kwargs)
+
+    async def async_mark_staged_payload_gc_deleted(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("mark_staged_payload_gc_deleted", **kwargs)
+
+    async def async_list_tasks_by_metadata(self, **kwargs: Any) -> list[dict[str, Any]]:
+        return await self._list_call("list_tasks_by_metadata", **kwargs)
 
 
 class TaskFutureService:
@@ -4770,8 +4968,8 @@ class TaskFutureService:
         request_json: bytes,
         meta: dict[str, Any] | None = None,
         payload_hash: str | None = None,
-    ) -> str:
-        await self._future_state.async_ensure_task(
+    ) -> dict[str, Any]:
+        out = await self._future_state.async_ensure_task(
             request_id=str(request_id),
             op=str(op),
             domain_key=str(domain_key),
@@ -4780,7 +4978,12 @@ class TaskFutureService:
             metadata=dict(meta or {}),
             status="pending",
         )
-        return str(request_id)
+        out = _wire_result(out)
+        return {
+            "request_id": str(request_id),
+            "created": bool(out.get("created")),
+            "record": out.get("record"),
+        }
 
     async def async_ensure_pending(self, request_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         out = await self._future_state.async_ensure_task(
@@ -4925,13 +5128,22 @@ class TaskFutureService:
         wait = getattr(self._future_state, "async_wait_task_status_change", None)
         if wait is None:
             return None
-        out = await wait(
-            request_id=str(request_id),
-            timeout_s=float(timeout_s),
-            terminal_only=bool(terminal_only),
-        )
+        try:
+            out = await wait(
+                request_id=str(request_id),
+                timeout_s=float(timeout_s),
+                terminal_only=bool(terminal_only),
+            )
+        except (KeyError, TaskStateNotFoundError):
+            out = {"missing": True}
         if bool(out.get("missing")):
-            raise KeyError(f"Unknown request_id: {request_id}") from None
+            out = await self._task_state.async_wait_task_status_change(
+                request_id=str(request_id),
+                timeout_s=float(timeout_s),
+                terminal_only=bool(terminal_only),
+            )
+            if bool(out.get("missing")):
+                raise KeyError(f"Unknown request_id: {request_id}") from None
         record = out.get("record")
         if not isinstance(record, dict):
             return None

@@ -71,3 +71,32 @@ async def test_model_work_dispatch_does_not_lazy_init_ray(monkeypatch) -> None:
         await dispatch.execute_model_work_item(item)
 
     assert init_ray_calls == []
+
+
+@pytest.mark.anyio
+async def test_model_work_dispatch_classifies_dead_actor_as_executor_outcome(monkeypatch) -> None:
+    from mint_server.backend import model_work_dispatch as dispatch
+    import ray
+
+    class ActorDiedError(RuntimeError):
+        pass
+
+    async def _raise_dead_actor(_name, _fn, **_kwargs):
+        raise ActorDiedError("backend actor died")
+
+    monkeypatch.setattr(dispatch, "run_async_with_otel_span", _raise_dead_actor)
+    monkeypatch.setattr(ray, "is_initialized", lambda: True)
+
+    item = SimpleNamespace(
+        op="internal.noop",
+        request_id="rid-noop",
+        request_json="{}",
+        user_id=None,
+        webhook_url=None,
+        extra=None,
+    )
+
+    outcome = await dispatch.execute_model_work_item(item)
+
+    assert outcome.kind == "fatal_backend_death"
+    assert outcome.error == "backend actor died"

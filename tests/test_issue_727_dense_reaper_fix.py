@@ -25,16 +25,13 @@ Adoption (Fix D):
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from mint_server.backend.model_actor_inventory import (
     ActorType,
-    ModelActorInventory,
-    _ModelActorInventoryState,
 )
 from mint_server.backend.model_actor_placement import (
     ModelActorPlacementReconciler,
@@ -42,7 +39,6 @@ from mint_server.backend.model_actor_placement import (
 )
 from mint_server.backend.model_actor_supervisor import (
     ModelActorSupervisor,
-    ModelActorSupervisorCore,
 )
 
 
@@ -217,6 +213,57 @@ def _make_supervisor(monkeypatch: pytest.MonkeyPatch) -> ModelActorSupervisor:
 
 
 class TestAdoption:
+    async def _cancel_reconcile_loop(self, pool: ModelActorSupervisor) -> None:
+        task = pool._reconcile_task
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
+    @pytest.mark.anyio
+    async def test_startup_adoption_skipped_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Startup does not touch Ray actor state unless adoption is explicitly enabled."""
+        pool = _make_supervisor(monkeypatch)
+
+        def _unexpected_adoption() -> None:
+            raise AssertionError("startup adoption should be opt-in")
+
+        monkeypatch.delenv("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS", raising=False)
+        monkeypatch.setattr(pool, "_adopt_surviving_gpu_actors", _unexpected_adoption)
+
+        try:
+            out = await pool.ensure_reconcile_loop_started()
+            assert out["reconcile_loop_running"] is True
+        finally:
+            await self._cancel_reconcile_loop(pool)
+
+    @pytest.mark.anyio
+    async def test_startup_adoption_runs_when_explicitly_enabled(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Controlled restart flows can still opt into survivor adoption."""
+        pool = _make_supervisor(monkeypatch)
+        calls = 0
+
+        def _record_adoption() -> None:
+            nonlocal calls
+            calls += 1
+
+        monkeypatch.setenv("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS", "true")
+        monkeypatch.setattr(pool, "_adopt_surviving_gpu_actors", _record_adoption)
+
+        try:
+            out = await pool.ensure_reconcile_loop_started()
+            assert out["reconcile_loop_running"] is True
+            assert calls == 1
+        finally:
+            await self._cancel_reconcile_loop(pool)
+
     def test_adopt_surviving_dense_actor_registered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

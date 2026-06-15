@@ -85,6 +85,7 @@ include = ["mint_server*"]
 
 [tool.pytest.ini_options]
 markers = [
+    "component: in-process multi-component tests with mocked external boundaries",
     "moe: tests requiring MoE resources",
     "slow: long-running tests",
 ]
@@ -101,6 +102,9 @@ host-runtime = [
 ]
 dev = [
     "matplotlib>=3.10.7",
+    "pyright==1.1.409",
+    "pytest>=7.0.0",
+    "ruff==0.15.5",
     "trio>=0.33.0",
 ]
 
@@ -185,6 +189,10 @@ transformer_engine = "base image managed"
 
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
+default = true
 
 [[tool.uv.index]]
 name = "pytorch-cpu"

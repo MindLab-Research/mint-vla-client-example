@@ -33,8 +33,7 @@ from mint_server.backend.node_placement import (ModelGpuPlacement,
                                                 parse_model_gpu_placement)
 from mint_server.backend.model_actor_pg_names import (
     namespace_actor_placement_group_name, namespace_pg_suffix)
-from mint_server.backend.ray_placement_groups import (
-    PlacementGroupMismatchError, get_named_placement_group)
+from mint_server.backend.ray_placement_groups import get_named_placement_group
 # Import centralized PFS paths from config
 from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE
 from mint_server.config import config as server_config
@@ -675,27 +674,10 @@ def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMES
 
 
 def _get_or_create_megatron_placement_group(*, pg_name: str, bundles: list[dict[str, float | int]]):
-    try:
-        return get_named_placement_group(
-            pg_name,
-            namespace=PERSISTENT_NAMESPACE,
-            expected_bundles=bundles,
-        )
-    except PlacementGroupMismatchError as e:
-        logger.warning(
-            "[MegatronWorkerGroup] Removing incompatible placement group %s: %s",
-            pg_name,
-            e,
-        )
-        ray.util.remove_placement_group(e.pg)
-    except Exception:
-        pass
-
-    return ray.util.placement_group(
-        bundles,
-        strategy="PACK",
-        name=pg_name,
-        lifetime="detached",
+    return get_named_placement_group(
+        pg_name,
+        namespace=PERSISTENT_NAMESPACE,
+        expected_bundles=bundles,
     )
 
 
@@ -7526,7 +7508,6 @@ class MegatronWorkerGroup:
                 pg_name=pg_name,
                 bundles=bundles,
             )
-            ray.get(self.placement_group.ready())
 
         logger.info(f"[MegatronWorkerGroup] Placement group ready with {world_size} GPUs")
 
@@ -7560,6 +7541,7 @@ class MegatronWorkerGroup:
                 **otel_env_vars(),
                 **_explicit_megatron_attention_backend_env_vars(),
                 },
+                include_ray_attach_hints=False,
             ),
         }
 
@@ -10724,9 +10706,6 @@ class MegatronWorkerGroup:
             except Exception:
                 pass
 
-        if self.placement_group:
-            ray.util.remove_placement_group(self.placement_group)
-
         self.workers = []
         self.placement_group = None
         self._observability_gpu_bindings_cache = []
@@ -11052,6 +11031,7 @@ def get_or_create_megatron_worker_group(
                     **otel_env_vars(),
                     **_explicit_megatron_attention_backend_env_vars(),
                 },
+                include_ray_attach_hints=False,
             )
         }
 

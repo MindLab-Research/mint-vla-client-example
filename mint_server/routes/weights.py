@@ -472,8 +472,8 @@ async def _enqueue_weights_model_work(
         ordering_key=affinity_group,
         extra=_build_execution_serial_extra(model_id=model_id, extra=dict(extra or {})),
         queued_meta=_weights_queued_meta(op=op, model_id=model_id),
-        task_futures_client=task_futures,
         scheduler_client=model_work_scheduler,
+        future_service_client=task_futures,
         trace_enqueue=_enqueue_weights_request_with_trace,
         trace_kwargs={
             "route_start_s": route_start_s,
