@@ -192,13 +192,13 @@ Before killing anything, list exact targets and verify the namespace prefix:
 ```bash
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
 export CLEANUP_NAMESPACE_PREFIX="mint_pr668_"
-RAY_ADDRESS="ray://${HEAD_IP}:10001" \
+MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
 /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'
 import os
 import ray
 
 prefix = os.environ["CLEANUP_NAMESPACE_PREFIX"]
-ray.init(address=os.environ["RAY_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
+ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
 targets = []
 for actor in ray.util.list_named_actors(all_namespaces=True):
     namespace = str(actor.get("namespace") or actor.get("ray_namespace") or "")
@@ -279,14 +279,14 @@ the project runtime Python and Ray Client:
 ```bash
 PY=/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-export RAY_ADDRESS="ray://${HEAD_IP}:10001"
+export MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001"
 export MINT_RAY_NAMESPACE="mint_${USER}"
 $PY - <<'PY'
 import os
 import ray
 
 namespace = os.environ["MINT_RAY_NAMESPACE"]
-ray.init(address=os.environ["RAY_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
+ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
 actor = ray.get_actor("mint_config", namespace=namespace)
 ray.kill(actor, no_restart=True)
 print(f"killed mint_config namespace={namespace}")
@@ -311,7 +311,6 @@ attaches through Ray Client using the current head-address file:
 
 ```bash
 HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-RAY_ADDRESS="ray://${HEAD_IP}:10001" \
 MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
 /vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200
 ```

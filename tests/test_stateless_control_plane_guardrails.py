@@ -280,14 +280,9 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
 
 
 def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
-    allowed = {
-        "mint_server/backend/multinode_inference.py",  # diagnostics only
-    }
     offenders: list[str] = []
     for path in sorted((REPO_ROOT / "mint_server" / "backend").rglob("*.py")):
         rel = path.relative_to(REPO_ROOT).as_posix()
-        if rel in allowed:
-            continue
         source = path.read_text(encoding="utf-8")
         if 'os.environ.get("RAY_ADDRESS"' in source or "os.environ.get('RAY_ADDRESS'" in source:
             offenders.append(rel)
@@ -322,18 +317,15 @@ def test_ray_address_production_references_are_explicitly_owned() -> None:
         "mint_server/config.py",  # actor env builder and no-attach runtime env keys.
         "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
         "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
-        "mint_server/backend/multinode_inference.py",  # no-attach runtime env key and diagnostics.
+        "mint_server/backend/multinode_inference.py",  # no-attach runtime env key.
         "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
-        "ops/backend/config.py",  # ops dashboard config fallback.
+        "ops/backend/config.py",  # explicit MINT_OPS_RAY_ADDRESS / MINT_RAY_GCS_ADDRESS config names.
         "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
         "scripts/vllm_worker_python.py",  # subprocess cleanup wrapper.
         "sitecustomize.py",  # worker/vLLM cleanup patches.
     }
     ignored_prefixes = (
         "tests/",
-        "scripts/tools/reproduce_issue_",
-        "scripts/tools/check_node_usage.py",
-        "scripts/tools/start_nvml_otel_probe.py",
         "scripts/tools/validate_gpu_uuid_binding.py",
     )
     actual_files: set[str] = set()

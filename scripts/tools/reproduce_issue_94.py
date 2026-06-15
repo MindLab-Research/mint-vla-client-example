@@ -35,7 +35,7 @@ def main() -> int:
 
     calls = _install_ray_stub()
 
-    os.environ["RAY_ADDRESS"] = "192.168.37.185:6379"
+    os.environ["MINT_RAY_GCS_ADDRESS"] = "192.168.37.185:6379"
     os.environ.pop("MINT_RAY_LOG_TO_DRIVER", None)
     init_ray(namespace="ns", ignore_reinit_error=True)
     if calls[-1].get("log_to_driver") is not False:

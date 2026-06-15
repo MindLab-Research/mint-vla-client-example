@@ -88,7 +88,7 @@ def _post(url: str, *, headers: dict[str, str], payload: dict[str, Any], timeout
 
 
 def _configure_ray_access(*, ray_address: str, ray_namespace: str) -> None:
-    os.environ["RAY_ADDRESS"] = str(ray_address)
+    os.environ["MINT_RAY_GCS_ADDRESS"] = str(ray_address)
     os.environ["MINT_RAY_NAMESPACE"] = str(ray_namespace)
     os.environ["MINT_RAY_NAMESPACE"] = str(ray_namespace)
 
@@ -265,7 +265,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--future-timeout-s", type=float, default=900.0)
     parser.add_argument("--stale-after-s", type=float, required=True)
     parser.add_argument("--cleanup-timeout-s", type=float, default=90.0)
-    parser.add_argument("--ray-address", default=_coalesce(os.environ.get("RAY_ADDRESS"), "192.168.36.5:26379"))
+    parser.add_argument("--ray-address", default=_coalesce(os.environ.get("MINT_RAY_GCS_ADDRESS"), "192.168.36.5:26379"))
     parser.add_argument("--ray-namespace", default=_coalesce(os.environ.get("MINT_RAY_NAMESPACE"), "mint_local_nolanho"))
     parser.add_argument("--report-json", default=None)
     return parser.parse_args()

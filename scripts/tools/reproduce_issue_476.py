@@ -12,7 +12,7 @@ import requests
 
 BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000").rstrip("/")
 API_KEY = os.environ.get("MINT_API_KEY", "dummy")
-RAY_ADDRESS = os.environ.get("RAY_ADDRESS", "").strip()
+MINT_RAY_GCS_ADDRESS = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
 RAY_NAMESPACE = (
     os.environ.get("MINT_RAY_NAMESPACE")
     or os.environ.get("MINT_RAY_NAMESPACE")
@@ -163,15 +163,15 @@ def _run_python(code: str, timeout_s: float = 120.0) -> str:
     if SSH_HOST in local_hosts:
         cmd = ["/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python", "-"]
         env = os.environ.copy()
-        if RAY_ADDRESS:
-            env["RAY_ADDRESS"] = RAY_ADDRESS
+        if MINT_RAY_GCS_ADDRESS:
+            env["MINT_RAY_GCS_ADDRESS"] = MINT_RAY_GCS_ADDRESS
         if RAY_NAMESPACE:
             env["MINT_RAY_NAMESPACE"] = RAY_NAMESPACE
             env["MINT_RAY_NAMESPACE"] = RAY_NAMESPACE
     else:
         cmd = ["ssh", SSH_HOST]
-        if RAY_ADDRESS:
-            cmd.append(f"RAY_ADDRESS={RAY_ADDRESS}")
+        if MINT_RAY_GCS_ADDRESS:
+            cmd.append(f"MINT_RAY_GCS_ADDRESS={MINT_RAY_GCS_ADDRESS}")
         if RAY_NAMESPACE:
             cmd.append(f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}")
             cmd.append(f"MINT_RAY_NAMESPACE={RAY_NAMESPACE}")
@@ -194,8 +194,8 @@ def _run_python(code: str, timeout_s: float = 120.0) -> str:
 
 
 def _actor_infos() -> list[dict[str, Any]]:
-    if not RAY_ADDRESS:
-        raise RuntimeError("RAY_ADDRESS is required")
+    if not MINT_RAY_GCS_ADDRESS:
+        raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
     if not RAY_NAMESPACE:
         raise RuntimeError("MINT_RAY_NAMESPACE or MINT_RAY_NAMESPACE is required")
     code = f"""
@@ -203,7 +203,7 @@ import json
 import os
 import ray
 
-ray.init(address=os.environ["RAY_ADDRESS"], ignore_reinit_error=True)
+ray.init(address=os.environ["MINT_RAY_GCS_ADDRESS"], ignore_reinit_error=True)
 ns = os.environ["MINT_RAY_NAMESPACE"]
 rows = []
 for entry in ray.util.list_named_actors(all_namespaces=True):
@@ -258,7 +258,7 @@ def main() -> int:
         print(f"base_url={BASE_URL}")
         print(f"base_model={BASE_MODEL}")
         print(f"ray_namespace={RAY_NAMESPACE!r}")
-        print(f"ray_address={RAY_ADDRESS!r}")
+        print(f"mint_ray_gcs_address={MINT_RAY_GCS_ADDRESS!r}")
 
         session_64 = _create_session(f"issue476-rank-{HIGH_RANK}-{uuid.uuid4().hex[:8]}")
         model_64 = _create_model(session_64, HIGH_RANK)

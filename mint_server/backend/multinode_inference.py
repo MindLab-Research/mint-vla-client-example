@@ -975,9 +975,9 @@ def _create_mint_vllm_multinode_actor(
             # disable to fall back to torch.distributed collectives.
             os.environ["VLLM_DISABLE_PYNCCL"] = "1"
             logger.info(
-                "vllm_child_env python=%s ray_address=%s py_path_head=%s ld_library_path=%s",
+                "vllm_child_env python=%s mint_ray_gcs_address=%s py_path_head=%s ld_library_path=%s",
                 sys.executable,
-                os.environ.get("RAY_ADDRESS", ""),
+                os.environ.get("MINT_RAY_GCS_ADDRESS", ""),
                 sys.path[:8],
                 os.environ.get("LD_LIBRARY_PATH", ""),
             )

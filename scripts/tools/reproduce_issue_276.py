@@ -14,7 +14,7 @@ UPSTREAM_BASE_URL = os.environ.get("MINT_UPSTREAM_BASE_URL", "http://localhost:1
 API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 BASE_MODEL = os.environ.get("MINT_MODEL", "Qwen/Qwen3-0.6B")
 MINT_DEV_HOST = os.environ.get("MINT_DEV_HOST", "mint-dev")
-RAY_ADDRESS = os.environ.get("MINT_RAY_ADDRESS", "192.168.37.63:6379")
+MINT_RAY_GCS_ADDRESS = os.environ.get("MINT_RAY_GCS_ADDRESS", "192.168.37.63:6379")
 GATEWAY_NAMESPACE = os.environ.get("MINT_GATEWAY_NAMESPACE", "mint_yiwen_issue_276_gateway")
 UPSTREAM_ALIAS = os.environ.get("MINT_UPSTREAM_ALIAS", "issue276-upstream")
 CHECKPOINTS_DIR = os.environ.get("MINT_CHECKPOINT_DIR", "/vePFS-Mindverse/share/mint_checkpoints")
@@ -71,7 +71,7 @@ def _make_training_archive(*, root: str, model_id: str) -> bytes:
 def _seed_gateway_remote_training_model(*, model_id: str) -> None:
     script = f"""
 cd /root/mint_project/mint-server-issue-276
-env RAY_ADDRESS={RAY_ADDRESS} \
+env MINT_RAY_GCS_ADDRESS={MINT_RAY_GCS_ADDRESS} \
 PYTHONPATH=/root/mint_project/mint-server-issue-276 \
 MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \
 MINT_RAY_NAMESPACE={GATEWAY_NAMESPACE} \

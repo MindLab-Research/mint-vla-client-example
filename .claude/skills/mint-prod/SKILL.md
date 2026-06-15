@@ -139,7 +139,7 @@ import os
 import ray
 
 namespace = os.environ.get("RAY_NAMESPACE") or os.environ.get("MINT_RAY_NAMESPACE") or "mint"
-address = os.environ.get("RAY_ADDRESS") or "auto"
+address = os.environ.get("MINT_RAY_GCS_ADDRESS") or "auto"
 ray.init(address=address, namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
 actor = ray.get_actor("mint_config", namespace=namespace)
 ray.kill(actor, no_restart=True)

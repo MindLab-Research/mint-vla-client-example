@@ -36,7 +36,7 @@ class OpsBackendConfig:
         ).strip()
         ray_address = (
             os.getenv("MINT_OPS_RAY_ADDRESS")
-            or os.getenv("RAY_ADDRESS")
+            or os.getenv("MINT_RAY_GCS_ADDRESS")
             or "auto"
         ).strip()
         api_key = (

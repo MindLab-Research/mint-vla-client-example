@@ -17,9 +17,9 @@ def _fail(msg: str) -> int:
 def main() -> int:
     if not RAY_NAMESPACE:
         return _fail("MINT_RAY_NAMESPACE is required (run on mint-dev with the server namespace)")
-    ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+    ray_address = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
     if not ray_address:
-        return _fail("RAY_ADDRESS is required and must be the validated GCS address")
+        return _fail("MINT_RAY_GCS_ADDRESS is required and must be the validated GCS address")
 
     try:
         import ray

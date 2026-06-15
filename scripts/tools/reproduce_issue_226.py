@@ -119,9 +119,9 @@ import time
 import ray
 
 ns = os.environ["MINT_RAY_NAMESPACE"]
-addr = os.environ.get("RAY_ADDRESS", "").strip()
+addr = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
 if not addr:
-    raise RuntimeError("RAY_ADDRESS is required")
+    raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 ray.init(address=addr, namespace=ns, ignore_reinit_error=True)
 
 @ray.remote
@@ -163,9 +163,9 @@ import os
 import ray
 
 ns = os.environ["MINT_RAY_NAMESPACE"]
-addr = os.environ.get("RAY_ADDRESS", "").strip()
+addr = os.environ.get("MINT_RAY_GCS_ADDRESS", "").strip()
 if not addr:
-    raise RuntimeError("RAY_ADDRESS is required")
+    raise RuntimeError("MINT_RAY_GCS_ADDRESS is required")
 ray.init(address=addr, namespace=ns, ignore_reinit_error=True)
 
 name = {json.dumps(name)}
