@@ -25,6 +25,10 @@ fi
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
   export MINT_CODE_ROOT="$repo_root"
 fi
+if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ]; then
+  echo "missing MINT_RAY_GCS_ADDRESS in prod config" >&2
+  exit 1
+fi
 
 api_tmp_root="${MINT_TMP_ROOT}/api/${USER:-unknown}"
 api_tmp_link="/tmp/mpa"
@@ -55,7 +59,7 @@ PY
 ray_temp_dir="${api_tmp_link}/ray"
 mkdir -p "${ray_temp_dir}"
 "${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/ray" start \
-  --address="${RAY_ADDRESS}" \
+  --address="${MINT_RAY_GCS_ADDRESS}" \
   --node-ip-address="${ray_node_ip}" \
   --num-cpus=0 \
   --num-gpus=0 \

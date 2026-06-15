@@ -75,7 +75,7 @@ Sync your local checkout to your chosen share path before starting:
 ```bash
 rsync -a --delete <your-local-checkout>/ /vePFS-Mindverse/share/<your-path>/
 MINT_CODE_ROOT=/vePFS-Mindverse/share/<your-path> MINT_DEV_USER=<you> \
-  MINT_DEV_DEPLOYMENT_ENV=/share/mint/dev/config/common.env \
+  MINT_DEV_DEPLOYMENT_ENV=/path/to/explicit/deployment.env \
   nohup scripts/start_dev_server.sh >> /tmp/mint_dev.log 2>&1 &
 ```
 

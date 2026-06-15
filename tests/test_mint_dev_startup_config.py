@@ -6,11 +6,8 @@ LEGACY_DEV_SECRETS_ENV = "MINT_DEV_" + "SECRETS_ENV"
 LEGACY_DEV_SECRETS_PATH = "/vePFS-Mindverse/share/mint/dev/config/" + "secrets.env"
 
 
-def test_dev_volcano_env_sources_external_config() -> None:
-    text = (REPO_ROOT / "configs" / "dev_volcano.env.sh").read_text()
-
-    assert 'mint_dev_config_env="${MINT_DEV_CONFIG_ENV:-/vePFS-Mindverse/share/mint/dev/config/common.env}"' in text
-    assert '. "${mint_dev_config_env}"' in text
+def test_dev_volcano_legacy_config_wrapper_is_removed() -> None:
+    assert not (REPO_ROOT / "configs" / "dev_volcano.env.sh").exists()
 
 
 def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
@@ -49,6 +46,7 @@ def test_runtime_config_has_no_dev_secrets_env_shim() -> None:
     text = (REPO_ROOT / "mint_server" / "runtime_config.py").read_text()
 
     assert LEGACY_DEV_SECRETS_ENV not in text
+    assert "MINT_DEV_CONFIG_ENV" not in text
 
 
 def test_agent_dev_skills_do_not_revive_legacy_dev_secrets() -> None:
@@ -76,6 +74,9 @@ def test_start_prod_server_script_uses_tmp_root_shortlink() -> None:
     assert '. "${prod_config_env}"' in text
     assert 'prod_secrets_env="${MINT_PROD_SECRETS_ENV:-/vePFS-Mindverse/share/mint/prod/config/secrets.env}"' in text
     assert '. "${prod_secrets_env}"' in text
+    assert "missing MINT_RAY_GCS_ADDRESS in prod config" in text
+    assert '--address="${MINT_RAY_GCS_ADDRESS}"' in text
+    assert '--address="${RAY_ADDRESS}"' not in text
     assert 'export MINT_RUNTIME_CHECKPOINT_DIR="/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints"' in text
     assert 'export MINT_CODE_ROOT="$repo_root"' in text
     legacy_gateway_prefix = "MINT_GATEWAY_" + "GLM" + "51"

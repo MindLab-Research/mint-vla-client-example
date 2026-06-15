@@ -72,7 +72,7 @@ def test_launcher_observability_reports_normalization_flags() -> None:
         },
         environ={
             "MINT_RAY_NAMESPACE": "ns-test",
-            "RAY_ADDRESS": "192.168.38.184:6379",
+            "MINT_RAY_GCS_ADDRESS": "192.168.38.184:6379",
             "RAY_CLIENT_ADDRESS": "ray://192.168.38.184:10001",
             "MINT_SERVER_ENV_NORMALIZED": "1",
             "MINT_SERVER_PYTHONPATH_CHANGED": "1",
@@ -84,6 +84,8 @@ def test_launcher_observability_reports_normalization_flags() -> None:
     assert meta["mode"] == "multi-worker"
     assert meta["workers"] == 8
     assert meta["namespace"] == "ns-test"
+    assert meta["mint_ray_gcs_address"] == "192.168.38.184:6379"
+    assert meta["ray_client_address"] == "ray://192.168.38.184:10001"
     assert meta["env_normalized"] is True
     assert meta["pythonpath_changed"] is True
     assert meta["ld_library_path_changed"] is False

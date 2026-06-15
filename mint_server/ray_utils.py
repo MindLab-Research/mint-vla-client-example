@@ -93,8 +93,7 @@ def ray_log_to_driver_kwargs() -> dict[str, Any]:
 
 
 def ray_client_working_dir() -> str | None:
-    addr = os.environ.get("RAY_ADDRESS", "").strip()
-    if not addr.startswith("ray://"):
+    if not any(os.environ.get(name, "").strip().startswith("ray://") for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS")):
         return None
     working_dir = os.environ.get("MINT_RAY_WORKING_DIR", "").strip()
     return working_dir or None
@@ -128,14 +127,14 @@ def preferred_driver_ray_address() -> str:
     configured_path = _configured_ray_head_address_path()
     if configured_path is not None:
         return _read_configured_ray_head_address(configured_path)
-    for name in (_RAY_GCS_ADDRESS_ENV, "RAY_ADDRESS"):
-        addr = os.environ.get(name, "").strip()
-        if addr:
-            return _normalize_ray_address(addr)
+    addr = os.environ.get(_RAY_GCS_ADDRESS_ENV, "").strip()
+    if addr:
+        return _normalize_ray_address(addr)
     raise MissingRayAddressError(
-        "RAY_ADDRESS must be set before initializing Ray "
+        "explicit Ray address is required before initializing Ray "
         f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
-        "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
+        "set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver, "
+        f"or {_RAY_GCS_ADDRESS_ENV} for direct attach)"
     )
 
 
@@ -388,9 +387,10 @@ def init_ray(**kwargs: Any) -> Any:
             if ray.is_initialized():
                 return None
             raise MissingRayAddressError(
-                "RAY_ADDRESS must be set before initializing Ray "
+                "explicit Ray address is required before initializing Ray "
                 f"(or set {_RAY_HEAD_ADDRESS_PATH_ENV}; "
-                "optionally set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver)"
+                "set MINT_RAY_CLIENT_ADDRESS or RAY_CLIENT_ADDRESS for the driver, "
+                f"or {_RAY_GCS_ADDRESS_ENV} for direct attach)"
             )
         desired_address: Any = configured_address
     elif isinstance(current, str):

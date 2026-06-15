@@ -315,7 +315,7 @@ def _runtime_env_value_is_uri(value: str) -> bool:
 
 
 def _actor_runtime_env_allows_local_paths() -> bool:
-    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS", "RAY_ADDRESS"):
+    for name in ("MINT_RAY_CLIENT_ADDRESS", "RAY_CLIENT_ADDRESS"):
         value = _env_nonempty(os.environ, name)
         if value and value.startswith("ray://"):
             return False

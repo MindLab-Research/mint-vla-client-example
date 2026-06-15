@@ -68,7 +68,7 @@ def test_ray_init_interprocess_lock_serializes_processes(tmp_path):
     assert results["contender"] >= 0.25
 
 
-def test_init_ray_resolves_auto_address(monkeypatch):
+def test_init_ray_resolves_auto_address_from_explicit_mint_gcs(monkeypatch):
     calls: list[dict[str, object]] = []
 
     fake_ray = SimpleNamespace(
@@ -80,8 +80,8 @@ def test_init_ray_resolves_auto_address(monkeypatch):
     def _no_lock():
         yield 0.0
 
-    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
-    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
     monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
     monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _no_lock)
@@ -124,6 +124,30 @@ def test_gcs_address_helpers_ignore_legacy_ray_address(monkeypatch):
 
     assert ray_utils.preferred_ray_gcs_address() is None
     assert ray_utils.strict_ray_gcs_address() is None
+
+
+def test_init_ray_ignores_legacy_ray_address_without_explicit_address(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
+    monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
+    monkeypatch.delenv("MINT_RAY_HEAD_ADDRESS_PATH", raising=False)
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    try:
+        ray_utils.init_ray(address="auto", namespace="mint", ignore_reinit_error=True)
+    except ray_utils.MissingRayAddressError as exc:
+        assert "explicit Ray address is required" in str(exc)
+    else:
+        raise AssertionError("legacy RAY_ADDRESS must not satisfy Ray init address contract")
+    assert calls == []
 
 
 def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch):
@@ -239,8 +263,8 @@ def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):
         raise AssertionError("interprocess lock should not run for remote ray attach")
         yield 0.0
 
-    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
-    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _unexpected_lock)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
@@ -272,8 +296,8 @@ def test_init_ray_reuses_existing_worker_context(monkeypatch):
         shutdown=lambda: (_ for _ in ()).throw(RuntimeError("shutdown should not run inside worker context")),
     )
 
-    monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
-    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+    monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
     monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 

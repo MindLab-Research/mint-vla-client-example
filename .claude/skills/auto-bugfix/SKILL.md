@@ -248,7 +248,6 @@ export MINT_RAY_NAMESPACE='$MINT_RAY_NAMESPACE'
 export MINT_PORT='$MINT_PORT'
 export MINT_USAGE_LOG_DIR='/tmp/mint_usage_issue_$ISSUE'
 export MINT_AUTH_MODE=no-auth
-export MINT_DEV_DEPLOYMENT_ENV=/vePFS-Mindverse/share/mint/dev/config/common.env
 exec scripts/start_dev_server.sh
 SH
 chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh

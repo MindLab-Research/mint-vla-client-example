@@ -319,15 +319,13 @@ def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> Non
 
 def test_ray_address_production_references_are_explicitly_owned() -> None:
     allowed_files = {
-        "mint_server/config.py",  # actor env builder and driver address fallback.
+        "mint_server/config.py",  # actor env builder and no-attach runtime env keys.
         "mint_server/backend/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
         "mint_server/backend/multi_lora_engine.py",  # no-attach runtime env key.
         "mint_server/backend/multinode_inference.py",  # no-attach runtime env key and diagnostics.
         "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
         "ops/backend/config.py",  # ops dashboard config fallback.
-        "scripts/run_server.py",  # launcher observability.
         "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
-        "scripts/start_prod_server.sh",  # prod launcher contract.
         "scripts/vllm_worker_python.py",  # subprocess cleanup wrapper.
         "sitecustomize.py",  # worker/vLLM cleanup patches.
     }
