@@ -37,7 +37,7 @@ of full model runtime provisioning.
 | Component harness | `uv run pytest tests/component/control_plane -q` | Contract-level scheduler/gateway/runtime/supervisor integration through public surfaces. |
 | Placement controller | `uv run pytest tests/test_cluster_placement_controller.py -q` | PG reservation, pending timeout, blocked retry, attach request shape, and rebuild semantics. |
 | Static guardrails | `uv run pytest tests/test_stateless_control_plane_guardrails.py -q` | Prevent regression to private route/storage access, legacy completion surfaces, direct backend PG creation, and async footguns. |
-| Issue 593 scheduler/engine-host/supervisor | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_runtime_actor.py tests/test_issue_593_model_actor_supervisor.py -q` | Narrow historical regressions around scheduler, engine-host, and supervisor behavior. |
+| Issue 593 scheduler/engine-host/supervisor | `uv run pytest tests/test_issue_593_model_work_scheduler.py tests/test_issue_593_model_engine_host.py tests/test_issue_593_model_actor_supervisor.py -q` | Narrow historical regressions around scheduler, engine-host, and supervisor behavior. |
 | Contract verifier | `uv run python scripts/tools/verify_scheduler_control_plane.py` | Broader local scheduler contract slate. |
 | Static checks | scoped `ruff`, scheduler-CI `pyright` config, `py_compile`, `git diff --check` | Make typed-boundary and import/syntax failures fail before runtime. |
 | Critical path soft gates | focused `pytest` nodeids for critical success and critical failure paths | Make the highest-value semantic paths visible as named 100%-pass gates instead of only incidental full-suite coverage. |

@@ -16,7 +16,7 @@ from pathlib import Path
 SCHEDULER_CONTROL_PLANE_TESTS = [
     "tests/component/control_plane",
     "tests/test_stateless_control_plane_guardrails.py",
-    "tests/test_issue_593_model_runtime_actor.py",
+    "tests/test_issue_593_model_engine_host.py",
     "tests/test_issue_593_model_work_scheduler.py",
     "tests/test_issue_616_task_state_store.py",
     "tests/test_future_state_store.py",

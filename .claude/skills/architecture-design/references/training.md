@@ -25,9 +25,9 @@ See `training-multitenancy.md` for the dense vs Megatron swap mechanisms.
   of calling local engine handles from the API worker.
 - `TrainingSessionManager` keeps runtime-actor-local working objects for active
   `model_id`s, inflight counters, and create-time scratch state after
-  `ModelRuntimeActor` initializes execution bindings. It is not the durable
+  `ModelEngineHost` initializes execution bindings. It is not the durable
   authority.
-- `ModelRuntimeActor` carries runtime-local execution handles through an
+- `ModelEngineHost` carries runtime-local execution handles through an
   `ExecutionContext` contextvar while dispatching queued model work. Route-local
   `_do_*` execution helpers may read that context, but runtime dispatch must not
   mutate FastAPI route module globals as an execution binding mechanism.

@@ -48,7 +48,7 @@ PYTHON_TARGETS=(
   tests/test_cluster_placement_controller.py
   tests/test_stateless_control_plane_guardrails.py
   tests/test_issue_593_model_work_scheduler.py
-  tests/test_issue_593_model_runtime_actor.py
+  tests/test_issue_593_model_engine_host.py
   tests/test_issue_593_model_actor_supervisor.py
   tests/test_model_work_task_gateway.py
   tests/conftest.py
@@ -78,7 +78,7 @@ COVERAGE_TEST_TARGETS=(
   tests/test_cluster_placement_controller.py
   tests/test_stateless_control_plane_guardrails.py
   tests/test_issue_593_model_work_scheduler.py
-  tests/test_issue_593_model_runtime_actor.py
+  tests/test_issue_593_model_engine_host.py
   tests/test_issue_593_model_actor_supervisor.py
   tests/test_model_work_task_gateway.py
 )
@@ -110,7 +110,7 @@ run_step "component harness" "${UV_RUN[@]}" pytest tests/component/control_plane
 run_step "placement controller" "${UV_RUN[@]}" pytest tests/test_cluster_placement_controller.py -q
 run_step "stateless guardrails" "${UV_RUN[@]}" pytest tests/test_stateless_control_plane_guardrails.py -q
 run_step "issue 593 scheduler" "${UV_RUN[@]}" pytest tests/test_issue_593_model_work_scheduler.py -q
-run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_runtime_actor.py -q
+run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_engine_host.py -q
 run_step "issue 593 supervisor" "${UV_RUN[@]}" pytest tests/test_issue_593_model_actor_supervisor.py -q
 run_step "contract verifier" "${UV_RUN[@]}" python scripts/tools/verify_scheduler_control_plane.py
 run_step "scoped ruff" "${UV_RUN[@]}" ruff check "${PYTHON_TARGETS[@]}" tests/component/control_plane

@@ -59,7 +59,7 @@ Implications:
   - `futures.py`: `request_id` polling.
 
 - `mint_server/backend/execution_context.py`
-  - Runtime-actor-local execution context for queued model work. `ModelRuntimeActor`
+  - Runtime-actor-local execution context for queued model work. `ModelEngineHost`
     binds manager/engine handles with a contextvar while executing dispatcher
     work items. API workers must leave route module execution globals unbound;
     runtime dispatch must not temporarily write route globals.
