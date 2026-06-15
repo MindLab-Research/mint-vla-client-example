@@ -151,6 +151,11 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "/repo/scripts/vllm_worker_python.py")
+    monkeypatch.setattr(
+        "mint_server.backend.model_engine_host.preferred_vllm_python_executable",
+        lambda: "/repo/scripts/vllm_worker_python.py",
+    )
 
     out = get_or_create_model_engine_host(
         domain_key="vllm:model-a",
@@ -165,6 +170,10 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    assert (
+        created[-1]["options"]["runtime_env"]["py_executable"]
+        == "/repo/scripts/vllm_worker_python.py"
+    )
     assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
 
 

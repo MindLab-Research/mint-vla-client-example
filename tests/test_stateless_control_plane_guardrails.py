@@ -279,6 +279,18 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
         assert 'env_vars[key] = ""' in source
 
 
+def test_model_engine_host_runtime_actor_uses_vllm_worker_wrapper() -> None:
+    path = REPO_ROOT / "mint_server" / "backend" / "model_engine_host.py"
+    functions = _module_functions(path)
+    helper = functions["get_or_create_model_engine_host"]
+    source = ast.get_source_segment(path.read_text(), helper) or ""
+
+    assert "preferred_vllm_python_executable" in source
+    assert '"py_executable"' in source
+    assert "actor_runtime_env_vars" in source
+    assert "include_ray_attach_hints=False" in source
+
+
 def test_sitecustomize_sanitizes_ray_worker_bootstrap_env_without_dropping_gcs() -> None:
     sitecustomize = _load_repo_sitecustomize()
 

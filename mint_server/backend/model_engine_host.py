@@ -14,7 +14,13 @@ from enum import StrEnum
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
-from ..config import PFS_PYTHONPATH, actor_runtime_env_vars, apply_detached_actor_resources, otel_env_vars
+from ..config import (
+    PFS_PYTHONPATH,
+    actor_runtime_env_vars,
+    apply_detached_actor_resources,
+    otel_env_vars,
+    preferred_vllm_python_executable,
+)
 from ..runtime_env import env_nonempty
 from ..logging_context import (
     classify_failure_reason,
@@ -284,6 +290,20 @@ def get_or_create_model_engine_host(
     if resolved_ray_address is None:
         raise RuntimeError("MINT_RAY_GCS_ADDRESS or RAY_ADDRESS is required")
 
+    runtime_env: dict[str, Any] = {
+        "env_vars": actor_runtime_env_vars(
+            pythonpath=PFS_PYTHONPATH,
+            extra={
+                **otel_env_vars(),
+                **(runtime_env_extra or {}),
+            },
+            include_ray_attach_hints=False,
+        )
+    }
+    preferred_python = (preferred_vllm_python_executable() or "").strip()
+    if preferred_python:
+        runtime_env["py_executable"] = preferred_python
+
     remote_cls = ray.remote(num_cpus=0, max_concurrency=64, max_restarts=-1)(ModelEngineHost)
     options: dict[str, Any] = {
         "name": name,
@@ -291,16 +311,7 @@ def get_or_create_model_engine_host(
         "lifetime": "detached",
         "get_if_exists": True,
         "max_task_retries": -1,
-        "runtime_env": {
-            "env_vars": actor_runtime_env_vars(
-                pythonpath=PFS_PYTHONPATH,
-                extra={
-                    **otel_env_vars(),
-                    **(runtime_env_extra or {}),
-                },
-                include_ray_attach_hints=False,
-            )
-        },
+        "runtime_env": runtime_env,
     }
     apply_detached_actor_resources(options, ray)
     return remote_cls.options(**options).remote(
