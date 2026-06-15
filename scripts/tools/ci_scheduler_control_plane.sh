@@ -51,7 +51,9 @@ PYTHON_TARGETS=(
   tests/test_issue_593_model_engine_host.py
   tests/test_issue_593_model_actor_supervisor.py
   tests/test_model_work_task_gateway.py
+  tests/test_smoke_dev_sampling_e2e.py
   tests/conftest.py
+  scripts/tools/smoke_dev_sampling_e2e.py
   scripts/tools/verify_scheduler_control_plane.py
 )
 
@@ -109,6 +111,7 @@ run_step "critical failure paths" "${UV_RUN[@]}" pytest "${CRITICAL_FAILURE_PATH
 run_step "component harness" "${UV_RUN[@]}" pytest tests/component/control_plane -q
 run_step "placement controller" "${UV_RUN[@]}" pytest tests/test_cluster_placement_controller.py -q
 run_step "stateless guardrails" "${UV_RUN[@]}" pytest tests/test_stateless_control_plane_guardrails.py -q
+run_step "dev sampling e2e smoke script" "${UV_RUN[@]}" pytest tests/test_smoke_dev_sampling_e2e.py -q
 run_step "issue 593 scheduler" "${UV_RUN[@]}" pytest tests/test_issue_593_model_work_scheduler.py -q
 run_step "issue 593 runtime" "${UV_RUN[@]}" pytest tests/test_issue_593_model_engine_host.py -q
 run_step "issue 593 supervisor" "${UV_RUN[@]}" pytest tests/test_issue_593_model_actor_supervisor.py -q
