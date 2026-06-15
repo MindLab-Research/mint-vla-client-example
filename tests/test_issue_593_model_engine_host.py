@@ -103,7 +103,7 @@ def test_issue_729_model_engine_host_does_not_export_nested_ray_address(monkeypa
     )
 
     assert host._ray_address == "192.168.40.99:6379"
-    assert os.environ["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in os.environ
     assert os.environ["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert os.environ.get("MINT_RAY_GCS_ADDRESS") is None
 
@@ -170,7 +170,7 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
 
     assert out == {"created": True}
     env_vars = created[-1]["options"]["runtime_env"]["env_vars"]
-    assert env_vars["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in env_vars
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
@@ -213,7 +213,7 @@ def test_issue_729_get_or_create_model_engine_host_uses_explicit_ray_address(mon
     )
     monkeypatch.setattr(
         "mint_server.backend.model_engine_host.actor_runtime_env_vars",
-        lambda **_kwargs: {"RAY_ADDRESS": ""},
+        lambda **_kwargs: {"RAY_CLIENT_ADDRESS": ""},
     )
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
 
@@ -227,7 +227,7 @@ def test_issue_729_get_or_create_model_engine_host_uses_explicit_ray_address(mon
 
     assert out == {"created": True}
     assert created[-1]["kwargs"]["ray_address"] == "192.168.40.99:6379"
-    assert created[-1]["options"]["runtime_env"]["env_vars"]["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in created[-1]["options"]["runtime_env"]["env_vars"]
 
 
 def _lease_with_attempt(request_id: str, attempt_id: str) -> dict:

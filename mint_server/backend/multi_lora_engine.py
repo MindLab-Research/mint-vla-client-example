@@ -69,7 +69,10 @@ def _read_process_env_var(name: str) -> str:
 def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
     # Ray worker bootstrap must use node-local Ray state, not driver/API host
     # hints. Ray runtime_env overlays but does not reliably delete inherited
-    # job env, so blank these keys instead of popping them.
+    # job env, so blank these keys instead of popping them. RAY_ADDRESS is not
+    # emitted in runtime_env; worker entry wrappers delete inherited values
+    # before Ray's Python bootstrap can consume them.
+    env_vars.pop("RAY_ADDRESS", None)
     for key in (
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_NODE_IP_ADDRESS",
@@ -77,7 +80,6 @@ def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
         "TMPDIR",
         "TMP",
         "TEMP",
-        "RAY_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     ):

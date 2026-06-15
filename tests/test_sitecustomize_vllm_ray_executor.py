@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.util
-import os
 import sys
 import types
 from pathlib import Path
@@ -84,7 +83,6 @@ def test_initialize_ray_cluster_uses_explicit_address_for_mint_init(monkeypatch)
                 "MINT_RAY_CLIENT_ADDRESS": "",
                 "MINT_RAY_NODE_IP_ADDRESS": "",
                 "MINT_RAY_TEMP_DIR": "",
-                "RAY_ADDRESS": "",
                 "RAY_CLIENT_ADDRESS": "",
                 "RAY_TMPDIR": "",
                 "TEMP": "",
@@ -382,7 +380,6 @@ def test_initialize_ray_cluster_patches_v0_executor_layout(monkeypatch):
     }
     assert parallel_config.ray_runtime_env["env_vars"] == {
         "PYTHONPATH": "/runtime:/repo",
-        "RAY_ADDRESS": "",
         "MINT_RAY_CLIENT_ADDRESS": "",
         "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
         "MINT_RAY_TEMP_DIR": "",
@@ -438,7 +435,6 @@ def test_runtime_env_to_dict_blanks_driver_attach_hints(monkeypatch):
         "TMPDIR": "",
         "TMP": "",
         "TEMP": "",
-        "RAY_ADDRESS": "",
         "RAY_CLIENT_ADDRESS": "",
         "MINT_RAY_CLIENT_ADDRESS": "",
         "MINT_RAY_GCS_ADDRESS": "192.168.39.234:6379",
@@ -467,7 +463,6 @@ def test_parallel_config_ray_runtime_env_blanks_driver_attach_hints_and_sets_wra
     assert sanitized == ParallelConfig.ray_runtime_env
     assert sanitized["env_vars"] == {
         "PYTHONPATH": "/runtime:/repo",
-        "RAY_ADDRESS": "",
         "RAY_CLIENT_ADDRESS": "",
         "MINT_RAY_CLIENT_ADDRESS": "",
         "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",

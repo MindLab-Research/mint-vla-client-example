@@ -230,7 +230,6 @@ _RAY_ATTACH_RUNTIME_ENV_KEYS = frozenset(
         "TMPDIR",
         "TMP",
         "TEMP",
-        "RAY_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     }
@@ -297,13 +296,14 @@ def actor_runtime_env_vars(
             out[key] = value
     if extra:
         out.update(extra)
+    out.pop("RAY_ADDRESS", None)
     if not include_ray_attach_hints:
         for key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
             # Ray runtime_env env_vars overlay the job/worker environment; they
-            # do not reliably delete inherited variables.  Empty values make
+            # do not reliably delete inherited variables. Empty values make
             # env_nonempty()/Ray attach helpers treat these as absent inside
-            # detached actor workers, preventing nested ray.init/direct attach
-            # attempts from a Ray worker process.
+            # detached actor workers. RAY_ADDRESS is intentionally not emitted;
+            # worker entry wrappers delete any inherited value before bootstrap.
             out[key] = ""
     if include_config_snapshot:
         out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"

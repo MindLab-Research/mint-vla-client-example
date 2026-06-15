@@ -165,7 +165,10 @@ def _sanitize_vllm_ray_runtime_env_dict(payload: object) -> object:
     if isinstance(env_vars, dict):
         cleaned = dict(env_vars)
         for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
-            cleaned[key] = ""
+            if key == "RAY_ADDRESS":
+                cleaned.pop(key, None)
+            else:
+                cleaned[key] = ""
         out["env_vars"] = cleaned
     return out
 

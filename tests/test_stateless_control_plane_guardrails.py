@@ -269,13 +269,12 @@ def test_vllm_runtime_env_helpers_blank_inherited_ray_attach_hints() -> None:
             "TMPDIR",
             "TMP",
             "TEMP",
-            "RAY_ADDRESS",
             "RAY_CLIENT_ADDRESS",
             "MINT_RAY_CLIENT_ADDRESS",
         ):
             assert f'"{key}"' in source
+        assert 'env_vars.pop("RAY_ADDRESS", None)' in source
         assert '"MINT_RAY_GCS_ADDRESS"' not in source
-        assert ".pop(" not in source
         assert 'env_vars[key] = ""' in source
 
 

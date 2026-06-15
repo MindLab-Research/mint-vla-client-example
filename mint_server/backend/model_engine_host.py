@@ -54,7 +54,6 @@ VLLM_TOKEN_BUDGET_REFRESH_S = 60.0
 VLLM_TOKEN_BUDGET_QUERY_TIMEOUT_S = 1.0
 ENGINE_RESTART_TIMEOUT_S = 30.0 * 60.0
 _RAY_ATTACH_ENV_KEYS = (
-    "RAY_ADDRESS",
     "RAY_CLIENT_ADDRESS",
     "MINT_RAY_CLIENT_ADDRESS",
     "MINT_RAY_HEAD_ADDRESS_PATH",
@@ -81,6 +80,7 @@ def _scheduler_result_ok(result: Any) -> bool:
 
 
 def _blank_process_ray_attach_hints() -> None:
+    os.environ.pop("RAY_ADDRESS", None)
     for key in _RAY_ATTACH_ENV_KEYS:
         os.environ[key] = ""
 

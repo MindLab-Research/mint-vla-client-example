@@ -169,7 +169,7 @@ def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch)
     assert out == {"ok": True}
     assert calls[0]["address"] == "ray://192.168.38.184:10001"
     env_vars = calls[0]["runtime_env"]["env_vars"]
-    assert env_vars["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in env_vars
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
@@ -193,7 +193,7 @@ def test_init_ray_does_not_promote_legacy_ray_address_to_job_gcs_hint(monkeypatc
     assert out == {"ok": True}
     assert calls[0]["address"] == "ray://192.168.38.184:10001"
     env_vars = calls[0]["runtime_env"]["env_vars"]
-    assert env_vars["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in env_vars
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert "MINT_RAY_GCS_ADDRESS" not in env_vars
 
@@ -245,7 +245,7 @@ def test_init_ray_blanks_attach_hints_without_dropping_existing_ray_client_runti
     assert runtime_env["py_modules"] == ["s3://bucket/mint.zip"]
     env_vars = runtime_env["env_vars"]
     assert env_vars["PYTHONPATH"] == "/shared/code"
-    assert env_vars["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in env_vars
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
 

@@ -29,7 +29,6 @@ _RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS = frozenset(
         "TMPDIR",
         "TMP",
         "TEMP",
-        "RAY_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
     }
@@ -359,6 +358,10 @@ def _blank_ray_worker_bootstrap_attach_env(address: str, existing: Any) -> dict[
     gcs_address = preferred_ray_gcs_address()
     if gcs_address:
         env_vars[_RAY_GCS_ADDRESS_ENV] = gcs_address
+    # Do not put RAY_ADDRESS into Ray runtime_env at all. Empty env values can be
+    # dropped or merged inconsistently by Ray; worker entry wrappers delete any
+    # inherited value before Ray's Python bootstrap starts.
+    env_vars.pop("RAY_ADDRESS", None)
     for key in _RAY_WORKER_BOOTSTRAP_ATTACH_ENV_KEYS:
         env_vars[key] = ""
     runtime_env["env_vars"] = env_vars

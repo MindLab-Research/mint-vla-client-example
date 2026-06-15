@@ -1371,13 +1371,13 @@ def test_actor_runtime_env_vars_blanks_ray_attach_hints_when_disabled(tmp_path):
     data = json.loads(out.stdout)
 
     for key in (
-        "RAY_ADDRESS",
         "MINT_RAY_CLIENT_ADDRESS",
         "RAY_CLIENT_ADDRESS",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_RAY_TEMP_DIR",
     ):
         assert data[key] == ""
+    assert "RAY_ADDRESS" not in data
     assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
 
 
@@ -1456,7 +1456,7 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
             "PFS_RUNTIME_ENV_ROOT": str(env_root),
             "MINT_CODE_ROOT": str(tmp_path / "repo"),
             "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
-            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
             "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_PY_MODULES_CSV": str(repo_pkg),
         },
@@ -1503,7 +1503,7 @@ def test_actor_runtime_env_without_attach_hints_sets_worker_wrapper(tmp_path):
     env_vars = data["env_vars"]
     assert data["py_executable"] == str(wrapper)
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
-    assert env_vars["RAY_ADDRESS"] == ""
+    assert "RAY_ADDRESS" not in env_vars
     assert env_vars["RAY_CLIENT_ADDRESS"] == ""
     assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
 

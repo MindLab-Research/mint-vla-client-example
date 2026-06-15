@@ -152,7 +152,6 @@ async def test_issue_593_verl_inference_disables_sleep_mode_by_default(monkeypat
             or {
                 "PYTHONPATH": pythonpath,
                 **(extra or {}),
-                "RAY_ADDRESS": "" if not include_ray_attach_hints else "should-not-be-used",
                 "RAY_CLIENT_ADDRESS": "" if not include_ray_attach_hints else "should-not-be-used",
                 "MINT_RAY_CLIENT_ADDRESS": "" if not include_ray_attach_hints else "should-not-be-used",
                 "MINT_RAY_GCS_ADDRESS": "192.168.40.99:6379",
