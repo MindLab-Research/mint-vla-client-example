@@ -142,6 +142,30 @@ def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch)
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.38.184:6379"
 
 
+def test_init_ray_sets_job_py_executable_for_ray_client_workers(monkeypatch, tmp_path):
+    calls: list[dict[str, object]] = []
+    wrapper = tmp_path / "repo" / "scripts" / "vllm_worker_python.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.delenv("RAY_ADDRESS", raising=False)
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(wrapper))
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "ray://192.168.38.184:10001"
+    assert calls[0]["runtime_env"]["py_executable"] == str(wrapper)
+
+
 def test_init_ray_blanks_attach_hints_without_dropping_existing_ray_client_runtime_env(monkeypatch):
     calls: list[dict[str, object]] = []
 

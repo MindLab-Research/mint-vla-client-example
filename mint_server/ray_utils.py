@@ -253,6 +253,15 @@ def client_job_runtime_env(*, address: str | None = None) -> dict[str, Any] | No
         return None
     runtime_env = _job_level_runtime_env(addr, _driver_runtime_env())
     runtime_env = _blank_ray_worker_bootstrap_attach_env(addr, runtime_env)
+    if isinstance(runtime_env, dict):
+        try:
+            from mint_server.config import preferred_vllm_python_executable  # noqa: PLC0415
+
+            preferred_python = (preferred_vllm_python_executable() or "").strip()
+        except Exception:
+            preferred_python = ""
+        if preferred_python:
+            runtime_env.setdefault("py_executable", preferred_python)
     return runtime_env or None
 
 
