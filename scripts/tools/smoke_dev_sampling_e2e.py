@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from transformers import AutoTokenizer
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 DEFAULT_HF_HOME = "/vePFS-Mindverse/share/huggingface"
@@ -90,6 +89,8 @@ def cached_tokenizer_dir(model_name: str) -> Path | None:
 
 
 def load_tokenizer(model_name: str, events: EventWriter) -> Any:
+    from transformers import AutoTokenizer
+
     os.environ.setdefault("HF_HOME", DEFAULT_HF_HOME)
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
