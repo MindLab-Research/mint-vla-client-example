@@ -44,7 +44,7 @@ def test_issue_290_all_actor_runtime_env_call_otel_env_vars():
         "mint_server/backend/training/verl/verl_inference.py": 1,
         "mint_server/backend/actors/model_engine_host.py": 1,
         "mint_server/backend/scheduling/model_work_scheduler.py": 1,
-        "mint_server/backend/ray_cluster/node_metrics_daemon.py": 1,
+        "mint_server/backend/observability/node_metrics_daemon.py": 1,
         "mint_server/backend/stores/task_state_store.py": 1,
         "mint_server/backend/core/config_actor.py": 1,
     }

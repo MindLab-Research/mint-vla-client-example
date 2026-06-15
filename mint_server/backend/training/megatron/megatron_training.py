@@ -826,7 +826,7 @@ def create_ppo_loss_fn(
         }
 
         # Calculate precision difference metrics if we have rollout log_probs
-        from mint_server.backend.core.debug_metrics import calculate_debug_metrics
+        from mint_server.backend.observability.debug_metrics import calculate_debug_metrics
 
         # Build a batch dict compatible with calculate_debug_metrics
         # IMPORTANT: Naming convention:

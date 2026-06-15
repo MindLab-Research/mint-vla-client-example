@@ -205,7 +205,7 @@ def build_sample_once_billing_observations(
 def _record_vllm_workload_start(
     *, actor_name: str | None, base_model: str, op: str
 ) -> None:
-    from mint_server.backend.core.runtime_observability import runtime_observability
+    from mint_server.backend.observability.runtime_observability import runtime_observability
 
     runtime_observability.begin_vllm_request(
         actor_name=actor_name, base_model=base_model, op=op
@@ -245,7 +245,7 @@ def _record_vllm_workload_finish(
     ttft_s: float | None = None,
     tpot_s: float | None = None,
 ) -> None:
-    from mint_server.backend.core.runtime_observability import runtime_observability
+    from mint_server.backend.observability.runtime_observability import runtime_observability
 
     runtime_observability.finish_vllm_request(
         actor_name=actor_name,

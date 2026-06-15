@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-import mint_server.backend.core.runtime_observability as runtime_obs_module
+import mint_server.backend.observability.runtime_observability as runtime_obs_module
 
 
 def test_issue_439_dense_trainer_does_not_pass_removed_session_state_root(monkeypatch) -> None:

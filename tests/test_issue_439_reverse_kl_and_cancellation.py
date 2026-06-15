@@ -9,7 +9,7 @@ from mint_server.backend.training.megatron.megatron_distributed import (
     MegatronWorkerGroup,
 )
 from mint_server.backend.training.bumblebee.bumblebee_distributed import BumblebeeRankWorker, BumblebeeWorkerGroup
-from mint_server.backend.core.runtime_observability import RuntimeObservability
+from mint_server.backend.observability.runtime_observability import RuntimeObservability
 from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.models.types import ComputeLogprobsRequest, ModelInput, SampleRequest, SamplingParams
 from mint_server.routes import sampling as sampling_route
@@ -87,7 +87,7 @@ def test_issue_439_asample_cancellation_decrements_active_requests(monkeypatch: 
         lambda *_args, **_kwargs: anyio.sleep(0),
     )
     monkeypatch.setattr(
-        "mint_server.backend.core.runtime_observability.runtime_observability",
+        "mint_server.backend.observability.runtime_observability.runtime_observability",
         obs,
     )
 
@@ -132,7 +132,7 @@ def test_issue_439_compute_logprobs_cancellation_decrements_active_requests(monk
     monkeypatch.setattr(sampling_route, "task_futures", task_futures)
     monkeypatch.setattr(sampling_route, "session_manager", session_manager)
     monkeypatch.setattr(
-        "mint_server.backend.core.runtime_observability.runtime_observability",
+        "mint_server.backend.observability.runtime_observability.runtime_observability",
         obs,
     )
 

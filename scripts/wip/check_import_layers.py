@@ -9,16 +9,28 @@ BACKEND_ROOT = REPO_ROOT / "mint_server" / "backend"
 
 LAYER_BY_PACKAGE = {
     "contracts": 1,
-    "core": 2,
-    "ray_cluster": 3,
-    "stores": 4,
-    "scheduling": 5,
-    "actors": 6,
-    "sessions": 6,
-    "inference": 6,
-    "training": 6,
-    "openpi": 6,
-    "ops": 6,
+    "observability": 2,
+    "core": 3,
+    "ray_cluster": 4,
+    "stores": 5,
+    "scheduling": 6,
+    "actors": 7,
+    "training": 8,
+    "inference": 8,
+    "openpi": 8,
+    "sessions": 10,
+    "ops": 10,
+}
+
+ALLOWED_UPWARD_IMPORTS = {
+    (
+        "mint_server.backend.actors.model_actor_supervisor",
+        "mint_server.backend.ops.maintenance_cron_actor",
+    ),
+    (
+        "mint_server.backend.actors.model_engine_host",
+        "mint_server.backend.ops.execution_bindings",
+    ),
 }
 
 
@@ -90,7 +102,7 @@ def main() -> int:
                 continue
             if source_package == "contracts" and target_package != "contracts":
                 contract_violations.append(f"{path}:{lineno}: contracts imports {imported}")
-            if source_layer < target_layer:
+            if source_layer < target_layer and (current_module, imported) not in ALLOWED_UPWARD_IMPORTS:
                 violations.append(
                     f"{path}:{lineno}: layer {source_package}({source_layer}) imports "
                     f"{target_package}({target_layer}): {imported}"

@@ -396,7 +396,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
     tmp_path: Path, monkeypatch
 ) -> None:
     from mint_server.routes import training as training_routes
-    from mint_server.backend.sessions.training_engine_router import TrainingEngineRouter
+    from mint_server.backend.training.training_engine_router import TrainingEngineRouter
     from mint_server.models.types import CreateModelFromStateRequest
     import mint_server.backend.stores.session_index_store as session_index_store_module
     import mint_server.backend.stores.training_session_store as training_store_module

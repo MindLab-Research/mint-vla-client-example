@@ -4,16 +4,16 @@ from types import SimpleNamespace
 
 import pytest
 import mint_server.logging_context as logging_context
-import mint_server.backend.actors.runtime_actor_metrics as runtime_actor_metrics
-import mint_server.backend.inference.vllm_scheduler_observability as vllm_obs_mod
-from mint_server.backend.core.runtime_observability import RuntimeObservability
+import mint_server.backend.observability.runtime_actor_metrics as runtime_actor_metrics
+import mint_server.backend.observability.vllm_scheduler_observability as vllm_obs_mod
+from mint_server.backend.observability.runtime_observability import RuntimeObservability
 from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
-from mint_server.backend.inference.vllm_scheduler_observability import VllmStatsObserver
+from mint_server.backend.observability.vllm_scheduler_observability import VllmStatsObserver
 
 
 def test_issue_432_verl_training_records_megatron_switch_metrics(monkeypatch) -> None:
     obs = RuntimeObservability()
-    import mint_server.backend.core.runtime_observability as runtime_obs_mod
+    import mint_server.backend.observability.runtime_observability as runtime_obs_mod
 
     monkeypatch.setattr(runtime_obs_mod, "runtime_observability", obs)
     engine = VerlTrainingEngine()

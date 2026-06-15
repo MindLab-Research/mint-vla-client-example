@@ -47,8 +47,8 @@ from mint_server.runtime_env import (
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from mint_server.backend.actors.node_placement import assert_node_ip_capacity, parse_model_gpu_placement
-from mint_server.backend.actors.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
-from mint_server.backend.inference.vllm_scheduler_observability import (
+from mint_server.backend.observability.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
+from mint_server.backend.observability.vllm_scheduler_observability import (
     VllmStatsObserver,
     attach_vllm_stats_logger,
     install_vllm_iteration_observability_patches,

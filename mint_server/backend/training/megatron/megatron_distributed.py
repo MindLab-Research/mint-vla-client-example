@@ -47,7 +47,7 @@ from mint_server.logging_context import (get_current_traceparent, get_request_id
                                start_as_current_span_from_traceparent)
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
-from mint_server.backend.actors.runtime_actor_metrics import (current_ray_actor_name,
+from mint_server.backend.observability.runtime_actor_metrics import (current_ray_actor_name,
                                     init_megatron_group_runtime_otel_metrics,
                                     init_megatron_rank_runtime_otel_metrics)
 
@@ -7796,7 +7796,7 @@ class MegatronWorkerGroup:
                 e,
                 exc_info=True,
             )
-            from mint_server.backend.core.runtime_observability import runtime_observability
+            from mint_server.backend.observability.runtime_observability import runtime_observability
 
             runtime_observability.record_megatron_session_switch_failure(
                 base_model=str(
@@ -10762,7 +10762,7 @@ def get_or_create_megatron_worker_group(
             diagnostics = ray.get(actor.get_diagnostics.remote(), timeout=diagnostics_timeout_s)
         except ray.exceptions.RayActorError:
             logger.warning(f"Megatron actor {actor_name} is dead, killing to free name")
-            from mint_server.backend.core.runtime_observability import runtime_observability
+            from mint_server.backend.observability.runtime_observability import runtime_observability
 
             runtime_observability.record_megatron_actor_lifecycle(
                 base_model=observability_model,
