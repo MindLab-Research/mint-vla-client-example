@@ -2098,6 +2098,16 @@ def _patch_vllm_system_utils_spawn_without_ray_address() -> None:
 
     _maybe_force_spawn._mint_no_ray_address_spawn_hint = True  # type: ignore[attr-defined]
     system_utils._maybe_force_spawn = _maybe_force_spawn  # type: ignore[method-assign]
+    for module_name in (
+        # vLLM imports the function into module globals in these executor paths.
+        # Patch already-imported aliases so they do not keep the upstream
+        # RAY_ADDRESS-writing implementation.
+        "vllm.v1.executor.multiproc_executor",
+        "vllm.executor.multiproc_executor",
+    ):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "_maybe_force_spawn"):
+            setattr(module, "_maybe_force_spawn", _maybe_force_spawn)
 
 
 def _patch_ray_placement_group_bundle_cache() -> None:
