@@ -355,9 +355,11 @@ def _blank_ray_worker_bootstrap_attach_env(address: str, existing: Any) -> dict[
         return existing
     env_vars_raw = runtime_env.get("env_vars")
     env_vars = dict(env_vars_raw) if isinstance(env_vars_raw, dict) else {}
-    gcs_address = preferred_ray_gcs_address()
-    if gcs_address:
-        env_vars[_RAY_GCS_ADDRESS_ENV] = gcs_address
+    # Keep Ray Client job-level worker bootstrap free of direct cluster attach
+    # hints. Mint actors that need the GCS address receive it through
+    # actor_runtime_env_vars(); Ray default workers must register with the
+    # raylet-provided bootstrap flags instead of observing a direct-attach env.
+    env_vars.pop(_RAY_GCS_ADDRESS_ENV, None)
     # Do not put RAY_ADDRESS into Ray runtime_env at all. Empty env values can be
     # dropped or merged inconsistently by Ray; worker entry wrappers delete any
     # inherited value before Ray's Python bootstrap starts.

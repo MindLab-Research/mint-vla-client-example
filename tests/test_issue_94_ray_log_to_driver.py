@@ -10,7 +10,6 @@ _BLANKED_ATTACH_HINTS = {
     "MINT_RAY_CLIENT_ADDRESS",
     "MINT_RAY_NODE_IP_ADDRESS",
     "MINT_RAY_TEMP_DIR",
-    "RAY_ADDRESS",
     "RAY_CLIENT_ADDRESS",
     "RAY_TMPDIR",
     "TEMP",
@@ -20,6 +19,8 @@ _BLANKED_ATTACH_HINTS = {
 
 
 def _assert_blanked_attach_hints(env_vars: dict[str, str]) -> None:
+    assert "RAY_ADDRESS" not in env_vars
+    assert "MINT_RAY_GCS_ADDRESS" not in env_vars
     for key in _BLANKED_ATTACH_HINTS:
         assert env_vars[key] == ""
 
