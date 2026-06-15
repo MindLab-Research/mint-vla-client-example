@@ -7,8 +7,11 @@ cd "$ROOT_DIR"
 export PYRIGHT_PYTHON_FORCE_VERSION="${PYRIGHT_PYTHON_FORCE_VERSION:-1.1.409}"
 export MINT_SCHEDULER_COVERAGE_MIN="${MINT_SCHEDULER_COVERAGE_MIN:-75}"
 export MINT_SCHEDULER_COVERAGE_FILE_MIN="${MINT_SCHEDULER_COVERAGE_FILE_MIN:-70}"
-COVERAGE_FILE="${COVERAGE_FILE:-${TMPDIR:-/tmp}/mint_scheduler_control_plane.coverage}"
-COVERAGE_JSON="${COVERAGE_JSON:-${TMPDIR:-/tmp}/mint_scheduler_control_plane.coverage.json}"
+export GIT_PAGER=cat
+export PAGER=cat
+export LESS=FRX
+COVERAGE_FILE="${COVERAGE_FILE:-${TMPDIR:-/tmp}/mint_scheduler_control_plane_coverage_data}"
+COVERAGE_JSON="${COVERAGE_JSON:-${TMPDIR:-/tmp}/mint_scheduler_control_plane_coverage.json}"
 
 UV_RUN=(uv run)
 if [[ "${MINT_CI_UV_NO_SYNC:-}" == "1" ]]; then
@@ -153,4 +156,4 @@ for source_file in source_files:
 if failures:
     raise SystemExit("coverage per-file gate failed:\n" + "\n".join(failures))
 PY
-run_step "diff whitespace" git diff --check
+run_step "diff whitespace" git --no-pager diff --check
