@@ -27,6 +27,7 @@ from mint_server.backend.model_work_execution_context import (
     get_current_model_work_consumer_id,
     get_current_model_work_lease_id,
 )
+from mint_server.backend.model_work_scheduler import ModelWorkSchedulerConflictError
 from mint_server.backend.task_payload_store import TaskPayloadStore
 
 
@@ -1077,6 +1078,39 @@ async def test_model_engine_host_pushes_unhealthy_liveness_before_skipping_claim
     assert payload.engine_ready is False
     assert payload.engine_health.status is EngineHealthStatus.UNHEALTHY
     assert payload.engine_health.reason == "not_ready"
+
+
+@pytest.mark.anyio
+async def test_model_engine_host_pushes_ready_liveness_when_scheduler_still_starting() -> None:
+    class _StartingScheduler(_FakeScheduler):
+        async def claim(self, **kwargs):
+            self.claim_calls.append(kwargs)
+            raise ModelWorkSchedulerConflictError(
+                "replica 'replica-0' is not claimable: status='starting'"
+            )
+
+    scheduler = _StartingScheduler(claims=[[_lease("runtime-req-waits-for-ready-sync")]])
+    engine = _FakeEngineLifecycle(ready=True)
+    push = _FakeLivenessPush()
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_generation=3,
+        scheduler_client=scheduler,
+        task_futures_client=_FakeTaskFutureService(),
+        engine_lifecycle=engine,
+        liveness_push=push,
+    )
+
+    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+
+    assert len(scheduler.claim_calls) == 1
+    assert len(push.payloads) == 1
+    assert push.payloads[0].engine_ready is True
+    assert push.payloads[0].engine_health.status is EngineHealthStatus.READY
+    snapshot = actor.health_snapshot()
+    assert snapshot["last_error"] is None
+    assert snapshot["last_error_traceback"] is None
 
 
 @pytest.mark.anyio

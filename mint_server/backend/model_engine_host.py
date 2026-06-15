@@ -669,15 +669,22 @@ class ModelEngineHost:
             await self._push_liveness()
             return {"claimed": 0, "executed": 0, "engine_ready": False}
         max_items, token_budget = await self._claim_limits()
-        claimed = await self._scheduler.claim(
-            domain_key=self._config.domain_key,
-            replica_id=self._config.replica_id,
-            consumer_id=self._config.consumer_id,
-            consumer_generation=self._config.actor_generation,
-            max_items=max_items,
-            token_budget=token_budget,
-            lease_ttl_s=self._config.lease_ttl_s,
-        )
+        try:
+            claimed = await self._scheduler.claim(
+                domain_key=self._config.domain_key,
+                replica_id=self._config.replica_id,
+                consumer_id=self._config.consumer_id,
+                consumer_generation=self._config.actor_generation,
+                max_items=max_items,
+                token_budget=token_budget,
+                lease_ttl_s=self._config.lease_ttl_s,
+            )
+        except Exception as exc:
+            if self._is_scheduler_not_claimable_error(exc):
+                self._empty_polls_total += 1
+                await self._push_liveness()
+                return {"claimed": 0, "executed": 0}
+            raise
         leases = _scheduler_claim_leases(claimed)
         if not leases:
             self._empty_polls_total += 1
@@ -834,6 +841,11 @@ class ModelEngineHost:
             return True
         context = getattr(exc, "__context__", None)
         return isinstance(context, (KeyError, TaskStateNotFoundError))
+
+    @staticmethod
+    def _is_scheduler_not_claimable_error(exc: BaseException) -> bool:
+        text = f"{type(exc).__name__}: {exc}".lower()
+        return "modelworkschedulerconflicterror" in text and "not claimable" in text
 
     def _clear_transient_scheduler_error(self) -> None:
         error = str(self._last_error or "").lower()
