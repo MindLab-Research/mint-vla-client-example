@@ -1432,6 +1432,49 @@ def test_actor_runtime_env_skips_local_py_modules_in_ray_client_mode(tmp_path):
     assert "py_modules" not in data
 
 
+def test_actor_runtime_env_without_attach_hints_sets_worker_wrapper(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    repo = tmp_path / "repo"
+    wrapper = repo / "scripts" / "vllm_worker_python.py"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env; "
+                "print(json.dumps(actor_runtime_env("
+                "pythonpath='X', include_ray_attach_hints=False)))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(repo),
+            "PFS_HF_MODULES_PATH": str(tmp_path / "hf"),
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_ADDRESS": "ray://192.168.39.87:10001",
+        },
+    )
+    data = json.loads(out.stdout)
+    env_vars = data["env_vars"]
+    assert data["py_executable"] == str(wrapper)
+    assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert env_vars["RAY_ADDRESS"] == ""
+    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
+    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+
+
 def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)

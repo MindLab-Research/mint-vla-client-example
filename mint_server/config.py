@@ -353,6 +353,10 @@ def actor_runtime_env(
     # Ray Client accepts local-path working_dir only at ray.init(job) level.
     if working_dir and (allow_local_paths or _runtime_env_value_is_uri(working_dir)):
         runtime_env["working_dir"] = working_dir
+    if not include_ray_attach_hints:
+        preferred_python = (preferred_vllm_python_executable() or "").strip()
+        if preferred_python:
+            runtime_env["py_executable"] = preferred_python
     return runtime_env
 
 
