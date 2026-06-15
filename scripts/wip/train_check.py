@@ -20,7 +20,6 @@ from urllib.request import Request, urlopen
 
 DEFAULT_BASE_URL = "https://mint.macaron.xin"
 DEFAULT_RESULTS_ROOT = "/root/run_results/mint"
-PROD_CONFIG_DIR = Path("/vePFS-Mindverse/share/mint/prod/config")
 FEISHU_TITLE = "MinT sanity-check report"
 QWEN35_MODEL = "Qwen/Qwen3.5-27B"
 DEFAULT_MODELS = {
@@ -264,32 +263,13 @@ def model_slug(model: str) -> str:
     )
 
 
-def load_env_file(path: Path) -> None:
-    if not path.exists():
-        return
-    for raw_line in path.read_text().splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :]
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if value and value[0] == value[-1] and value[0] in {"'", '"'}:
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
-
-
 def validate_production_env(base_url: str) -> str:
     if base_url != DEFAULT_BASE_URL:
         raise SystemExit(f"train-check expects base URL {DEFAULT_BASE_URL}, got: {base_url}")
 
     api_key = os.environ.get("MINT_API_KEY")
     if not api_key:
-        raise SystemExit("missing MINT_API_KEY in env/.secrets.env")
+        raise SystemExit("missing MINT_API_KEY in the explicit launch environment")
     os.environ.setdefault("MINT_API_KEY", api_key)
 
     owner = os.environ.get("MINT_TEST_CHECKPOINT_OWNER_ID", "")
@@ -1127,7 +1107,7 @@ def write_summary(
     json_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
 
     lines = [
-        f"# Train Check Summary",
+        "# Train Check Summary",
         "",
         f"- base_url: `{args.base_url}`",
         f"- num_models: `{len(results)}`",
@@ -1214,10 +1194,6 @@ def print_dry_run(runs: list[ModelRun], sequential: bool) -> None:
 def main() -> int:
     args = parse_args()
     ensure_runner_exists()
-    load_env_file(Path(".secrets.env"))
-    if args.base_url == DEFAULT_BASE_URL:
-        load_env_file(PROD_CONFIG_DIR / "prod.env")
-        load_env_file(PROD_CONFIG_DIR / "secrets.env")
     if args.all_models and args.parallel:
         raise SystemExit("--all-models must run sequentially for production sanity-check")
 

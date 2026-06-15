@@ -27,7 +27,7 @@ Hard rules:
 - Minimize downtime: prefer killing one specific actor for one specific model over restarting the API process; do not restart Ray/head/worker nodes as first response.
 - Do not use an ad-hoc "hung after N seconds" cutoff. Under load, 235B can queue for many minutes. Treat only the configured timeout or explicit service/server error as failure.
 - No START notifications. Send exactly one final Feishu report at the end, including preflight failures.
-- Never print secrets, process environments, or full `.secrets.env` contents.
+- Never print secrets, process environments, or credential file contents.
 
 ## Canonical Runner
 
@@ -40,7 +40,7 @@ Run from `/root/code/mint`:
 Use the canonical wrapper unless the wrapper itself fails before it can enforce the contract. Do not hand-roll the old shell/Python snippets in the agent response.
 
 Wrapper contract:
-- Loads `.secrets.env` without printing secrets.
+- Reads credentials only from the explicit launch environment.
 - Forces `MINT_BASE_URL` to `https://mint.macaron.xin`.
 - Requires `MINT_API_KEY`.
 - Requires `MINT_TEST_CHECKPOINT_OWNER_ID` to be a 24-character production owner ObjectId.
