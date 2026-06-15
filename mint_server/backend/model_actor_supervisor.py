@@ -2106,17 +2106,18 @@ class ModelActorSupervisorCore:
             "domain_key": spec.domain_key,
             "replica_id": spec.replica_id,
             "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
-            "state": "healthy",
+            "state": "starting",
             "actor_name": spec.normalized_actor_name(),
             "launcher_key": spec.launcher_key,
             "generation": generation,
             "consumer_id": consumer_id_for_replica(spec.domain_key, spec.replica_id, generation),
             "crash_count": int(self._states.get(key, {}).get("crash_count", 0)),
             "last_error": None,
-            "last_action": f"create:{reason}",
+            "last_action": f"create_pending_liveness:{reason}",
             "last_action_at": time.time(),
             "node_pins": spec.normalized_node_pins(),
             "gpu_count": spec.gpu_count,
+            "scheduler_status": "starting",
         }
         try:
             await self._sync_scheduler(raise_on_error=True)
@@ -2511,10 +2512,8 @@ class ModelActorSupervisorCore:
                 actor,
                 latest_push.to_wire(),
             ):
-                self._actors.pop(key, None)
-                self._actor_generations.pop(key, None)
-                results[label] = self._states.get(key, {})
-                continue
+                self._latest_push.pop(key, None)
+                latest_push = None
 
             stale_after_s = _liveness_stale_after_s(self._reconcile_interval_s)
             push_stale = _liveness_push_is_stale(
@@ -2526,6 +2525,38 @@ class ModelActorSupervisorCore:
                 latest_push,
                 threshold_percent=_liveness_gpu_busy_threshold_percent(),
             )
+            previous = self._states.get(key, {})
+            state_age_s = max(0.0, now - float(previous.get("last_action_at") or now))
+            if latest_push is None and str(previous.get("state") or "") == "starting" and state_age_s <= stale_after_s:
+                self._states[key] = {
+                    **previous,
+                    "domain_key": spec.domain_key,
+                    "replica_id": spec.replica_id,
+                    "queue_id": queue_id_for_replica(spec.domain_key, spec.replica_id),
+                    "state": "starting",
+                    "actor_name": spec.normalized_actor_name(),
+                    "launcher_key": spec.launcher_key,
+                    "generation": int(self._generations.get(key, 0) or previous.get("generation") or 0),
+                    "consumer_id": str(
+                        previous.get("consumer_id")
+                        or consumer_id_for_replica(
+                            spec.domain_key,
+                            spec.replica_id,
+                            int(self._generations.get(key, 0) or previous.get("generation") or 0),
+                        )
+                    ),
+                    "last_error": None,
+                    "last_action": "awaiting_liveness",
+                    "last_action_at": now,
+                    "liveness_stale": False,
+                    "liveness_stale_after_s": stale_after_s,
+                    "node_pins": resolved_node_pins,
+                    "worker_aliases": original_spec.normalized_worker_aliases(),
+                    "gpu_count": spec.gpu_count,
+                    "scheduler_status": "starting",
+                }
+                results[label] = self._states[key]
+                continue
             health = latest_push.to_wire() if latest_push is not None else {}
             generation = int(
                 getattr(latest_push, "actor_generation", None)
@@ -2537,7 +2568,6 @@ class ModelActorSupervisorCore:
                 or consumer_id_for_replica(spec.domain_key, spec.replica_id, generation)
             )
             if push_stale and not gpu_busy:
-                previous = self._states.get(key, {})
                 crash_count = int(previous.get("crash_count", 0)) + 1
                 stale_age_s = None
                 if latest_push is not None and latest_push.pushed_at is not None:
@@ -2613,7 +2643,6 @@ class ModelActorSupervisorCore:
                     else (latest_push.last_error or latest_push.engine_health.reason or "engine not ready")
                 )
 
-            previous = self._states.get(key, {})
             crash_count = int(previous.get("crash_count", 0))
             if state == "unhealthy":
                 crash_count += 1

@@ -1334,23 +1334,72 @@ async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> Non
     assert synced[1][0]["generation"] >= 1
     assert synced[1][0]["consumer_id"].endswith(f"generation::{synced[1][0]['generation']}")
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
-    assert replica["state"] == "healthy"
+    assert replica["state"] == "starting"
     assert replica["generation"] >= 1
     assert replica["queue_id"] == "vllm:model-a::replica-0"
     assert replica["base_model"] == "model-a"
     assert out["snapshot"]["domains"]["vllm:model-a"] == {
         "replicas": 1,
-        "healthy": 1,
+        "healthy": 0,
         "unhealthy": 0,
     }
     assert synced[-1][0]["domain_key"] == "vllm:model-a"
     assert synced[-1][0]["replica_id"] == "replica-0"
     assert synced[-1][0]["queue_id"] == "vllm:model-a::replica-0"
-    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "starting"
     assert synced[-1][0]["capacity"] == 4
     async_snapshot = await supervisor.async_snapshot()
     assert async_snapshot["replicas"] == supervisor.snapshot()["replicas"]
     assert isinstance(async_snapshot["snapshot_generated_at"], float)
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_keeps_started_runtime_unclaimable_until_fresh_liveness() -> None:
+    created: list[_FakeRuntimeActor] = []
+    synced: list[list[dict]] = []
+
+    async def _factory(spec: ModelActorSpec, generation: int):
+        actor = _FakeRuntimeActor(
+            actor_name=spec.normalized_actor_name(),
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            generation=generation,
+        )
+        created.append(actor)
+        return actor
+
+    supervisor = ModelActorSupervisor(
+        specs=[ModelActorSpec(domain_key="vllm:model-a", replica_id="replica-0")],
+        runtime_factory=_factory,
+        scheduler_sync=lambda registrations: synced.append(
+            [registration.to_dict() for registration in registrations]
+        ),
+        **_disabled_control_plane_kwargs(),
+    )
+
+    first = await supervisor.reconcile_once()
+    generation = created[0].generation
+    stale_generation = generation - 1
+    stale_result = await supervisor.push_liveness(
+        _liveness_push(generation=stale_generation).to_wire()
+    )
+    second = await supervisor.reconcile_once()
+    fresh_result = await supervisor.push_liveness(
+        _liveness_push(generation=generation).to_wire()
+    )
+    third = await supervisor.reconcile_once()
+
+    label = "vllm:model-a::replica-0"
+    assert stale_result["ok"] is False
+    assert stale_result["reason"] == "stale_generation"
+    assert first["snapshot"]["replicas"][label]["state"] == "starting"
+    assert second["snapshot"]["replicas"][label]["state"] == "starting"
+    assert synced[-2][0]["status"] == "starting"
+    assert fresh_result["ok"] is True
+    assert third["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert third["snapshot"]["replicas"][label]["generation"] == generation
+    assert third["snapshot"]["replicas"][label]["last_action"] == "liveness_push"
+    assert synced[-1][0]["status"] == "healthy"
 
 
 @pytest.mark.anyio
@@ -1641,7 +1690,7 @@ async def test_issue_593_supervisor_projects_scheduler_backlog_to_desired_runtim
     assert out["snapshot"]["replicas"][label]["base_model"] == base_model
     assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.8"]
     assert synced[-1][0]["domain_key"] == domain_key
-    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "starting"
 
 
 @pytest.mark.anyio
@@ -1669,18 +1718,25 @@ async def test_issue_593_supervisor_restarts_dead_runtime_with_monotonic_generat
     )
     await supervisor.reconcile_once()
     first_generation = created[0].generation
-    created[0].health_errors.append(RuntimeError("actor died"))
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=first_generation,
+            utilization_percent=0.0,
+            pushed_at=time.time() - 120.0,
+        ).to_wire()
+    )
 
     out = await supervisor.reconcile_once()
 
     assert len(created) == 2
     assert created[1].generation > first_generation
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
-    assert replica["state"] == "healthy"
+    assert replica["state"] == "starting"
     assert replica["generation"] == created[1].generation
     assert replica["crash_count"] == 1
     assert out["snapshot"]["restarted_total"] == 1
     assert synced[-1][0]["generation"] == created[1].generation
+    assert synced[-1][0]["status"] == "starting"
 
 
 @pytest.mark.anyio
@@ -1708,18 +1764,24 @@ async def test_issue_593_supervisor_restarts_runtime_that_reports_not_running() 
     )
     await supervisor.reconcile_once()
     first_generation = created[0].generation
-    created[0].running = False
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=first_generation,
+            running=False,
+            engine_ready=False,
+            last_error="runtime stopped",
+        ).to_wire()
+    )
 
     out = await supervisor.reconcile_once()
 
-    assert len(created) == 2
-    assert created[1].generation > first_generation
+    assert len(created) == 1
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
-    assert replica["state"] == "healthy"
-    assert replica["generation"] == created[1].generation
+    assert replica["state"] == "unhealthy"
+    assert replica["generation"] == first_generation
     assert replica["crash_count"] == 1
-    assert out["snapshot"]["restarted_total"] == 1
-    assert synced[-1][0]["status"] == "healthy"
+    assert out["snapshot"]["restarted_total"] == 0
+    assert synced[-1][0]["status"] == "unhealthy"
 
 
 @pytest.mark.anyio
@@ -1850,9 +1912,9 @@ async def test_model_actor_supervisor_restarts_stale_gpu_idle_runtime_without_pu
     assert len(created) == 2
     assert created[1].generation > first_generation
     assert actor.health_snapshot_calls == 0
-    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["state"] == "starting"
     assert out["snapshot"]["replicas"][label]["generation"] == created[1].generation
-    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "starting"
 
 
 @pytest.mark.anyio
@@ -1910,7 +1972,7 @@ async def test_issue_593_supervisor_ignores_stale_generation_health_failure() ->
 
 
 @pytest.mark.anyio
-async def test_issue_593_supervisor_restarts_runtime_with_unrecovered_execution_error() -> None:
+async def test_issue_593_supervisor_marks_runtime_unhealthy_from_liveness_execution_error() -> None:
     created: list[_FakeRuntimeActor] = []
     synced: list[list[dict]] = []
 
@@ -1934,21 +1996,24 @@ async def test_issue_593_supervisor_restarts_runtime_with_unrecovered_execution_
     )
     await supervisor.reconcile_once()
     first_generation = created[0].generation
-    created[0].last_error = "future failed: engine startup failed"
-    created[0].failed_total = 2
-    created[0].processed_total = 2
-    created[0].completed_total = 0
+    await supervisor.push_liveness(
+        _liveness_push(
+            generation=first_generation,
+            running=True,
+            engine_ready=False,
+            last_error="future failed: engine startup failed",
+        ).to_wire()
+    )
 
     out = await supervisor.reconcile_once()
 
-    assert len(created) == 2
-    assert created[1].generation > first_generation
+    assert len(created) == 1
     replica = out["snapshot"]["replicas"]["vllm:model-a::replica-0"]
-    assert replica["state"] == "healthy"
-    assert replica["generation"] == created[1].generation
+    assert replica["state"] == "unhealthy"
+    assert replica["generation"] == first_generation
     assert replica["crash_count"] == 1
-    assert out["snapshot"]["restarted_total"] == 1
-    assert synced[-1][0]["status"] == "healthy"
+    assert out["snapshot"]["restarted_total"] == 0
+    assert synced[-1][0]["status"] == "unhealthy"
 
 
 @pytest.mark.anyio
@@ -3187,10 +3252,10 @@ async def test_issue_593_supervisor_precreates_controller_pg_before_runtime() ->
     assert pg_calls[0]["name"] == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
     assert pg_calls[0]["bundles"] == [{"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1}]
     replica = out["snapshot"]["replicas"]["vllm:Qwen/Test::replica-0"]
-    assert replica["state"] == "healthy"
+    assert replica["state"] == "starting"
     assert replica["node_pins"] == ["10.0.0.7"]
     assert out["snapshot"]["placement_groups_created_total"] == 1
-    assert synced[-1][0]["status"] == "healthy"
+    assert synced[-1][0]["status"] == "starting"
 
 
 @pytest.mark.anyio

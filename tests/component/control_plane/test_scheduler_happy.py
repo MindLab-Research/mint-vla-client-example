@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 import pytest
 from typing import Any, cast
 
@@ -9,6 +11,8 @@ from mint_server.backend.control_plane_contracts import (
     AsyncTaskLedger,
     ModelWorkTaskGateway,
 )
+from mint_server.backend.engine_adapter import EngineHealth, EngineHealthStatus
+from mint_server.backend.engine_liveness import EngineLivenessPush
 from mint_server.backend.model_work_task_gateway import SchedulerModelWorkTaskGateway
 from mint_server.backend.task_state_store import FutureStatus
 
@@ -112,6 +116,20 @@ async def test_scheduler_component_supervisor_syncs_real_scheduler(tmp_path) -> 
         out = await supervisor.reconcile_once()
         replica = out["snapshot"]["replicas"][f"{world.domain_key}::{world.replica_id}"]
         generation = int(replica["generation"])
+        await supervisor.push_liveness(
+            EngineLivenessPush(
+                actor_name=str(replica["actor_name"]),
+                domain_key=world.domain_key,
+                replica_id=world.replica_id,
+                consumer_id=str(replica["consumer_id"]),
+                actor_generation=generation,
+                running=True,
+                engine_ready=True,
+                engine_health=EngineHealth(status=EngineHealthStatus.READY),
+                pushed_at=time.time(),
+            )
+        )
+        await supervisor.reconcile_once()
         await world.enqueue_sampling("component-supervisor")
         claimed = await world.runtime_queue.claim(
             domain_key=world.domain_key,
