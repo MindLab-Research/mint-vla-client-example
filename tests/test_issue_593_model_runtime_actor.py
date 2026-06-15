@@ -18,6 +18,7 @@ from mint_server.backend.task_state_store import FutureStatus
 from mint_server.backend.model_engine_host import (
     ModelEngineHost,
     _default_executor,
+    actor_runtime_env_vars,
     default_model_engine_host_name,
     get_or_create_model_engine_host,
 )
@@ -147,6 +148,9 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
         "mint_server.config.PFS_HF_MODULES_PATH",
         "/hf",
     )
+    monkeypatch.setitem(actor_runtime_env_vars.__globals__, "PFS_RUNTIME_ENV_ROOT", "/runtime")
+    monkeypatch.setitem(actor_runtime_env_vars.__globals__, "MINT_CODE_ROOT", "/repo")
+    monkeypatch.setitem(actor_runtime_env_vars.__globals__, "PFS_HF_MODULES_PATH", "/hf")
     monkeypatch.delenv("RAY_ADDRESS", raising=False)
     monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.40.99:6379")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")

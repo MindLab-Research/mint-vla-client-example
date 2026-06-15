@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 import types
 from pathlib import Path
@@ -505,6 +506,95 @@ def test_vllm_system_utils_spawn_hint_does_not_leave_ray_address(monkeypatch):
     assert "RAY_ADDRESS" not in __import__("os").environ
     assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert __import__("os").environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
+    os.environ.pop("MINT_RAY_GCS_ADDRESS", None)
+
+
+def test_ray_init_patch_cleans_runtime_ray_address_reintroduced_by_worker(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = types.ModuleType("ray")
+
+    def original_init(*args, **kwargs):
+        import os
+
+        calls.append(
+            {
+                "args": args,
+                "kwargs": kwargs,
+                "ray_address_env": os.environ.get("RAY_ADDRESS"),
+                "ray_client_env": os.environ.get("RAY_CLIENT_ADDRESS"),
+                "mint_ray_client_env": os.environ.get("MINT_RAY_CLIENT_ADDRESS"),
+                "mint_ray_gcs_env": os.environ.get("MINT_RAY_GCS_ADDRESS"),
+            }
+        )
+        return {"ok": True}
+
+    fake_ray.init = original_init  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", "1")
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_init_drop_worker_attach_hints()
+
+    out = fake_ray.init(address="auto", namespace="mint")  # type: ignore[attr-defined]
+
+    assert out == {"ok": True}
+    assert calls == [
+        {
+            "args": (),
+            "kwargs": {"address": "auto", "namespace": "mint"},
+            "ray_address_env": None,
+            "ray_client_env": None,
+            "mint_ray_client_env": None,
+            "mint_ray_gcs_env": "192.168.40.99:6379",
+        }
+    ]
+    assert "RAY_ADDRESS" not in __import__("os").environ
+    assert __import__("os").environ["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
+    os.environ.pop("MINT_RAY_GCS_ADDRESS", None)
+
+
+def test_ray_init_patch_leaves_driver_ray_address_outside_worker_env(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = types.ModuleType("ray")
+
+    def original_init(*args, **kwargs):
+        import os
+
+        calls.append(
+            {
+                "ray_address_env": os.environ.get("RAY_ADDRESS"),
+                "ray_client_env": os.environ.get("RAY_CLIENT_ADDRESS"),
+            }
+        )
+        return {"ok": True}
+
+    fake_ray.init = original_init  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.delenv("MINT_ENABLE_VLLM_IMPORT_PATCHES", raising=False)
+    monkeypatch.delenv("RAY_ACTOR_ID", raising=False)
+    monkeypatch.setattr(sys, "argv", ["python", "scripts/run_server.py"])
+    monkeypatch.setenv("RAY_ADDRESS", "192.168.40.99:6379")
+    monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.40.99:10001")
+
+    module = _load_repo_sitecustomize()
+    module._patch_ray_init_drop_worker_attach_hints()
+
+    out = fake_ray.init(address="auto")  # type: ignore[attr-defined]
+
+    assert out == {"ok": True}
+    assert calls == [
+        {
+            "ray_address_env": "192.168.40.99:6379",
+            "ray_client_env": "ray://192.168.40.99:10001",
+        }
+    ]
+    assert __import__("os").environ["RAY_ADDRESS"] == "192.168.40.99:6379"
 
 
 def test_qwen35_text_only_adapter_patch_runs_from_sitecustomize(monkeypatch):

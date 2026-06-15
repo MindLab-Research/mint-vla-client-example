@@ -81,6 +81,7 @@ def test_init_ray_resolves_auto_address(monkeypatch):
         yield 0.0
 
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
     monkeypatch.delenv("MINT_RAY_CLIENT_ADDRESS", raising=False)
     monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _no_lock)
@@ -183,6 +184,7 @@ def test_init_ray_skips_lock_when_attaching_to_existing_cluster(monkeypatch):
         yield 0.0
 
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
     monkeypatch.setattr(ray_utils, "_ray_init_interprocess_lock", _unexpected_lock)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
@@ -215,6 +217,7 @@ def test_init_ray_reuses_existing_worker_context(monkeypatch):
     )
 
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
+    monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
     monkeypatch.setattr(ray_utils, "_RAY_LAST_INIT_ADDRESS", None)
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 

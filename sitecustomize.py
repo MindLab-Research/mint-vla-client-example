@@ -90,6 +90,9 @@ def _sanitize_ray_worker_bootstrap_process_environment(
     if not _should_sanitize_ray_worker_environment(environ, argv):
         return
     target = os.environ if environ is None else environ
+    ray_address = str(target.get("RAY_ADDRESS", "") or "").strip()
+    if ray_address and not ray_address.startswith("ray://"):
+        target.setdefault("MINT_RAY_GCS_ADDRESS", ray_address)
     for key in _DRIVER_ONLY_RAY_RUNTIME_ENV_KEYS:
         target.pop(key, None)
 
@@ -207,6 +210,24 @@ def _patch_ray_runtime_env_to_dict_drop_driver_attach_hints() -> None:
 
     to_dict._mint_drops_driver_attach_hints = True  # type: ignore[attr-defined]
     RuntimeEnv.to_dict = to_dict  # type: ignore[method-assign]
+
+
+def _patch_ray_init_drop_worker_attach_hints() -> None:
+    try:
+        import ray
+    except Exception:
+        return
+
+    original = getattr(ray, "init", None)
+    if not callable(original) or getattr(original, "_mint_drops_worker_attach_hints", False):
+        return
+
+    def init(*args, **kwargs):  # type: ignore[no-untyped-def]
+        _sanitize_ray_worker_bootstrap_process_environment()
+        return original(*args, **kwargs)
+
+    init._mint_drops_worker_attach_hints = True  # type: ignore[attr-defined]
+    ray.init = init  # type: ignore[method-assign]
 
 
 def _strip_host_only_sys_path_entries(paths: list[str]) -> list[str]:
@@ -2216,6 +2237,7 @@ def _apply_vllm_worker_patches() -> None:
     os.environ.setdefault("TVM_FFI_DISABLE_TORCH_C_DLPACK", "1")
 
     _patch_ray_runtime_env_to_dict_drop_driver_attach_hints()
+    _patch_ray_init_drop_worker_attach_hints()
     _patch_vllm_ray_env_carry_over_pythonpath()
     _patch_vllm_system_utils_spawn_without_ray_address()
     if not _env_flag("MINT_VLLM_DISABLE_MOE_LORA_PACKING", default=False):
