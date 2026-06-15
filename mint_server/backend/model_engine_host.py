@@ -1454,6 +1454,7 @@ class ModelEngineHost:
                     lease_ttl_s=self._config.lease_ttl_s,
                 )
                 if _scheduler_result_ok(result):
+                    await self._push_liveness()
                     continue
                 raise RuntimeError(f"model work lease renew failed: {result!r}")
 

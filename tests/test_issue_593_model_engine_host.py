@@ -790,6 +790,51 @@ async def test_issue_593_model_runtime_offloads_sync_executor_and_renews(tmp_pat
 
 
 @pytest.mark.anyio
+async def test_model_engine_host_pushes_active_liveness_while_renewing_long_executor(tmp_path) -> None:
+    lease = _lease("runtime-req-active-liveness")
+    scheduler = _FakeScheduler(claims=[[lease]])
+    task_futures = _FakeTaskFutureService(statuses={lease["item"]["request_id"]: FutureStatus.PENDING})
+    push = _FakeLivenessPush()
+    payload_store = TaskPayloadStore(tmp_path)
+
+    async def _executor(_lease: dict) -> ExecutorOutcome:
+        await asyncio.sleep(0.24)
+        return ExecutorOutcome(kind="success", payload={"ok": True})
+
+    actor = ModelEngineHost(
+        domain_key="vllm:model-a",
+        replica_id="replica-0",
+        actor_name="runtime-a",
+        actor_generation=3,
+        lease_ttl_s=0.3,
+        scheduler_client=scheduler,
+        task_futures_client=task_futures,
+        payload_store=payload_store,
+        liveness_push=push,
+        executor=_executor,
+    )
+
+    assert await actor.run_once() == {"claimed": 1, "executed": 1}
+
+    active_payloads = [
+        payload
+        for payload in push.payloads
+        if payload.active_lease_id == lease["lease_id"]
+    ]
+    assert active_payloads
+    assert active_payloads[0].active_request_id == lease["item"]["request_id"]
+    assert active_payloads[0].active_lease_count == 1
+    assert push.payloads[-1].active_request_id is None
+    assert push.payloads[-1].active_lease_count == 0
+    assert scheduler.renewed and scheduler.renewed[0]["lease_id"] == lease["lease_id"]
+    success = scheduler.finished_success[0]
+    assert payload_store.read_json_payload(
+        path=success["result_path"],
+        expected_checksum=success["result_checksum"],
+    ) == {"ok": True}
+
+
+@pytest.mark.anyio
 async def test_issue_616_model_runtime_does_not_requeue_after_task_state_success_commit(
     tmp_path,
 ) -> None:
