@@ -60,6 +60,13 @@ def test_agent_dev_skills_do_not_revive_legacy_dev_secrets() -> None:
         assert LEGACY_DEV_SECRETS_PATH not in text
 
 
+def test_agent_cluster_skills_do_not_revive_repo_secret_files() -> None:
+    text = (REPO_ROOT / ".claude" / "skills" / "aliyun-cluster" / "SKILL.md").read_text()
+
+    assert ".secrets.env" not in text
+    assert "source .env" not in text
+
+
 def test_prod_volcano_env_sources_external_config() -> None:
     text = (REPO_ROOT / "configs" / "prod_volcano.env.sh").read_text()
 

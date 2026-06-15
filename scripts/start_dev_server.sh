@@ -5,9 +5,9 @@ set -eu
 #
 # Contract: supply the smallest possible set of inputs; everything else uses
 # code defaults (host/port, LD_LIBRARY_PATH, vLLM child python, HF modules,
-# supported-model list). This script deliberately does NOT source the legacy
-# shared common.env, because that file hardcodes a fixed code checkout and a
-# shared Ray namespace, both of which must be chosen per launch.
+# supported-model list). This script deliberately does NOT source ambient
+# shared env files, because code checkout and Ray namespace are per-launch
+# identity inputs.
 #
 # Required (script refuses to start if absent):
 #   MINT_CODE_ROOT   Your personal mint-server checkout under /vePFS-Mindverse/share/.

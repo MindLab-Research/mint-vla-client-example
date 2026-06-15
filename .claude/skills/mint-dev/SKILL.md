@@ -41,9 +41,8 @@ historical `ssh mint-dev` commands.
 `scripts/start_dev_server.sh` is the dev launcher. It takes the smallest
 possible input set and lets everything else fall back to code defaults
 (host/port, `LD_LIBRARY_PATH`, vLLM child python, HF modules, supported-model
-list). It does NOT source a shared `common.env`; that historical file hardcodes
-a fixed code checkout and a shared Ray namespace, which the per-launch contract
-forbids.
+list). It does NOT source ambient shared env files: code checkout and Ray
+namespace are per-launch identity inputs.
 
 | Variable | Role | Source |
 |----------|------|--------|

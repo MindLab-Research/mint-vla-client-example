@@ -45,7 +45,6 @@ rsync -avz --dry-run \
   --exclude='__pycache__' \
   --exclude='*.pyc' \
   --exclude='.env' \
-  --exclude='.secrets.env' \
   --exclude='.venv' \
   --exclude='.venv*/' \
   --exclude='.venv_cpu/' \
@@ -99,7 +98,8 @@ ssh mint-prod-aliyun 'apt-get update && apt-get install -y ca-certificates'
 
 ### Credentials source (mint-prod-aliyun)
 
-For this project, credentials are stored in the repo-root `.env`:
+Credentials must come from an operator-managed env file outside the repo or
+from the launching shell:
 - `ALI_ACCESSKEY_ID`
 - `ALI_ACCESSKEY_SECRET`
 
@@ -107,7 +107,7 @@ Workflow:
 ```bash
 cd /path/to/mint-server-prod
 set -a
-source .env
+. /path/to/operator/aliyun.env
 set +a
 ```
 
@@ -267,7 +267,7 @@ Key env vars:
 Start (uses project-owned `.venv_cpu`; logs to `/tmp/mint_server_auth.log`):
 ```bash
 ssh mint-prod-aliyun 'cd /vePFS-Mindverse/share/code/mint-server-aliyun && \
-  set -a && source .secrets.env && set +a && \
+  set -a && . /path/to/operator/mint-prod-aliyun.env && set +a && \
   pkill -f "[p]ython scripts/run_server.py" 2>/dev/null || true; \
   nohup bash -c "PYTHONPATH=$PWD:$PYTHONPATH HF_HUB_OFFLINE=1 HF_HOME=/vePFS-Mindverse/share/huggingface \
     PYTHONDONTWRITEBYTECODE=1 MINT_RAY_GCS_ADDRESS=<MINT_PROD_ALIYUN_RAY_HEAD_IP>:6379 MINT_PORT=18000 \
