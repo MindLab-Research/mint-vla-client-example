@@ -84,14 +84,25 @@ nodes:
         pool: qwen
 ```
 
-V1 reads desired state from the static config file, then rebuilds runtime state
+**Provider node lifecycle has been moved to `RayClusterController` (k8s
+Deployment). See `ray-cluster-controller.md`.**
+
+`ModelActorSupervisor` no longer calls provider SDKs or holds provider
+credentials. Reconcile step 3 reads resolved topology from Redis
+(`mint:cluster:{cluster_id}:topology`) instead of querying Volcano/Aliyun
+directly. `topology_state.yaml` is no longer written by the supervisor.
+
+The description below is retained for historical context and to document the
+static topology config file format, which the controller still uses as a seed.
+
+~~V1 reads desired state from the static config file, then rebuilds runtime state
 from the provider and Ray. For Volcano, node management uses the Volcano Engine
 ML Platform Python SDK (`volcengine-python-sdk`) from the detached
 `mint_model_actor_supervisor` process. The supervisor must run on the trusted
 driver/control-plane node; model/runtime actors, daemon actors, API workers, and
-ConfigActor must not hold cloud provider credentials.
+ConfigActor must not hold cloud provider credentials.~~
 
-Volcano SDK credentials use the SDK default credential chain. This can reuse
+~~Volcano SDK credentials use the SDK default credential chain. This can reuse
 credentials created by the Volcano CLI, but only when those credentials are
 available to the driver process. Current SDKs read `VOLCENGINE_ACCESS_KEY` /
 `VOLCENGINE_SECRET_KEY`, `VOLCENGINE_SESSION_TOKEN`, `VOLCENGINE_CLI_CONFIG_FILE`

@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mint Ray Cluster Controller — Architecture</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: "SF Mono", "Fira Code", monospace; background: #0f1117; color: #c9d1d9; padding: 32px; }
+  h1 { font-size: 14px; font-weight: 600; color: #8b949e; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 32px; }
+
+  .canvas { position: relative; width: 960px; margin: 0 auto; }
+
+  /* Zones */
+  .zone {
+    position: absolute;
+    border-radius: 8px;
+    border: 1.5px solid;
+    padding: 12px 16px 8px;
+  }
+  .zone-label {
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  .zone-k8s   { border-color: #388bfd44; background: #388bfd08; top: 0;    left: 0;   width: 280px; height: 140px; }
+  .zone-redis { border-color: #d2383044; background: #d2383008; top: 0;    left: 340px; width: 280px; height: 140px; }
+  .zone-mlp   { border-color: #3fb95044; background: #3fb95008; top: 200px; left: 0;   width: 960px; height: 360px; }
+
+  .zone-k8s   .zone-label { color: #388bfd; }
+  .zone-redis .zone-label { color: #d23830; }
+  .zone-mlp   .zone-label { color: #3fb950; }
+
+  /* Boxes */
+  .box {
+    position: absolute;
+    border-radius: 6px;
+    border: 1.5px solid;
+    padding: 10px 14px;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+  .box-title {
+    font-size: 11px;
+    font-weight: 700;
+    margin-bottom: 4px;
+  }
+  .box-detail { font-size: 10px; color: #8b949e; }
+
+  /* k8s controller */
+  .box-controller {
+    border-color: #388bfd;
+    background: #388bfd14;
+    top: 28px; left: 20px; width: 240px;
+  }
+  .box-controller .box-title { color: #388bfd; }
+
+  /* Redis */
+  .box-redis {
+    border-color: #d23830;
+    background: #d2383014;
+    top: 20px; left: 360px; width: 240px; height: 110px;
+  }
+  .box-redis .box-title { color: #d23830; }
+  .box-redis .box-detail { line-height: 1.8; }
+
+  /* MLP inner boxes */
+  .box-driver {
+    border-color: #e3b341;
+    background: #e3b34114;
+    top: 250px; left: 20px; width: 340px;
+  }
+  .box-driver .box-title { color: #e3b341; }
+
+  .box-head {
+    border-color: #8b949e;
+    background: #8b949e14;
+    top: 250px; left: 400px; width: 180px;
+  }
+  .box-head .box-title { color: #8b949e; }
+
+  .box-worker {
+    border-color: #bc8cff;
+    background: #bc8cff14;
+    top: 250px; left: 620px; width: 300px;
+  }
+  .box-worker .box-title { color: #bc8cff; }
+
+  /* Provider */
+  .box-provider {
+    border-color: #8b949e55;
+    background: #8b949e08;
+    top: 420px; left: 20px; width: 200px;
+  }
+  .box-provider .box-title { color: #8b949e; }
+
+  /* SVG arrows layer */
+  svg.arrows {
+    position: absolute;
+    top: 0; left: 0;
+    width: 960px;
+    height: 620px;
+    pointer-events: none;
+    overflow: visible;
+  }
+
+  .arrow { fill: none; stroke-width: 1.5; marker-end: url(#arrowhead); }
+  .arr-blue   { stroke: #388bfd88; }
+  .arr-red    { stroke: #d2383088; }
+  .arr-yellow { stroke: #e3b34188; }
+  .arr-purple { stroke: #bc8cff88; }
+  .arr-gray   { stroke: #8b949e88; }
+  .arr-dashed { stroke-dasharray: 5 4; }
+
+  .edge-label {
+    font-size: 9px;
+    fill: #8b949e;
+    font-family: "SF Mono", "Fira Code", monospace;
+    letter-spacing: .04em;
+  }
+
+  /* Legend */
+  .legend {
+    margin-top: 640px;
+    display: flex;
+    gap: 32px;
+    flex-wrap: wrap;
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 11px; color: #8b949e; }
+  .legend-line { width: 28px; height: 2px; border-radius: 1px; }
+</style>
+</head>
+<body>
+<h1>Mint — Ray Cluster Controller Architecture</h1>
+
+<div class="canvas" style="height: 620px;">
+
+  <!-- Zones -->
+  <div class="zone zone-k8s">
+    <div class="zone-label">Kubernetes</div>
+  </div>
+  <div class="zone zone-redis">
+    <div class="zone-label">Redis</div>
+  </div>
+  <div class="zone zone-mlp">
+    <div class="zone-label">MLP — Volcano / Aliyun</div>
+  </div>
+
+  <!-- Controller box -->
+  <div class="box box-controller">
+    <div class="box-title">RayClusterController</div>
+    <div class="box-detail">node lifecycle loop · 30s</div>
+    <div class="box-detail">ray health probe · 10s</div>
+    <div class="box-detail">HTTP API (scale-up / down)</div>
+  </div>
+
+  <!-- Redis box -->
+  <div class="box box-redis">
+    <div class="box-title">Shared State</div>
+    <div class="box-detail">config &nbsp;&nbsp;&nbsp; desired</div>
+    <div class="box-detail">topology &nbsp; ray:head</div>
+    <div class="box-detail">controller:status</div>
+    <div class="box-detail">supervisor:node_actors:*</div>
+  </div>
+
+  <!-- ray driver -->
+  <div class="box box-driver">
+    <div class="box-title">ray driver node · CPU-heavy</div>
+    <div class="box-detail">mint-server (FastAPI)</div>
+    <div class="box-detail">&nbsp; ray_utils → reads ray:head</div>
+    <div class="box-detail">&nbsp; config → reads mint:cluster:*:config</div>
+    <div class="box-detail" style="margin-top:6px;">ModelActorSupervisor (detached actor)</div>
+    <div class="box-detail">&nbsp; reconcile step 3 → reads topology</div>
+    <div class="box-detail">&nbsp; writes supervisor:node_actors:*</div>
+  </div>
+
+  <!-- ray head -->
+  <div class="box box-head">
+    <div class="box-title">ray head node</div>
+    <div class="box-detail">GCS :6379</div>
+    <div class="box-detail">dashboard</div>
+    <div class="box-detail">scheduler</div>
+  </div>
+
+  <!-- ray workers -->
+  <div class="box box-worker">
+    <div class="box-title">ray worker nodes · GPU</div>
+    <div class="box-detail">vLLM actors</div>
+    <div class="box-detail">Megatron workers</div>
+    <div class="box-detail">dense trainers</div>
+    <div class="box-detail">NodeMetricsDaemon</div>
+  </div>
+
+  <!-- provider -->
+  <div class="box box-provider">
+    <div class="box-title">Provider APIs</div>
+    <div class="box-detail">Volcano Engine SDK</div>
+    <div class="box-detail">Aliyun DLC SDK</div>
+  </div>
+
+  <!-- Arrows SVG -->
+  <svg class="arrows">
+    <defs>
+      <marker id="arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#8b949e88"/>
+      </marker>
+      <marker id="arrowhead-blue" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#388bfd88"/>
+      </marker>
+      <marker id="arrowhead-red" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#d2383088"/>
+      </marker>
+      <marker id="arrowhead-yellow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+        <polygon points="0 0, 8 3, 0 6" fill="#e3b34188"/>
+      </marker>
+    </defs>
+
+    <!-- controller → Redis (write topology, ray:head, status) -->
+    <path class="arrow arr-blue" marker-end="url(#arrowhead-blue)"
+      d="M 260 70 L 360 70"/>
+    <text class="edge-label" x="270" y="63">write topology / ray:head</text>
+
+    <!-- Redis → controller (read desired) -->
+    <path class="arrow arr-red" marker-end="url(#arrowhead-red)"
+      d="M 360 90 L 260 90"/>
+    <text class="edge-label" x="270" y="103">read desired</text>
+
+    <!-- controller → Provider (provider SDK) -->
+    <path class="arrow arr-blue" marker-end="url(#arrowhead-blue)"
+      d="M 140 140 L 110 420"/>
+    <text class="edge-label" x="50" y="290">provider SDK</text>
+
+    <!-- controller → ray head (health probe) -->
+    <path class="arrow arr-blue arr-dashed" marker-end="url(#arrowhead-blue)"
+      d="M 260 100 Q 490 160 490 248"/>
+    <text class="edge-label" x="380" y="175">GCS health probe</text>
+
+    <!-- Redis → driver (read config, topology, ray:head) -->
+    <path class="arrow arr-red" marker-end="url(#arrowhead-red)"
+      d="M 420 130 L 190 248"/>
+    <text class="edge-label" x="255" y="195">read config / topology / ray:head</text>
+
+    <!-- driver → Redis (write node_actors) -->
+    <path class="arrow arr-yellow" marker-end="url(#arrowhead-yellow)"
+      d="M 340 290 Q 480 220 480 130"/>
+    <text class="edge-label" x="430" y="215">write node_actors</text>
+
+    <!-- driver → ray head (Ray GCS) -->
+    <path class="arrow arr-yellow" marker-end="url(#arrowhead-yellow)"
+      d="M 360 310 L 400 310"/>
+    <text class="edge-label" x="362" y="305">Ray GCS</text>
+
+    <!-- ray head → workers (Ray) -->
+    <path class="arrow arr-gray" marker-end="url(#arrowhead)"
+      d="M 580 320 L 620 320"/>
+    <text class="edge-label" x="583" y="314">Ray</text>
+
+  </svg>
+
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item">
+    <div class="legend-line" style="background:#388bfd88;"></div>
+    RayClusterController
+  </div>
+  <div class="legend-item">
+    <div class="legend-line" style="background:#e3b34188;"></div>
+    mint-server / ModelActorSupervisor
+  </div>
+  <div class="legend-item">
+    <div class="legend-line" style="background:#d2383088;"></div>
+    Redis read
+  </div>
+  <div class="legend-item">
+    <div class="legend-line" style="background:#8b949e88;"></div>
+    Ray internal
+  </div>
+  <div class="legend-item">
+    <div class="legend-line" style="background:#388bfd88; background: repeating-linear-gradient(90deg,#388bfd88 0,#388bfd88 5px,transparent 5px,transparent 9px);"></div>
+    health probe (dashed)
+  </div>
+</div>
+
+</body>
+</html>
