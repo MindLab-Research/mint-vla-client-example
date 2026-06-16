@@ -47,7 +47,7 @@ from mint_server.backend.actors.model_actor_placement import (
     model_actor_placement_reconciler,
 )
 from mint_server.backend.scheduling.model_work_scheduler import ModelReplicaRegistration, ModelWorkSchedulerClient, model_work_scheduler
-from mint_server.backend.ray_cluster.node_metrics_daemon import (
+from mint_server.backend.observability.node_metrics_daemon import (
     NodeMetricsDaemonSpec,
     get_or_create_node_metrics_collector_actor,
     node_metrics_actor_name,

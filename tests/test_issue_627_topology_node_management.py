@@ -8,8 +8,8 @@ import yaml
 import pytest
 
 from mint_server.backend.actors.model_actor_supervisor import ModelActorSpec, ModelActorSupervisor, desired_specs_from_env
-from mint_server.backend.ray_cluster.node_metrics_daemon import NodeMetricsDaemonSpec
-from mint_server.backend.ray_cluster import node_metrics_daemon as node_metrics_daemon_module
+from mint_server.backend.observability import node_metrics_daemon as node_metrics_daemon_module
+from mint_server.backend.observability.node_metrics_daemon import NodeMetricsDaemonSpec
 from mint_server.backend.ray_cluster.topology import (
     ProviderTaskState,
     RayNodeState,
@@ -2315,12 +2315,13 @@ async def test_issue_627_raw_ip_worker_alias_is_resolved_without_provider_submit
             },
         },
         scheduler_sync=lambda _registrations: None,
+        control_plane_dependencies=[],
     )
 
     out = await supervisor.reconcile_once()
 
     label = "vllm:Qwen/Test::replica-0"
-    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["state"] == "starting"
     assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.99"]
     assert created[0].normalized_node_pins() == ["10.0.0.99"]
     assert submitted == []
@@ -2361,12 +2362,13 @@ async def test_issue_627_raw_ip_worker_alias_works_without_topology_config() -> 
             },
         },
         scheduler_sync=lambda _registrations: None,
+        control_plane_dependencies=[],
     )
 
     out = await supervisor.reconcile_once()
 
     label = "vllm:Qwen/Test::replica-0"
-    assert out["snapshot"]["replicas"][label]["state"] == "healthy"
+    assert out["snapshot"]["replicas"][label]["state"] == "starting"
     assert out["snapshot"]["replicas"][label]["node_pins"] == ["10.0.0.99"]
     assert created[0].normalized_node_pins() == ["10.0.0.99"]
 

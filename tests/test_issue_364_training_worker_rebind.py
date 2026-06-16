@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 import mint_server.backend.training.dense.dense_trainer as dense_trainer
-import mint_server.backend.core.runtime_observability as runtime_obs_module
+import mint_server.backend.observability.runtime_observability as runtime_obs_module
 from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.backend.training.training_session_manager import TrainingSession
 

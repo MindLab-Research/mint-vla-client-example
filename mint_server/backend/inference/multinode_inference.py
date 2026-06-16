@@ -42,8 +42,8 @@ from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_fro
 from mint_server.backend.ray_cluster.multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
 from mint_server.backend.actors.ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
-from mint_server.backend.actors.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
-from mint_server.backend.inference.vllm_scheduler_observability import (
+from mint_server.backend.observability.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
+from mint_server.backend.observability.vllm_scheduler_observability import (
     VllmStatsObserver,
     install_vllm_iteration_observability_patches,
     make_vllm_stats_logger_factory,

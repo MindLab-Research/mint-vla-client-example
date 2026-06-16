@@ -100,6 +100,12 @@ class SessionManager:
             "sampling_sessions_inflight": 0,
         }
         self._obs_sampling_by_model: dict[str, dict[str, int | str]] = {}
+        try:
+            from mint_server.backend.inference.multi_lora_engine import register_lora_session_invalidator
+
+            register_lora_session_invalidator(self.mark_model_lora_sessions_unloaded)
+        except Exception:
+            logger.debug("multi-LoRA session invalidator registration skipped", exc_info=True)
 
     def _persist_sampling_session_info(self, session_id: str, info: SessionInfo) -> None:
         if not info.uses_multi_lora:

@@ -29,7 +29,7 @@ async def initialize_execution_bindings() -> dict[str, Any]:
     from mint_server.backend.openpi.action_session_manager import ActionSessionRouter
     from mint_server.backend.core.execution_context import ExecutionContext
     from mint_server.backend.sessions.session_manager import DEFAULT_INACTIVITY_TIMEOUT, SessionManager
-    from mint_server.backend.sessions.training_engine_router import TrainingEngineRouter
+    from mint_server.backend.training.training_engine_router import TrainingEngineRouter
     from mint_server.backend.training.training_session_manager import TrainingSessionManager
 
     inference_manager = SessionManager(

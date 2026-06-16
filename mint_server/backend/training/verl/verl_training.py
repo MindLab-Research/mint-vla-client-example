@@ -664,7 +664,7 @@ class TrainingWorker:
             json.dumps(attrs, sort_keys=True, ensure_ascii=True),
         )
         record_span_event_otel("mint.training_input_contract_violation", attributes=attrs)
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         runtime_observability.record_training_incident(
             kind="contract_violation",
@@ -3024,7 +3024,7 @@ class VerlTrainingEngine:
         if not actor_name:
             return
 
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         runtime_observability.record_dense_actor_fatal(
             base_model=session.base_model,
@@ -3122,7 +3122,7 @@ class VerlTrainingEngine:
         interval_s: float = 30.0,
         timeout_s: float | None = None,
     ):
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         started = time.monotonic()
         effective_timeout_s = timeout_s
@@ -3207,7 +3207,7 @@ class VerlTrainingEngine:
         switch_count = float(metrics.get("session_switch_total:sum", 0.0) or 0.0)
         if switch_count <= 0:
             return
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         session_state = "existing" if float(metrics.get("session_switch_existing_session:mean", 0.0) or 0.0) >= 0.5 else "new"
         runtime_observability.record_megatron_session_switch(
@@ -3223,7 +3223,7 @@ class VerlTrainingEngine:
     async def _recover_dense_worker(self, session: "TrainingSession", *, reason: str) -> ray.actor.ActorHandle:
         """Rebind a dense trainer actor after eviction/death."""
         from mint_server.backend.training.dense.dense_trainer import get_or_create_dense_trainer
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         model_id = session.model_id
         base_model, name_key = self._resolve_session_base_model(session)
@@ -3295,7 +3295,7 @@ class VerlTrainingEngine:
         if not actor_name:
             return None
         namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
-        from mint_server.backend.core.runtime_observability import runtime_observability
+        from mint_server.backend.observability.runtime_observability import runtime_observability
 
         if session.backend == "peft":
             from mint_server.backend.training.dense.dense_trainer import dense_trainer_reuse_block_reason

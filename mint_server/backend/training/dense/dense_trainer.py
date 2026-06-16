@@ -226,7 +226,7 @@ def retire_dense_trainer(
     actor: Any | None = None,
 ) -> str:
     """Poison a dense trainer so it cannot be reused after fatal GPU failures."""
-    from mint_server.backend.core.runtime_observability import runtime_observability
+    from mint_server.backend.observability.runtime_observability import runtime_observability
 
     pool = get_model_actor_supervisor()
     entry = pool.get(actor_name)
@@ -420,7 +420,7 @@ def get_or_create_dense_trainer(
             bind_decision = "create"
 
             from mint_server.backend.core.model_registry import is_topology_desired_model
-            from mint_server.backend.core.runtime_observability import runtime_observability
+            from mint_server.backend.observability.runtime_observability import runtime_observability
 
             is_topology_desired = is_topology_desired_model(base_model)
 

@@ -13,7 +13,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -89,26 +89,20 @@ def _prepare_vllm_actor_runtime_env(env_vars: dict[str, str]) -> None:
 # Fixed namespace for persistent actors (without this, each process gets random namespace)
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
 
+_LORA_SESSION_INVALIDATORS: list[Callable[[str], int]] = []
+
+
+def register_lora_session_invalidator(invalidator: Callable[[str], int]) -> None:
+    if invalidator not in _LORA_SESSION_INVALIDATORS:
+        _LORA_SESSION_INVALIDATORS.append(invalidator)
+
 
 def _invalidate_model_session_loras(model_name: str) -> None:
     """Force multi-LoRA sessions for a model to reload after actor recreate."""
     try:
-        managers = []
-
-        from mint_server.backend.sessions.session_manager import session_manager as backend_session_manager
-
-        if backend_session_manager is not None:
-            managers.append(backend_session_manager)
-
-        from mint_server.routes import sampling as sampling_routes
-
-        route_session_manager = getattr(sampling_routes, "session_manager", None)
-        if route_session_manager is not None and route_session_manager not in managers:
-            managers.append(route_session_manager)
-
         invalidated = 0
-        for manager in managers:
-            invalidated += manager.mark_model_lora_sessions_unloaded(model_name)
+        for invalidator in list(_LORA_SESSION_INVALIDATORS):
+            invalidated += int(invalidator(model_name) or 0)
         if invalidated:
             logger.info(
                 "Invalidated cached LoRA load state for %s session(s) on model=%s after vLLM actor recreate",
