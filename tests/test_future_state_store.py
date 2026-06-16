@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 
 from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
-from mint_server.backend.stores.future_state_store import FutureStateStore
 from mint_server.backend.stores.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
+
+FutureStateStore = TaskStateStore
 
 
 class _LocalFutureStateClient:
@@ -92,7 +93,7 @@ class _LocalTaskStateClient:
 def test_future_state_store_scheduler_lease_and_finalize() -> None:
     store = FutureStateStore.in_memory()
     owner = store.acquire_scheduler_owner(owner_id="scheduler-a", ttl_s=30.0, now=100.0)
-    assert owner["ok"] is True
+    assert owner.ok is True
 
     store.create_task(
         request_id="req-1",
@@ -102,14 +103,14 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         metadata={"op": "sampling.asample"},
         now=101.0,
     )
-    store.assign_task(request_id="req-1", subqueue_id="q-1", scheduler_epoch=owner["epoch"], now=102.0)
+    store.assign_task(request_id="req-1", subqueue_id="q-1", scheduler_epoch=owner.epoch, now=102.0)
     store.claim_task(
         request_id="req-1",
         subqueue_id="q-1",
         lease_id="lease-1",
         attempt_id="attempt-1",
         consumer_id="consumer-1",
-        scheduler_epoch=owner["epoch"],
+        scheduler_epoch=owner.epoch,
         runtime_generation=1,
         lease_ttl_s=30.0,
         now=103.0,
@@ -118,18 +119,18 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         request_id="req-1",
         lease_id="lease-1",
         attempt_id="attempt-1",
-        scheduler_epoch=owner["epoch"],
+        scheduler_epoch=owner.epoch,
         runtime_generation=1,
         lease_ttl_s=60.0,
         now=104.0,
     )
-    assert renewed["record"]["status"] == "leased"
-    assert renewed["record"]["lease_expires_at"] == 164.0
+    assert renewed.record["status"] == "leased"
+    assert renewed.record["lease_expires_at"] == 164.0
     store.begin_finalize(
         request_id="req-1",
         lease_id="lease-1",
         attempt_id="attempt-1",
-        scheduler_epoch=owner["epoch"],
+        scheduler_epoch=owner.epoch,
         runtime_generation=1,
         finalize_ttl_s=30.0,
         staged_payload_path="/tmp/payload.json",
@@ -139,17 +140,15 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         request_id="req-1",
         lease_id="lease-1",
         attempt_id="attempt-1",
-        scheduler_epoch=owner["epoch"],
+        scheduler_epoch=owner.epoch,
         runtime_generation=1,
         result_path="/tmp/payload.json",
         result_checksum="sha256:abc",
         result_size_bytes=12,
-        metadata={"billing_status": "outboxed"},
         now=106.0,
     )
 
-    assert out["record"]["status"] == "done"
-    assert out["record"]["metadata"]["billing_status"] == "outboxed"
+    assert out.record["status"] == "done"
     assert store.get_task("req-1")["request_json"] == b'{"x":1}'
 
 

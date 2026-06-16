@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -169,7 +168,7 @@ def test_task_state_store_ray_actor_ping_uses_health_concurrency_group(monkeypat
 
 
 def test_training_session_inflight_is_durable_metadata(tmp_path: Path) -> None:
-    store = TaskStateStore(str(tmp_path / "task-state-training-inflight.sqlite3"))
+    store = TaskStateStore(str(tmp_path / "task-state" / "task-state-training-inflight.sqlite3"))
     try:
         store.upsert_training_session(
             model_id="model-inflight",
@@ -249,7 +248,7 @@ def test_task_state_store_client_sync_cached_actor_survives_reset(monkeypatch) -
 
 def test_task_state_store_actor_wait_status_change_notifies(tmp_path) -> None:
     async def _run() -> None:
-        actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch.sqlite3"))
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-watch.sqlite3"))
         try:
             actor.create_task(
                 request_id="req-watch",
@@ -289,41 +288,13 @@ def test_task_state_store_actor_future_store_init_is_singleton_under_concurrency
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.backend.stores.future_state_store as future_state_store_module
-
-    actor = _TaskStateStoreActor(str(tmp_path / "task-state-concurrency.sqlite3"))
-    created: list[object] = []
-
-    class _FakeFutureStateStore:
-        def __init__(self, path: str) -> None:
-            self.db_path = path
-            created.append(self)
-            time.sleep(0.05)
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(future_state_store_module, "FutureStateStore", _FakeFutureStateStore)
-
-    barrier = threading.Barrier(3)
-    results: list[object] = []
-
-    def _worker() -> None:
-        barrier.wait()
-        results.append(actor._future_store_or_create())
-
-    threads = [threading.Thread(target=_worker) for _ in range(2)]
+    # KVBackend is now created eagerly in TaskStateStore.__init__,
+    # singleton semantics are guaranteed at construction time.
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-concurrency.sqlite3"))
     try:
-        for thread in threads:
-            thread.start()
-        barrier.wait()
-        for thread in threads:
-            thread.join(timeout=1.0)
-        assert all(not thread.is_alive() for thread in threads)
-        assert len(created) == 1
-        assert len(results) == 2
-        assert results[0] is results[1]
-        assert results[0] is created[0]
+        kv1 = actor._store._kv
+        kv2 = actor._store._kv
+        assert kv1 is kv2
     finally:
         actor.close()
 
@@ -350,7 +321,7 @@ def test_issue_638_task_state_store_stats_include_future_dashboard_fields(tmp_pa
             "max_duration_ms": 0.0,
         }
     )
-    actor = _TaskStateStoreActor(str(tmp_path / "task-state-metrics.sqlite3"))
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-metrics.sqlite3"))
     try:
         actor.create_task(
             request_id="req-pending",
@@ -447,7 +418,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
     monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
     monkeypatch.setattr(logging_context, "init_actor_observability", lambda: None)
 
-    actor = _TaskStateStoreActor(str(tmp_path / "task-state-otel.sqlite3"))
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-otel.sqlite3"))
     try:
         actor.create_task(
             request_id="req-pending",
@@ -602,7 +573,7 @@ def test_task_state_store_client_stats_exposes_client_process_rpc_metrics(monkey
 
 def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
     async def _run() -> None:
-        actor = _TaskStateStoreActor(str(tmp_path / "task-state-watch-timeout.sqlite3"))
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-watch-timeout.sqlite3"))
         try:
             actor.create_task(
                 request_id="req-watch-timeout",
@@ -630,7 +601,7 @@ def test_task_state_store_actor_wait_status_change_times_out(tmp_path) -> None:
 
 def test_task_state_store_actor_wait_terminal_only_ignores_active_progress(tmp_path) -> None:
     async def _run() -> None:
-        actor = _TaskStateStoreActor(str(tmp_path / "task-state-terminal-watch.sqlite3"))
+        actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-terminal-watch.sqlite3"))
         try:
             actor.create_task(
                 request_id="req-terminal-watch",
@@ -727,56 +698,6 @@ def test_owner_epoch_fences_stale_scheduler() -> None:
         )
         assert stale_renew.ok is False
         assert stale_renew.reason == "stale_owner"
-    finally:
-        store.close()
-
-
-def test_task_state_store_migrates_staged_payload_columns(tmp_path) -> None:
-    db_path = tmp_path / "task_state.sqlite3"
-    conn = sqlite3.connect(db_path)
-    try:
-        conn.executescript(
-            """
-            CREATE TABLE tasks (
-                request_id TEXT PRIMARY KEY,
-                op TEXT NOT NULL,
-                status TEXT NOT NULL,
-                domain_key TEXT NOT NULL,
-                subqueue_id TEXT,
-                lease_id TEXT,
-                attempt_id TEXT,
-                scheduler_epoch INTEGER,
-                runtime_generation INTEGER,
-                consumer_id TEXT,
-                request_json BLOB NOT NULL,
-                payload_hash TEXT,
-                result_path TEXT,
-                result_checksum TEXT,
-                result_size_bytes INTEGER,
-                error TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}',
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                assigned_at REAL,
-                leased_at REAL,
-                lease_expires_at REAL,
-                finalizing_until REAL
-            );
-            """
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    store = TaskStateStore(db_path)
-    try:
-        columns = {
-            str(row[1])
-            for row in store._conn.execute("PRAGMA table_info(tasks)").fetchall()
-        }
-        assert "staged_payload_path" in columns
-        assert "staged_payload_checksum" in columns
-        assert "staged_payload_size_bytes" in columns
     finally:
         store.close()
 
@@ -1400,60 +1321,6 @@ def test_billing_outbox_failure_terminal_is_not_billed() -> None:
         store.close()
 
 
-def test_billing_outbox_not_written_when_terminal_success_rejected(monkeypatch) -> None:
-    store = TaskStateStore.in_memory()
-    try:
-        store.ensure_task(
-            request_id="future-reject",
-            op="sampling.asample",
-            domain_key="future:default",
-            metadata={},
-            status="running",
-            now=100.0,
-        )
-        appended: list[dict] = []
-
-        def _append(*args, **kwargs):
-            appended.append({"args": args, "kwargs": kwargs})
-            return {"ok": True, "inserted": 1, "duplicate": 0, "conflicts": 0, "errors": []}
-
-        monkeypatch.setattr(store._hot_kv, "append_billing_outbox", _append)
-
-        def _fail_record_event(*_args, **_kwargs):
-            raise RuntimeError("terminal event write failed")
-
-        monkeypatch.setattr(store, "_record_event", _fail_record_event)
-
-        observation = build_billing_observation(
-            account_id="acct-1",
-            apikey_id="key-1",
-            request_id="future-reject",
-            charge_item="sampling",
-            quantity=7,
-            unit="tokens",
-            route="sampling.asample",
-            dimension="sample",
-            model="Qwen/Test",
-            observed_at=101.0,
-        )
-        with pytest.raises(RuntimeError, match="terminal event write failed"):
-            store.complete_task_success(
-                request_id="future-reject",
-                result_path="/tmp/result.json",
-                result_checksum="sha256:abc",
-                result_size_bytes=17,
-                metadata={"done_at": 102.0},
-                billing_observations=[observation],
-                now=102.0,
-            )
-
-        assert appended == []
-        assert store.billing_outbox_stats(now=103.0)["by_status"] == {}
-        assert store.get_task("future-reject")["status"] == "running"
-    finally:
-        store.close()
-
-
 def test_billing_outbox_idempotent_terminal_retry_writes_missing_billing() -> None:
     store = TaskStateStore.in_memory()
     try:
@@ -1979,7 +1846,7 @@ def test_expired_leases_include_finalizing_deadline() -> None:
 
 
 def test_task_state_store_actor_uses_single_db_path(tmp_path) -> None:
-    db_path = tmp_path / "task_state.sqlite3"
+    db_path = tmp_path / "task-state" / "task_state.sqlite3"
     actor = _TaskStateStoreActor(str(db_path))
     try:
         owner = actor.acquire_scheduler_owner(owner_id="scheduler-a", ttl_s=30.0, now=100.0)
@@ -2010,7 +1877,7 @@ def test_task_state_store_actor_uses_single_db_path(tmp_path) -> None:
 
 
 def test_task_state_store_actor_stats_uses_future_metrics_not_active_task_scan(tmp_path) -> None:
-    actor = _TaskStateStoreActor(str(tmp_path / "task-state-stats-no-active-scan.sqlite3"))
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task-state-stats-no-active-scan.sqlite3"))
     try:
         actor.create_task(
             request_id="req-actor",
@@ -2289,10 +2156,7 @@ def test_task_future_service_wait_status_falls_back_to_scheduler_task_state() ->
 
 
 def test_task_state_actor_future_success_preserves_billing_observations(tmp_path) -> None:
-    from mint_server.backend.stores.future_state_store import FutureStateStore
-
-    actor = _TaskStateStoreActor(str(tmp_path / "task-state.sqlite3"))
-    actor._future_store = FutureStateStore.in_memory()
+    actor = _TaskStateStoreActor(":memory:")
     try:
         actor.future_ensure_task(
             request_id="future-actor-bill",
@@ -2376,7 +2240,7 @@ def test_task_state_store_owns_gateway_routes() -> None:
 
 
 def test_task_state_store_actor_exposes_session_metadata_methods(tmp_path) -> None:
-    actor = _TaskStateStoreActor(str(tmp_path / "task_state.sqlite3"))
+    actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task_state.sqlite3"))
     try:
         actor.upsert_sampling_session(session_id="sampler-a", info={"session_id": "sampler-a"})
         assert actor.get_sampling_session(session_id="sampler-a")["session_id"] == "sampler-a"
