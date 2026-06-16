@@ -5,8 +5,9 @@ import json
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any, Callable
+
+from mint_server.backend.stores.kv_backend import InMemoryKVBackend, KVBackend, RocksKVBackend
 
 class TaskHotKVStoreError(RuntimeError):
     pass
@@ -37,79 +38,6 @@ def _json_loads(value: str | bytes | None) -> dict[str, Any]:
     return out
 
 
-class _DictKV:
-    def __init__(self) -> None:
-        self._data: dict[str, str] = {}
-
-    def get(self, key: str) -> str | None:
-        return self._data.get(str(key))
-
-    def put(self, key: str, value: str) -> None:
-        self._data[str(key)] = str(value)
-
-    def delete(self, key: str) -> None:
-        self._data.pop(str(key), None)
-
-    def keys(self) -> list[str]:
-        return list(self._data.keys())
-
-    def close(self) -> None:
-        self._data.clear()
-
-
-class _RocksKV:
-    def __init__(self, path: str) -> None:
-        try:
-            from rocksdict import Rdict
-        except Exception as e:
-            if "pytest-" in str(path):
-                self._fallback = _DictKV()
-                self._db = None
-                return
-            raise TaskHotKVStoreUnavailableError("rocksdict is required for persistent hot KV store") from e
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._fallback = None
-        self._db = Rdict(str(path))
-
-    def get(self, key: str) -> str | None:
-        if self._fallback is not None:
-            return self._fallback.get(key)
-        value = self._db.get(str(key))
-        if value is None:
-            return None
-        if isinstance(value, bytes):
-            return value.decode("utf-8")
-        return str(value)
-
-    def put(self, key: str, value: str) -> None:
-        if self._fallback is not None:
-            self._fallback.put(key, value)
-            return
-        self._db[str(key)] = str(value)
-
-    def delete(self, key: str) -> None:
-        if self._fallback is not None:
-            self._fallback.delete(key)
-            return
-        try:
-            del self._db[str(key)]
-        except KeyError:
-            pass
-
-    def keys(self) -> list[str]:
-        if self._fallback is not None:
-            return self._fallback.keys()
-        return [str(key.decode("utf-8") if isinstance(key, bytes) else key) for key in self._db.keys()]
-
-    def close(self) -> None:
-        if self._fallback is not None:
-            self._fallback.close()
-            return
-        close = getattr(self._db, "close", None)
-        if callable(close):
-            close()
-
-
 class TaskHotKVStore:
     """RocksDB-backed hot metadata store owned by TaskStateStore.
 
@@ -122,7 +50,15 @@ class TaskHotKVStore:
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self._db_path = str(db_path)
-        self._kv = _DictKV() if self._db_path == ":memory:" else _RocksKV(self._db_path)
+        self._kv: KVBackend = (
+            InMemoryKVBackend()
+            if self._db_path == ":memory:"
+            else RocksKVBackend(
+                self._db_path,
+                unavailable_error=TaskHotKVStoreUnavailableError,
+                memory_fallback_for_pytest=True,
+            )
+        )
         self._locks = [threading.RLock() for _ in range(self._STRIPES)]
         self._billing_id_lock = threading.RLock()
         self._billing_next_id = 1
@@ -160,21 +96,17 @@ class TaskHotKVStore:
     def _list_namespace(self, namespace: str) -> list[dict[str, Any]]:
         prefix = f"{namespace}:"
         out: list[dict[str, Any]] = []
-        for key in self._kv.keys():
-            if key.startswith(prefix):
-                record = self._get_json(key)
-                if record is not None:
-                    out.append(record)
+        for key in self._kv.keys(prefix=prefix):
+            record = self._get_json(key)
+            if record is not None:
+                out.append(record)
         return out
 
     def _rebuild_indexes(self) -> None:
         max_id = 0
-        for key in list(self._kv.keys()):
-            if key.startswith("idx:billing:"):
-                self._kv.delete(key)
-        for key in self._kv.keys():
-            if not key.startswith("billing:"):
-                continue
+        for key in list(self._kv.keys(prefix="idx:billing:")):
+            self._kv.delete(key)
+        for key in self._kv.keys(prefix="billing:"):
             record = self._get_json(key)
             if record is None:
                 continue
@@ -204,7 +136,7 @@ class TaskHotKVStore:
     def _billing_status_ids(self, status: str) -> list[int]:
         prefix = f"idx:billing:status:{str(status)}:"
         out: list[int] = []
-        for key in sorted(k for k in self._kv.keys() if k.startswith(prefix)):
+        for key in self._kv.keys(prefix=prefix):
             value = self._kv.get(key)
             if value is not None:
                 out.append(int(value))
