@@ -30,11 +30,32 @@ class StubModelWorkScheduler:
         return {"ok": True, **dict(kwargs)}
 
 
+class _ModelWorkFutureStubMixin:
+    async def async_create_model_work_with_id(self, request_id: str, **_kwargs) -> dict:
+        return {"created": True, "request_id": request_id}
+
+
 def _queued_payload(call: dict) -> dict:
     raw = call["request_json"]
     if isinstance(raw, bytes):
         return json.loads(raw.decode("utf-8"))
     return dict(raw)
+
+
+def _patch_weights_inflight(monkeypatch, weights_routes, calls: list[tuple[str, int]] | None = None) -> None:
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        if calls is not None:
+            calls.append((model_id, delta))
+
+    monkeypatch.setattr(weights_routes, "_mark_training_inflight", _mark_training_inflight)
+
+
+def _patch_training_inflight(monkeypatch, training_routes, calls: list[tuple[str, int]] | None = None) -> None:
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        if calls is not None:
+            calls.append((model_id, delta))
+
+    monkeypatch.setattr(training_routes, "_mark_training_inflight", _mark_training_inflight)
 
 
 def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_without_admission_reservation(
@@ -72,9 +93,12 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
         encoding="utf-8",
     )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             return None
+
+        async def async_create_model_work_with_id(self, request_id: str, **_kwargs) -> dict:
+            return {"created": True, "request_id": request_id}
 
         async def async_mark_queued(self, request_id: str, meta: dict | None = None) -> None:
             return None
@@ -92,6 +116,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
     monkeypatch.setattr(training_routes, "training_engine", object())
     monkeypatch.setattr(training_routes, "training_manager", object())
     monkeypatch.setattr(training_routes, "can_access_model", lambda base_model, user_data: True)
+    _patch_training_inflight(monkeypatch, training_routes)
 
     app = _make_write_app()
     app.include_router(training_routes.router, prefix="/api/v1")
@@ -199,7 +224,6 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
     class StubTrainingEngine:
         def __init__(self) -> None:
             self.load_calls: list[dict] = []
-            self._model_actor_supervisor_actor_names = {}
 
         async def unbind_session(self, session) -> None:
             return None
@@ -225,7 +249,7 @@ def test_issue_283_create_model_from_state_background_uses_resolved_path(tmp_pat
             _ = session
             return {}
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -314,10 +338,9 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
     manager = TrainingSessionManager()
 
     class StubTrainingEngine:
-        def __init__(self) -> None:
-            self._model_actor_supervisor_actor_names = {model_id: "megatron-actor-417"}
-
         async def create_training_session(self, session) -> None:
+            session.actor_name = "megatron-actor-417"
+            session.namespace = "mint"
             return None
 
         async def load_weights(self, *, session, load_path: str, load_optimizer: bool) -> None:
@@ -339,7 +362,7 @@ def test_issue_417_create_model_from_state_persists_loaded_lora_config(
         async def shutdown_session(self, session) -> None:
             _ = session
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -459,7 +482,7 @@ def test_issue_283_create_model_from_state_background_restores_openpi_training_c
                 )
             )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -559,7 +582,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
         encoding="utf-8",
     )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -599,6 +622,7 @@ def test_issue_283_load_state_route_queues_resolved_path(tmp_path: Path, monkeyp
     monkeypatch.setattr(weights_routes, "training_engine", object())
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -684,7 +708,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             self.load_calls.append({"load_path": load_path, "load_optimizer": load_optimizer})
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -709,6 +733,7 @@ def test_issue_283_load_state_background_uses_resolved_path(tmp_path: Path, monk
         "async_upsert_training_session",
         _async_upsert_training_session,
     )
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     req = LoadStateRequest(model_id="model-283", path=str(checkpoint_dir), optimizer=True)
 
@@ -772,12 +797,11 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
             self.persisted.append(model_id)
 
     class StubTrainingEngine:
-        def __init__(self) -> None:
-            self._model_actor_supervisor_actor_names = {"model-417": "megatron-actor-417"}
-
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             assert load_path == str(checkpoint_dir)
             assert load_optimizer is False
+            session.actor_name = "megatron-actor-417"
+            session.namespace = "mint"
             session.current_step = 12
             session.learning_rate = 2e-4
             session.lora_config = LoRAConfig(
@@ -787,7 +811,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
                 train_unembed=False,
             )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
 
@@ -808,6 +832,7 @@ def test_issue_417_load_state_persists_loaded_lora_config(tmp_path: Path, monkey
     monkeypatch.setattr(weights_routes, "training_manager", training_manager)
     monkeypatch.setattr(weights_routes, "task_futures", task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     req = LoadStateRequest(model_id="model-417", path=str(checkpoint_dir), optimizer=False)
     asyncio.run(weights_routes._do_load_state("req-417-load", req, user_id="admin-user"))
@@ -905,16 +930,16 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
             raise AssertionError(f"mark_persisted must not run after failed upsert: {model_id}")
 
     class StubTrainingEngine:
-        _model_actor_supervisor_actor_names = {"model-417-persist-fail": "megatron-actor-417"}
-
         async def load_weights(self, session, load_path: str, load_optimizer: bool) -> None:
             assert load_path == str(checkpoint_dir)
             assert load_optimizer is True
+            session.actor_name = "megatron-actor-417"
+            session.namespace = "mint"
             session.current_step = 77
             session.learning_rate = 9e-5
             session.lora_config = LoRAConfig(rank=16, train_attn=False, train_mlp=True, train_unembed=False)
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         def __init__(self) -> None:
             self.resolved: list[tuple[str, dict]] = []
             self.failed: list[tuple[str, str]] = []
@@ -934,6 +959,7 @@ def test_issue_417_load_state_reports_success_when_metadata_persist_fails_after_
     monkeypatch.setattr(weights_routes, "training_manager", StubTrainingManager())
     monkeypatch.setattr(weights_routes, "task_futures", task_futures)
     monkeypatch.setattr(training_store_module, "async_upsert_training_session", _async_upsert_training_session)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     req = LoadStateRequest(model_id="model-417-persist-fail", path=str(checkpoint_dir), optimizer=True)
     asyncio.run(weights_routes._do_load_state("req-417-persist-fail", req, user_id="user-417"))
@@ -961,7 +987,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     from mint_server.routes import weights as weights_routes
     import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -988,6 +1014,7 @@ def test_issue_283_save_routes_use_detached_training_info_without_route_runtime(
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1038,7 +1065,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
         encoding="utf-8",
     )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1065,6 +1092,7 @@ def test_issue_283_load_state_route_uses_detached_training_info_without_route_ru
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1094,7 +1122,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     from mint_server.routes import weights as weights_routes
     import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1122,6 +1150,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
         return None
 
     manager = StubTrainingManager()
+    inflight_calls: list[tuple[str, int]] = []
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
@@ -1129,6 +1158,7 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes, inflight_calls)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1141,7 +1171,8 @@ def test_issue_283_save_routes_restore_inflight_protection(monkeypatch) -> None:
         )
         assert resp.status_code == 200, resp.text
 
-    assert manager.calls == [("model-283", 1), ("model-283", 1)]
+    assert manager.calls == []
+    assert inflight_calls == [("model-283", 1), ("model-283", 1)]
     assert [call["op"] for call in stub_queue.calls] == ["weights.save_weights", "weights.save_state"]
 
 
@@ -1178,7 +1209,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         encoding="utf-8",
     )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1206,6 +1237,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
         return None
 
     manager = StubTrainingManager()
+    inflight_calls: list[tuple[str, int]] = []
     stub_queue = StubModelWorkScheduler()
 
     monkeypatch.setattr(scheduler_module, "model_work_scheduler", stub_queue)
@@ -1213,6 +1245,7 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
     monkeypatch.setattr(weights_routes, "training_engine", None)
     monkeypatch.setattr(weights_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes, inflight_calls)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1228,7 +1261,8 @@ def test_issue_283_load_state_route_restores_inflight_protection(tmp_path: Path,
     )
 
     assert resp.status_code == 200, resp.text
-    assert manager.calls == [("model-283", 1)]
+    assert manager.calls == []
+    assert inflight_calls == [("model-283", 1)]
     assert len(stub_queue.calls) == 1
     assert stub_queue.calls[0]["op"] == "weights.load_state"
 
@@ -1240,20 +1274,17 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
     import mint_server.backend.stores.training_session_store as training_store_module
     import mint_server.gateway as gateway_module
 
-    async def _get_training_route_session_info(_model_id: str):
-        return None
-
     async def _async_get_training_session_info(_model_id: str):
         raise RuntimeError("store down")
 
     async def _unexpected_async_remote_training_model(*_args, **_kwargs):
         raise AssertionError("remote fallback should not run after detached-store failure")
 
-    monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
     monkeypatch.setattr(training_store_module, "async_get_training_session_info", _async_get_training_session_info)
     monkeypatch.setattr(gateway_module, "async_remote_training_model", _unexpected_async_remote_training_model)
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(weights_routes, "training_engine", None)
+    monkeypatch.setattr(weights_routes, "_get_route_training_store_info", training_routes._get_training_route_session_info)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1267,12 +1298,14 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["detail"] == "Training session store unavailable"
+
+
 def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) -> None:
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1306,6 +1339,7 @@ def test_issue_283_save_routes_refresh_detached_enqueue_protection(monkeypatch) 
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(weights_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")
@@ -1354,7 +1388,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
         encoding="utf-8",
     )
 
-    class StubTaskFutureService:
+    class StubTaskFutureService(_ModelWorkFutureStubMixin):
         async def async_create_with_id(self, request_id: str) -> None:
             _ = request_id
 
@@ -1388,6 +1422,7 @@ def test_issue_283_load_state_route_refreshes_detached_enqueue_protection(tmp_pa
     monkeypatch.setattr(weights_routes, "training_manager", None)
     monkeypatch.setattr(weights_routes, "_protect_training_session_enqueue_window", _protect_training_session_enqueue_window)
     monkeypatch.setattr(training_routes, "_get_training_route_session_info", _get_training_route_session_info)
+    _patch_weights_inflight(monkeypatch, weights_routes)
 
     app = _make_write_app()
     app.include_router(weights_routes.router, prefix="/api/v1")

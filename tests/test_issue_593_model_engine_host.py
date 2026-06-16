@@ -2278,25 +2278,47 @@ async def test_issue_593_model_runtime_empty_poll_preserves_last_error() -> None
 
 @pytest.mark.anyio
 async def test_issue_593_model_runtime_empty_poll_clears_transient_scheduler_mismatch() -> None:
-    scheduler = _FakeScheduler()
+    class _MismatchThenEmptyScheduler(_FakeScheduler):
+        def __init__(self) -> None:
+            super().__init__()
+            self._raised = False
+
+        async def claim(self, **kwargs):
+            self.claim_calls.append(kwargs)
+            if not self._raised:
+                self._raised = True
+                raise ModelWorkSchedulerConflictError(
+                    "consumer_id mismatch for replica 'replica-0': expected 'old', got 'new'"
+                )
+            return {"ok": True, "leases": []}
+
+    scheduler = _MismatchThenEmptyScheduler()
     actor = ModelEngineHost(
         domain_key="vllm:model-a",
         replica_id="replica-0",
+        poll_interval_s=0.01,
         scheduler_client=scheduler,
         task_futures_client=_FakeTaskFutureService(),
         executor=lambda _lease: asyncio.sleep(0),
     )
-    actor._last_error = (
-        "RayTaskError(ModelWorkSchedulerConflictError): consumer_id mismatch for replica "
-        "'replica-0': expected 'old', got 'new'"
-    )
-    actor._last_error_traceback = "traceback"
 
-    assert await actor.run_once() == {"claimed": 0, "executed": 0}
+    async def _wait_until(predicate) -> None:
+        async def _poll() -> None:
+            while not predicate():
+                await asyncio.sleep(0.01)
 
-    snapshot = actor.health_snapshot()
-    assert snapshot["last_error"] is None
-    assert snapshot["last_error_traceback"] is None
+        await asyncio.wait_for(_poll(), timeout=1.0)
+
+    await actor.start()
+    try:
+        await _wait_until(lambda: "consumer_id mismatch" in str(actor.health_snapshot()["last_error"]))
+        await _wait_until(lambda: len(scheduler.claim_calls) >= 2)
+
+        snapshot = actor.health_snapshot()
+        assert snapshot["last_error"] is None
+        assert snapshot["last_error_traceback"] is None
+    finally:
+        await actor.shutdown()
 
 
 @pytest.mark.anyio

@@ -212,12 +212,7 @@ async def _persist_loaded_training_session(
             "Cannot persist loaded training session without model_id, session_id, and base_model"
         )
 
-    actor_name = None
-    engine = _current_training_engine()
-    if engine is not None:
-        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(
-            model_id
-        )
+    actor_name = str(getattr(session, "actor_name", "") or "") or None
     if actor_name is not None:
         session.actor_name = str(actor_name or "") or None
     if not getattr(session, "namespace", None):
@@ -381,9 +376,10 @@ async def _get_or_restore_training_session_for_weights(model_id: str):
             worker = None
         if worker is not None:
             getattr(engine, "_workers", {})[model_id] = worker
-            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = (
-                actor_name
-            )
+            recycler = getattr(engine, "_actor_recycler", None)
+            bind = getattr(recycler, "bind_session_actor", None)
+            if callable(bind):
+                bind(model_id, actor_name)
             session.actor_name = actor_name
             session.namespace = namespace
 
@@ -510,8 +506,7 @@ async def _enqueue_weights_request_with_trace(
     tracer = get_otel_tracer()
     future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
     if tracer is None:
-        await enqueue_coro
-        return
+        return await enqueue_coro
 
     with tracer.start_as_current_span(f"{op}.enqueue") as span:
         span.set_attribute("component", "routes.weights")
@@ -527,7 +522,7 @@ async def _enqueue_weights_request_with_trace(
             },
         )
         enqueue_start_s = time.perf_counter()
-        await enqueue_coro
+        out = await enqueue_coro
         span.add_event(
             "enqueue_done",
             {
@@ -539,6 +534,7 @@ async def _enqueue_weights_request_with_trace(
                 ),
             },
         )
+        return out
 
 
 async def _safe_update_weights_meta(request_id: str, meta: dict[str, object]) -> None:

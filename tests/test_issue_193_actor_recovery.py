@@ -8,7 +8,6 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -17,6 +16,7 @@ def test_issue_193_megatron_load_weights_marks_recycled_worker_loaded(monkeypatc
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, "megatron-actor")
 
     live_workers = [dead_worker, recovered_worker]
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
@@ -80,7 +80,6 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     recovered_worker.__ray_ready__ = _RecordingRemoteMethod("recovered-ready-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -89,6 +88,7 @@ def test_issue_193_megatron_load_weights_recovers_when_ready_probe_actor_dies(mo
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, "megatron-actor")
 
     live_workers = [dead_worker, recovered_worker, recovered_worker]
     recycle_calls: list[tuple[str, str]] = []
@@ -226,7 +226,6 @@ def test_issue_670_bumblebee_explicit_load_retries_after_rank_worker_death(monke
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -235,6 +234,7 @@ def test_issue_670_bumblebee_explicit_load_retries_after_rank_worker_death(monke
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
     checkpoint_path = tmp_path / "bumblebee-checkpoint"
     checkpoint_path.mkdir()
 
@@ -286,7 +286,7 @@ def test_issue_670_bumblebee_explicit_load_retries_after_rank_worker_death(monke
     ]
     assert recycle_calls == [("load_weights", "ActorDiedError")]
     assert keepalive_calls == ["dead-load-ref", "recovered-load-ref"]
-    assert model_id not in engine._poisoned_sessions
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_670_bumblebee_explicit_load_keeps_session_poisoned_when_retry_load_fails(monkeypatch, tmp_path):
@@ -295,7 +295,6 @@ def test_issue_670_bumblebee_explicit_load_keeps_session_poisoned_when_retry_loa
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -304,6 +303,7 @@ def test_issue_670_bumblebee_explicit_load_keeps_session_poisoned_when_retry_loa
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
     checkpoint_path = tmp_path / "bumblebee-checkpoint"
     checkpoint_path.mkdir()
 
@@ -339,7 +339,7 @@ def test_issue_670_bumblebee_explicit_load_keeps_session_poisoned_when_retry_loa
             )
         )
 
-    assert "checkpoint reload must complete successfully" in engine._poisoned_sessions[model_id]
+    _assert_session_poisoned(engine, session, "checkpoint reload must complete successfully")
 
     async def _train_after_failed_reload():
         await engine._run_worker_call_with_actor_recycle(
@@ -358,7 +358,6 @@ def test_issue_670_bumblebee_explicit_load_recycles_when_rank_liveness_probe_fai
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -367,6 +366,7 @@ def test_issue_670_bumblebee_explicit_load_recycles_when_rank_liveness_probe_fai
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
     checkpoint_path = tmp_path / "bumblebee-checkpoint"
     checkpoint_path.mkdir()
 
@@ -426,7 +426,7 @@ def test_issue_670_bumblebee_explicit_load_recycles_when_rank_liveness_probe_fai
     assert recovered_worker.load_checkpoint.calls == [
         ((str(checkpoint_path), True), {"traceparent": None, "session_id": model_id})
     ]
-    assert model_id not in engine._poisoned_sessions
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_670_bumblebee_training_op_still_fails_closed_after_rank_worker_death(monkeypatch):
@@ -435,7 +435,6 @@ def test_issue_670_bumblebee_training_op_still_fails_closed_after_rank_worker_de
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -444,6 +443,7 @@ def test_issue_670_bumblebee_training_op_still_fails_closed_after_rank_worker_de
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
 
     submit_workers: list[object] = []
     recycle_calls: list[tuple[str, str]] = []
@@ -477,7 +477,7 @@ def test_issue_670_bumblebee_training_op_still_fails_closed_after_rank_worker_de
 
     assert submit_workers == [dead_worker]
     assert recycle_calls == [("forward_backward", "ActorDiedError")]
-    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+    _assert_session_poisoned(engine, session, "reload from checkpoint before retrying")
 
 
 def _issue_670_training_request() -> SimpleNamespace:
@@ -497,7 +497,6 @@ def test_issue_670_bumblebee_public_forward_backward_recycles_and_poisons(monkey
     dead_worker = _FakeWorker(ref="dead-fb-ref")
     recovered_worker = _FakeWorker(ref="recovered-fb-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_670_bumblebee_public_fb",
@@ -505,6 +504,7 @@ def test_issue_670_bumblebee_public_forward_backward_recycles_and_poisons(monkey
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
     request = _issue_670_training_request()
     recycle_calls: list[tuple[str, str]] = []
 
@@ -546,7 +546,7 @@ def test_issue_670_bumblebee_public_forward_backward_recycles_and_poisons(monkey
     ]
     assert recovered_worker.forward_backward.calls == []
     assert recycle_calls == [("forward_backward", "ActorDiedError")]
-    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+    _assert_session_poisoned(engine, session, "reload from checkpoint before retrying")
 
 
 @pytest.mark.parametrize(
@@ -567,7 +567,6 @@ def test_issue_670_bumblebee_public_training_step_ops_recycle_and_poison(
     dead_worker = _FakeWorker(ref=ref)
     recovered_worker = _FakeWorker(ref=f"recovered-{method_name}-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
     session = TrainingSession(
         model_id=model_id,
         session_id=f"session_issue_670_bumblebee_public_{method_name}",
@@ -575,6 +574,7 @@ def test_issue_670_bumblebee_public_training_step_ops_recycle_and_poison(
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, "bumblebee-actor")
     request = _issue_670_training_request()
     recycle_calls: list[tuple[str, str]] = []
 
@@ -604,7 +604,7 @@ def test_issue_670_bumblebee_public_training_step_ops_recycle_and_poison(
     assert getattr(dead_worker, remote_method_name).calls
     assert getattr(recovered_worker, remote_method_name).calls == []
     assert recycle_calls == [(method_name, "ActorDiedError")]
-    assert "reload from checkpoint before retrying" in engine._poisoned_sessions[model_id]
+    _assert_session_poisoned(engine, session, "reload from checkpoint before retrying")
 
 
 def test_issue_670_bumblebee_public_training_ops_block_poisoned_session(monkeypatch):
@@ -612,17 +612,19 @@ def test_issue_670_bumblebee_public_training_ops_block_poisoned_session(monkeypa
     model_id = "model_issue_670_bumblebee_public_poison"
     worker = _FakeWorker(ref="unused-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
-    engine._poisoned_sessions[model_id] = (
-        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
-        "checkpoint reload must complete successfully before training can continue."
-    )
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_670_bumblebee_public_poison",
         model_seq_id=0,
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
+    )
+    _bind_session_actor(session, "bumblebee-actor")
+    _mark_session_poisoned(
+        engine,
+        model_id,
+        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
+        "checkpoint reload must complete successfully before training can continue.",
     )
     request = _issue_670_training_request()
     monkeypatch.setattr(
@@ -648,17 +650,19 @@ def test_issue_670_bumblebee_successful_explicit_load_unpoisons_public_training(
     worker = _FakeLoadWorker(ref="load-ref")
     worker.forward_backward = _RecordingRemoteMethod("fb-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "bumblebee-actor"
-    engine._poisoned_sessions[model_id] = (
-        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
-        "checkpoint reload must complete successfully before training can continue."
-    )
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_670_bumblebee_load_unpoison",
         model_seq_id=0,
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
+    )
+    _bind_session_actor(session, "bumblebee-actor")
+    _mark_session_poisoned(
+        engine,
+        model_id,
+        f"[{model_id}] bumblebee actor recycled before explicit load_weights; "
+        "checkpoint reload must complete successfully before training can continue.",
     )
     checkpoint_path = tmp_path / "bumblebee-checkpoint"
     checkpoint_path.mkdir()
@@ -689,7 +693,7 @@ def test_issue_670_bumblebee_successful_explicit_load_unpoisons_public_training(
         )
     )
     assert meta == {"current_step": 80, "learning_rate": 4e-5}
-    assert model_id not in engine._poisoned_sessions
+    _assert_session_not_poisoned(engine, session)
 
     result = asyncio.run(engine.forward_backward(session, _issue_670_training_request()))
     assert result == {"metrics": {"loss:mean": 0.1}}
@@ -756,7 +760,7 @@ def test_issue_193_megatron_load_weights_missing_actor_with_dirty_sibling_fails_
     with pytest.raises(RuntimeError, match="dirty_sibling"):
         asyncio.run(_run())
 
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memory(monkeypatch):
@@ -765,10 +769,6 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
-    engine._actor_loaded_sessions["shared-megatron-actor"] = model_id
-    engine._actor_volatile_sessions["shared-megatron-actor"] = {model_id}
-
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_193_megatron_dead_dirty",
@@ -776,6 +776,7 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _mark_actor_volatile(engine, session, "shared-megatron-actor")
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -809,7 +810,7 @@ def test_issue_193_megatron_recycle_fails_loud_when_live_state_was_only_in_memor
 
     assert keepalive_calls == [dead_worker]
     assert recycle_calls == []
-    assert "Reload the lost session from a checkpoint before continuing." in engine._poisoned_sessions[model_id]
+    _assert_session_poisoned(engine, session, "Reload the lost session from a checkpoint before continuing.")
 
 
 def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(monkeypatch, tmp_path):
@@ -819,10 +820,6 @@ def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(mo
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
     recovered_worker = object()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._actor_loaded_sessions[actor_name] = model_id
-    engine._actor_volatile_sessions[actor_name] = {model_id}
-
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_651_megatron_explicit_load_dirty",
@@ -830,6 +827,7 @@ def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(mo
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _mark_actor_volatile(engine, session, actor_name)
 
     async def fake_recycle(recycle_session, *, op, cause, allow_create=True):
         assert recycle_session is session
@@ -858,9 +856,8 @@ def test_issue_651_explicit_load_recycle_defers_same_session_volatile_cleanup(mo
     )
 
     assert result is recovered_worker
-    assert engine._actor_loaded_sessions[actor_name] == model_id
-    assert engine._actor_volatile_sessions[actor_name] == {model_id}
-    assert model_id not in engine._poisoned_sessions
+    _assert_actor_has_volatile_sessions(engine, actor_name, {model_id})
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_651_explicit_load_recycle_still_fails_after_request_started(monkeypatch, tmp_path):
@@ -869,10 +866,6 @@ def test_issue_651_explicit_load_recycle_still_fails_after_request_started(monke
     actor_name = "shared-megatron-actor"
     checkpoint_path = tmp_path / "checkpoint"
     checkpoint_path.mkdir()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._actor_loaded_sessions[actor_name] = model_id
-    engine._actor_volatile_sessions[actor_name] = {model_id}
-
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_651_megatron_explicit_load_started_dirty",
@@ -880,6 +873,7 @@ def test_issue_651_explicit_load_recycle_still_fails_after_request_started(monke
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _mark_actor_volatile(engine, session, actor_name)
 
     async def fake_recycle(*_args, **_kwargs):
         raise AssertionError("request-started actor death must fail before recycle")
@@ -898,7 +892,7 @@ def test_issue_651_explicit_load_recycle_still_fails_after_request_started(monke
     with pytest.raises(RuntimeError, match="live in-memory state that was never persisted"):
         asyncio.run(_run())
 
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypatch):
@@ -907,9 +901,6 @@ def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypa
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
-    engine._actor_loaded_sessions["shared-megatron-actor"] = model_id
-
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_193_megatron_dead_clean",
@@ -917,6 +908,7 @@ def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypa
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _mark_actor_loaded(engine, session, "shared-megatron-actor")
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -953,7 +945,7 @@ def test_issue_193_megatron_recycle_retries_when_no_live_state_was_lost(monkeypa
     assert result == {"ok": True}
     assert submit_workers == [dead_worker, recovered_worker]
     assert recycle_calls == [("forward", "ActorDiedError")]
-    assert model_id not in engine._poisoned_sessions
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_death(monkeypatch):
@@ -973,11 +965,8 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_supervisor_actor_names[session_a.model_id] = actor_name
-    engine._model_actor_supervisor_actor_names[session_b.model_id] = actor_name
-
-    engine._note_successful_worker_call(session_a, op="forward_backward")
-    engine._note_successful_worker_call(session_b, op="forward")
+    _mark_actor_volatile(engine, session_a, actor_name)
+    _mark_actor_loaded(engine, session_b, actor_name)
 
     recycle_calls: list[tuple[str, str]] = []
 
@@ -998,8 +987,8 @@ def test_issue_193_megatron_switched_out_dirty_session_still_poisoned_on_actor_d
         asyncio.run(_run())
 
     assert recycle_calls == []
-    assert engine._actor_volatile_sessions.get(actor_name) is None
-    assert session_a.model_id in engine._poisoned_sessions
+    _assert_actor_has_no_volatile_sessions(engine, actor_name)
+    _assert_session_poisoned(engine, session_a, "live in-memory state that was never persisted")
 
 
 def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkeypatch):
@@ -1009,7 +998,6 @@ def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkey
     dead_worker = _FakeSamplerWorker()
     recovered_worker = _FakeSamplerWorker()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -1018,6 +1006,7 @@ def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkey
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _bind_session_actor(session, actor_name)
 
     async def fake_async_get_ray_ref(*_args, **_kwargs):
         raise RuntimeError("Bumblebee rank worker count mismatch: expected=4 observed=0")
@@ -1037,7 +1026,7 @@ def test_issue_679_bumblebee_missing_before_request_rebinds_clean_session(monkey
 
     assert asyncio.run(_run()) is recovered_worker
     assert recycle_calls == [("save_lora_weights_for_sampler", "RuntimeError")]
-    assert model_id not in engine._poisoned_sessions
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(monkeypatch):
@@ -1046,9 +1035,6 @@ def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(mon
     actor_name = "mint_bumblebee_qwen3_30b_a3b_instruct_2507"
     dead_worker = _FakeSamplerWorker()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._actor_volatile_sessions[actor_name] = {model_id}
-
     session = TrainingSession(
         model_id=model_id,
         session_id="session_issue_679_bumblebee_dirty_rebind",
@@ -1056,6 +1042,7 @@ def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(mon
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="bumblebee",
     )
+    _mark_actor_volatile(engine, session, actor_name)
 
     async def fake_async_get_ray_ref(*_args, **_kwargs):
         raise RuntimeError("Bumblebee rank worker count mismatch: expected=4 observed=0")
@@ -1071,8 +1058,8 @@ def test_issue_679_bumblebee_missing_before_request_poisons_volatile_session(mon
 
     with pytest.raises(RuntimeError, match="live in-memory state"):
         asyncio.run(_run())
-    assert model_id in engine._poisoned_sessions
-    assert engine._actor_volatile_sessions.get(actor_name) is None
+    _assert_session_poisoned(engine, session, ".*")
+    _assert_actor_has_no_volatile_sessions(engine, actor_name)
 
 
 def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_next_train_step(monkeypatch):
@@ -1081,7 +1068,6 @@ def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_ne
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -1092,7 +1078,7 @@ def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_ne
     )
     # load_optimizer=False path clears volatility because adapter shards plus
     # metadata are persisted to the Megatron session cache.
-    engine._note_successful_worker_call(session, op="load_weights")
+    _mark_actor_loaded(engine, session, "shared-megatron-actor")
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -1129,8 +1115,8 @@ def test_issue_193_megatron_adapter_only_load_restore_stays_recoverable_until_ne
     assert result == {"ok": True}
     assert submit_workers == [dead_worker, recovered_worker]
     assert recycle_calls == [("forward", "ActorDiedError")]
-    assert engine._actor_volatile_sessions.get("shared-megatron-actor") is None
-    assert model_id not in engine._poisoned_sessions
+    _assert_actor_has_no_volatile_sessions(engine, "shared-megatron-actor")
+    _assert_session_not_poisoned(engine, session)
 
 
 def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(monkeypatch):
@@ -1138,7 +1124,6 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
     model_id = "model_issue_193_megatron_load_with_optimizer"
     worker = _FakeLoadWorker(ref="megatron-load-with-optimizer-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -1147,6 +1132,7 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, "shared-megatron-actor")
 
     async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
         if awaitable == "fake-load-ready-ref":
@@ -1171,7 +1157,7 @@ def test_issue_193_megatron_load_weights_with_optimizer_keeps_session_volatile(m
 
     asyncio.run(_run())
 
-    assert engine._actor_volatile_sessions["shared-megatron-actor"] == {model_id}
+    _assert_actor_has_volatile_sessions(engine, "shared-megatron-actor", {model_id})
 
 
 def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loaded_finishes(monkeypatch):
@@ -1180,7 +1166,6 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
     worker = _FakeLoadWorker(ref="megatron-load-mark-gap-ref")
     worker.mark_session_loaded = _RecordingRemoteMethod(_failed_ray_ref(ray.exceptions.ActorDiedError()))
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -1189,6 +1174,7 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, "shared-megatron-actor")
 
     async def fake_keepalive(awaitable, keepalive_session, interval_s=30.0, timeout_s=None):
         if awaitable == "fake-load-ready-ref":
@@ -1213,7 +1199,7 @@ def test_issue_193_megatron_load_weights_keeps_session_volatile_until_mark_loade
     with pytest.raises(ray.exceptions.ActorDiedError):
         asyncio.run(_run())
 
-    assert engine._actor_volatile_sessions["shared-megatron-actor"] == {model_id}
+    _assert_actor_has_volatile_sessions(engine, "shared-megatron-actor", {model_id})
 
 
 def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
@@ -1222,7 +1208,6 @@ def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -1231,7 +1216,8 @@ def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._note_successful_worker_call(session, op="train_step")
+    _bind_session_actor(session, "shared-megatron-actor")
+    _note_worker_call(engine, session, op="train_step")
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -1259,8 +1245,8 @@ def test_issue_193_megatron_train_step_marks_session_volatile(monkeypatch):
     with pytest.raises(RuntimeError, match="live in-memory state that was never persisted"):
         asyncio.run(_run())
 
-    assert engine._actor_volatile_sessions.get("shared-megatron-actor") is None
-    assert model_id in engine._poisoned_sessions
+    _assert_actor_has_no_volatile_sessions(engine, "shared-megatron-actor")
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_sampler_save_does_not_clear_volatile_train_state(monkeypatch):
@@ -1274,12 +1260,12 @@ def test_issue_193_megatron_sampler_save_does_not_clear_volatile_train_state(mon
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    _bind_session_actor(session, actor_name)
 
-    engine._note_successful_worker_call(session, op="forward_backward")
-    engine._note_successful_worker_call(session, op="save_lora_weights_for_sampler")
+    _note_worker_call(engine, session, op="forward_backward")
+    _note_worker_call(engine, session, op="save_lora_weights_for_sampler")
 
-    assert engine._actor_volatile_sessions[actor_name] == {model_id}
+    _assert_actor_has_volatile_sessions(engine, actor_name, {model_id})
 
 
 def test_issue_193_megatron_save_weights_does_not_clear_volatile_train_state():
@@ -1293,12 +1279,12 @@ def test_issue_193_megatron_save_weights_does_not_clear_volatile_train_state():
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    _bind_session_actor(session, actor_name)
 
-    engine._note_successful_worker_call(session, op="forward_backward")
-    engine._note_successful_worker_call(session, op="save_weights")
+    _note_worker_call(engine, session, op="forward_backward")
+    _note_worker_call(engine, session, op="save_weights")
 
-    assert engine._actor_volatile_sessions[actor_name] == {model_id}
+    _assert_actor_has_volatile_sessions(engine, actor_name, {model_id})
 
 
 def test_issue_193_megatron_missing_worker_rebinds_before_recycle(monkeypatch):
@@ -1474,8 +1460,8 @@ def test_issue_193_megatron_missing_worker_with_live_state_still_fails_closed(mo
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._actor_volatile_sessions[actor_name] = {model_id}
+    _bind_session_actor(session, actor_name)
+    _mark_actor_volatile(engine, session, actor_name)
 
     async def fake_rebind(*_args, **_kwargs):
         raise RuntimeError(f"[{model_id}] missing worker for backend=megatron")
@@ -1500,7 +1486,7 @@ def test_issue_193_megatron_missing_worker_with_live_state_still_fails_closed(mo
     with pytest.raises(RuntimeError, match="live in-memory state that was never persisted"):
         asyncio.run(_run())
 
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch):
@@ -1554,7 +1540,7 @@ def test_issue_193_megatron_missing_actor_without_cache_fails_closed(monkeypatch
         asyncio.run(_run())
 
     assert rebind_calls == [("forward:missing_worker", False)]
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_missing_actor_invalid_session_metadata_fails_closed(monkeypatch):
@@ -1608,7 +1594,7 @@ def test_issue_193_megatron_missing_actor_invalid_session_metadata_fails_closed(
         asyncio.run(_run())
 
     assert rebind_calls == [("forward:missing_worker", False)]
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_193_megatron_missing_actor_with_persisted_dirty_marker_fails_closed(monkeypatch):
@@ -1666,7 +1652,7 @@ def test_issue_193_megatron_missing_actor_with_persisted_dirty_marker_fails_clos
         asyncio.run(_run())
 
     assert rebind_calls == [("forward:missing_worker", False)]
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_651_explicit_load_defers_same_session_actor_only_marker_cleanup(monkeypatch, tmp_path):
@@ -1682,7 +1668,7 @@ def test_issue_651_explicit_load_defers_same_session_actor_only_marker_cleanup(m
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
+    _bind_session_actor(session, actor_name)
 
     class _DirtySelfSessionManager:
         def list_actor_only_state_sessions(self, actor_name_arg):
@@ -1805,7 +1791,7 @@ def test_issue_193_megatron_missing_actor_with_dirty_sibling_fails_closed(monkey
     with pytest.raises(RuntimeError, match="dirty_sibling"):
         asyncio.run(_run())
 
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
 
 
 class _Issue651ProbeRemoteMethod:

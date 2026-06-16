@@ -16,7 +16,6 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
     model_id = "model_issue_193_invalid_meta_load"
     worker = _FakeLoadWorker(ref="invalid-meta-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -26,6 +25,7 @@ def test_issue_193_load_weights_invalid_meta_warns_without_pollution(monkeypatch
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "shared-actor")
     session.current_step = 77
     session.learning_rate = 1.5e-4
 
@@ -56,7 +56,6 @@ def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
     model_id = "model_issue_193_invalid_meta_megatron_load"
     worker = _FakeLoadWorker(ref="invalid-meta-megatron-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-megatron-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -66,6 +65,7 @@ def test_issue_193_megatron_load_weights_invalid_meta_fails_loud(monkeypatch):
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, "shared-megatron-actor")
     session.current_step = 12
     session.learning_rate = 9e-5
 
@@ -120,6 +120,10 @@ def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkey
         lambda **kwargs: asyncio.sleep(0, result=worker),
     )
     monkeypatch.setattr(
+        "mint_server.backend.training.bumblebee.bumblebee_distributed.async_get_or_create_bumblebee_worker_group",
+        lambda **kwargs: asyncio.sleep(0, result=worker),
+    )
+    monkeypatch.setattr(
         "mint_server.backend.actors.model_actor_supervisor.get_model_actor_supervisor",
         lambda: SimpleNamespace(
             touch=lambda *_args, **_kwargs: None,
@@ -144,7 +148,8 @@ def test_issue_193_megatron_create_training_session_waits_for_ready_probe(monkey
 
     assert keepalive_calls == [("fake-load-ready-ref", model_id, 30.0, 3600.0)]
     assert engine._workers[model_id] is worker
-    assert session.backend == "megatron"
+    assert session.backend == "bumblebee"
+    assert session.actor_name
     assert session.is_active is True
 
 

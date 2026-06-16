@@ -9,6 +9,7 @@ import mint_server.backend.training.dense.dense_trainer as dense_trainer
 import mint_server.backend.observability.runtime_observability as runtime_obs_module
 from mint_server.backend.training.verl.verl_training import TrainingWorker, VerlTrainingEngine
 from mint_server.backend.training.training_session_manager import TrainingSession
+from tests.issue193_common import _assert_session_poisoned
 
 
 @pytest.fixture
@@ -156,7 +157,6 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
     )
     session.actor_name = "mint_dense_qwen__qwen3_0_6b"
     session.namespace = "mint"
-    engine._model_actor_supervisor_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
 
@@ -208,7 +208,6 @@ async def test_issue_561_dense_fatal_error_retires_actor(monkeypatch: pytest.Mon
     assert retire_calls[0]["fatal_op"] == "forward_backward"
     assert "forward_backward" in str(retire_calls[0]["reason"])
     assert "device-side assert" in str(retire_calls[0]["reason"])
-    assert session.model_id not in engine._model_actor_supervisor_actor_names
     assert session.actor_name is None
     assert session.namespace is None
     snap = obs.snapshot()
@@ -246,7 +245,6 @@ async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: 
     )
     session.actor_name = "mint_dense_qwen__qwen3_0_6b"
     session.namespace = "mint"
-    engine._model_actor_supervisor_actor_names[session.model_id] = session.actor_name
 
     worker = SimpleNamespace(forward_backward=_RemoteCall())
 
@@ -284,12 +282,7 @@ async def test_issue_561_dense_retire_failure_hard_poisons_session(monkeypatch: 
     with pytest.raises(_RayTaskError, match="RayTaskError"):
         await engine.forward_backward(session, request)
 
-    hard_error = engine._hard_poisoned_sessions[session.model_id]
-    assert "dense actor retirement failed" in hard_error
-    assert "outcome=kill_failed" in hard_error
-    with pytest.raises(RuntimeError, match="dense actor retirement failed"):
-        engine._raise_if_session_poisoned(session, op="load_weights")
-    assert session.model_id not in engine._model_actor_supervisor_actor_names
+    _assert_session_poisoned(engine, session, "dense actor retirement failed")
     assert session.actor_name is None
     assert session.namespace is None
     assert any(

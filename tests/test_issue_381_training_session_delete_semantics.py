@@ -60,10 +60,8 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
 
     engine._workers[model_id] = worker
     engine._workers[sibling_model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._model_actor_supervisor_actor_names[sibling_model_id] = actor_name
-    engine._actor_loaded_sessions[actor_name] = model_id
-    engine._actor_volatile_sessions[actor_name] = {model_id}
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     import mint_server.backend.training.verl.verl_training as verl_training
 
@@ -75,6 +73,13 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
         ),
     )
     monkeypatch.setattr(verl_training.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
+    monkeypatch.setattr(
+        "mint_server.backend.stores.training_session_store.list_training_sessions",
+        lambda: [
+            {"model_id": model_id, "actor_name": actor_name},
+            {"model_id": sibling_model_id, "actor_name": actor_name},
+        ],
+    )
 
     asyncio.run(engine.delete_session(session))
 
@@ -83,11 +88,7 @@ def test_issue_381_delete_session_cleans_shared_megatron_state(monkeypatch: pyte
     assert killed == []
     assert set_session_calls == [(actor_name, sibling_model_id)]
     assert model_id not in engine._workers
-    assert model_id not in engine._model_actor_supervisor_actor_names
     assert sibling_model_id in engine._workers
-    assert sibling_model_id in engine._model_actor_supervisor_actor_names
-    assert engine._actor_loaded_sessions == {}
-    assert engine._actor_volatile_sessions == {}
     assert session.is_active is False
 
 
@@ -104,8 +105,8 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
 
     engine._workers[model_id] = worker
     engine._workers[sibling_model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._model_actor_supervisor_actor_names[sibling_model_id] = actor_name
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     import mint_server.backend.training.verl.verl_training as verl_training
 
@@ -121,6 +122,13 @@ def test_issue_381_delete_session_cleans_shared_dense_state(monkeypatch: pytest.
         lambda target_model_id: cleared_dense_sessions.append(target_model_id),
     )
     monkeypatch.setattr(verl_training.ray_kill, "kill", lambda *args, **kwargs: killed.append(dict(kwargs)))
+    monkeypatch.setattr(
+        "mint_server.backend.stores.training_session_store.list_training_sessions",
+        lambda: [
+            {"model_id": model_id, "actor_name": actor_name},
+            {"model_id": sibling_model_id, "actor_name": actor_name},
+        ],
+    )
 
     asyncio.run(engine.delete_session(session))
 

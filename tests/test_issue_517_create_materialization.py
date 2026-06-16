@@ -48,6 +48,14 @@ class _AsyncTaskFutureService:
         self.failed.append((request_id, error))
 
 
+def _patch_training_inflight(monkeypatch: pytest.MonkeyPatch, calls: list[tuple[str, int]] | None = None) -> None:
+    async def _mark_training_inflight(model_id: str, delta: int) -> None:
+        if calls is not None:
+            calls.append((model_id, delta))
+
+    monkeypatch.setattr(training_route, "_mark_training_inflight", _mark_training_inflight)
+
+
 @pytest.mark.anyio
 async def test_issue_517_do_create_model_persists_unmaterialized_session_without_materializing(
     monkeypatch: pytest.MonkeyPatch,
@@ -137,7 +145,8 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
     async def _create_training_session(session) -> None:
         order.append("create")
         session.is_active = True
-        engine._model_actor_supervisor_actor_names[session.model_id] = "actor-517"
+        session.actor_name = "actor-517"
+        session.namespace = "mint"
 
     async def _forward_backward(session, request):
         order.append("forward_backward")
@@ -158,7 +167,6 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
 
     engine = SimpleNamespace(
         _workers={},
-        _model_actor_supervisor_actor_names={},
         create_training_session=_create_training_session,
         forward_backward=_forward_backward,
     )
@@ -177,6 +185,7 @@ async def test_issue_517_forward_backward_materializes_unmaterialized_session_on
         "task_futures",
         task_futures,
     )
+    _patch_training_inflight(monkeypatch)
 
     req = ForwardBackwardRequest(
         model_id="run-517",
@@ -390,7 +399,8 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
     async def _create_training_session(session) -> None:
         create_calls.append(session.model_id)
         session.is_active = True
-        engine._model_actor_supervisor_actor_names[session.model_id] = "dense-actor-528"
+        session.actor_name = "dense-actor-528"
+        session.namespace = "mint"
 
     async def _forward_backward(session, request):
         forward_calls.append(request.model_id)
@@ -409,7 +419,6 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
 
     engine = SimpleNamespace(
         _workers={},
-        _model_actor_supervisor_actor_names={},
         create_training_session=_create_training_session,
         forward_backward=_forward_backward,
     )
@@ -428,6 +437,7 @@ async def test_issue_528_dense_materialization_happens_once_on_first_stateful_us
         "task_futures",
         _AsyncTaskFutureService(),
     )
+    _patch_training_inflight(monkeypatch)
 
     req = ForwardBackwardRequest(
         model_id="run-528",

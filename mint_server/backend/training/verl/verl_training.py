@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -38,6 +37,10 @@ from mint_server.backend.core.training_backend_selection import (
     _select_moe_training_backend,
     _uses_distributed_training_backend,
 )
+from mint_server.backend.training.verl.verl_actor_recycler import VerlActorRecycler
+from mint_server.backend.training.verl.verl_checkpoint_ops import CheckpointOps
+from mint_server.backend.training.verl.verl_engine_config import VerlEngineConfig
+from mint_server.backend.training.verl.training_worker_contract import TrainingWorkerInputContract
 
 torch = None  # type: ignore[assignment]
 
@@ -389,6 +392,7 @@ class TrainingWorker:
         self._current_session_id: str | None = None
         self.max_lora_rank = int(lora_rank)
         self._current_actual_rank: int | None = None
+        self._input_contract = self._make_input_contract()
 
         logger.info("[TrainingWorker] Ready")
 
@@ -575,113 +579,23 @@ class TrainingWorker:
             return int(tokenizer_vocab)
         return None
 
-    @staticmethod
-    def _numeric_bounds(values: list[Any]) -> tuple[int | float | None, int | float | None]:
-        numeric = [value for value in values if isinstance(value, (int, float)) and not isinstance(value, bool)]
-        if not numeric:
-            return None, None
-        return min(numeric), max(numeric)
-
-    @staticmethod
-    def _invalid_token_positions(values: list[Any], *, vocab_size: int | None, limit: int = 8) -> list[int]:
-        bad: list[int] = []
-        for idx, value in enumerate(values):
-            is_valid_int = isinstance(value, int) and not isinstance(value, bool)
-            if not is_valid_int:
-                bad.append(idx)
-            elif int(value) < 0:
-                bad.append(idx)
-            elif vocab_size is not None and int(value) >= int(vocab_size):
-                bad.append(idx)
-            if len(bad) >= limit:
-                break
-        return bad
-
-    @staticmethod
-    def _invalid_numeric_positions(values: list[Any], *, limit: int = 8) -> list[int]:
-        bad: list[int] = []
-        for idx, value in enumerate(values):
-            if isinstance(value, bool) or not isinstance(value, (int, float)):
-                bad.append(idx)
-            elif not math.isfinite(float(value)):
-                bad.append(idx)
-            if len(bad) >= limit:
-                break
-        return bad
-
-    def _raise_forward_backward_contract_violation(
-        self,
-        *,
-        session_id: str | None,
-        loss_fn: str,
-        reason: str,
-        input_ids: list[Any],
-        target_tokens: list[Any],
-        weights: list[Any],
-        old_logprobs: list[Any] | None = None,
-        advantages: list[Any] | None = None,
-    ) -> None:
-        vocab_size = self._resolve_vocab_size()
-        input_min, input_max = self._numeric_bounds(input_ids)
-        target_min, target_max = self._numeric_bounds(target_tokens)
-        attrs = {
-            "session_id": str(session_id or "-"),
-            "loss_fn": str(loss_fn),
-            "reason": str(reason),
-            "vocab_size": -1 if vocab_size is None else int(vocab_size),
-            "input_len": len(input_ids),
-            "target_len": len(target_tokens),
-            "weights_len": len(weights),
-            "old_logprobs_len": len(old_logprobs or []),
-            "advantages_len": len(advantages or []),
-            "input_min": "none" if input_min is None else str(input_min),
-            "input_max": "none" if input_max is None else str(input_max),
-            "target_min": "none" if target_min is None else str(target_min),
-            "target_max": "none" if target_max is None else str(target_max),
-            "bad_input_positions": json.dumps(
-                self._invalid_token_positions(input_ids, vocab_size=vocab_size),
-                separators=(",", ":"),
-            ),
-            "bad_target_positions": json.dumps(
-                self._invalid_token_positions(target_tokens, vocab_size=vocab_size),
-                separators=(",", ":"),
-            ),
-            "bad_weight_positions": json.dumps(
-                self._invalid_numeric_positions(weights),
-                separators=(",", ":"),
-            ),
-            "bad_old_logprob_positions": json.dumps(
-                self._invalid_numeric_positions(old_logprobs or []),
-                separators=(",", ":"),
-            ),
-            "bad_advantage_positions": json.dumps(
-                self._invalid_numeric_positions(advantages or []),
-                separators=(",", ":"),
-            ),
-        }
-        logger.error(
-            "[TrainingWorker] dense_input_contract_violation %s",
-            json.dumps(attrs, sort_keys=True, ensure_ascii=True),
-        )
-        record_span_event_otel("mint.training_input_contract_violation", attributes=attrs)
+    def _make_input_contract(self) -> TrainingWorkerInputContract:
         from mint_server.backend.observability.runtime_observability import runtime_observability
 
-        runtime_observability.record_training_incident(
-            kind="contract_violation",
-            base_model=str(getattr(self, "_base_model", "unknown") or "unknown"),
-            backend="peft",
-            op="forward_backward",
-            status="error",
-            failure_class="input_contract",
-            request_id=str(get_request_id() or "") or None,
-            session_id=None if session_id is None else str(session_id),
-            detail=str(reason),
-            context=attrs,
+        return TrainingWorkerInputContract(
+            base_model=lambda: str(getattr(self, "_base_model", "unknown") or "unknown"),
+            vocab_size=self._resolve_vocab_size,
+            request_id=get_request_id,
+            record_span_event=record_span_event_otel,
+            record_training_incident=runtime_observability.record_training_incident,
         )
-        raise ValueError(
-            "dense_input_contract_violation: "
-            f"reason={reason} input_len={len(input_ids)} target_len={len(target_tokens)} weights_len={len(weights)}"
-        )
+
+    def _input_contract_validator(self) -> TrainingWorkerInputContract:
+        validator = getattr(self, "_input_contract", None)
+        if not isinstance(validator, TrainingWorkerInputContract):
+            validator = self._make_input_contract()
+            self._input_contract = validator
+        return validator
 
     def _validate_forward_backward_contract(
         self,
@@ -694,106 +608,15 @@ class TrainingWorker:
         old_logprobs: list[Any] | None = None,
         advantages: list[Any] | None = None,
     ) -> None:
-        vocab_size = self._resolve_vocab_size()
-        if self._invalid_token_positions(input_ids, vocab_size=vocab_size):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="input_ids_out_of_range",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if self._invalid_token_positions(target_tokens, vocab_size=vocab_size):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="target_tokens_out_of_range",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if self._invalid_numeric_positions(weights):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="weights_non_finite_or_non_numeric",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if len(target_tokens) != len(weights):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="target_weights_len_mismatch",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if len(target_tokens) != len(input_ids):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="target_seq_len_mismatch",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if old_logprobs is not None and old_logprobs and self._invalid_numeric_positions(old_logprobs):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="old_logprobs_non_finite_or_non_numeric",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if old_logprobs is not None and old_logprobs and len(old_logprobs) != len(target_tokens):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="old_logprobs_len_mismatch",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if advantages is not None and advantages and self._invalid_numeric_positions(advantages):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="advantages_non_finite_or_non_numeric",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
-        if advantages is not None and advantages and len(advantages) != len(target_tokens):
-            self._raise_forward_backward_contract_violation(
-                session_id=session_id,
-                loss_fn=loss_fn,
-                reason="advantages_len_mismatch",
-                input_ids=input_ids,
-                target_tokens=target_tokens,
-                weights=weights,
-                old_logprobs=old_logprobs,
-                advantages=advantages,
-            )
+        self._input_contract_validator().validate_forward_backward(
+            session_id=session_id,
+            loss_fn=loss_fn,
+            input_ids=input_ids,
+            target_tokens=target_tokens,
+            weights=weights,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+        )
 
     def forward_backward(
         self,
@@ -2075,29 +1898,15 @@ class VerlTrainingEngine:
         self.default_base_model = default_base_model
         self.default_lora_rank = default_lora_rank
         self._workers: dict[str, ray.actor.ActorHandle] = {}
-        # Map model_id -> Ray actor name published in ModelActorSupervisor inventory, used to keep
-        # actors marked as active during long-running calls (32k forward/backward).
-        self._model_actor_supervisor_actor_names: dict[str, str] = {}
-        self._actor_loaded_sessions: dict[str, str] = {}
-        self._actor_volatile_sessions: dict[str, set[str]] = {}
-        # Session-level poisoned marker for mid-call actor failures.
-        # Value stores the user-facing reason that requires reload boundary.
-        self._poisoned_sessions: dict[str, str] = {}
-        self._hard_poisoned_sessions: dict[str, str] = {}
-        self._megatron_recycle_locks: dict[str, asyncio.Lock] = {}
-        self._megatron_recycle_locks_guard = asyncio.Lock()
+        self._actor_recycler = VerlActorRecycler()
+        self._engine_config = VerlEngineConfig()
+        self._checkpoint_ops = CheckpointOps()
 
     def _megatron_guard_preflight_enabled(self) -> bool:
-        raw = os.environ.get("MINT_MEGATRON_GUARD_PREFLIGHT", "1").strip().lower()
-        return raw not in ("0", "false", "no", "off")
+        return self._engine_config.megatron_guard_preflight_enabled()
 
     def _megatron_guard_query_timeout_s(self) -> float:
-        raw = os.environ.get("MINT_MEGATRON_GUARD_QUERY_TIMEOUT_S", "30").strip()
-        try:
-            timeout_s = float(raw)
-        except Exception:
-            timeout_s = 30.0
-        return max(1.0, timeout_s)
+        return self._engine_config.megatron_guard_query_timeout_s()
 
     async def _ensure_megatron_session_guard_clean(
         self,
@@ -2159,7 +1968,7 @@ class VerlTrainingEngine:
         longer than the idle timeout. We keep actors marked as active while a
         request is in-flight to prevent eviction of busy actors.
         """
-        actor_name = self._model_actor_supervisor_actor_names.get(session.model_id)
+        actor_name = self._actor_name_for_session(session)
         if not actor_name:
             return
         try:
@@ -2172,28 +1981,13 @@ class VerlTrainingEngine:
             logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
 
     def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
-        return self._model_actor_supervisor_actor_names.get(session.model_id)
+        return self._actor_recycler.actor_name_for_session(session) or str(getattr(session, "actor_name", "") or "") or None
 
     def _raise_if_session_poisoned(self, session: "TrainingSession", *, op: str) -> None:
-        hard_error = self._hard_poisoned_sessions.get(session.model_id)
-        if hard_error is not None:
-            raise RuntimeError(hard_error)
-        if op == "load_weights":
-            return
-        error = self._poisoned_sessions.get(session.model_id)
-        if error is not None:
-            raise RuntimeError(error)
+        self._actor_recycler.raise_if_session_poisoned(session, op=op)
 
     def _note_successful_worker_call(self, session: "TrainingSession", *, op: str) -> None:
-        actor_name = self._actor_name_for_session(session)
-        if not actor_name:
-            return
-        self._actor_loaded_sessions[actor_name] = session.model_id
-        if op in {"forward_backward", "optim_step", "train_step"}:
-            self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
-        if op == "load_weights":
-            self._poisoned_sessions.pop(session.model_id, None)
-            self._hard_poisoned_sessions.pop(session.model_id, None)
+        self._actor_recycler.note_successful_worker_call(session, op=op)
 
     def _megatron_op_requires_fail_closed_after_actor_death(self, op: str) -> bool:
         return op in {
@@ -2219,7 +2013,7 @@ class VerlTrainingEngine:
         from mint_server.backend.training.megatron.megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
 
         session_manager = MegatronSessionStateManager()
-        actor_name = self._model_actor_supervisor_actor_names.get(session.model_id)
+        actor_name = self._actor_name_for_session(session)
         if not actor_name:
             actor_name = _make_megatron_actor_name(session.base_model or "")
 
@@ -2286,7 +2080,7 @@ class VerlTrainingEngine:
         actor_name = self._actor_name_for_session(session)
         lost_session_ids: list[str] = []
         if actor_name is not None:
-            lost_session_ids = sorted(self._actor_volatile_sessions.get(actor_name, set()))
+            lost_session_ids = self._actor_recycler.volatile_sessions_for_actor(actor_name)
 
         explicit_same_session_reload = (
             session.backend == "megatron"
@@ -2305,10 +2099,9 @@ class VerlTrainingEngine:
                 "Reload the lost session from a checkpoint before continuing."
             )
             for sid in lost_session_ids:
-                self._poisoned_sessions[sid] = err
+                self._actor_recycler.mark_poisoned(sid, err)
             if actor_name:
-                self._actor_loaded_sessions.pop(actor_name, None)
-                self._actor_volatile_sessions.pop(actor_name, None)
+                self._actor_recycler.clear_actor_runtime_state(actor_name)
             raise RuntimeError(err) from cause
 
         if explicit_same_session_reload and actor_name:
@@ -2327,10 +2120,9 @@ class VerlTrainingEngine:
                 explicit_checkpoint_path=explicit_checkpoint_path,
             )
             if missing_actor_error is not None:
-                self._poisoned_sessions[session.model_id] = missing_actor_error
+                self._actor_recycler.mark_poisoned(session.model_id, missing_actor_error)
                 if actor_name:
-                    self._actor_loaded_sessions.pop(actor_name, None)
-                    self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.clear_actor_runtime_state(actor_name)
                 raise RuntimeError(missing_actor_error) from cause
             if request_started and self._megatron_op_requires_fail_closed_after_actor_death(op):
                 worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
@@ -2339,15 +2131,13 @@ class VerlTrainingEngine:
                     "operation may have partially executed before the crash; "
                     "reload from checkpoint before retrying."
                 )
-                self._poisoned_sessions[session.model_id] = err
+                self._actor_recycler.mark_poisoned(session.model_id, err)
                 if actor_name:
-                    self._actor_loaded_sessions.pop(actor_name, None)
-                    self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.clear_actor_runtime_state(actor_name)
                 raise RuntimeError(err) from cause
             worker = await self._recycle_megatron_actor(session, op=op, cause=cause)
             if actor_name and not explicit_same_session_reload:
-                self._actor_loaded_sessions.pop(actor_name, None)
-                self._actor_volatile_sessions.pop(actor_name, None)
+                self._actor_recycler.clear_actor_runtime_state(actor_name)
             return worker
 
         if session.backend == "bumblebee":
@@ -2359,8 +2149,7 @@ class VerlTrainingEngine:
             )
             if missing_before_request and not lost_session_ids:
                 if actor_name:
-                    self._actor_loaded_sessions.pop(actor_name, None)
-                    self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.clear_actor_runtime_state(actor_name)
                 return worker
             if lost_session_ids:
                 joined = ", ".join(lost_session_ids)
@@ -2371,10 +2160,9 @@ class VerlTrainingEngine:
                     "Reload the lost session from a checkpoint before continuing."
                 )
                 for sid in lost_session_ids:
-                    self._poisoned_sessions[sid] = err
+                    self._actor_recycler.mark_poisoned(sid, err)
                 if actor_name:
-                    self._actor_loaded_sessions.pop(actor_name, None)
-                    self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.clear_actor_runtime_state(actor_name)
                 raise RuntimeError(err) from cause
             explicit_checkpoint_reload = (
                 op == "load_weights"
@@ -2382,7 +2170,8 @@ class VerlTrainingEngine:
                 and os.path.isdir(explicit_checkpoint_path)
             )
             if explicit_checkpoint_reload:
-                self._poisoned_sessions[session.model_id] = (
+                self._actor_recycler.mark_poisoned(
+                    session.model_id,
                     f"[{session.model_id}] bumblebee actor recycled before explicit load_weights; "
                     "checkpoint reload must complete successfully before training can continue."
                 )
@@ -2392,7 +2181,7 @@ class VerlTrainingEngine:
                 "operation may have partially executed before the crash; "
                 "reload from checkpoint before retrying."
             )
-            self._poisoned_sessions[session.model_id] = err
+            self._actor_recycler.mark_poisoned(session.model_id, err)
             raise RuntimeError(err) from cause
 
         worker = await self._recycle_dense_actor(session, op=op, cause=cause)
@@ -2402,7 +2191,7 @@ class VerlTrainingEngine:
                 "operation may have partially executed before the crash; "
                 "reload from checkpoint before retrying."
             )
-            self._poisoned_sessions[session.model_id] = err
+            self._actor_recycler.mark_poisoned(session.model_id, err)
             raise RuntimeError(err) from cause
         return worker
 
@@ -2565,7 +2354,7 @@ class VerlTrainingEngine:
         ),
             refresh_observability=False,
         )
-        self._model_actor_supervisor_actor_names[session.model_id] = actor_name
+        self._actor_recycler.bind_session_actor(session.model_id, actor_name)
         self._workers[session.model_id] = worker
         self._touch_actor(session)
         session.backend = "megatron"
@@ -2653,7 +2442,7 @@ class VerlTrainingEngine:
             ),
             refresh_observability=False,
         )
-        self._model_actor_supervisor_actor_names[session.model_id] = actor_name
+        self._actor_recycler.bind_session_actor(session.model_id, actor_name)
         self._workers[session.model_id] = worker
         self._touch_actor(session)
         session.backend = "bumblebee"
@@ -2669,12 +2458,7 @@ class VerlTrainingEngine:
         return worker
 
     async def _get_actor_recycle_lock(self, actor_name: str) -> asyncio.Lock:
-        async with self._megatron_recycle_locks_guard:
-            lock = self._megatron_recycle_locks.get(actor_name)
-            if lock is None:
-                lock = asyncio.Lock()
-                self._megatron_recycle_locks[actor_name] = lock
-            return lock
+        return await self._actor_recycler.recycle_lock_for_actor(actor_name)
 
     @staticmethod
     def _walk_exception_chain(error: BaseException) -> list[BaseException]:
@@ -3020,7 +2804,7 @@ class VerlTrainingEngine:
         if fatal_reason is None:
             return
 
-        actor_name = str(self._model_actor_supervisor_actor_names.get(session.model_id) or getattr(session, "actor_name", "") or "")
+        actor_name = str(self._actor_name_for_session(session) or getattr(session, "actor_name", "") or "")
         if not actor_name:
             return
 
@@ -3089,8 +2873,7 @@ class VerlTrainingEngine:
                 f"actor_name={actor_name} outcome={retire_outcome}. "
                 "Operator must recycle the actor before this session can continue."
             )
-            self._poisoned_sessions[session.model_id] = retire_failure
-            self._hard_poisoned_sessions[session.model_id] = retire_failure
+            self._actor_recycler.mark_hard_poisoned(session.model_id, retire_failure)
             runtime_observability.record_training_incident(
                 kind="dense_actor_retire_failed",
                 base_model=session.base_model,
@@ -3107,7 +2890,7 @@ class VerlTrainingEngine:
             logger.error(retire_failure)
 
         self._workers.pop(session.model_id, None)
-        self._model_actor_supervisor_actor_names.pop(session.model_id, None)
+        self._actor_recycler.unbind_session_actor(session.model_id)
         if str(getattr(session, "actor_name", "") or "") == actor_name:
             session.actor_name = None
             session.namespace = None
@@ -3150,7 +2933,7 @@ class VerlTrainingEngine:
         except Exception as e:
             status, failure_class = self._classify_training_failure(e)
             actor_name = str(
-                self._model_actor_supervisor_actor_names.get(session.model_id)
+                self._actor_name_for_session(session)
                 or getattr(session, "actor_name", "")
                 or ""
             )
@@ -3240,7 +3023,7 @@ class VerlTrainingEngine:
             session_id=session.model_id,
         )
         self._workers[model_id] = dense.actor
-        self._model_actor_supervisor_actor_names[model_id] = dense.actor_name
+        self._actor_recycler.bind_session_actor(model_id, dense.actor_name)
         session.actor_name = dense.actor_name
         session.namespace = RAY_NAMESPACE
         self._touch_actor(session)
@@ -3338,7 +3121,7 @@ class VerlTrainingEngine:
             )
             return None
         self._workers[session.model_id] = worker
-        self._model_actor_supervisor_actor_names[session.model_id] = actor_name
+        self._actor_recycler.bind_session_actor(session.model_id, actor_name)
         self._touch_actor(session)
         if session.backend == "peft":
             runtime_observability.record_dense_actor_bind_decision(
@@ -3378,10 +3161,10 @@ class VerlTrainingEngine:
         model_id = session.model_id
         worker = self._workers.get(model_id)
         authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
-        bound_actor_name = str(self._model_actor_supervisor_actor_names.get(model_id) or "")
+        bound_actor_name = str(self._actor_recycler.actor_name_for_model(model_id) or "")
         if authoritative_actor_name and bound_actor_name and bound_actor_name != authoritative_actor_name:
             self._workers.pop(model_id, None)
-            self._model_actor_supervisor_actor_names[model_id] = authoritative_actor_name
+            self._actor_recycler.bind_session_actor(model_id, authoritative_actor_name)
             worker = None
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason=f"{op}:metadata_rebind")
@@ -3456,112 +3239,17 @@ class VerlTrainingEngine:
 
     def _strict_megatron_save_meta_enabled(self) -> bool:
         """Whether invalid save metadata should fail the request for megatron."""
-        raw = os.environ.get("MINT_MEGATRON_STRICT_SAVE_META", "1").strip().lower()
-        return raw not in ("0", "false", "no", "off")
+        return self._checkpoint_ops.strict_megatron_save_meta_enabled()
 
     def _apply_megatron_loaded_lora_config(
         self,
         session: "TrainingSession",
         meta: dict[str, object],
     ) -> None:
-        lora_cfg = getattr(session, "lora_config", None)
-        if lora_cfg is None:
-            return
-        updates = {
-            "rank": int(cast(int, meta["actual_rank"])),
-            "train_attn": bool(meta["train_attn"]),
-            "train_mlp": bool(meta["train_mlp"]),
-            "train_unembed": bool(meta["train_unembed"]),
-        }
-        if hasattr(lora_cfg, "model_copy"):
-            session.lora_config = lora_cfg.model_copy(update=updates)
-            return
-        if hasattr(lora_cfg, "copy"):
-            session.lora_config = lora_cfg.copy(update=updates)
-            return
-        for key, value in updates.items():
-            setattr(lora_cfg, key, value)
+        self._checkpoint_ops.apply_megatron_loaded_lora_config(session, meta)
 
     def _validate_megatron_load_meta(self, meta: Any, *, op: str) -> dict[str, object]:
-        if not isinstance(meta, dict):
-            raise RuntimeError(
-                f"Megatron load_checkpoint returned invalid metadata for {op}: "
-                f"expected dict, got {type(meta).__name__}"
-            )
-
-        required_keys = {
-            "current_step",
-            "learning_rate",
-            "actual_rank",
-            "actor_only_state_dirty",
-            "checkpoint_path",
-            "optimizer_restored",
-            "train_attn",
-            "train_mlp",
-            "train_unembed",
-        }
-        missing = sorted(required_keys - set(meta))
-        if missing:
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: missing keys {missing}"
-            )
-
-        current_step = meta["current_step"]
-        if not isinstance(current_step, int) or isinstance(current_step, bool) or current_step < 0:
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: current_step must be a non-negative int, got {current_step!r}"
-            )
-
-        lr_value = meta["learning_rate"]
-        if not isinstance(lr_value, (int, float)) or isinstance(lr_value, bool):
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: learning_rate must be finite, got {lr_value!r}"
-            )
-        learning_rate = float(lr_value)
-        if not math.isfinite(learning_rate):
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: learning_rate must be finite, got {lr_value!r}"
-            )
-
-        actual_rank = meta["actual_rank"]
-        if not isinstance(actual_rank, int) or isinstance(actual_rank, bool) or actual_rank <= 0:
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: actual_rank must be a positive int, got {actual_rank!r}"
-            )
-
-        checkpoint_path = meta["checkpoint_path"]
-        if not isinstance(checkpoint_path, str) or not checkpoint_path:
-            raise RuntimeError(
-                "Megatron load_checkpoint returned invalid metadata for "
-                f"{op}: checkpoint_path must be a non-empty string, got {checkpoint_path!r}"
-            )
-
-        normalized: dict[str, object] = {
-            "current_step": current_step,
-            "learning_rate": learning_rate,
-            "actual_rank": actual_rank,
-            "checkpoint_path": checkpoint_path,
-        }
-        for key in (
-            "actor_only_state_dirty",
-            "optimizer_restored",
-            "train_attn",
-            "train_mlp",
-            "train_unembed",
-        ):
-            value = meta[key]
-            if not isinstance(value, bool):
-                raise RuntimeError(
-                    "Megatron load_checkpoint returned invalid metadata for "
-                    f"{op}: {key} must be bool, got {value!r}"
-                )
-            normalized[key] = value
-        return normalized
+        return self._checkpoint_ops.validate_megatron_load_meta(meta, op=op)
 
     def _update_session_step_monotonic(
         self,
@@ -3571,51 +3259,12 @@ class VerlTrainingEngine:
         op: str,
         strict: bool = False,
     ) -> None:
-        """Monotonic, type-safe current_step update from worker metadata."""
-        model_id = session.model_id
-        if not isinstance(meta, dict):
-            msg = (
-                f"[{model_id}] {op}: invalid meta type {type(meta).__name__}; "
-                f"current_step={session.current_step}"
-            )
-            if strict:
-                raise ValueError(msg)
-            logger.warning(msg)
-            return
-
-        if "current_step" not in meta:
-            msg = (
-                f"[{model_id}] {op}: meta missing current_step; "
-                f"current_step={session.current_step}"
-            )
-            if strict:
-                raise ValueError(msg)
-            logger.warning(msg)
-            return
-
-        meta_step = meta.get("current_step")
-        if not isinstance(meta_step, int) or isinstance(meta_step, bool):
-            msg = (
-                f"[{model_id}] {op}: invalid current_step type={type(meta_step).__name__} "
-                f"value={meta_step!r}; current_step={session.current_step}"
-            )
-            if strict:
-                raise ValueError(msg)
-            logger.warning(msg)
-            return
-
-        prev_step = session.current_step
-        next_step = max(prev_step, meta_step)
-        if meta_step < prev_step:
-            logger.warning(
-                "[%s] %s: stale current_step=%s < existing=%s; keep monotonic value=%s",
-                model_id,
-                op,
-                meta_step,
-                prev_step,
-                next_step,
-            )
-        session.current_step = next_step
+        self._checkpoint_ops.update_session_step_monotonic(
+            session,
+            meta,
+            op=op,
+            strict=strict,
+        )
 
     def _update_session_from_load_meta(
         self,
@@ -3624,52 +3273,7 @@ class VerlTrainingEngine:
         *,
         op: str,
     ) -> None:
-        """Best-effort load metadata application without polluting session state."""
-        model_id = session.model_id
-        if not isinstance(meta, dict):
-            logger.warning(
-                "[%s] %s: invalid meta type %s; preserving current_step=%s lr=%s",
-                model_id,
-                op,
-                type(meta).__name__,
-                session.current_step,
-                session.learning_rate,
-            )
-            return
-
-        meta_step = meta.get("current_step")
-        if isinstance(meta_step, int) and not isinstance(meta_step, bool):
-            session.current_step = meta_step
-        elif "current_step" in meta:
-            logger.warning(
-                "[%s] %s: invalid current_step type=%s value=%r; preserving current_step=%s",
-                model_id,
-                op,
-                type(meta_step).__name__,
-                meta_step,
-                session.current_step,
-            )
-        else:
-            logger.warning(
-                "[%s] %s: meta missing current_step; preserving current_step=%s",
-                model_id,
-                op,
-                session.current_step,
-            )
-
-        if "learning_rate" not in meta:
-            return
-        try:
-            session.learning_rate = float(meta["learning_rate"])
-        except Exception:
-            logger.warning(
-                "[%s] %s: invalid learning_rate type=%s value=%r; preserving learning_rate=%s",
-                model_id,
-                op,
-                type(meta["learning_rate"]).__name__,
-                meta["learning_rate"],
-                session.learning_rate,
-            )
+        self._checkpoint_ops.update_session_from_load_meta(session, meta, op=op)
 
     async def _await_with_keepalive(
         self,
@@ -3901,7 +3505,7 @@ class VerlTrainingEngine:
             from mint_server.backend.training.megatron.megatron_distributed import _make_megatron_actor_name
 
             actor_name = _make_megatron_actor_name(base_model or "")
-            self._model_actor_supervisor_actor_names[model_id] = actor_name
+            self._actor_recycler.bind_session_actor(model_id, actor_name)
             session.actor_name = actor_name
             session.namespace = RAY_NAMESPACE
             self._touch_actor(session)
@@ -3992,7 +3596,7 @@ class VerlTrainingEngine:
             )
             session.backend = "bumblebee"
             actor_name = _make_bumblebee_actor_name(base_model or "")
-            self._model_actor_supervisor_actor_names[model_id] = actor_name
+            self._actor_recycler.bind_session_actor(model_id, actor_name)
             session.actor_name = actor_name
             session.namespace = RAY_NAMESPACE
             self._touch_actor(session)
@@ -4026,7 +3630,7 @@ class VerlTrainingEngine:
                 flush=True,
             )
             worker = dense.actor
-            self._model_actor_supervisor_actor_names[model_id] = dense.actor_name
+            self._actor_recycler.bind_session_actor(model_id, dense.actor_name)
             self._touch_actor(session)
 
             # Reinitialize LoRA weights for fresh session (statelessness)
@@ -4054,7 +3658,7 @@ class VerlTrainingEngine:
                     timeout_s=effective_reinit_timeout_s,
                 )
             except Exception:
-                self._model_actor_supervisor_actor_names.pop(model_id, None)
+                self._actor_recycler.unbind_session_actor(model_id)
                 self._workers.pop(model_id, None)
                 try:
                     from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
@@ -4083,7 +3687,7 @@ class VerlTrainingEngine:
                 "on",
             )
             if skip_ready_wait:
-                actor_name = self._model_actor_supervisor_actor_names.get(model_id)
+                actor_name = self._actor_recycler.actor_name_for_model(model_id)
                 if actor_name:
                     from mint_server.backend.actors.model_actor_publication import mark_backend_model_actor_ready
 
@@ -4120,7 +3724,7 @@ class VerlTrainingEngine:
                 timeout_s=ready_timeout_s,
             )
         except Exception:
-            self._model_actor_supervisor_actor_names.pop(model_id, None)
+            self._actor_recycler.unbind_session_actor(model_id)
             self._workers.pop(model_id, None)
             try:
                 from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
@@ -4133,7 +3737,7 @@ class VerlTrainingEngine:
             f"[DEBUG {model_id}] __ray_ready__ done",
             flush=True,
         )
-        actor_name = self._model_actor_supervisor_actor_names.get(model_id)
+        actor_name = self._actor_name_for_session(session)
         if actor_name:
             from mint_server.backend.actors.model_actor_publication import mark_backend_model_actor_ready
 
@@ -5258,7 +4862,7 @@ class VerlTrainingEngine:
             self._apply_megatron_loaded_lora_config(session, meta)
             actor_name = self._actor_name_for_session(session)
             if actor_name and bool(meta["optimizer_restored"]):
-                self._actor_volatile_sessions.setdefault(actor_name, set()).add(session.model_id)
+                self._actor_recycler.mark_session_volatile(actor_name, session.model_id)
 
             worker = await self._get_live_worker(session, op="load_weights", allow_recover=False)
             await async_get_ray_ref(
@@ -5279,11 +4883,7 @@ class VerlTrainingEngine:
             if not bool(meta["optimizer_restored"]):
                 actor_name = self._actor_name_for_session(session)
                 if actor_name:
-                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
-                    if volatile_sessions:
-                        volatile_sessions.discard(session.model_id)
-                        if not volatile_sessions:
-                            self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.discard_session_volatile(actor_name, session.model_id)
         else:
             # Dense workers keep the older lenient metadata path because legacy
             # PEFT checkpoints can omit training_meta.json.
@@ -5295,13 +4895,9 @@ class VerlTrainingEngine:
             if not load_optimizer:
                 actor_name = self._actor_name_for_session(session)
                 if actor_name:
-                    volatile_sessions = self._actor_volatile_sessions.get(actor_name)
-                    if volatile_sessions:
-                        volatile_sessions.discard(session.model_id)
-                        if not volatile_sessions:
-                            self._actor_volatile_sessions.pop(actor_name, None)
+                    self._actor_recycler.discard_session_volatile(actor_name, session.model_id)
 
-        self._poisoned_sessions.pop(session.model_id, None)
+        self._actor_recycler.clear_poisoned(session.model_id)
 
         logger.info(f"[{model_id}] load_weights: step={session.current_step}")
         return meta if isinstance(meta, dict) else None
@@ -5310,17 +4906,17 @@ class VerlTrainingEngine:
         """Delete actor-local session state, then release or unbind the worker."""
         model_id = session.model_id
 
-        actor_name = self._model_actor_supervisor_actor_names.get(model_id)
+        actor_name = self._actor_name_for_session(session)
         worker = self._workers.get(model_id)
         authoritative_actor_name = str(getattr(session, "actor_name", "") or "")
         if authoritative_actor_name and actor_name and actor_name != authoritative_actor_name:
             self._workers.pop(model_id, None)
-            self._model_actor_supervisor_actor_names[model_id] = authoritative_actor_name
+            self._actor_recycler.bind_session_actor(model_id, authoritative_actor_name)
             worker = None
             actor_name = authoritative_actor_name
         if worker is None:
             worker = await self._rebind_worker_from_session_metadata(session, reason="shutdown_session")
-            actor_name = self._model_actor_supervisor_actor_names.get(model_id) or str(getattr(session, "actor_name", "") or "") or None
+            actor_name = self._actor_recycler.actor_name_for_model(model_id) or str(getattr(session, "actor_name", "") or "") or None
         traceparent = get_current_traceparent()
 
         if worker is not None:
@@ -5343,7 +4939,7 @@ class VerlTrainingEngine:
         actor_protected = False
         other_users: list[str] = []
         if actor_name:
-            other_users = [mid for mid, an in self._model_actor_supervisor_actor_names.items() if an == actor_name and mid != model_id]
+            other_users = self._actor_recycler.bound_model_ids_for_actor(actor_name, exclude_model_id=model_id)
             try:
                 from mint_server.backend.stores.training_session_store import list_training_sessions
 
@@ -5371,21 +4967,9 @@ class VerlTrainingEngine:
             except Exception:
                 pass
 
-        self._model_actor_supervisor_actor_names.pop(model_id, None)
+        self._actor_recycler.unbind_session_actor(model_id)
         self._workers.pop(model_id, None)
-
-        actor_loaded_sessions = getattr(self, "_actor_loaded_sessions", None)
-        if isinstance(actor_loaded_sessions, dict) and actor_name:
-            if actor_loaded_sessions.get(actor_name) == model_id:
-                actor_loaded_sessions.pop(actor_name, None)
-
-        actor_volatile_sessions = getattr(self, "_actor_volatile_sessions", None)
-        if isinstance(actor_volatile_sessions, dict) and actor_name:
-            volatile = actor_volatile_sessions.get(actor_name)
-            if isinstance(volatile, set):
-                volatile.discard(model_id)
-                if not volatile:
-                    actor_volatile_sessions.pop(actor_name, None)
+        self._actor_recycler.clear_session_runtime_state(model_id, actor_name)
 
         try:
             if session.backend == "peft":

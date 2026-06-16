@@ -119,7 +119,6 @@ async def test_issue_317_load_state_restores_session_from_detached_metadata(
     class _Engine:
         def __init__(self) -> None:
             self._workers = {}
-            self._model_actor_supervisor_actor_names = {}
 
         async def load_weights(
             self, session, load_path: str, load_optimizer: bool

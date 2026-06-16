@@ -8,7 +8,6 @@ import logging
 import os
 import re
 import time
-import traceback
 from dataclasses import dataclass
 from enum import StrEnum
 from types import SimpleNamespace
@@ -36,6 +35,9 @@ from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHea
 from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
 from mint_server.backend.core.execution_context import ExecutionContext, bind_execution_context
 from mint_server.backend.actors.model_actor_supervisor import consumer_id_for_replica, queue_id_for_replica
+from mint_server.backend.actors.model_engine_active_lease import ActiveLeaseTracker
+from mint_server.backend.actors.model_engine_health_snapshot import EngineHealthSnapshot
+from mint_server.backend.actors.model_engine_token_budget import TokenBudgetController
 from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
 from mint_server.backend.core.model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from mint_server.backend.stores.task_payload_store import TaskPayloadStore
@@ -506,23 +508,12 @@ class ModelEngineHost:
         self._self_exit_requested = False
         self._engine_death_lock = asyncio.Lock()
         self._loop_task: asyncio.Task | None = None
-        self._active_request_id: str | None = None
-        self._active_lease_id: str | None = None
-        self._active_leases: dict[str, dict[str, Any]] = {}
+        self._active_leases = ActiveLeaseTracker(lease_item_wire=_lease_item_wire)
         self._started_at = time.time()
-        self._last_claimed_at: float | None = None
-        self._last_completed_at: float | None = None
-        self._last_renewed_at: float | None = None
-        self._max_renew_rpc_latency_s = 0.0
-        self._consecutive_renew_failures = 0
-        self._last_renew_deadline_slack_s: float | None = None
-        self._last_error: str | None = None
-        self._last_error_traceback: str | None = None
-        self._dynamic_token_budget: int | None = None
-        self._dynamic_token_capacity_tokens: int | None = None
-        self._dynamic_token_budget_ratio: float | None = None
-        self._dynamic_token_budget_updated_at: float | None = None
-        self._dynamic_token_budget_error: str | None = None
+        self._health_snapshot = EngineHealthSnapshot()
+        self._token_budget_controller = TokenBudgetController(
+            refresh_interval_s=VLLM_TOKEN_BUDGET_REFRESH_S,
+        )
         self._processed_total = 0
         self._completed_total = 0
         self._failed_total = 0
@@ -565,13 +556,7 @@ class ModelEngineHost:
             "actor_generation": int(self._config.actor_generation),
             "running": bool(self._running),
             "draining": bool(self._draining),
-            "active_request_id": self._active_request_id,
-            "active_lease_id": self._active_lease_id,
-            "active_request_ids": [
-                str(_lease_item_wire(lease)["request_id"]) for lease in self._active_leases.values()
-            ],
-            "active_lease_ids": list(self._active_leases.keys()),
-            "active_lease_count": len(self._active_leases),
+            **self._active_leases.snapshot_fields(),
             "engine_ready": self._engine_ready,
             "engine_restarting": bool(self._engine_restarting),
             "engine_restart_deadline_at": self._engine_restart_deadline_at,
@@ -581,14 +566,7 @@ class ModelEngineHost:
             "engine_failure_epoch": int(self._engine_failure_epoch),
             "self_exit_requested": bool(self._self_exit_requested),
             "started_at": float(self._started_at),
-            "last_claimed_at": self._last_claimed_at,
-            "last_completed_at": self._last_completed_at,
-            "last_renewed_at": self._last_renewed_at,
-            "max_renew_rpc_latency_s": self._max_renew_rpc_latency_s,
-            "consecutive_renew_failures": self._consecutive_renew_failures,
-            "last_renew_deadline_slack_s": self._last_renew_deadline_slack_s,
-            "last_error": self._last_error,
-            "last_error_traceback": self._last_error_traceback,
+            **self._health_snapshot.snapshot(),
             "processed_total": int(self._processed_total),
             "completed_total": int(self._completed_total),
             "failed_total": int(self._failed_total),
@@ -600,11 +578,7 @@ class ModelEngineHost:
             "max_claim": int(self._config.max_claim),
             "token_budget": self._config.token_budget,
             "runtime_env_fingerprint": self._config.runtime_env_fingerprint,
-            "dynamic_token_budget": self._dynamic_token_budget,
-            "dynamic_token_capacity_tokens": self._dynamic_token_capacity_tokens,
-            "dynamic_token_budget_ratio": self._dynamic_token_budget_ratio,
-            "dynamic_token_budget_updated_at": self._dynamic_token_budget_updated_at,
-            "dynamic_token_budget_error": self._dynamic_token_budget_error,
+            **self._token_budget_controller.snapshot(),
             "execution_timeout_s": self._config.execution_timeout_s,
         }
 
@@ -690,7 +664,7 @@ class ModelEngineHost:
             await self._push_liveness()
             return {"claimed": 0, "executed": 0}
 
-        self._last_claimed_at = time.time()
+        self._health_snapshot.record_claimed()
         valid_leases = [lease for lease in leases if isinstance(lease, dict)]
         if len(valid_leases) == 1:
             await self._execute_lease(valid_leases[0])
@@ -735,28 +709,12 @@ class ModelEngineHost:
                 await asyncio.gather(renew_task, return_exceptions=True)
 
     async def _refresh_dynamic_token_budget(self) -> int | None:
-        now = time.time()
-        if self._dynamic_token_budget is not None and self._dynamic_token_budget_updated_at is not None:
-            if now - float(self._dynamic_token_budget_updated_at) < VLLM_TOKEN_BUDGET_REFRESH_S:
-                return int(self._dynamic_token_budget)
-        try:
-            budget = await self._token_budget_provider()
-        except Exception as e:
-            self._dynamic_token_budget_error = f"{type(e).__name__}: {e}"
-            logger.debug(
-                "[model_runtime] dynamic token budget refresh failed actor=%s domain=%s error=%s",
-                self._config.actor_name,
-                self._config.domain_key,
-                self._dynamic_token_budget_error,
-            )
-            return self._dynamic_token_budget
-        if budget is None:
-            return self._dynamic_token_budget
-        budget_i = max(1, int(budget))
-        self._dynamic_token_budget = budget_i
-        self._dynamic_token_budget_updated_at = now
-        self._dynamic_token_budget_error = None
-        return budget_i
+        return await self._token_budget_controller.refresh(
+            self._token_budget_provider,
+            actor_name=self._config.actor_name,
+            domain_key=self._config.domain_key,
+            logger=logger,
+        )
 
     async def _default_token_budget_provider(self) -> int | None:
         if not self._is_vllm_domain():
@@ -784,9 +742,7 @@ class ModelEngineHost:
         if capacity is None:
             return None
         ratio = VLLM_TOKEN_BUDGET_RATIO
-        self._dynamic_token_capacity_tokens = int(capacity)
-        self._dynamic_token_budget_ratio = float(ratio)
-        return max(1, int(float(capacity) * ratio))
+        return self._token_budget_controller.budget_from_capacity(capacity, ratio)
 
     def _vllm_actor_name(self) -> str | None:
         base_model = str(self._config.base_model or "").strip()
@@ -819,16 +775,10 @@ class ModelEngineHost:
             set_request_id(str(request_id))
 
     def _clear_active_lease(self, lease_id: str) -> None:
-        self._active_leases.pop(str(lease_id), None)
-        next_lease = next(iter(self._active_leases.values()), None)
-        self._active_request_id = (
-            str(_lease_item_wire(next_lease)["request_id"]) if isinstance(next_lease, dict) else None
-        )
-        self._active_lease_id = next(iter(self._active_leases.keys()), None)
+        self._active_leases.clear(lease_id)
 
     def _record_error(self, e: BaseException) -> None:
-        self._last_error = f"{type(e).__name__}: {e}"
-        self._last_error_traceback = traceback.format_exc()
+        self._health_snapshot.record_exception(e)
 
     @staticmethod
     def _is_missing_future_state_error(exc: BaseException) -> bool:
@@ -846,12 +796,7 @@ class ModelEngineHost:
         return "modelworkschedulerconflicterror" in text and "not claimable" in text
 
     def _clear_transient_scheduler_error(self) -> None:
-        error = str(self._last_error or "").lower()
-        if not error:
-            return
-        if "modelworkschedulerconflicterror" in error or "consumer_id mismatch" in error:
-            self._last_error = None
-            self._last_error_traceback = None
+        self._health_snapshot.clear_transient_scheduler_error()
 
     @staticmethod
     def _normalize_optional_timeout_s(value: Any) -> float | None:
@@ -1105,15 +1050,15 @@ class ModelEngineHost:
             return EngineHealth(
                 status=EngineHealthStatus.UNHEALTHY,
                 reason="not_ready",
-                last_error=self._last_error,
+                last_error=self._health_snapshot.last_error,
             )
         if self._engine_restarting:
             return EngineHealth(
                 status=EngineHealthStatus.RESTARTING,
                 restart_count=int(self._engine_restart_count),
-                last_error=self._last_error,
+                last_error=self._health_snapshot.last_error,
             )
-        return EngineHealth(status=EngineHealthStatus.READY, last_error=self._last_error)
+        return EngineHealth(status=EngineHealthStatus.READY, last_error=self._health_snapshot.last_error)
 
     async def _engine_observability(self) -> EngineObservability:
         if self._engine_lifecycle is None:
@@ -1153,11 +1098,11 @@ class ModelEngineHost:
             engine_ready=bool(self._engine_ready),
             engine_health=await self._engine_health(),
             observability=await self._engine_observability(),
-            active_request_id=self._active_request_id,
-            active_lease_id=self._active_lease_id,
-            active_lease_count=len(self._active_leases),
+            active_request_id=self._active_leases.active_request_id,
+            active_lease_id=self._active_leases.active_lease_id,
+            active_lease_count=int(self._active_leases.snapshot_fields()["active_lease_count"]),
             pushed_at=time.time(),
-            last_error=self._last_error,
+            last_error=self._health_snapshot.last_error,
         )
         try:
             out = self._liveness_push(payload)
@@ -1330,7 +1275,7 @@ class ModelEngineHost:
             self._engine_failure_epoch += 1
             self._record_error(RuntimeError(error))
             await self._mark_engine_unhealthy(error)
-            leases = list(self._active_leases.values())
+            leases = self._active_leases.leases()
             if not leases:
                 await self._restart_engine()
                 return
@@ -1492,14 +1437,13 @@ class ModelEngineHost:
 
     def _record_renew_result(self, *, ok: bool, latency_s: float, lease_ttl_s: float) -> None:
         latency = max(0.0, float(latency_s))
-        self._max_renew_rpc_latency_s = max(self._max_renew_rpc_latency_s, latency)
         if ok:
-            self._last_renewed_at = time.time()
             self._renewed_total += 1
-            self._consecutive_renew_failures = 0
-            self._last_renew_deadline_slack_s = max(0.0, float(lease_ttl_s) - latency)
-            return
-        self._consecutive_renew_failures += 1
+        self._health_snapshot.record_renew_result(
+            ok=ok,
+            latency_s=latency,
+            lease_ttl_s=lease_ttl_s,
+        )
 
     async def _call_executor(self, lease: dict[str, Any]) -> ExecutorOutcome | None:
         result = await asyncio.to_thread(self._executor, lease)
@@ -1552,9 +1496,7 @@ class ModelEngineHost:
         lease_id = legacy_token.lease_id
         token: LeaseToken | None = None
         attempt_id = self._lease_attempt_id(lease)
-        self._active_leases[lease_id] = lease
-        self._active_request_id = request_id
-        self._active_lease_id = lease_id
+        self._active_leases.set_active(lease_id=lease_id, request_id=request_id, lease=lease)
         self._restore_item_context(lease)
         if not await self._status_is_pending(lease):
             self._clear_active_lease(lease_id)
@@ -1575,7 +1517,7 @@ class ModelEngineHost:
                 )
                 self._processed_total += 1
                 self._failed_total += 1
-                self._last_completed_at = time.time()
+                self._health_snapshot.record_completed()
                 self._clear_active_lease(lease_id)
                 return
             self._record_error(e)
@@ -1714,12 +1656,10 @@ class ModelEngineHost:
                             self._config.actor_name,
                             request_id,
                             failed,
-                        )
+                    )
                     self._processed_total += 1
                     self._completed_total += 1
-                    self._last_completed_at = time.time()
-                    self._last_error = None
-                    self._last_error_traceback = None
+                    self._health_snapshot.record_success()
                     return
                 await self._task_futures.async_fail(request_id, str(finalization.payload))
                 failed = await self._scheduler.fail(
@@ -1733,12 +1673,10 @@ class ModelEngineHost:
                         self._config.actor_name,
                         request_id,
                         failed,
-                    )
+                )
                 self._processed_total += 1
                 self._failed_total += 1
-                self._last_error = f"future failed: {finalization.payload}"
-                self._last_error_traceback = None
-                self._last_completed_at = time.time()
+                self._health_snapshot.record_failure(f"future failed: {finalization.payload}")
                 return
             token = _lease_token(lease)
             finalization_started_at = time.time()
@@ -1839,15 +1777,11 @@ class ModelEngineHost:
             if finalization.kind == "resolve":
                 self._processed_total += 1
                 self._completed_total += 1
-                self._last_completed_at = time.time()
-                self._last_error = None
-                self._last_error_traceback = None
+                self._health_snapshot.record_success()
                 return
             self._processed_total += 1
             self._failed_total += 1
-            self._last_error = f"future failed: {finalization.payload}"
-            self._last_error_traceback = None
-            self._last_completed_at = time.time()
+            self._health_snapshot.record_failure(f"future failed: {finalization.payload}")
         except asyncio.CancelledError:
             await self._cancel_executor_task(task, reason="runtime_cancelled")
             try:
