@@ -518,7 +518,10 @@ def _drop_local_training_session(model_id: str) -> None:
                 )
     if engine is not None:
         getattr(engine, "_workers", {}).pop(model_id, None)
-        getattr(engine, "_model_actor_supervisor_actor_names", {}).pop(model_id, None)
+        recycler = getattr(engine, "_actor_recycler", None)
+        unbind = getattr(recycler, "unbind_session_actor", None)
+        if callable(unbind):
+            unbind(model_id)
 
 
 def _refresh_training_session_from_info_if_needed(
@@ -552,14 +555,15 @@ def _refresh_training_session_from_info_if_needed(
     ) or (incoming_namespace is not None and incoming_namespace != current_namespace)
     if actor_binding_changed and engine is not None:
         getattr(engine, "_workers", {}).pop(model_id, None)
+        recycler = getattr(engine, "_actor_recycler", None)
         if incoming_actor_name is not None:
-            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = (
-                incoming_actor_name
-            )
+            bind = getattr(recycler, "bind_session_actor", None)
+            if callable(bind):
+                bind(model_id, incoming_actor_name)
         else:
-            getattr(engine, "_model_actor_supervisor_actor_names", {}).pop(
-                model_id, None
-            )
+            unbind = getattr(recycler, "unbind_session_actor", None)
+            if callable(unbind):
+                unbind(model_id)
     if (
         incoming_version <= current_version
         and incoming_step <= current_step
@@ -809,9 +813,10 @@ async def _restore_training_session(model_id: str):
                         session.namespace = original_session_state["namespace"]
                 return None
             getattr(engine, "_workers", {})[model_id] = worker
-            getattr(engine, "_model_actor_supervisor_actor_names", {})[model_id] = (
-                actor_name
-            )
+            recycler = getattr(engine, "_actor_recycler", None)
+            bind = getattr(recycler, "bind_session_actor", None)
+            if callable(bind):
+                bind(model_id, str(actor_name))
 
         return session
     except Exception as e:
@@ -943,13 +948,26 @@ async def _best_effort_delete_training_session(
                 allow_actor_shutdown,
             )
             actor_name = str(getattr(session, "actor_name", "") or "")
-            other_users = [
-                mid
-                for mid, bound_actor in getattr(
-                    training_engine, "_model_actor_supervisor_actor_names", {}
-                ).items()
-                if bound_actor == actor_name and mid != model_id
-            ]
+            other_users: list[str] = []
+            recycler = getattr(training_engine, "_actor_recycler", None)
+            bound_model_ids_for_actor = getattr(recycler, "bound_model_ids_for_actor", None)
+            if callable(bound_model_ids_for_actor):
+                other_users.extend(
+                    bound_model_ids_for_actor(actor_name, exclude_model_id=model_id)
+                )
+            try:
+                from mint_server.backend.stores.training_session_store import list_training_sessions
+
+                for other_info in list_training_sessions():
+                    if not isinstance(other_info, dict):
+                        continue
+                    other_model_id = str(other_info.get("model_id") or "")
+                    if not other_model_id or other_model_id == model_id:
+                        continue
+                    if str(other_info.get("actor_name") or "") == actor_name and other_model_id not in other_users:
+                        other_users.append(other_model_id)
+            except Exception:
+                pass
             replacement_session = other_users[0] if other_users else None
             worker = getattr(training_engine, "_workers", {}).get(model_id)
             if worker is None:
@@ -991,9 +1009,9 @@ async def _best_effort_delete_training_session(
                         e,
                     )
             cleanup_ok = cleanup_ok and delete_ok
-            getattr(training_engine, "_model_actor_supervisor_actor_names", {}).pop(
-                model_id, None
-            )
+            unbind = getattr(recycler, "unbind_session_actor", None)
+            if callable(unbind):
+                unbind(model_id)
             getattr(training_engine, "_workers", {}).pop(model_id, None)
             session.is_active = False
             if actor_name:
@@ -1216,9 +1234,10 @@ def _has_training_worker_binding(model_id: str) -> bool:
         return False
     if model_id in getattr(training_engine, "_workers", {}):
         return True
-    return model_id in getattr(
-        training_engine, "_model_actor_supervisor_actor_names", {}
-    )
+    snapshot = _get_training_snapshot(model_id)
+    if snapshot is not None and str(getattr(snapshot, "actor_name", "") or ""):
+        return True
+    return False
 
 
 async def _get_training_session_for_request(model_id: str):
@@ -1636,11 +1655,9 @@ async def _materialize_training_session_for_stateful_use(session: Any) -> Any:
             session.tokenizer_source_path = (
                 str(tokenizer_metadata.get("tokenizer_source_path") or "") or None
             )
-        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(
-            session.model_id
-        )
-        session.actor_name = str(actor_name or "") or None
-        session.namespace = RAY_NAMESPACE
+        actor_name = str(getattr(session, "actor_name", "") or "") or None
+        session.actor_name = actor_name
+        session.namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
         session.materialization_state = MATERIALIZATION_STATE_READY
         ready_version = _next_training_session_metadata_version(session)
         await async_upsert_training_session(
@@ -2717,11 +2734,9 @@ async def _do_create_model_from_state(
 
         from mint_server.backend.stores.training_session_store import async_upsert_training_session
 
-        actor_name = getattr(engine, "_model_actor_supervisor_actor_names", {}).get(
-            model_id
-        )
-        session.actor_name = str(actor_name or "") or None
-        session.namespace = RAY_NAMESPACE
+        actor_name = str(getattr(session, "actor_name", "") or "") or None
+        session.actor_name = actor_name
+        session.namespace = str(getattr(session, "namespace", "") or RAY_NAMESPACE)
         await async_upsert_training_session(
             _build_training_session_store_payload(
                 session=session,

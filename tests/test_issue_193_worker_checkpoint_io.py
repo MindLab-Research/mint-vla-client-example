@@ -421,7 +421,6 @@ def test_issue_193_dense_save_weights_passes_explicit_session_id_and_keepalive(m
     model_id = "model_issue_193_dense_save"
     worker = _FakeWorker(ref="dense-save-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "dense-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -431,6 +430,7 @@ def test_issue_193_dense_save_weights_passes_explicit_session_id_and_keepalive(m
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "dense-actor")
 
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
 
@@ -458,7 +458,6 @@ def test_issue_193_dense_save_lora_passes_explicit_session_id_and_keepalive(monk
     model_id = "model_issue_193_dense_lora"
     worker = _FakeSamplerWorker(ref="dense-save-lora-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "dense-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -468,6 +467,7 @@ def test_issue_193_dense_save_lora_passes_explicit_session_id_and_keepalive(monk
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "dense-actor")
 
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
 
@@ -497,7 +497,6 @@ def test_issue_193_dense_load_weights_passes_explicit_session_id_and_keepalive(m
     model_id = "model_issue_193_dense_load"
     worker = _FakeLoadWorker(ref="dense-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "shared-actor"
     monkeypatch.setattr(engine, "_get_live_worker", lambda *args, **kwargs: asyncio.sleep(0, result=worker))
 
     session = TrainingSession(
@@ -507,6 +506,7 @@ def test_issue_193_dense_load_weights_passes_explicit_session_id_and_keepalive(m
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "shared-actor")
     session.learning_rate = 1e-4
 
     keepalive_calls: list[tuple[object, str, float, float | None]] = []
@@ -539,7 +539,6 @@ def test_issue_193_dense_save_weights_fails_loud_when_worker_died(monkeypatch):
     model_id = "model_issue_193_dense_save_dead"
     worker = _FakeWorker(ref="dense-save-ref-dead")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "dead-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -548,6 +547,7 @@ def test_issue_193_dense_save_weights_fails_loud_when_worker_died(monkeypatch):
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "dead-actor")
 
     monkeypatch.setattr(
         ray,
@@ -573,7 +573,6 @@ def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
     dead_worker = _FakeLoadWorker(ref="dead-load-ref")
     recovered_worker = _FakeLoadWorker(ref="recovered-load-ref")
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "dead-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -582,6 +581,7 @@ def test_issue_193_dense_load_weights_rebinds_after_worker_death(monkeypatch):
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "dead-actor")
 
     monkeypatch.setattr(
         ray,
@@ -625,7 +625,6 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     model_id = "model_issue_193_megatron_load"
     worker = _FakeLoadWorker(ref="megatron-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
     monkeypatch.setenv("MINT_LOAD_CHECKPOINT_TIMEOUT_S", "4321")
 
     session = TrainingSession(
@@ -640,6 +639,7 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
             train_unembed=False,
         ),
     )
+    _bind_session_actor(session, "megatron-actor")
     load_path = tmp_path / "issue_193_megatron_load"
     load_path.mkdir()
     (load_path / "adapter_config.json").write_text(
@@ -724,7 +724,6 @@ def test_issue_417_megatron_legacy_load_weights_passes_session_train_flags(monke
     model_id = "model_issue_417_megatron_legacy_load"
     worker = _FakeLoadWorker(ref="megatron-legacy-load-ref")
     engine._workers[model_id] = worker
-    engine._model_actor_supervisor_actor_names[model_id] = "megatron-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -738,6 +737,7 @@ def test_issue_417_megatron_legacy_load_weights_passes_session_train_flags(monke
             train_unembed=False,
         ),
     )
+    _bind_session_actor(session, "megatron-actor")
     load_path = tmp_path / "legacy_rank_shard"
     load_path.mkdir()
     (load_path / "mp_rank_00_adapter.pt").write_bytes(b"adapter")

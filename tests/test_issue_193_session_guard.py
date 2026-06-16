@@ -366,6 +366,7 @@ def test_issue_527_megatron_explicit_load_prepare_same_session_discards_target_a
 def test_issue_193_megatron_forward_uses_ensure_session_loaded(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
+    _init_megatron_group_observability(group)
     ensure_calls: list[str] = []
 
     class _FakeWorker:
@@ -392,6 +393,7 @@ def test_issue_193_megatron_forward_uses_ensure_session_loaded(monkeypatch):
 def test_issue_193_megatron_forward_backward_uses_ensure_session_loaded(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
+    _init_megatron_group_observability(group)
     ensure_calls: list[str] = []
 
     class _FakeWorker:
@@ -438,6 +440,7 @@ def test_issue_193_megatron_forward_backward_uses_ensure_session_loaded(monkeypa
 def test_issue_193_megatron_optim_step_uses_ensure_session_loaded(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
+    _init_megatron_group_observability(group)
     ensure_calls: list[str] = []
 
     class _FakeWorker:
@@ -468,6 +471,7 @@ def test_issue_193_megatron_optim_step_uses_ensure_session_loaded(monkeypatch):
 def test_issue_193_megatron_ab_interleave_reloads_session_before_optim_step(monkeypatch):
     group_cls = MegatronWorkerGroup.__ray_actor_class__
     group = group_cls.__new__(group_cls)
+    _init_megatron_group_observability(group)
     ensure_calls: list[str] = []
     call_log: list[tuple[str, str, str | None]] = []
 
@@ -631,7 +635,6 @@ def test_issue_193_megatron_midcall_mutating_op_fails_closed_even_when_actor_was
     recovered_worker = object()
     actor_name = "shared-megatron-actor"
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -640,6 +643,7 @@ def test_issue_193_megatron_midcall_mutating_op_fails_closed_even_when_actor_was
         base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
         backend="megatron",
     )
+    _bind_session_actor(session, actor_name)
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -668,9 +672,7 @@ def test_issue_193_megatron_midcall_mutating_op_fails_closed_even_when_actor_was
     with pytest.raises(RuntimeError, match="operation may have partially executed before the crash"):
         asyncio.run(_run())
 
-    assert engine._poisoned_sessions[model_id].startswith(
-        f"[{model_id}] megatron actor died during op=forward_backward"
-    )
+    _assert_session_poisoned(engine, session, f"\\[{model_id}\\] megatron actor died during op=forward_backward")
 
 
 def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(monkeypatch):
@@ -679,7 +681,6 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
     dead_worker = object()
     recovered_worker = object()
     engine._workers[model_id] = dead_worker
-    engine._model_actor_supervisor_actor_names[model_id] = "dense-actor"
 
     session = TrainingSession(
         model_id=model_id,
@@ -688,6 +689,7 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    _bind_session_actor(session, "dense-actor")
 
     async def fake_get_live_worker(*args, **kwargs):
         return dead_worker
@@ -716,8 +718,8 @@ def test_issue_193_dense_recycle_fails_loud_after_dead_worker_during_forward(mon
     with pytest.raises(RuntimeError, match="dense actor recycle detected after op=forward"):
         asyncio.run(_run())
 
-    assert model_id in engine._poisoned_sessions
-    assert model_id in engine._poisoned_sessions
+    _assert_session_poisoned(engine, session, ".*")
+    _assert_session_poisoned(engine, session, ".*")
 
 
 def test_issue_527_contaminated_session_blocks_request_before_restore():

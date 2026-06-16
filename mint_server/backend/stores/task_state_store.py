@@ -27,7 +27,10 @@ from mint_server.backend.contracts.control_plane_contracts import (
     WireCompatibleResult,
 )
 from mint_server.backend.core.model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
+from mint_server.backend.stores.billing_outbox import BillingOutbox
 from mint_server.backend.stores.task_hot_kv_store import TaskHotKVStore
+from mint_server.backend.stores.task_state_queries import TaskQueries
+from mint_server.backend.stores.task_state_schema import TaskStateSchema
 
 
 ACTIVE_TASK_STATUSES = frozenset({"pending", "queued", "running", "assigned", "leased", "finalizing"})
@@ -639,7 +642,17 @@ class TaskStateStore:
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self._db_path = str(db_path)
         self._lock = threading.RLock()
+        self._schema = TaskStateSchema(db_path=self._db_path)
+        self._queries = TaskQueries(
+            not_found_error=TaskStateNotFoundError,
+            conflict_error=TaskStateConflictError,
+        )
         self._hot_kv = TaskHotKVStore(":memory:" if self._db_path == ":memory:" else _task_hot_kv_store_db_path(self._db_path))
+        self._billing_outbox = BillingOutbox(
+            self._hot_kv,
+            inc_metric=_inc_billing_metric,
+            metrics_snapshot=billing_metrics_snapshot,
+        )
         self._session_heartbeat_max_age_s = float(
             os.environ.get("MINT_SESSION_HEARTBEAT_MAX_AGE_S", str(7 * 24 * 3600))
         )
@@ -1077,13 +1090,7 @@ class TaskStateStore:
         return self._hot_kv.prune_heartbeats(now=now, max_age_s=max_age_s)
 
     def _configure_connection(self) -> None:
-        if self._db_path != ":memory:":
-            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn.execute("PRAGMA busy_timeout = 5000")
-        self._conn.execute("PRAGMA foreign_keys = ON")
-        if self._db_path != ":memory:":
-            self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._schema.configure_connection(self._conn)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1101,131 +1108,13 @@ class TaskStateStore:
 
     def _apply_schema(self) -> None:
         with self._lock:
-            conn = self._conn
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS scheduler_owner (
-                    name TEXT PRIMARY KEY,
-                    owner_id TEXT NOT NULL,
-                    epoch INTEGER NOT NULL,
-                    renewed_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    fencing_token TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS tasks (
-                    request_id TEXT PRIMARY KEY,
-                    op TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    domain_key TEXT NOT NULL,
-                    subqueue_id TEXT,
-                    lease_id TEXT,
-                    attempt_id TEXT,
-                    scheduler_epoch INTEGER,
-                    runtime_generation INTEGER,
-                    consumer_id TEXT,
-                    request_json BLOB NOT NULL,
-                    payload_hash TEXT,
-                    result_path TEXT,
-                    result_checksum TEXT,
-                    result_size_bytes INTEGER,
-                    staged_payload_path TEXT,
-                    staged_payload_checksum TEXT,
-                    staged_payload_size_bytes INTEGER,
-                    error TEXT,
-                    metadata_json TEXT NOT NULL DEFAULT '{}',
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL,
-                    assigned_at REAL,
-                    leased_at REAL,
-                    lease_expires_at REAL,
-                    finalizing_until REAL
-                );
-
-                CREATE TABLE IF NOT EXISTS task_events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    request_id TEXT NOT NULL,
-                    version INTEGER NOT NULL,
-                    event_type TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    FOREIGN KEY(request_id) REFERENCES tasks(request_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS billing_outbox (
-                    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_id TEXT NOT NULL UNIQUE,
-                    event_json TEXT NOT NULL,
-                    event_hash TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    claim_id TEXT,
-                    claimed_until REAL,
-                    attempt_count INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT,
-                    created_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_status_created
-                    ON tasks(status, created_at);
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_domain_status_created
-                    ON tasks(domain_key, status, created_at);
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_subqueue_status_created
-                    ON tasks(subqueue_id, status, created_at);
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_lease_expires
-                    ON tasks(lease_expires_at);
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_finalizing_until
-                    ON tasks(finalizing_until);
-
-                CREATE INDEX IF NOT EXISTS idx_tasks_result_path
-                    ON tasks(result_path);
-
-                CREATE INDEX IF NOT EXISTS idx_billing_outbox_status_claimed
-                    ON billing_outbox(status, claimed_until, created_at);
-                """
-            )
-            self._ensure_tasks_columns(conn)
-            self._ensure_billing_outbox_columns(conn)
+            self._schema.apply_schema(self._conn)
 
     def _ensure_tasks_columns(self, conn: sqlite3.Connection) -> None:
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(tasks)").fetchall()
-        }
-        required = {
-            "staged_payload_path": "TEXT",
-            "staged_payload_checksum": "TEXT",
-            "staged_payload_size_bytes": "INTEGER",
-        }
-        for name, type_sql in required.items():
-            if name not in columns:
-                conn.execute(f"ALTER TABLE tasks ADD COLUMN {name} {type_sql}")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_tasks_staged_payload_path ON tasks(staged_payload_path)"
-        )
+        self._schema.ensure_tasks_columns(conn)
 
     def _ensure_billing_outbox_columns(self, conn: sqlite3.Connection) -> None:
-        columns = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(billing_outbox)").fetchall()
-        }
-        required = {
-            "event_hash": "TEXT",
-            "claim_id": "TEXT",
-            "claimed_until": "REAL",
-            "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-            "last_error": "TEXT",
-        }
-        for name, type_sql in required.items():
-            if name not in columns:
-                conn.execute(f"ALTER TABLE billing_outbox ADD COLUMN {name} {type_sql}")
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_billing_outbox_status_claimed ON billing_outbox(status, claimed_until, created_at)"
-        )
+        self._schema.ensure_billing_outbox_columns(conn)
 
     def integrity_check(self) -> str:
         with self._lock:
@@ -1721,23 +1610,14 @@ class TaskStateStore:
         ttl_s = float(older_than_s)
         if ttl_s <= 0:
             return []
-        cutoff = _now(now) - ttl_s
-        sql = """
-            SELECT * FROM tasks
-            WHERE status IN ('done', 'failed', 'cancelled', 'expired', 'retrieved')
-              AND result_path IS NOT NULL
-              AND result_path != ''
-            ORDER BY updated_at, request_id
-            LIMIT ?
-        """
+        ts = _now(now)
         with self._lock:
-            rows = self._conn.execute(sql, (max(0, int(limit)),)).fetchall()
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            record = self._row_to_record(row)
-            if self._terminal_completed_at(record) <= cutoff:
-                out.append(record)
-        return out
+            rows = self._queries.list_terminal_payload_rows_for_eviction(self._conn, limit=limit)
+        return self._queries.filter_terminal_payload_rows_for_eviction(
+            rows,
+            older_than_s=ttl_s,
+            now=ts,
+        )
 
     def mark_payload_evicted(
         self,
@@ -1793,66 +1673,14 @@ class TaskStateStore:
         if ttl_s <= 0:
             return []
         ts = _now(now)
-        cutoff = ts - ttl_s
-        batch_limit = max(0, int(limit))
-        if batch_limit <= 0:
-            return []
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT * FROM tasks
-                WHERE staged_payload_path IS NOT NULL
-                   OR metadata_json LIKE '%abandoned_staged_payload_paths%'
-                ORDER BY updated_at, request_id
-                LIMIT ?
-                """,
-                (batch_limit,),
-            ).fetchall()
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            record = self._row_to_record(row)
-            request_id = str(record["request_id"])
-            active_path = record.get("staged_payload_path")
-            status = str(record.get("status") or "")
-            if isinstance(active_path, str) and active_path:
-                if status == "finalizing":
-                    finalizing_until = record.get("finalizing_until")
-                    expired_at = float(finalizing_until or record.get("updated_at") or 0.0)
-                    eligible = expired_at <= cutoff
-                else:
-                    eligible = float(record.get("updated_at") or 0.0) <= cutoff
-                if eligible:
-                    out.append(
-                        {
-                            "request_id": request_id,
-                            "path": active_path,
-                            "kind": "active",
-                            "status": status,
-                        }
-                    )
-                    if len(out) >= batch_limit:
-                        return out
-
-            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-            abandoned = metadata.get("abandoned_staged_payload_paths")
-            if not isinstance(abandoned, list):
-                continue
-            if float(record.get("updated_at") or 0.0) > cutoff:
-                continue
-            for path in abandoned:
-                if not isinstance(path, str) or not path:
-                    continue
-                out.append(
-                    {
-                        "request_id": request_id,
-                        "path": path,
-                        "kind": "abandoned",
-                        "status": status,
-                    }
-                )
-                if len(out) >= batch_limit:
-                    return out
-        return out
+            rows = self._queries.list_staged_payload_rows_for_gc(self._conn, limit=limit)
+        return self._queries.filter_staged_payload_rows_for_gc(
+            rows,
+            older_than_s=ttl_s,
+            now=ts,
+            limit=limit,
+        )
 
     def mark_staged_payload_gc_deleted(
         self,
@@ -1964,20 +1792,7 @@ class TaskStateStore:
         source: str = "unknown",
         now: float | None = None,
     ) -> dict[str, Any]:
-        normalized = [dict(item) for item in observations if isinstance(item, dict)]
-        if not normalized:
-            return {"ok": True, "source": str(source), "inserted": 0, "duplicate": 0, "conflicts": 0, "errors": []}
-        out = self._hot_kv.append_billing_outbox(observations=normalized, source=source, now=now)
-        inserted = int(out.get("inserted") or 0)
-        conflicts = int(out.get("conflicts") or 0)
-        errors = out.get("errors") if isinstance(out.get("errors"), list) else []
-        if inserted:
-            _inc_billing_metric("event_inserted", inserted)
-        if conflicts:
-            _inc_billing_metric("outbox_conflict", conflicts)
-        if errors:
-            _inc_billing_metric("write_error", len(errors))
-        return out
+        return self._billing_outbox.append(observations=observations, source=source, now=now)
 
     def _append_billing_outbox_after_terminal_success(
         self,
@@ -1986,27 +1801,11 @@ class TaskStateStore:
         source: str,
         now: float,
     ) -> dict[str, Any]:
-        normalized = [dict(item) for item in (observations or []) if isinstance(item, dict)]
-        if not normalized:
-            return {}
-        try:
-            billing_result = self.append_billing_outbox(
-                observations=normalized,
-                source=source,
-                now=now,
-            )
-            if not bool(billing_result.get("ok")):
-                return {"billing_status": "dropped", "billing_error": billing_result}
-            inserted = int(billing_result.get("inserted") or 0)
-            if inserted > 0:
-                return {
-                    "billing_status": "outboxed",
-                    "billing_observation_count": inserted,
-                }
-            return {}
-        except Exception as e:
-            _inc_billing_metric("write_error", 1)
-            return {"billing_status": "dropped", "billing_error": f"{type(e).__name__}: {e}"}
+        return self._billing_outbox.append_after_terminal_success(
+            observations=observations,
+            source=source,
+            now=now,
+        )
 
     def _best_effort_update_billing_metadata(
         self,
@@ -2039,7 +1838,7 @@ class TaskStateStore:
         lease_ttl_s: float = 60.0,
         now: float | None = None,
     ) -> list[dict[str, Any]]:
-        return self._hot_kv.claim_billing_outbox(
+        return self._billing_outbox.claim(
             claim_id=str(claim_id),
             limit=int(limit),
             lease_ttl_s=float(lease_ttl_s),
@@ -2052,7 +1851,7 @@ class TaskStateStore:
         claim_id: str,
         outbox_ids: list[int],
     ) -> dict[str, Any]:
-        return self._hot_kv.delete_billing_outbox_claim(
+        return self._billing_outbox.delete_claim(
             claim_id=str(claim_id),
             outbox_ids=[int(value) for value in outbox_ids],
         )
@@ -2066,7 +1865,7 @@ class TaskStateStore:
         error: str,
         now: float | None = None,
     ) -> dict[str, Any]:
-        return self._hot_kv.mark_billing_outbox_claim_failed(
+        return self._billing_outbox.mark_claim_failed(
             claim_id=str(claim_id),
             outbox_ids=[int(value) for value in outbox_ids],
             permanent=bool(permanent),
@@ -2075,22 +1874,10 @@ class TaskStateStore:
         )
 
     def billing_outbox_stats(self, *, now: float | None = None) -> dict[str, Any]:
-        stats = self._hot_kv.billing_outbox_stats(now=now)
-        stats["metrics"] = billing_metrics_snapshot()
-        return stats
+        return self._billing_outbox.stats(now=now)
 
     def _terminal_completed_at(self, record: dict[str, Any]) -> float:
-        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-        for key in ("done_at", "failed_at"):
-            value = metadata.get(key)
-            if isinstance(value, (int, float)):
-                return float(value)
-            try:
-                if value is not None:
-                    return float(value)
-            except Exception:
-                pass
-        return float(record.get("updated_at") or 0.0)
+        return self._queries.terminal_completed_at(record)
 
     def list_tasks_by_metadata(
         self,
@@ -2099,26 +1886,9 @@ class TaskStateStore:
         statuses: list[str] | None = None,
         limit: int = 1000,
     ) -> list[dict[str, Any]]:
-        status_values = list(statuses or [])
-        params: list[Any] = []
-        sql = "SELECT * FROM tasks"
-        if status_values:
-            placeholders = ", ".join("?" for _ in status_values)
-            sql += f" WHERE status IN ({placeholders})"
-            params.extend(status_values)
-        sql += " ORDER BY created_at, request_id"
         with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
-        normalized_filters = dict(filters or {})
-        out: list[dict[str, Any]] = []
-        for row in rows:
-            record = self._row_to_record(row)
-            metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
-            if all(metadata.get(key) == value for key, value in normalized_filters.items()):
-                out.append(record)
-                if len(out) >= int(limit):
-                    break
-        return out
+            rows = self._queries.list_tasks_by_metadata_rows(self._conn, statuses=statuses)
+        return self._queries.filter_tasks_by_metadata_rows(rows, filters=filters, limit=limit)
 
     def _complete_task_direct(
         self,
@@ -2664,17 +2434,8 @@ class TaskStateStore:
         return out
 
     def list_active_tasks(self, *, limit: int | None = None) -> list[dict[str, Any]]:
-        sql = """
-            SELECT * FROM tasks
-            WHERE status IN ('pending', 'assigned', 'leased', 'finalizing')
-            ORDER BY created_at, request_id
-        """
-        params: tuple[Any, ...] = ()
-        if limit is not None:
-            sql += " LIMIT ?"
-            params = (max(0, int(limit)),)
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            rows = self._queries.list_active_task_rows(self._conn, limit=limit)
         return [self._row_to_record(row) for row in rows]
 
     def future_metrics_stats(self, *, now: float | None = None) -> dict[str, Any]:
@@ -2682,113 +2443,22 @@ class TaskStateStore:
         active_statuses = tuple(sorted(ACTIVE_TASK_STATUSES))
         terminal_statuses = tuple(sorted(TERMINAL_TASK_STATUSES))
         with self._lock:
-            status_rows = self._conn.execute(
-                "SELECT status, COUNT(*) AS count FROM tasks GROUP BY status"
-            ).fetchall()
-            op_rows = self._conn.execute(
-                "SELECT op, status, COUNT(*) AS count FROM tasks GROUP BY op, status"
-            ).fetchall()
-            scalar_row = self._conn.execute(
-                """
-                SELECT
-                    COUNT(*) AS total,
-                    SUM(CASE WHEN result_path IS NOT NULL AND result_path != '' THEN 1 ELSE 0 END) AS refs,
-                    SUM(CASE WHEN metadata_json IS NOT NULL AND metadata_json != '{}' THEN 1 ELSE 0 END) AS meta
-                FROM tasks
-                """
-            ).fetchone()
-            pending_age_row = self._conn.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS count,
-                    MAX(? - created_at) AS oldest_s,
-                    AVG(? - created_at) AS avg_s
-                FROM tasks
-                WHERE status IN ({",".join("?" for _ in active_statuses)})
-                """,
-                (ts, ts, *active_statuses),
-            ).fetchone()
-            done_age_row = self._conn.execute(
-                f"""
-                SELECT
-                    COUNT(*) AS count,
-                    MAX(? - updated_at) AS oldest_s,
-                    AVG(? - updated_at) AS avg_s
-                FROM tasks
-                WHERE status IN ({",".join("?" for _ in terminal_statuses)})
-                """,
-                (ts, ts, *terminal_statuses),
-            ).fetchone()
-
-        by_status = {str(row["status"]): int(row["count"] or 0) for row in status_rows}
-        pending_statuses = ACTIVE_TASK_STATUSES
-        result_statuses = {"done", "retrieved"}
-        error_statuses = {"failed"}
-
-        by_op: dict[str, dict[str, int]] = {}
-        for row in op_rows:
-            op = str(row["op"] or "unknown")
-            status = str(row["status"] or "unknown")
-            count = int(row["count"] or 0)
-            bucket = by_op.setdefault(op, {"pending": 0, "results": 0, "errors": 0})
-            if status in pending_statuses:
-                bucket["pending"] += count
-            elif status in result_statuses:
-                bucket["results"] += count
-            elif status in error_statuses:
-                bucket["errors"] += count
-
-        pending = sum(by_status.get(status, 0) for status in pending_statuses)
-        results = sum(by_status.get(status, 0) for status in result_statuses)
-        errors = sum(by_status.get(status, 0) for status in error_statuses)
-        refs = int(scalar_row["refs"] or 0) if scalar_row is not None else 0
-        meta = int(scalar_row["meta"] or 0) if scalar_row is not None else 0
-        oldest_pending_s = float(pending_age_row["oldest_s"] or 0.0) if pending_age_row is not None else 0.0
-        oldest_done_s = float(done_age_row["oldest_s"] or 0.0) if done_age_row is not None else 0.0
-        avg_pending_s = float(pending_age_row["avg_s"] or 0.0) if pending_age_row is not None else 0.0
-        avg_done_s = float(done_age_row["avg_s"] or 0.0) if done_age_row is not None else 0.0
-
-        return {
-            "pending": int(pending),
-            "results": int(results),
-            "errors": int(errors),
-            "refs": refs,
-            "meta": meta,
-            "expired": int(by_status.get("expired", 0)),
-            "retrieved": int(by_status.get("retrieved", 0)),
-            "execution_timeout_s": float(server_config.task_pending_ttl_s),
-            "queue_timeout_s": float(getattr(server_config, "retrieve_future_wait_timeout_s", 20.0)),
-            "result_ttl_s": float(server_config.task_result_ttl_s),
-            "tombstone_ttl_s": float(server_config.task_tombstone_ttl_s),
-            "by_op": by_op,
-            "age_stats": {
-                "oldest_pending_s": oldest_pending_s,
-                "oldest_done_s": oldest_done_s,
-                "avg_pending_s": avg_pending_s,
-                "avg_done_s": avg_done_s,
-            },
-            "payload_stats": {
-                "result_refs_count": refs,
-                "errors_count": int(errors),
-                "refs_count": refs,
-            },
-            "timeout_counts": future_timeout_metrics_snapshot(),
-        }
+            return self._queries.future_metrics_stats(
+                self._conn,
+                now=ts,
+                active_statuses=active_statuses,
+                terminal_statuses=terminal_statuses,
+                execution_timeout_s=float(server_config.task_pending_ttl_s),
+                queue_timeout_s=float(getattr(server_config, "retrieve_future_wait_timeout_s", 20.0)),
+                result_ttl_s=float(server_config.task_result_ttl_s),
+                tombstone_ttl_s=float(server_config.task_tombstone_ttl_s),
+                timeout_counts=future_timeout_metrics_snapshot(),
+            )
 
     def list_expired_leases(self, *, now: float | None = None, limit: int | None = None) -> list[dict[str, Any]]:
         ts = _now(now)
-        sql = """
-            SELECT * FROM tasks
-            WHERE status IN ('leased', 'finalizing')
-              AND COALESCE(finalizing_until, lease_expires_at, 0) <= ?
-            ORDER BY COALESCE(finalizing_until, lease_expires_at, 0), created_at
-        """
-        params: tuple[Any, ...] = (ts,)
-        if limit is not None:
-            sql += " LIMIT ?"
-            params = (ts, max(0, int(limit)))
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            rows = self._queries.list_expired_lease_rows(self._conn, now=ts, limit=limit)
         return [self._row_to_record(row) for row in rows]
 
     def get_task(self, request_id: str) -> dict[str, Any]:
@@ -2797,10 +2467,7 @@ class TaskStateStore:
         return self._row_to_record(row)
 
     def _get_row(self, conn: sqlite3.Connection, request_id: str) -> sqlite3.Row:
-        row = conn.execute("SELECT * FROM tasks WHERE request_id = ?", (str(request_id),)).fetchone()
-        if row is None:
-            raise TaskStateNotFoundError(str(request_id))
-        return row
+        return self._queries.get_row(conn, request_id)
 
     def _raise_task_transition_error(
         self,
@@ -2808,43 +2475,10 @@ class TaskStateStore:
         request_id: str,
         action: str,
     ) -> None:
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE request_id = ?",
-            (str(request_id),),
-        ).fetchone()
-        if row is None:
-            raise TaskStateNotFoundError(str(request_id))
-        raise TaskStateConflictError(f"cannot {action}; current status={row['status']!r}")
+        self._queries.raise_transition_error(conn, request_id, action)
 
     def _row_to_record(self, row: sqlite3.Row) -> dict[str, Any]:
-        return {
-            "request_id": row["request_id"],
-            "op": row["op"],
-            "status": row["status"],
-            "domain_key": row["domain_key"],
-            "subqueue_id": row["subqueue_id"],
-            "lease_id": row["lease_id"],
-            "attempt_id": row["attempt_id"],
-            "scheduler_epoch": row["scheduler_epoch"],
-            "runtime_generation": row["runtime_generation"],
-            "consumer_id": row["consumer_id"],
-            "request_json": bytes(row["request_json"]),
-            "payload_hash": row["payload_hash"],
-            "result_path": row["result_path"],
-            "result_checksum": row["result_checksum"],
-            "result_size_bytes": row["result_size_bytes"],
-            "staged_payload_path": row["staged_payload_path"],
-            "staged_payload_checksum": row["staged_payload_checksum"],
-            "staged_payload_size_bytes": row["staged_payload_size_bytes"],
-            "error": row["error"],
-            "metadata": _json_loads(row["metadata_json"]),
-            "created_at": row["created_at"],
-            "updated_at": row["updated_at"],
-            "assigned_at": row["assigned_at"],
-            "leased_at": row["leased_at"],
-            "lease_expires_at": row["lease_expires_at"],
-            "finalizing_until": row["finalizing_until"],
-        }
+        return self._queries.row_to_record(row)
 
 
 def _ray_namespace() -> str:

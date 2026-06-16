@@ -40,7 +40,6 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -49,6 +48,8 @@ def test_issue_230_timeout_does_not_kill_actor(monkeypatch: pytest.MonkeyPatch) 
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     killed: list[dict] = []
 
@@ -92,7 +93,6 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -101,6 +101,8 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     observed_inflight: list[int] = []
     before_last_accessed = pool.get(actor_name).last_accessed
@@ -149,7 +151,6 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
     pool.mark_ready(actor_name)
 
     engine = VerlTrainingEngine()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
 
     session = TrainingSession(
         model_id=model_id,
@@ -158,6 +159,8 @@ def test_issue_230_keepalive_cancellation_silences_late_exception(monkeypatch: p
         base_model="Qwen/Qwen3-0.6B",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
     discarded: list[str] = []
 
     from mint_server.backend.ray_cluster import async_ray_control
@@ -215,8 +218,6 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
 
     engine = VerlTrainingEngine()
     shared_worker = object()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._model_actor_supervisor_actor_names[other_model_id] = actor_name
     engine._workers[model_id] = shared_worker
     engine._workers[other_model_id] = shared_worker
 
@@ -227,6 +228,8 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
         base_model="Qwen/Qwen3-4B-Instruct-2507",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     import mint_server.backend.training.verl.verl_training as verl_training
 
@@ -236,13 +239,19 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
         killed.append(dict(kwargs))
 
     monkeypatch.setattr(verl_training.ray_kill, "kill", _fake_kill)
+    monkeypatch.setattr(
+        "mint_server.backend.stores.training_session_store.list_training_sessions",
+        lambda: [
+            {"model_id": model_id, "actor_name": actor_name},
+            {"model_id": other_model_id, "actor_name": actor_name},
+        ],
+    )
 
     asyncio.run(engine.shutdown_session(session))
 
     assert killed == []
-    assert model_id not in engine._model_actor_supervisor_actor_names
-    assert other_model_id in engine._model_actor_supervisor_actor_names
     assert model_id not in engine._workers
+    assert other_model_id in engine._workers
     assert entry.current_session == other_model_id
     assert pool.get(actor_name).current_session == other_model_id
 
@@ -277,7 +286,6 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
             return True
 
     worker = _ShutdownRecorder()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
     engine._workers[model_id] = worker
 
     session = TrainingSession(
@@ -287,6 +295,8 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
         base_model="Qwen/Qwen3-4B-Instruct-2507",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     import mint_server.backend.training.verl.verl_training as verl_training
 
@@ -301,7 +311,6 @@ def test_issue_230_shutdown_session_keeps_protected_dense_actor_alive(monkeypatc
 
     assert worker.calls == 0
     assert killed == []
-    assert model_id not in engine._model_actor_supervisor_actor_names
     assert model_id not in engine._workers
     assert entry.current_session is None
     assert pool.is_protected(actor_name) is True

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import time
@@ -44,10 +43,24 @@ from mint_server.backend.contracts.control_plane_contracts import (
     as_task_ledger,
 )
 from mint_server.backend.stores.task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
+from mint_server.backend.scheduling.scheduler_admission import (
+    AdmissionAccounting,
+    sampling_inflight_admission_mode,
+    sampling_inflight_limit,
+)
+from mint_server.backend.scheduling.scheduler_counters import SchedulerCounters
+from mint_server.backend.scheduling.scheduler_loops import BackgroundLoopSupervisor
+from mint_server.backend.scheduling.scheduler_metrics import (
+    CLAIMABLE_REPLICA_STATUSES,
+    SchedulerMetrics,
+    metric_number,
+    otel_metric_attrs,
+    scheduler_domain_base_model,
+)
+from mint_server.backend.scheduling.scheduler_queue_projection import QueueProjection
 
 logger = logging.getLogger(__name__)
 
-CLAIMABLE_REPLICA_STATUSES = frozenset({"healthy", "ready"})
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
 TRAINING_SAME_AFFINITY_MULTI_CLAIM_DOMAINS = ("bumblebee:", "megatron:")
@@ -86,23 +99,11 @@ def _ray_model_work_scheduler_actor_name() -> str:
 
 
 def _otel_metric_attrs() -> dict[str, str]:
-    attrs = {
-        "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
-        "mint.cluster_id": os.getenv("MINT_CLUSTER_ID", "").strip(),
-        "ray_namespace": _ray_namespace(),
-    }
-    return {key: value for key, value in attrs.items() if value}
+    return otel_metric_attrs(ray_namespace=_ray_namespace())
 
 
 def _metric_number(value: object) -> float | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return 1.0 if value else 0.0
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+    return metric_number(value)
 
 
 def _same_affinity_multi_claim_domains_from_env() -> tuple[str, ...]:
@@ -120,39 +121,15 @@ def _model_work_scheduler_use_task_state_store_from_env() -> bool:
 
 
 def _sampling_inflight_admission_mode() -> str:
-    raw = (
-        os.environ.get("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE")
-        or str(getattr(server_config, "sampling_inflight_admission_mode", "observe"))
-    )
-    mode = str(raw).strip().lower()
-    if mode in {"0", "false", "disabled", "disable"}:
-        return "off"
-    if mode in {"1", "true", "enabled", "enable"}:
-        return "enforce"
-    if mode in {"off", "observe", "enforce"}:
-        return mode
-    return "observe"
+    return sampling_inflight_admission_mode()
 
 
 def _sampling_inflight_limit(name: str, config_attr: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        raw = getattr(server_config, config_attr, default)
-    try:
-        return int(raw)
-    except (TypeError, ValueError):
-        return int(default)
+    return sampling_inflight_limit(name, config_attr, default)
 
 
 def _scheduler_domain_base_model(domain_key: object) -> str | None:
-    domain = str(domain_key or "").strip()
-    if not domain or ":" not in domain:
-        return None
-    backend, model = domain.split(":", 1)
-    if backend.strip().lower() != "vllm":
-        return None
-    model = model.strip()
-    return model or None
+    return scheduler_domain_base_model(domain_key)
 
 
 def _model_work_scheduler_actor_resources() -> dict[str, float] | None:
@@ -393,288 +370,265 @@ class _ModelWorkSchedulerActor:
         self._lease_id_by_request_id: dict[str, str] = {}
         self._request_locations: dict[str, str] = {}
         self._affinity_replica: dict[tuple[str, str], str] = {}
-        self._completed = 0
-        self._failed = 0
-        self._requeued = 0
-        self._stale_dropped = 0
-        self._appended = 0
-        self._assigned = 0
-        self._claimed = 0
-        self._sampling_inflight_by_domain: dict[str, int] = {}
-        self._sampling_inflight_by_principal_domain: dict[tuple[str, str], int] = {}
-        self._sampling_inflight_tokens_by_domain: dict[str, int] = {}
-        self._sampling_inflight_tokens_by_principal_domain: dict[tuple[str, str], int] = {}
-        self._sampling_principal_domain_by_request_id: dict[str, tuple[str, str]] = {}
-        self._sampling_token_cost_by_request_id: dict[str, int] = {}
-        self._sampling_admission_would_reject: dict[tuple[str, str], int] = {}
-        self._sampling_admission_reject: dict[tuple[str, str], int] = {}
-        self._background_loop_manager_task: asyncio.Task | None = None
-        self._background_loop_tasks: dict[str, asyncio.Task] = {}
-        self._background_loop_start_deferred: set[str] = set()
-        self._background_loops_shutdown = False
-        self._assignment_loop_task: asyncio.Task | None = None
-        self._assignment_loop_interval_s = float(
-            os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")
-        )
-        self._reaper_loop_task: asyncio.Task | None = None
-        self._reaper_loop_interval_s = float(
-            os.environ.get("MINT_MODEL_WORK_SCHEDULER_REAPER_INTERVAL_S", "10.0")
-        )
-        self._reaper_recovered = 0
-        self._reaper_scanned = 0
+        self._counters = SchedulerCounters()
+        self._admission = AdmissionAccounting()
+        self._queue_projection = QueueProjection(self)
         owner_ttl_s = float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0))
         self._task_state_owner_lock = asyncio.Lock()
-        self._owner_heartbeat_task: asyncio.Task | None = None
-        self._owner_heartbeat_interval_s = float(
-            os.environ.get(
-                "MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S",
-                str(max(1.0, min(10.0, owner_ttl_s / 3.0))),
-            )
+        self._loops = BackgroundLoopSupervisor(
+            assignment_loop=self._assignment_loop,
+            owner_heartbeat_loop=self._owner_heartbeat_loop,
+            reaper_loop=self._reaper_loop,
+            use_task_state_store=self._use_task_state_store,
+            assignment_interval_s=float(os.environ.get("MINT_MODEL_WORK_SCHEDULER_ASSIGNMENT_INTERVAL_S", "1.0")),
+            owner_heartbeat_interval_s=float(
+                os.environ.get(
+                    "MINT_MODEL_WORK_SCHEDULER_OWNER_HEARTBEAT_INTERVAL_S",
+                    str(max(1.0, min(10.0, owner_ttl_s / 3.0))),
+                )
+            ),
+            reaper_interval_s=float(os.environ.get("MINT_MODEL_WORK_SCHEDULER_REAPER_INTERVAL_S", "10.0")),
         )
-        self._otel_enabled = False
-        self._otel_error: str | None = None
+        self._metrics = SchedulerMetrics(
+            ray_namespace=_ray_namespace,
+            stats_snapshot=self._stats_snapshot,
+        )
         self._init_otel_metrics()
         self._ensure_background_loops_started()
 
+    @property
+    def _assigned_work_type(self) -> type[_AssignedWork]:
+        return _AssignedWork
+
+    @staticmethod
+    def _queue_key(domain_key: str, replica_id: str) -> tuple[str, str]:
+        return _queue_key(domain_key, replica_id)
+
+    @property
+    def _completed(self) -> int:
+        return self._counters.completed
+
+    @_completed.setter
+    def _completed(self, value: int) -> None:
+        self._counters.completed = int(value)
+
+    @property
+    def _failed(self) -> int:
+        return self._counters.failed
+
+    @_failed.setter
+    def _failed(self, value: int) -> None:
+        self._counters.failed = int(value)
+
+    @property
+    def _requeued(self) -> int:
+        return self._counters.requeued
+
+    @_requeued.setter
+    def _requeued(self, value: int) -> None:
+        self._counters.requeued = int(value)
+
+    @property
+    def _stale_dropped(self) -> int:
+        return self._counters.stale_dropped
+
+    @_stale_dropped.setter
+    def _stale_dropped(self, value: int) -> None:
+        self._counters.stale_dropped = int(value)
+
+    @property
+    def _appended(self) -> int:
+        return self._counters.appended
+
+    @_appended.setter
+    def _appended(self, value: int) -> None:
+        self._counters.appended = int(value)
+
+    @property
+    def _assigned(self) -> int:
+        return self._counters.assigned
+
+    @_assigned.setter
+    def _assigned(self, value: int) -> None:
+        self._counters.assigned = int(value)
+
+    @property
+    def _claimed(self) -> int:
+        return self._counters.claimed
+
+    @_claimed.setter
+    def _claimed(self, value: int) -> None:
+        self._counters.claimed = int(value)
+
+    @property
+    def _reaper_recovered(self) -> int:
+        return self._counters.reaper_recovered
+
+    @_reaper_recovered.setter
+    def _reaper_recovered(self, value: int) -> None:
+        self._counters.reaper_recovered = int(value)
+
+    @property
+    def _reaper_scanned(self) -> int:
+        return self._counters.reaper_scanned
+
+    @_reaper_scanned.setter
+    def _reaper_scanned(self, value: int) -> None:
+        self._counters.reaper_scanned = int(value)
+
+    @property
+    def _background_loop_manager_task(self) -> asyncio.Task | None:
+        return self._loops.manager_task
+
+    @_background_loop_manager_task.setter
+    def _background_loop_manager_task(self, value: asyncio.Task | None) -> None:
+        self._loops.manager_task = value
+
+    @property
+    def _background_loop_tasks(self) -> dict[str, asyncio.Task]:
+        return self._loops.tasks
+
+    @property
+    def _background_loop_start_deferred(self) -> set[str]:
+        return self._loops.start_deferred
+
+    @_background_loop_start_deferred.setter
+    def _background_loop_start_deferred(self, value: set[str]) -> None:
+        self._loops.start_deferred = value
+
+    @property
+    def _background_loops_shutdown(self) -> bool:
+        return self._loops.shutdown
+
+    @_background_loops_shutdown.setter
+    def _background_loops_shutdown(self, value: bool) -> None:
+        self._loops.shutdown = value
+
+    @property
+    def _assignment_loop_task(self) -> asyncio.Task | None:
+        return self._loops.assignment_task
+
+    @_assignment_loop_task.setter
+    def _assignment_loop_task(self, value: asyncio.Task | None) -> None:
+        self._loops.assignment_task = value
+
+    @property
+    def _assignment_loop_interval_s(self) -> float:
+        return self._loops.assignment_interval_s
+
+    @_assignment_loop_interval_s.setter
+    def _assignment_loop_interval_s(self, value: float) -> None:
+        self._loops.assignment_interval_s = float(value)
+
+    @property
+    def _owner_heartbeat_task(self) -> asyncio.Task | None:
+        return self._loops.owner_heartbeat_task
+
+    @_owner_heartbeat_task.setter
+    def _owner_heartbeat_task(self, value: asyncio.Task | None) -> None:
+        self._loops.owner_heartbeat_task = value
+
+    @property
+    def _owner_heartbeat_interval_s(self) -> float:
+        return self._loops.owner_heartbeat_interval_s
+
+    @_owner_heartbeat_interval_s.setter
+    def _owner_heartbeat_interval_s(self, value: float) -> None:
+        self._loops.owner_heartbeat_interval_s = float(value)
+
+    @property
+    def _reaper_loop_task(self) -> asyncio.Task | None:
+        return self._loops.reaper_task
+
+    @_reaper_loop_task.setter
+    def _reaper_loop_task(self, value: asyncio.Task | None) -> None:
+        self._loops.reaper_task = value
+
+    @property
+    def _reaper_loop_interval_s(self) -> float:
+        return self._loops.reaper_interval_s
+
+    @_reaper_loop_interval_s.setter
+    def _reaper_loop_interval_s(self, value: float) -> None:
+        self._loops.reaper_interval_s = float(value)
+
+    @property
+    def _otel_enabled(self) -> bool:
+        return self._metrics.enabled
+
+    @property
+    def _otel_error(self) -> str | None:
+        return self._metrics.error
+
+    @property
+    def _sampling_inflight_by_domain(self) -> dict[str, int]:
+        return self._admission.inflight_by_domain
+
+    @_sampling_inflight_by_domain.setter
+    def _sampling_inflight_by_domain(self, value: dict[str, int]) -> None:
+        self._admission.inflight_by_domain = value
+
+    @property
+    def _sampling_inflight_by_principal_domain(self) -> dict[tuple[str, str], int]:
+        return self._admission.inflight_by_principal_domain
+
+    @_sampling_inflight_by_principal_domain.setter
+    def _sampling_inflight_by_principal_domain(self, value: dict[tuple[str, str], int]) -> None:
+        self._admission.inflight_by_principal_domain = value
+
+    @property
+    def _sampling_inflight_tokens_by_domain(self) -> dict[str, int]:
+        return self._admission.inflight_tokens_by_domain
+
+    @_sampling_inflight_tokens_by_domain.setter
+    def _sampling_inflight_tokens_by_domain(self, value: dict[str, int]) -> None:
+        self._admission.inflight_tokens_by_domain = value
+
+    @property
+    def _sampling_inflight_tokens_by_principal_domain(self) -> dict[tuple[str, str], int]:
+        return self._admission.inflight_tokens_by_principal_domain
+
+    @_sampling_inflight_tokens_by_principal_domain.setter
+    def _sampling_inflight_tokens_by_principal_domain(
+        self,
+        value: dict[tuple[str, str], int],
+    ) -> None:
+        self._admission.inflight_tokens_by_principal_domain = value
+
+    @property
+    def _sampling_principal_domain_by_request_id(self) -> dict[str, tuple[str, str]]:
+        return self._admission.principal_domain_by_request_id
+
+    @_sampling_principal_domain_by_request_id.setter
+    def _sampling_principal_domain_by_request_id(self, value: dict[str, tuple[str, str]]) -> None:
+        self._admission.principal_domain_by_request_id = value
+
+    @property
+    def _sampling_token_cost_by_request_id(self) -> dict[str, int]:
+        return self._admission.token_cost_by_request_id
+
+    @_sampling_token_cost_by_request_id.setter
+    def _sampling_token_cost_by_request_id(self, value: dict[str, int]) -> None:
+        self._admission.token_cost_by_request_id = value
+
+    @property
+    def _sampling_admission_would_reject(self) -> dict[tuple[str, str], int]:
+        return self._admission.would_reject
+
+    @_sampling_admission_would_reject.setter
+    def _sampling_admission_would_reject(self, value: dict[tuple[str, str], int]) -> None:
+        self._admission.would_reject = value
+
+    @property
+    def _sampling_admission_reject(self) -> dict[tuple[str, str], int]:
+        return self._admission.reject
+
+    @_sampling_admission_reject.setter
+    def _sampling_admission_reject(self, value: dict[tuple[str, str], int]) -> None:
+        self._admission.reject = value
+
     def _init_otel_metrics(self) -> None:
-        endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
-        if not endpoint:
-            return
-        try:
-            from opentelemetry import metrics
-            from opentelemetry.metrics import Observation
-
-            meter = metrics.get_meter("mint.model_work_scheduler")
-
-            def _attrs(**extra: object) -> dict[str, str]:
-                attrs = _otel_metric_attrs()
-                for key, value in extra.items():
-                    text = str(value if value is not None else "").strip()
-                    if text:
-                        attrs[key] = text
-                return attrs
-
-            def _gauge(name: str, callback, *, unit: str | None = None) -> None:
-                kwargs: dict[str, Any] = {"callbacks": [callback]}
-                if unit:
-                    kwargs["unit"] = unit
-                meter.create_observable_gauge(name, **kwargs)
-
-            def _scalar(field: str):
-                def _callback(_options):
-                    value = _metric_number(self._stats_snapshot().get(field))
-                    if value is None:
-                        return []
-                    return [Observation(value, _attrs())]
-
-                return _callback
-
-            _gauge("mint_model_work_scheduler_depth", _scalar("depth"))
-            _gauge("mint_model_work_scheduler_backlog_depth", _scalar("backlog_depth"))
-
-            def _counter(field: str):
-                def _callback(_options):
-                    counters = self._stats_snapshot().get("counters")
-                    if not isinstance(counters, dict):
-                        return []
-                    value = _metric_number(counters.get(field))
-                    if value is None:
-                        return []
-                    return [Observation(value, _attrs())]
-
-                return _callback
-
-            for key in (
-                "appended",
-                "assigned",
-                "claimed",
-                "completed",
-                "failed",
-                "requeued",
-                "stale_dropped",
-            ):
-                _gauge(f"mint_model_work_scheduler_{key}_total", _counter(key))
-
-            def _domain_backlog(_options):
-                backlog_by_domain = self._stats_snapshot().get("backlog_depth_by_domain")
-                if not isinstance(backlog_by_domain, dict):
-                    return []
-                observations = []
-                for domain_key, depth in sorted(backlog_by_domain.items()):
-                    value = _metric_number(depth)
-                    if value is None:
-                        continue
-                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
-                return observations
-
-            _gauge("mint_model_work_scheduler_domain_backlog_depth", _domain_backlog)
-
-            def _replica_queue_depth(_options):
-                replica_queues = self._stats_snapshot().get("replica_queues")
-                if not isinstance(replica_queues, dict):
-                    return []
-                observations = []
-                for queue_id, rec in sorted(replica_queues.items()):
-                    if not isinstance(rec, dict):
-                        continue
-                    value = _metric_number(rec.get("depth"))
-                    if value is None:
-                        continue
-                    observations.append(
-                        Observation(
-                            value,
-                            _attrs(
-                                domain_key=rec.get("domain_key") or "unknown",
-                                replica_id=rec.get("replica_id") or "unknown",
-                                queue_id=queue_id,
-                                status=rec.get("status") or "unknown",
-                            ),
-                        )
-                    )
-                return observations
-
-            _gauge("mint_model_work_scheduler_replica_queue_depth", _replica_queue_depth)
-
-            def _leases(_options):
-                leases = self._stats_snapshot().get("leases")
-                if not isinstance(leases, list):
-                    return []
-                return [Observation(float(len(leases)), _attrs())]
-
-            _gauge("mint_model_work_scheduler_leases", _leases)
-
-            def _sample_model_load(metric: str):
-                def _callback(_options):
-                    stats = self._stats_snapshot()
-                    load: dict[str, dict[str, float]] = {}
-                    replica_queues = stats.get("replica_queues")
-                    if isinstance(replica_queues, dict):
-                        for rec in replica_queues.values():
-                            if not isinstance(rec, dict):
-                                continue
-                            base_model = _scheduler_domain_base_model(rec.get("domain_key"))
-                            if not base_model:
-                                continue
-                            bucket = load.setdefault(
-                                base_model,
-                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
-                            )
-                            bucket["pending_requests"] += float(_metric_number(rec.get("depth")) or 0.0)
-                            if str(rec.get("status") or "").lower() in CLAIMABLE_REPLICA_STATUSES:
-                                bucket["capacity_workers"] += 1.0
-                    leases = stats.get("leases")
-                    if isinstance(leases, list):
-                        for lease in leases:
-                            if not isinstance(lease, dict):
-                                continue
-                            item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
-                            base_model = _scheduler_domain_base_model(
-                                item.get("domain_key") or lease.get("domain_key")
-                            )
-                            if not base_model:
-                                continue
-                            bucket = load.setdefault(
-                                base_model,
-                                {"pending_requests": 0.0, "inflight_workers": 0.0, "capacity_workers": 0.0},
-                            )
-                            bucket["inflight_workers"] += 1.0
-                    observations = []
-                    for base_model, bucket in sorted(load.items()):
-                        capacity = float(bucket.get("capacity_workers", 0.0))
-                        values = {
-                            "pending_requests": float(bucket.get("pending_requests", 0.0)),
-                            "inflight_workers": float(bucket.get("inflight_workers", 0.0)),
-                            "capacity_workers": capacity,
-                            "load_pct": 0.0
-                            if capacity <= 0.0
-                            else 100.0 * float(bucket.get("inflight_workers", 0.0)) / capacity,
-                        }
-                        observations.append(
-                            Observation(
-                                values[metric],
-                                _attrs(base_model=base_model, workload="sample"),
-                            )
-                        )
-                    return observations
-
-                return _callback
-
-            _gauge("mint_model_load_pct", _sample_model_load("load_pct"))
-            _gauge("mint_model_pending_requests", _sample_model_load("pending_requests"))
-            _gauge("mint_model_inflight_workers", _sample_model_load("inflight_workers"))
-            _gauge("mint_model_capacity_workers", _sample_model_load("capacity_workers"))
-
-            def _sampling_inflight_by_domain(_options):
-                sampling = self._stats_snapshot().get("sampling_inflight")
-                by_domain = sampling.get("by_domain") if isinstance(sampling, dict) else None
-                if not isinstance(by_domain, dict):
-                    return []
-                observations = []
-                for domain_key, count in sorted(by_domain.items()):
-                    value = _metric_number(count)
-                    if value is None:
-                        continue
-                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
-                return observations
-
-            _gauge("mint_sampling_inflight_by_domain", _sampling_inflight_by_domain)
-
-            def _sampling_inflight_principal_domain_max(_options):
-                sampling = self._stats_snapshot().get("sampling_inflight")
-                max_by_domain = sampling.get("principal_domain_max_by_domain") if isinstance(sampling, dict) else None
-                if not isinstance(max_by_domain, dict):
-                    return []
-                observations = []
-                for domain_key, count in sorted(max_by_domain.items()):
-                    value = _metric_number(count)
-                    if value is None:
-                        continue
-                    observations.append(Observation(value, _attrs(domain_key=domain_key)))
-                return observations
-
-            _gauge(
-                "mint_sampling_inflight_principal_domain_max",
-                _sampling_inflight_principal_domain_max,
-            )
-
-            def _sampling_admission_counter(decision: str):
-                def _callback(_options):
-                    stats = self._stats_snapshot().get("sampling_admission_counters")
-                    records = stats.get(decision) if isinstance(stats, dict) else None
-                    if not isinstance(records, list):
-                        return []
-                    observations = []
-                    for record in records:
-                        if not isinstance(record, dict):
-                            continue
-                        value = _metric_number(record.get("count"))
-                        if value is None:
-                            continue
-                        observations.append(
-                            Observation(
-                                value,
-                                _attrs(
-                                    domain_key=record.get("domain_key"),
-                                    reason=record.get("reason"),
-                                ),
-                            )
-                        )
-                    return observations
-
-                return _callback
-
-            _gauge(
-                "mint_sampling_admission_would_reject_total",
-                _sampling_admission_counter("would_reject"),
-            )
-            _gauge(
-                "mint_sampling_admission_reject_total",
-                _sampling_admission_counter("reject"),
-            )
-
-            self._otel_enabled = True
-        except Exception as e:
-            self._otel_error = f"{type(e).__name__}: {e}"
+        self._metrics.init_otel_metrics()
 
     def _all_request_ids(self) -> set[str]:
         return set(self._request_locations)
@@ -749,91 +703,16 @@ class _ModelWorkSchedulerActor:
                 )
 
     def _desired_background_loop_names(self) -> list[str]:
-        names: list[str] = []
-        if self._assignment_loop_interval_s > 0:
-            names.append("assignment")
-        if self._use_task_state_store and self._owner_heartbeat_interval_s > 0:
-            names.append("owner_heartbeat")
-        if self._use_task_state_store and self._reaper_loop_interval_s > 0:
-            names.append("reaper")
-        return names
+        return self._loops.desired_names()
 
     def _background_loop_running(self, name: str) -> bool:
-        task = self._background_loop_tasks.get(name)
-        if task is not None:
-            return not task.done()
-        manager = self._background_loop_manager_task
-        return (
-            manager is not None
-            and not manager.done()
-            and name in self._desired_background_loop_names()
-            and name not in self._background_loop_start_deferred
-        )
-
-    async def _background_loop_manager(self) -> None:
-        try:
-            async with asyncio.TaskGroup() as task_group:
-                if "assignment" in self._desired_background_loop_names():
-                    self._assignment_loop_task = task_group.create_task(
-                        self._assignment_loop(),
-                        name="model-work-scheduler-assignment-loop",
-                    )
-                    self._background_loop_tasks["assignment"] = self._assignment_loop_task
-                if "owner_heartbeat" in self._desired_background_loop_names():
-                    self._owner_heartbeat_task = task_group.create_task(
-                        self._owner_heartbeat_loop(),
-                        name="model-work-scheduler-owner-heartbeat-loop",
-                    )
-                    self._background_loop_tasks["owner_heartbeat"] = self._owner_heartbeat_task
-                if "reaper" in self._desired_background_loop_names():
-                    self._reaper_loop_task = task_group.create_task(
-                        self._reaper_loop(),
-                        name="model-work-scheduler-reaper-loop",
-                    )
-                    self._background_loop_tasks["reaper"] = self._reaper_loop_task
-        finally:
-            self._background_loop_tasks.clear()
-            self._assignment_loop_task = None
-            self._owner_heartbeat_task = None
-            self._reaper_loop_task = None
+        return self._loops.running(name)
 
     def _ensure_background_loops_started(self) -> None:
-        if self._background_loops_shutdown:
-            return
-        desired = self._desired_background_loop_names()
-        if not desired:
-            self._background_loop_start_deferred.clear()
-            return
-        if self._background_loop_manager_task is not None and not self._background_loop_manager_task.done():
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self._background_loop_start_deferred = set(desired)
-            logger.debug(
-                "[model_work_scheduler] background loop start deferred; no running event loop names=%s",
-                sorted(desired),
-            )
-            return
-        self._background_loop_start_deferred.clear()
-        self._background_loop_manager_task = loop.create_task(
-            self._background_loop_manager(),
-            name="model-work-scheduler-background-loop-manager",
-        )
+        self._loops.ensure_started()
 
     async def shutdown_background_loops(self) -> dict[str, Any]:
-        self._background_loops_shutdown = True
-        task = self._background_loop_manager_task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        self._background_loop_manager_task = None
-        self._background_loop_tasks.clear()
-        self._assignment_loop_task = None
-        self._owner_heartbeat_task = None
-        self._reaper_loop_task = None
-        return {"ok": True}
+        return await self._loops.shutdown_loops()
 
     def _ensure_owner_heartbeat_started(self) -> None:
         self._ensure_background_loops_started()
@@ -898,182 +777,19 @@ class _ModelWorkSchedulerActor:
         )
 
     def _is_sampling_inflight_work(self, item: ModelWorkItem) -> bool:
-        return str(item.op) == "sampling.asample"
+        return self._admission.is_sampling_inflight_work(item)
 
     def _sampling_principal(self, item: ModelWorkItem) -> str:
-        extra_principal = item.extra.get("sampling_admission_principal")
-        for value in (extra_principal, item.throttle_principal, item.apikey_id, item.user_id):
-            text = str(value or "").strip()
-            if text:
-                return text
-        return "anonymous"
+        return self._admission.principal(item)
 
     def _track_sampling_inflight_locked(self, item: ModelWorkItem) -> None:
-        if not self._is_sampling_inflight_work(item):
-            return
-        request_id = str(item.request_id)
-        if request_id in self._sampling_principal_domain_by_request_id:
-            return
-        domain_key = str(item.domain_key)
-        principal = self._sampling_principal(item)
-        key = (principal, domain_key)
-        self._sampling_principal_domain_by_request_id[request_id] = key
-        token_cost = max(1, int(item.token_cost))
-        self._sampling_token_cost_by_request_id[request_id] = token_cost
-        self._sampling_inflight_by_domain[domain_key] = self._sampling_inflight_by_domain.get(domain_key, 0) + 1
-        self._sampling_inflight_by_principal_domain[key] = (
-            self._sampling_inflight_by_principal_domain.get(key, 0) + 1
-        )
-        self._sampling_inflight_tokens_by_domain[domain_key] = (
-            self._sampling_inflight_tokens_by_domain.get(domain_key, 0) + token_cost
-        )
-        self._sampling_inflight_tokens_by_principal_domain[key] = (
-            self._sampling_inflight_tokens_by_principal_domain.get(key, 0) + token_cost
-        )
+        self._admission.track_locked(item)
 
     def _untrack_sampling_inflight_locked(self, request_id: str) -> None:
-        key = self._sampling_principal_domain_by_request_id.pop(str(request_id), None)
-        if key is None:
-            return
-        principal, domain_key = key
-        token_cost = max(1, int(self._sampling_token_cost_by_request_id.pop(str(request_id), 1)))
-        current_domain = self._sampling_inflight_by_domain.get(domain_key, 0) - 1
-        if current_domain > 0:
-            self._sampling_inflight_by_domain[domain_key] = current_domain
-        else:
-            self._sampling_inflight_by_domain.pop(domain_key, None)
-        current_principal = self._sampling_inflight_by_principal_domain.get((principal, domain_key), 0) - 1
-        if current_principal > 0:
-            self._sampling_inflight_by_principal_domain[(principal, domain_key)] = current_principal
-        else:
-            self._sampling_inflight_by_principal_domain.pop((principal, domain_key), None)
-        current_domain_tokens = self._sampling_inflight_tokens_by_domain.get(domain_key, 0) - token_cost
-        if current_domain_tokens > 0:
-            self._sampling_inflight_tokens_by_domain[domain_key] = current_domain_tokens
-        else:
-            self._sampling_inflight_tokens_by_domain.pop(domain_key, None)
-        current_principal_tokens = (
-            self._sampling_inflight_tokens_by_principal_domain.get((principal, domain_key), 0)
-            - token_cost
-        )
-        if current_principal_tokens > 0:
-            self._sampling_inflight_tokens_by_principal_domain[(principal, domain_key)] = current_principal_tokens
-        else:
-            self._sampling_inflight_tokens_by_principal_domain.pop((principal, domain_key), None)
+        self._admission.untrack_locked(request_id)
 
     def _sampling_inflight_limit_decision_locked(self, item: ModelWorkItem) -> dict[str, Any]:
-        mode = _sampling_inflight_admission_mode()
-        if mode == "off" or not self._is_sampling_inflight_work(item):
-            return {"ok": True, "mode": mode}
-        domain_key = str(item.domain_key)
-        principal = self._sampling_principal(item)
-        principal_key = (principal, domain_key)
-        principal_current = int(self._sampling_inflight_by_principal_domain.get(principal_key, 0))
-        domain_current = int(self._sampling_inflight_by_domain.get(domain_key, 0))
-        token_cost = max(1, int(item.token_cost))
-        principal_token_current = int(
-            self._sampling_inflight_tokens_by_principal_domain.get(principal_key, 0)
-        )
-        domain_token_current = int(self._sampling_inflight_tokens_by_domain.get(domain_key, 0))
-        principal_limit = _sampling_inflight_limit(
-            "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
-            "sampling_max_inflight_per_principal_domain",
-            1024,
-        )
-        domain_limit = _sampling_inflight_limit(
-            "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
-            "sampling_max_inflight_per_domain",
-            10240,
-        )
-        principal_token_limit = _sampling_inflight_limit(
-            "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
-            "sampling_max_inflight_tokens_per_principal_domain",
-            0,
-        )
-        domain_token_limit = _sampling_inflight_limit(
-            "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
-            "sampling_max_inflight_tokens_per_domain",
-            0,
-        )
-        reason: str | None = None
-        current = 0
-        limit = 0
-        if principal_limit > 0 and principal_current >= principal_limit:
-            reason = "principal_domain_inflight_limit_exceeded"
-            current = principal_current
-            limit = principal_limit
-        elif domain_limit > 0 and domain_current >= domain_limit:
-            reason = "domain_inflight_limit_exceeded"
-            current = domain_current
-            limit = domain_limit
-        elif principal_token_limit > 0 and principal_token_current + token_cost > principal_token_limit:
-            reason = "principal_domain_token_budget_exceeded"
-            current = principal_token_current + token_cost
-            limit = principal_token_limit
-        elif domain_token_limit > 0 and domain_token_current + token_cost > domain_token_limit:
-            reason = "domain_token_budget_exceeded"
-            current = domain_token_current + token_cost
-            limit = domain_token_limit
-        if reason is None:
-            return {
-                "ok": True,
-                "mode": mode,
-                "domain_key": domain_key,
-                "principal": principal,
-                "principal_current": principal_current,
-                "principal_limit": principal_limit,
-                "domain_current": domain_current,
-                "domain_limit": domain_limit,
-                "token_cost": token_cost,
-                "principal_token_current": principal_token_current,
-                "principal_token_limit": principal_token_limit,
-                "domain_token_current": domain_token_current,
-                "domain_token_limit": domain_token_limit,
-            }
-        counter_key = (domain_key, reason)
-        if mode == "observe":
-            self._sampling_admission_would_reject[counter_key] = (
-                self._sampling_admission_would_reject.get(counter_key, 0) + 1
-            )
-            return {
-                "ok": True,
-                "mode": mode,
-                "would_reject": True,
-                "reason": reason,
-                "domain_key": domain_key,
-                "principal": principal,
-                "current": current,
-                "limit": limit,
-                "principal_current": principal_current,
-                "principal_limit": principal_limit,
-                "domain_current": domain_current,
-                "domain_limit": domain_limit,
-                "token_cost": token_cost,
-                "principal_token_current": principal_token_current,
-                "principal_token_limit": principal_token_limit,
-                "domain_token_current": domain_token_current,
-                "domain_token_limit": domain_token_limit,
-            }
-        self._sampling_admission_reject[counter_key] = self._sampling_admission_reject.get(counter_key, 0) + 1
-        return {
-            "ok": False,
-            "mode": mode,
-            "reason": reason,
-            "domain_key": domain_key,
-            "principal": principal,
-            "current": current,
-            "limit": limit,
-            "principal_current": principal_current,
-            "principal_limit": principal_limit,
-            "domain_current": domain_current,
-            "domain_limit": domain_limit,
-            "token_cost": token_cost,
-            "principal_token_current": principal_token_current,
-            "principal_token_limit": principal_token_limit,
-            "domain_token_current": domain_token_current,
-            "domain_token_limit": domain_token_limit,
-            "retry_after_s": 5,
-        }
+        return self._admission.limit_decision_locked(item)
 
     async def _persist_requeue_task(self, request_id: str, *, reason: str) -> bool:
         if not self._use_task_state_store:
@@ -1212,20 +928,7 @@ class _ModelWorkSchedulerActor:
         return True
 
     def _hot_projection_matches_work_item_locked(self, item: ModelWorkItem) -> bool:
-        lease_id = self._lease_id_by_request_id.get(item.request_id)
-        if lease_id is not None:
-            lease = self._leases_by_id.get(lease_id)
-            if lease is not None:
-                return self._task_record_matches_work_item(lease.item.to_dict(), item)
-        for queue in self._replica_queues.values():
-            for assigned in queue:
-                if assigned.item.request_id == item.request_id:
-                    return self._task_record_matches_work_item(assigned.item.to_dict(), item)
-        for backlog in self._domain_backlog.values():
-            for current in backlog:
-                if current.request_id == item.request_id:
-                    return self._task_record_matches_work_item(current.to_dict(), item)
-        return False
+        return self._queue_projection.hot_projection_matches_work_item_locked(item)
 
     async def _duplicate_append_matches_hydrated_pending_task(self, item: ModelWorkItem) -> bool:
         if not self._use_task_state_store:
@@ -1309,10 +1012,10 @@ class _ModelWorkSchedulerActor:
             )
 
     def _backlog(self, domain_key: str) -> deque[ModelWorkItem]:
-        return self._domain_backlog.setdefault(str(domain_key), deque())
+        return self._queue_projection.backlog(domain_key)
 
     def _queue(self, domain_key: str, replica_id: str) -> deque[_AssignedWork]:
-        return self._replica_queues.setdefault(_queue_key(domain_key, replica_id), deque())
+        return self._queue_projection.queue(domain_key, replica_id)
 
     def _claim_requires_same_affinity(self, domain_key: str) -> bool:
         prefixes = self._same_affinity_multi_claim_domains
@@ -1321,77 +1024,28 @@ class _ModelWorkSchedulerActor:
         return str(domain_key).startswith(prefixes)
 
     def _ordering_key_has_active_lease_locked(self, ordering_key: str | None) -> bool:
-        if not ordering_key:
-            return False
-        for lease in self._leases_by_id.values():
-            if lease.item.ordering_key == ordering_key:
-                return True
-        return False
+        return self._queue_projection.ordering_key_has_active_lease_locked(ordering_key)
 
     def _cluster_queue_head_affinity(self, queue: deque[_AssignedWork]) -> None:
-        if not queue:
-            return
-        affinity_group = queue[0].item.affinity_group
-        if affinity_group is None:
-            return
-        same: deque[_AssignedWork] = deque()
-        other: deque[_AssignedWork] = deque()
-        while queue:
-            assigned = queue.popleft()
-            if assigned.item.affinity_group == affinity_group:
-                same.append(assigned)
-            else:
-                other.append(assigned)
-        queue.extend(same)
-        queue.extend(other)
+        self._queue_projection.cluster_queue_head_affinity(queue)
 
     def _drop_empty_backlog(self, domain_key: str) -> None:
-        backlog = self._domain_backlog.get(domain_key)
-        if backlog is not None and not backlog:
-            self._domain_backlog.pop(domain_key, None)
+        self._queue_projection.drop_empty_backlog(domain_key)
 
     def _has_inflight_scheduler_transition_locked(self) -> bool:
-        return any(
-            location in {"assigning", "claiming", "requeueing", "finalizing"}
-            for location in self._request_locations.values()
-        )
+        return self._queue_projection.has_inflight_scheduler_transition_locked()
 
     def _assigned_matches_locked(self, assigned: _AssignedWork, *, location: str = "assigning") -> bool:
-        request_id = assigned.item.request_id
-        if self._request_locations.get(request_id) != location:
-            return False
-        if location != "assigning":
-            for queue in self._replica_queues.values():
-                if any(current.item.request_id == request_id for current in queue):
-                    return False
-        return not any(item.request_id == request_id for backlog in self._domain_backlog.values() for item in backlog)
+        return self._queue_projection.assigned_matches_locked(assigned, location=location)
 
     def _commit_assigned_locked(self, assigned: _AssignedWork) -> None:
-        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
-        if not any(current.item.request_id == assigned.item.request_id for current in queue):
-            queue.append(assigned)
-        self._request_locations[assigned.item.request_id] = "assigned"
-        self._assigned += 1
+        self._queue_projection.commit_assigned_locked(assigned)
 
     def _restore_assigned_to_queue_locked(self, assigned: _AssignedWork) -> None:
-        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
-        queue.appendleft(assigned)
-        self._request_locations[assigned.item.request_id] = "assigned"
+        self._queue_projection.restore_assigned_to_queue_locked(assigned)
 
     def _restore_assigning_to_backlog_locked(self, assigned: _AssignedWork) -> bool:
-        if self._request_locations.get(assigned.item.request_id) != "assigning":
-            return False
-        key = _queue_key(assigned.item.domain_key, assigned.replica_id)
-        queue = self._queue(assigned.item.domain_key, assigned.replica_id)
-        kept = deque(
-            current
-            for current in queue
-            if current.item.request_id != assigned.item.request_id
-        )
-        self._replica_queues[key] = kept
-        self._backlog(assigned.item.domain_key).appendleft(assigned.item)
-        self._request_locations[assigned.item.request_id] = "backlog"
-        return True
+        return self._queue_projection.restore_assigning_to_backlog_locked(assigned)
 
     async def _restore_or_commit_assigning_after_cancel(self, pending: list[_AssignedWork]) -> None:
         async with self._cv:
@@ -1420,34 +1074,7 @@ class _ModelWorkSchedulerActor:
                     self._restore_assigning_to_backlog_locked(assigned)
 
     def _prepare_assignments_locked(self, *, max_items: int | None = None) -> tuple[list[_AssignedWork], list[str]]:
-        pending: list[_AssignedWork] = []
-        skipped_domains: list[str] = []
-        limit = None if max_items is None else max(0, int(max_items))
-        for domain_key in sorted(list(self._domain_backlog)):
-            backlog = self._domain_backlog.get(domain_key)
-            while backlog:
-                if limit is not None and len(pending) >= limit:
-                    return pending, skipped_domains
-                item = backlog[0]
-                replica = self._choose_replica(item)
-                if replica is None:
-                    skipped_domains.append(domain_key)
-                    break
-                backlog.popleft()
-                assigned = _AssignedWork(
-                    item=item,
-                    replica_id=replica.replica_id,
-                    queue_id=replica.effective_queue_id,
-                    assigned_at=time.time(),
-                    assignment_generation=replica.generation,
-                    assignment_reason="least_loaded_affinity",
-                )
-                pending.append(assigned)
-                queue = self._queue(replica.domain_key, replica.replica_id)
-                queue.append(assigned)
-                self._request_locations[item.request_id] = "assigning"
-            self._drop_empty_backlog(domain_key)
-        return pending, skipped_domains
+        return self._queue_projection.prepare_assignments_locked(max_items=max_items)
 
     async def _assign_pending_core_unlocked(self, *, max_items: int | None = None) -> AssignPendingResult:
         async with self._cv:
@@ -1505,90 +1132,19 @@ class _ModelWorkSchedulerActor:
         return await self._assign_pending_typed(hydrate_task_state=hydrate_task_state)
 
     def _remove_request_from_memory_locked(self, request_id: str) -> bool:
-        request_id = str(request_id)
-        removed = False
-        for domain_key, backlog in list(self._domain_backlog.items()):
-            kept = deque(item for item in backlog if item.request_id != request_id)
-            if len(kept) != len(backlog):
-                removed = True
-                self._domain_backlog[domain_key] = kept
-                self._drop_empty_backlog(domain_key)
-        for key, queue in list(self._replica_queues.items()):
-            kept = deque(assigned for assigned in queue if assigned.item.request_id != request_id)
-            if len(kept) != len(queue):
-                removed = True
-                self._replica_queues[key] = kept
-        lease_id = self._lease_id_by_request_id.pop(request_id, None)
-        if lease_id is not None:
-            removed = self._leases_by_id.pop(lease_id, None) is not None or removed
-        self._request_locations.pop(request_id, None)
-        if removed:
-            self._untrack_sampling_inflight_locked(request_id)
-        return removed
+        return self._queue_projection.remove_request_from_memory_locked(request_id)
 
     def _claimable_replicas(self, domain_key: str) -> list[ModelReplicaRegistration]:
-        candidates = [
-            replica
-            for (replica_domain, _), replica in self._replicas.items()
-            if replica_domain == domain_key and replica.claimable
-        ]
-        active_by_replica: dict[str, int] = {}
-        for lease in self._leases_by_id.values():
-            if lease.domain_key != domain_key:
-                continue
-            active_by_replica[lease.replica_id] = active_by_replica.get(lease.replica_id, 0) + 1
-        replicas = [
-            replica
-            for replica in candidates
-            if active_by_replica.get(replica.replica_id, 0)
-            + len(self._queue(replica.domain_key, replica.replica_id))
-            < max(1, int(replica.capacity))
-        ]
-        replicas.sort(
-            key=lambda r: (
-                active_by_replica.get(r.replica_id, 0) + len(self._queue(r.domain_key, r.replica_id)),
-                active_by_replica.get(r.replica_id, 0),
-                len(self._queue(r.domain_key, r.replica_id)),
-                r.replica_id,
-            )
-        )
-        return replicas
+        return self._queue_projection.claimable_replicas(domain_key)
 
     def _choose_replica(self, item: ModelWorkItem) -> ModelReplicaRegistration | None:
-        replicas = self._claimable_replicas(item.domain_key)
-        if not replicas:
-            return None
-        if item.affinity_group:
-            affinity_key = (item.domain_key, item.affinity_group)
-            sticky = self._affinity_replica.get(affinity_key)
-            if sticky is not None:
-                for replica in replicas:
-                    if replica.replica_id == sticky:
-                        return replica
-        replica = replicas[0]
-        if item.affinity_group:
-            self._affinity_replica[(item.domain_key, item.affinity_group)] = replica.replica_id
-        return replica
+        return self._queue_projection.choose_replica(item)
 
     def _requeue_assigned(self, assigned: _AssignedWork, *, reason: str) -> None:
-        item = assigned.item
-        updated_extra = dict(item.extra)
-        updated_extra["last_requeue_reason"] = str(reason)
-        updated = ModelWorkItem(
-            **{
-                **asdict(item),
-                "request_json": item.request_json,
-                "extra": updated_extra,
-            }
-        )
-        self._backlog(updated.domain_key).appendleft(updated)
-        self._request_locations[updated.request_id] = "backlog"
-        self._requeued += 1
+        self._queue_projection.requeue_assigned(assigned, reason=reason)
 
     def _remove_request_location(self, request_id: str) -> None:
-        self._request_locations.pop(str(request_id), None)
-        self._lease_id_by_request_id.pop(str(request_id), None)
-        self._untrack_sampling_inflight_locked(str(request_id))
+        self._queue_projection.remove_request_location(request_id)
 
     def _claim_conflict_cause(self, exc: BaseException) -> TaskStateConflictError | None:
         if isinstance(exc, TaskStateConflictError):
@@ -1623,11 +1179,7 @@ class _ModelWorkSchedulerActor:
         return None
 
     def _drop_claiming_request_locked(self, assigned: _AssignedWork) -> bool:
-        if self._request_locations.get(assigned.item.request_id) != "claiming":
-            return False
-        self._remove_request_location(assigned.item.request_id)
-        self._stale_dropped += 1
-        return True
+        return self._queue_projection.drop_claiming_request_locked(assigned)
 
     async def _restore_or_commit_claiming_after_cancel(
         self,
@@ -3025,26 +2577,6 @@ class _ModelWorkSchedulerActor:
         backlog_depth_by_domain = {
             domain: len(backlog) for domain, backlog in sorted(self._domain_backlog.items())
         }
-        principal_domain_max_by_domain: dict[str, int] = {}
-        active_principals_by_domain: dict[str, int] = {}
-        principal_domain_token_max_by_domain: dict[str, int] = {}
-        for (_principal, domain_key), count in self._sampling_inflight_by_principal_domain.items():
-            principal_domain_max_by_domain[domain_key] = max(
-                principal_domain_max_by_domain.get(domain_key, 0),
-                int(count),
-            )
-            active_principals_by_domain[domain_key] = active_principals_by_domain.get(domain_key, 0) + 1
-        for (_principal, domain_key), tokens in self._sampling_inflight_tokens_by_principal_domain.items():
-            principal_domain_token_max_by_domain[domain_key] = max(
-                principal_domain_token_max_by_domain.get(domain_key, 0),
-                int(tokens),
-            )
-
-        def _counter_records(counters: dict[tuple[str, str], int]) -> list[dict[str, Any]]:
-            return [
-                {"domain_key": domain_key, "reason": reason, "count": int(count)}
-                for (domain_key, reason), count in sorted(counters.items())
-            ]
 
         replica_queues = {}
         for key, queue in sorted(self._replica_queues.items()):
@@ -3066,20 +2598,7 @@ class _ModelWorkSchedulerActor:
             "scheduler_instance_id": self._instance_id,
             "scheduler_epoch": self._scheduler_epoch,
             "task_state_store_enabled": self._use_task_state_store,
-            "background_loop_manager_running": self._background_loop_manager_task is not None
-            and not self._background_loop_manager_task.done(),
-            "background_loop_names": [
-                name
-                for name in ("assignment", "owner_heartbeat", "reaper")
-                if self._background_loop_running(name)
-            ],
-            "background_loop_start_deferred": sorted(self._background_loop_start_deferred),
-            "assignment_loop_interval_s": self._assignment_loop_interval_s,
-            "assignment_loop_running": self._background_loop_running("assignment"),
-            "owner_heartbeat_interval_s": self._owner_heartbeat_interval_s,
-            "owner_heartbeat_running": self._background_loop_running("owner_heartbeat"),
-            "reaper_loop_interval_s": self._reaper_loop_interval_s,
-            "reaper_loop_running": self._background_loop_running("reaper"),
+            **self._loops.stats_snapshot(),
             "now": now,
             "depth": sum(backlog_depth_by_domain.values())
             + sum(len(queue) for queue in self._replica_queues.values())
@@ -3089,51 +2608,9 @@ class _ModelWorkSchedulerActor:
             "replicas": [replica.to_dict() for _, replica in sorted(self._replicas.items())],
             "replica_queues": replica_queues,
             "leases": [lease.to_dict() for lease in self._leases_by_id.values()],
-            "sampling_inflight": {
-                "mode": _sampling_inflight_admission_mode(),
-                "per_principal_domain_limit": _sampling_inflight_limit(
-                    "MINT_SAMPLING_MAX_INFLIGHT_PER_PRINCIPAL_DOMAIN",
-                    "sampling_max_inflight_per_principal_domain",
-                    1024,
-                ),
-                "per_domain_limit": _sampling_inflight_limit(
-                    "MINT_SAMPLING_MAX_INFLIGHT_PER_DOMAIN",
-                    "sampling_max_inflight_per_domain",
-                    10240,
-                ),
-                "per_principal_domain_token_limit": _sampling_inflight_limit(
-                    "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN",
-                    "sampling_max_inflight_tokens_per_principal_domain",
-                    0,
-                ),
-                "per_domain_token_limit": _sampling_inflight_limit(
-                    "MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_DOMAIN",
-                    "sampling_max_inflight_tokens_per_domain",
-                    0,
-                ),
-                "by_domain": dict(sorted(self._sampling_inflight_by_domain.items())),
-                "principal_domain_max_by_domain": dict(sorted(principal_domain_max_by_domain.items())),
-                "active_principals_by_domain": dict(sorted(active_principals_by_domain.items())),
-                "tokens_by_domain": dict(sorted(self._sampling_inflight_tokens_by_domain.items())),
-                "principal_domain_token_max_by_domain": dict(
-                    sorted(principal_domain_token_max_by_domain.items())
-                ),
-            },
-            "sampling_admission_counters": {
-                "would_reject": _counter_records(self._sampling_admission_would_reject),
-                "reject": _counter_records(self._sampling_admission_reject),
-            },
-            "counters": {
-                "appended": self._appended,
-                "assigned": self._assigned,
-                "claimed": self._claimed,
-                "completed": self._completed,
-                "failed": self._failed,
-                "requeued": self._requeued,
-                "stale_dropped": self._stale_dropped,
-                "reaper_scanned": self._reaper_scanned,
-                "reaper_recovered": self._reaper_recovered,
-            },
+            "sampling_inflight": self._admission.inflight_snapshot(),
+            "sampling_admission_counters": self._admission.admission_counters_snapshot(),
+            "counters": self._counters.snapshot(),
         }
 
     def stats(self) -> dict[str, Any]:

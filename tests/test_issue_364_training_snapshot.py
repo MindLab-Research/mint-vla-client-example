@@ -94,7 +94,7 @@ async def test_issue_364_training_route_restores_snapshot_from_detached_store(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     manager = TrainingSessionManager()
-    engine = SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={})
+    engine = SimpleNamespace(_workers={})
 
     async def _async_get_training_session_info(model_id: str):
         assert model_id == "model-364-restore"
@@ -158,7 +158,7 @@ async def test_issue_364_training_route_refreshes_step_without_version_bump(
 
     monkeypatch.setattr(manager, "get_session", lambda model_id: manager._sessions.get(model_id))
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(training_route, "_has_training_worker_binding", lambda _model_id: True)
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
@@ -243,7 +243,7 @@ async def test_issue_364_training_route_drops_stale_local_snapshot_when_store_en
         return None
 
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
@@ -278,7 +278,7 @@ async def test_issue_364_get_model_info_rejects_stale_local_training_cache(
         return None
 
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
@@ -356,7 +356,7 @@ async def test_issue_364_get_training_run_refreshes_read_only_metadata_from_stor
 
     monkeypatch.setattr(training_route.time, "time", lambda: 200.0)
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
@@ -451,7 +451,7 @@ async def test_issue_364_get_model_info_refreshes_read_only_metadata_from_store(
 
     monkeypatch.setattr(training_route.time, "time", lambda: 200.0)
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
@@ -496,7 +496,7 @@ async def test_issue_364_get_info_refreshes_read_only_metadata_from_store(
         }
 
     monkeypatch.setattr(training_route, "training_manager", manager)
-    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}))
+    monkeypatch.setattr(training_route, "training_engine", SimpleNamespace(_workers={}))
     monkeypatch.setattr(
         "mint_server.backend.stores.training_session_store.async_get_training_session_info",
         _async_get_training_session_info,
@@ -770,10 +770,7 @@ def test_issue_364_refresh_training_session_drops_stale_worker_binding_when_acto
             "namespace": "old-ns",
         }
     )
-    engine = SimpleNamespace(
-        _workers={"model-364-binding": object()},
-        _model_actor_supervisor_actor_names={"model-364-binding": "old-actor"},
-    )
+    engine = SimpleNamespace(_workers={"model-364-binding": object()})
 
     monkeypatch.setattr(training_route, "training_manager", manager)
     monkeypatch.setattr(training_route, "training_engine", engine)
@@ -793,7 +790,6 @@ def test_issue_364_refresh_training_session_drops_stale_worker_binding_when_acto
     )
 
     assert "model-364-binding" not in engine._workers
-    assert engine._model_actor_supervisor_actor_names["model-364-binding"] == "new-actor"
     assert manager.get_local_session("model-364-binding").actor_name == "new-actor"
 
 
@@ -928,7 +924,7 @@ async def test_issue_364_get_tokenizer_falls_back_to_local_metadata_when_worker_
     monkeypatch.setattr(
         training_route,
         "training_engine",
-        SimpleNamespace(_workers={}, _model_actor_supervisor_actor_names={}, get_tokenizer_info=_broken_get_tokenizer_info),
+        SimpleNamespace(_workers={}, get_tokenizer_info=_broken_get_tokenizer_info),
     )
     async def _restore_none(_model_id: str):
         return None

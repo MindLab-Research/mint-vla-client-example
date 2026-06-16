@@ -67,7 +67,6 @@ class _StubTrainingEngine:
         self.unbind_calls = []
         self.delete_calls = []
         self._workers = {}
-        self._model_actor_supervisor_actor_names = {}
 
     async def unbind_session(self, session):
         self.unbind_calls.append(session.model_id)
@@ -80,7 +79,6 @@ class _StubTrainingEngine:
         if delete_session is not None:
             delete_session.remote(session.model_id)
         self._workers.pop(session.model_id, None)
-        self._model_actor_supervisor_actor_names.pop(session.model_id, None)
         session.is_active = False
 
     async def shutdown_session(self, session):
@@ -260,7 +258,8 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     deleted_model_ids = []
 
     engine._workers[stale.model_id] = shared_worker
-    engine._model_actor_supervisor_actor_names[stale.model_id] = "shared-actor"
+    stale.actor_name = "shared-actor"
+    stale.namespace = "mint"
 
     monkeypatch.setattr(training_routes, "training_manager", manager)
     monkeypatch.setattr(training_routes, "training_engine", engine)
@@ -307,7 +306,7 @@ async def test_issue_368_cleanup_skips_shared_actor_shutdown_after_restore(
     assert shared_worker.delete_calls == ["model-stale"]
     assert deleted_model_ids == ["model-stale"]
     assert stale.model_id not in engine._workers
-    assert stale.model_id not in engine._model_actor_supervisor_actor_names
+    assert stale.is_active is False
 
 
 def test_issue_368_sync_training_session_step_bumps_when_result_has_no_step(monkeypatch: pytest.MonkeyPatch) -> None:

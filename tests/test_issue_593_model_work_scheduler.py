@@ -9,10 +9,12 @@ from mint_server.backend.scheduling.model_work_scheduler import (
     ModelWorkSchedulerConflictError,
     ModelWorkSchedulerCodeIdentityMismatchError,
     ModelWorkSchedulerClient,
+    ModelWorkItem,
     _ModelWorkSchedulerActor,
     _model_work_scheduler_use_task_state_store_from_env,
     _ray_model_work_scheduler_actor_name,
 )
+from mint_server.backend.scheduling.scheduler_admission import AdmissionAccounting
 from mint_server.backend.stores.task_state_store import TaskStateConflictError, TaskStateStore
 
 
@@ -850,6 +852,64 @@ def test_scheduler_append_can_assign_immediately() -> None:
     asyncio.run(_run())
 
 
+def test_admission_accounting_snapshot_preserves_scheduler_stats_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MINT_SAMPLING_INFLIGHT_ADMISSION_MODE", "observe")
+    monkeypatch.setenv("MINT_SAMPLING_MAX_INFLIGHT_TOKENS_PER_PRINCIPAL_DOMAIN", "10")
+    accounting = AdmissionAccounting()
+    item = ModelWorkItem.from_dict(
+        _work(
+            "req-token-1",
+            token_cost=7,
+            throttle_principal="apikey:key-a",
+        )
+    )
+    second = ModelWorkItem.from_dict(
+        _work(
+            "req-token-2",
+            token_cost=4,
+            throttle_principal="apikey:key-a",
+        )
+    )
+
+    accounting.track_locked(item)
+    decision = accounting.limit_decision_locked(second)
+
+    assert decision["ok"] is True
+    assert decision["would_reject"] is True
+    assert decision["reason"] == "principal_domain_token_budget_exceeded"
+    domain = "vllm:Qwen/Qwen3-30B-A3B-Instruct-2507"
+    assert accounting.inflight_snapshot() == {
+        "mode": "observe",
+        "per_principal_domain_limit": 1024,
+        "per_domain_limit": 10240,
+        "per_principal_domain_token_limit": 10,
+        "per_domain_token_limit": 0,
+        "by_domain": {domain: 1},
+        "principal_domain_max_by_domain": {domain: 1},
+        "active_principals_by_domain": {domain: 1},
+        "tokens_by_domain": {domain: 7},
+        "principal_domain_token_max_by_domain": {domain: 7},
+    }
+    assert accounting.admission_counters_snapshot() == {
+        "would_reject": [
+            {
+                "domain_key": domain,
+                "reason": "principal_domain_token_budget_exceeded",
+                "count": 1,
+            }
+        ],
+        "reject": [],
+    }
+
+    accounting.untrack_locked("req-token-1")
+
+    released = accounting.inflight_snapshot()
+    assert released["by_domain"] == {}
+    assert released["tokens_by_domain"] == {}
+
+
 def test_sampling_token_budget_admission_enforce_rejects_principal_domain(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -970,6 +1030,38 @@ def test_sampling_inflight_admission_observe_records_would_reject(
         ]
 
     asyncio.run(_run())
+
+
+def test_scheduler_private_probe_fields_delegate_to_collaborators() -> None:
+    actor = _ModelWorkSchedulerActor(use_task_state_store=True)
+
+    assert actor._background_loop_tasks is actor._loops.tasks
+    assert actor._background_loop_start_deferred is actor._loops.start_deferred
+    assert actor._assignment_loop_task is actor._loops.assignment_task
+    assert actor._owner_heartbeat_task is actor._loops.owner_heartbeat_task
+    assert actor._reaper_loop_task is actor._loops.reaper_task
+    assert actor._background_loops_shutdown is actor._loops.shutdown
+
+    assert actor._sampling_inflight_by_domain is actor._admission.inflight_by_domain
+    assert (
+        actor._sampling_inflight_by_principal_domain
+        is actor._admission.inflight_by_principal_domain
+    )
+    assert actor._sampling_inflight_tokens_by_domain is actor._admission.inflight_tokens_by_domain
+    assert (
+        actor._sampling_inflight_tokens_by_principal_domain
+        is actor._admission.inflight_tokens_by_principal_domain
+    )
+    assert (
+        actor._sampling_principal_domain_by_request_id
+        is actor._admission.principal_domain_by_request_id
+    )
+    assert actor._sampling_token_cost_by_request_id is actor._admission.token_cost_by_request_id
+    assert actor._sampling_admission_would_reject is actor._admission.would_reject
+    assert actor._sampling_admission_reject is actor._admission.reject
+
+    actor._sampling_inflight_by_domain = {"domain-a": 2}
+    assert actor._admission.inflight_by_domain == {"domain-a": 2}
 
 
 def test_sampling_inflight_admission_enforce_rejects_principal_domain(

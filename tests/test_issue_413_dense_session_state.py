@@ -109,8 +109,6 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     session_dir = _write_dense_session_dir(dense_root, model_id)
     worker = _DeletingWorker(lambda session_id: dense_state_module.delete_dense_session_state(session_id))
     engine = VerlTrainingEngine()
-    engine._model_actor_supervisor_actor_names[model_id] = actor_name
-    engine._model_actor_supervisor_actor_names[other_model_id] = actor_name
     engine._workers[model_id] = worker
     engine._workers[other_model_id] = worker
 
@@ -121,17 +119,26 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
         base_model="Qwen/Qwen3-4B-Instruct-2507",
         backend="peft",
     )
+    session.actor_name = actor_name
+    session.namespace = "mint"
 
     import mint_server.backend.training.verl.verl_training as verl_training
 
     monkeypatch.setattr(verl_training.ray, "get", lambda value, timeout=None: value)
+    monkeypatch.setattr(
+        "mint_server.backend.stores.training_session_store.list_training_sessions",
+        lambda: [
+            {"model_id": model_id, "actor_name": actor_name},
+            {"model_id": other_model_id, "actor_name": actor_name},
+        ],
+    )
 
     asyncio.run(engine.delete_session(session))
 
     assert worker.delete_calls == [model_id]
     assert not session_dir.exists()
-    assert model_id not in engine._model_actor_supervisor_actor_names
-    assert other_model_id in engine._model_actor_supervisor_actor_names
+    assert model_id not in engine._workers
+    assert other_model_id in engine._workers
     assert entry.current_session == other_model_id
 
     pool.unregister(actor_name)
