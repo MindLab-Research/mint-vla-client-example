@@ -5,7 +5,7 @@ Checkpoint endpoints follow /internal/v1/checkpoints spec:
 - GET /checkpoints/{checkpoint_id}/archive: Download checkpoint as tar.gz
 """
 
-import logging
+import structlog
 import os
 import subprocess
 import time
@@ -34,7 +34,7 @@ from mint_server.backend.ops.actor_admin import KillActorsRequest
 from mint_server.backend.stores.task_state_store import task_futures
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _internal_prometheus_metrics_enabled() -> bool:

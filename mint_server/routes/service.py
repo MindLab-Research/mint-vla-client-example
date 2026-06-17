@@ -14,7 +14,7 @@ Endpoints:
 from __future__ import annotations
 
 import json
-import logging
+import structlog
 import os
 import time
 import uuid
@@ -49,7 +49,7 @@ if TYPE_CHECKING:
     from mint_server.backend.sessions.session_manager import SessionManager
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Global session manager reference (set only in execution runtimes or tests)
 session_manager: SessionManager | None = None
@@ -857,14 +857,14 @@ async def _child_sampler_ids_for_heartbeat(
         from mint_server.backend.stores.session_index_store import async_get_sampler_index, async_get_session_index
 
         info = await async_get_session_index(root_session_id)
-    except Exception as e:
-        logger.warning("[session_heartbeat] session index lookup failed for %s: %s", root_session_id, e)
+    except Exception:
+        logger.warning("session_index_lookup_failed_for__s___s")
         return []
 
     if not isinstance(info, dict):
         return []
     if not _user_visible(request_user_data, info.get("user_id")):
-        logger.warning("[session_heartbeat] child sampler propagation denied for %s", root_session_id)
+        logger.warning("child_sampler_propagation_denied_for__s")
         return []
 
     seen: set[str] = set()
@@ -890,8 +890,8 @@ async def _child_sampler_ids_for_heartbeat(
         seen.add(sampler_id)
         try:
             sampler_info = await async_get_sampler_index(sampler_id)
-        except Exception as e:
-            logger.warning("[session_heartbeat] sampler index lookup failed for %s: %s", sampler_id, e)
+        except Exception:
+            logger.warning("sampler_index_lookup_failed_for__s___s")
             continue
         if not isinstance(sampler_info, dict):
             continue
@@ -909,8 +909,8 @@ async def _touch_child_sampler_sessions(root_session_id: str, request_user_data:
     for sampler_id in await _child_sampler_ids_for_heartbeat(root_session_id, request_user_data):
         try:
             await async_set_sampling_session_last_activity(sampler_id, time.time())
-        except Exception as e:
-            logger.warning("[session_heartbeat] child sampler activity update failed for %s: %s", sampler_id, e)
+        except Exception:
+            logger.warning("child_sampler_activity_update_failed_for__s___s")
 
 
 async def _update_session_heartbeat_store(session_id: str) -> None:
@@ -939,8 +939,8 @@ async def session_heartbeat(
         from mint_server.backend.stores.sampling_session_store import async_set_sampling_session_last_activity
 
         await async_set_sampling_session_last_activity(request.session_id, time.time())
-    except Exception as e:
-        logger.warning("[session_heartbeat] sampling session activity update failed for %s: %s", request.session_id, e)
+    except Exception:
+        logger.warning("sampling_session_activity_update_failed_for__s___s")
     await _touch_child_sampler_sessions(request.session_id, _get_user_data(http_request))
     return SessionHeartbeatResponse()
 

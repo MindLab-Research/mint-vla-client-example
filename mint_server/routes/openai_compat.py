@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import json
-import logging
+import structlog
 import os
 import re
 import time
@@ -36,7 +36,7 @@ from .sampling import build_sample_once_billing_observations, sample_once
 from .service import ensure_sampling_session
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 async def _append_billing_observations(observations) -> None:
@@ -451,13 +451,13 @@ def _parse_tool_call_payload(payload: str) -> OAIToolCall | None:
     try:
         parsed = json.loads(payload)
     except json.JSONDecodeError:
-        logger.warning("Skipping malformed tool_call JSON: %r", payload[:200])
+        logger.warning("skipping_malformed_tool_call_json", payload_preview=payload[:200])
         return None
 
     name = parsed.get("name")
     arguments = parsed.get("arguments", {})
     if not isinstance(name, str) or not name:
-        logger.warning("Skipping tool_call with missing/invalid name: %r", parsed)
+        logger.warning("skipping_tool_call_missing_name", parsed=parsed)
         return None
 
     arguments_json = (

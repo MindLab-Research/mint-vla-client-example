@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
+
 from typing import Any
 
 import ray
@@ -12,7 +13,7 @@ from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env,
 from mint_server.config_hydration import CONFIG_ACTOR_SELF_ENV
 from mint_server.runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _ACTOR_HANDLE: Any | None = None
 

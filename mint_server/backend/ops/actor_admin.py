@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
+
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -20,7 +21,7 @@ from mint_server.backend.ray_cluster.async_ray_control import (
 )
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class KillActorsRequest(BaseModel):
@@ -232,7 +233,7 @@ def _log_kill_request(
         payload["detail"] = detail
     if result is not None:
         payload["result"] = result
-    logger.info("[actors.kill] %s", payload)
+    logger.info("s")
 
 
 def _raise_if_busy_kill_targets(

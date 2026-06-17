@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+import structlog
 import os
 import threading
 import time
@@ -47,7 +47,7 @@ torch = None  # type: ignore[assignment]
 if TYPE_CHECKING:
     from mint_server.backend.training.training_session_manager import TrainingSession
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default idle timeout for TrainingWorker (seconds). Lifecycle is controlled by
 # session shutdown, explicit admin actions, and supervisor reconciliation.
@@ -76,7 +76,7 @@ def _uses_verl_fsdp2_lora_backend(requested_model: str | None) -> bool:
             == VERL_FSDP2_LORA_BACKEND
         )
     except Exception:
-        logger.debug("veRL FSDP2 LoRA model config lookup failed for %s", requested_model, exc_info=True)
+        logger.debug("verl_fsdp2_lora_model_config_lookup_failed_for__s", exc_info=True)
     return False
 
 
@@ -121,7 +121,7 @@ class SessionStateManager:
         import os
         self.base_path = base_path
         os.makedirs(base_path, exist_ok=True)
-        logger.info(f"[SessionStateManager] Initialized with base_path={base_path}")
+        logger.info("initialized_with", base_path=base_path)
 
     def get_session_path(self, session_id: str) -> str:
         """Get checkpoint directory path for a session."""
@@ -187,7 +187,7 @@ class SessionStateManager:
                     grads[name] = param.grad.cpu().clone()
             if grads:
                 torch.save(grads, os.path.join(session_path, "gradients.pt"))
-                logger.debug(f"[SessionStateManager] Saved {len(grads)} gradient tensors for {session_id}")
+                logger.debug("saved__s_gradient_tensors_for__s")
             else:
                 # Remove old gradients file if no gradients to save
                 grads_path = os.path.join(session_path, "gradients.pt")
@@ -201,7 +201,7 @@ class SessionStateManager:
         with open(os.path.join(session_path, "training_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
 
-        logger.debug(f"[SessionStateManager] Saved state for {session_id} (step={step})")
+        logger.debug("saved_state_for__s", step=session_id)
         return os.path.abspath(session_path)
 
     def load_state(
@@ -266,7 +266,7 @@ class SessionStateManager:
                             param.grad.copy_(grads[name])
                         grad_count += 1
                 has_gradients = grad_count > 0
-                logger.debug(f"[SessionStateManager] Restored {grad_count} gradient tensors for {session_id}")
+                logger.debug("restored__s_gradient_tensors_for__s")
 
         # 4. Load metadata
         meta = {"current_step": 0, "learning_rate": optimizer.param_groups[0]["lr"], "has_gradients": has_gradients}
@@ -277,7 +277,7 @@ class SessionStateManager:
                 meta.update(loaded_meta)
                 meta["has_gradients"] = has_gradients
 
-        logger.debug(f"[SessionStateManager] Loaded state for {session_id} (step={meta.get('current_step', 0)}, has_gradients={has_gradients})")
+        logger.debug("loaded_state_for__s", step=session_id, has_gradients=meta.get('current_step', 0))
         return meta
 
     def delete_session(self, session_id: str) -> bool:
@@ -295,7 +295,7 @@ class SessionStateManager:
         session_path = self.get_session_path(session_id)
         if os.path.exists(session_path):
             shutil.rmtree(session_path)
-            logger.info(f"[SessionStateManager] Deleted session {session_id}")
+            logger.info("deleted_session__s")
             return True
         return False
 
@@ -344,9 +344,9 @@ class TrainingWorker:
                 name="TrainingWorker-IdleWatchdog",
             )
             self._watchdog_thread.start()
-            logger.info(f"[TrainingWorker] Idle watchdog started (timeout={idle_timeout}s)")
+            logger.info("idle_watchdog_started___s", timeout=idle_timeout)
 
-        logger.info(f"[TrainingWorker] Loading {base_model} with LoRA rank={lora_rank}")
+        logger.info("loading__s_with_lora", rank=base_model)
 
         self._configure_attention_backends()
 
@@ -386,7 +386,7 @@ class TrainingWorker:
             self.model.gradient_checkpointing_enable()
             if hasattr(self.model, "enable_input_require_grads"):
                 self.model.enable_input_require_grads()
-            logger.info(f"[TrainingWorker] Gradient checkpointing enabled for {base_model}")
+            logger.info("gradient_checkpointing_enabled_for__s")
 
         # Apply LoRA
         # Per Tinker docs: "LoRA performs better when applied to all weight matrices,
@@ -420,7 +420,7 @@ class TrainingWorker:
         self._current_actual_rank: int | None = None
         self._input_contract = self._make_input_contract()
 
-        logger.info("[TrainingWorker] Ready")
+        logger.info("Ready")
 
     @staticmethod
     def _configure_attention_backends() -> None:
@@ -436,8 +436,8 @@ class TrainingWorker:
                     torch.backends.cuda.enable_mem_efficient_sdp(True)
                 if hasattr(torch.backends.cuda, "enable_math_sdp"):
                     torch.backends.cuda.enable_math_sdp(True)
-        except Exception as e:
-            logger.warning(f"[TrainingWorker] Failed to configure SDP backends: {e}")
+        except Exception:
+            logger.warning("failed_to_configure_sdp_backends___s")
 
     def _touch(self) -> None:
         """Update last activity timestamp. Call at start of every method."""
@@ -539,7 +539,7 @@ class TrainingWorker:
             save_gradients=False,  # Gradients already applied and zeroed
             actual_rank=actual_rank,
         )
-        logger.debug(f"[TrainingWorker] Saved session {session_id} state (step={self._step_count})")
+        logger.debug("saved_session__s_state", step=session_id)
 
     def _idle_watchdog(self) -> None:
         """Background thread that monitors for idle timeout.
@@ -562,8 +562,8 @@ class TrainingWorker:
                 # Clean shutdown
                 try:
                     self.shutdown()
-                except Exception as e:
-                    logger.error(f"[TrainingWorker] Shutdown error: {e}")
+                except Exception:
+                    logger.error("shutdown_error___s")
                 # Exit the Ray actor
                 ray.actor.exit_actor()
                 return
@@ -712,10 +712,10 @@ class TrainingWorker:
                         input_ids.extend(chunk["tokens"])
 
                 if not input_ids:
-                    logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                    logger.warning("No tokens in model_input chunks, skipping item")
                     continue
             else:
-                logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
+                logger.warning("No chunks in model_input, skipping item")
                 continue
 
             # Extract target tokens and weights/mask
@@ -983,10 +983,10 @@ class TrainingWorker:
                                 input_ids.extend(chunk["tokens"])
 
                         if not input_ids:
-                            logger.warning("[TrainingWorker] No tokens in model_input chunks, skipping item")
+                            logger.warning("No tokens in model_input chunks, skipping item")
                             continue
                     else:
-                        logger.warning("[TrainingWorker] No chunks in model_input, skipping item")
+                        logger.warning("No chunks in model_input, skipping item")
                         continue
 
                     # Extract target tokens and weights/mask
@@ -998,7 +998,7 @@ class TrainingWorker:
                     weights = weights_data.get("data", []) if weights_data else []
 
                     if not target_tokens:
-                        logger.warning("[TrainingWorker] Missing target_tokens, skipping item")
+                        logger.warning("Missing target_tokens, skipping item")
                         continue
 
                     # For forward-only, weights are optional - default to all 1s
@@ -1055,7 +1055,7 @@ class TrainingWorker:
 
         avg_loss = total_loss / max(total_tokens, 1)
 
-        logger.info(f"[TrainingWorker] forward: loss={avg_loss:.4f}, tokens={total_tokens:.0f}")
+        logger.info("forward", loss=avg_loss, tokens=total_tokens)
 
         return {
             "loss_fn_output_type": "sft_loss",
@@ -1315,7 +1315,7 @@ class TrainingWorker:
         if session_id:
             self._save_session_state(session_id, actual_rank=actual_rank)
 
-        logger.info(f"[TrainingWorker] optim_step: grad_norm={grad_norm:.4f}, step={self._step_count}")
+        logger.info("optim_step", grad_norm=grad_norm, step=self._step_count)
 
         return {
             "metrics": {"grad_norm:last": float(grad_norm)},
@@ -1397,7 +1397,7 @@ class TrainingWorker:
             json.dump(config, f, indent=2)
 
         abs_path = os.path.abspath(save_path)
-        logger.info(f"[TrainingWorker] Saved LoRA weights to {abs_path}")
+        logger.info("saved_lora_weights_to__s")
         return {
             "path": abs_path,
             "state_dict": state_dict,
@@ -1466,7 +1466,7 @@ class TrainingWorker:
             json.dump({k: v for k, v in meta.items() if k not in ("state_dict", "peft_config")}, f, indent=2)
 
         abs_path = os.path.abspath(save_path)
-        logger.info(f"[TrainingWorker] Saved checkpoint to {abs_path} (step={self._step_count})")
+        logger.info("saved_checkpoint_to__s", step=abs_path)
         return meta
 
     def load_checkpoint(
@@ -1569,14 +1569,14 @@ class TrainingWorker:
         from peft.utils.save_and_load import set_peft_model_state_dict
         set_peft_model_state_dict(self.model, state_dict)
         self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
-        logger.info(f"[TrainingWorker] Loaded LoRA weights from {adapter_path}")
+        logger.info("loaded_lora_weights_from__s")
 
         # 3. Apply metadata and optimizer state
         if "current_step" in meta:
             meta_step = meta["current_step"]
             if isinstance(meta_step, int) and not isinstance(meta_step, bool):
                 self._step_count = meta_step
-                logger.info(f"[TrainingWorker] Loaded metadata: step={self._step_count}")
+                logger.info("loaded_metadata", step=self._step_count)
             else:
                 logger.warning(
                     "[TrainingWorker] Invalid current_step type=%s value=%r in %s; "
@@ -1600,7 +1600,7 @@ class TrainingWorker:
 
         if load_optimizer:
             self.optimizer.load_state_dict(torch.load(optimizer_path, map_location=self.device))
-            logger.info(f"[TrainingWorker] Loaded optimizer state from {optimizer_path}")
+            logger.info("loaded_optimizer_state_from__s")
         else:
             # Non-resume loads must drop any session-local momentum/gradients that
             # _ensure_session_loaded() may have materialized from a previous session incarnation.
@@ -1649,7 +1649,7 @@ class TrainingWorker:
 
         # Phase 7: Apply padding if actual_rank < trainer_rank
         if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-            logger.info(f"[TrainingWorker] Padding adapter from rank {actual_rank} to {trainer_rank}")
+            logger.info("padding_adapter_from_rank__s_to__s")
             state_dict = pad_lora_state_dict(state_dict, actual_rank, trainer_rank)
 
         # Load into PEFT model
@@ -1660,7 +1660,7 @@ class TrainingWorker:
             actual_rank if actual_rank is not None else trainer_rank,
             zero_grads=True,
         )
-        logger.info(f"[TrainingWorker] Loaded adapter state from {checkpoint_path}")
+        logger.info("loaded_adapter_state_from__s")
 
         return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
 
@@ -1698,13 +1698,13 @@ class TrainingWorker:
 
         # Phase 7: Apply truncation if actual_rank < trainer_rank
         if actual_rank is not None and trainer_rank is not None and actual_rank < trainer_rank:
-            logger.info(f"[TrainingWorker] Truncating adapter from rank {trainer_rank} to {actual_rank}")
+            logger.info("truncating_adapter_from_rank__s_to__s")
             state_dict = truncate_lora_state_dict(state_dict, trainer_rank, actual_rank)
 
         # Save to safetensors format
         adapter_path = os.path.join(checkpoint_path, "adapter_model.safetensors")
         save_file(state_dict, adapter_path)
-        logger.info(f"[TrainingWorker] Saved adapter state to {checkpoint_path}")
+        logger.info("saved_adapter_state_to__s")
 
         return {"status": "ok", "path": checkpoint_path, "actual_rank": actual_rank}
 
@@ -1723,7 +1723,7 @@ class TrainingWorker:
         if learning_rate is not None:
             for group in self.optimizer.param_groups:
                 group["lr"] = learning_rate
-            logger.info(f"[TrainingWorker] Set learning rate to {learning_rate}")
+            logger.info("set_learning_rate_to__s")
 
         # Zero gradients
         self.optimizer.zero_grad()
@@ -1731,7 +1731,7 @@ class TrainingWorker:
         # Reset optimizer state (momentum/variance)
         # For AdamW, this resets exp_avg and exp_avg_sq
         self.optimizer.state.clear()
-        logger.info("[TrainingWorker] Reset optimizer state (momentum cleared)")
+        logger.info("Reset optimizer state (momentum cleared)")
 
         return {"status": "ok", "learning_rate": learning_rate}
 
@@ -1786,7 +1786,7 @@ class TrainingWorker:
             for group in self.optimizer.param_groups:
                 group["lr"] = learning_rate
             lr_updated = True
-            logger.info(f"[TrainingWorker] Set learning rate to {learning_rate}")
+            logger.info("set_learning_rate_to__s")
 
         # Zero gradients
         self.optimizer.zero_grad()
@@ -1795,12 +1795,12 @@ class TrainingWorker:
         # Reset optimizer state (momentum/variance)
         opt_state_reset = len(self.optimizer.state)
         self.optimizer.state.clear()
-        logger.info(f"[TrainingWorker] Reset optimizer state ({opt_state_reset} entries)")
+        logger.info("reset_optimizer_state___s_entries")
 
         # Reset step count
         self._step_count = 0
 
-        logger.info(f"[TrainingWorker] Reinitialized {reinit_count} LoRA params")
+        logger.info("reinitialized__s_lora_params")
         return {
             "status": "ok",
             "reinit_count": reinit_count,
@@ -1857,7 +1857,7 @@ class TrainingWorker:
         """
         import os
 
-        logger.info(f"[TrainingWorker] Swapping session: {old_session_id} -> {new_session_id}")
+        logger.info("swapping_session___s_____s")
 
         # Get trainer rank from current model
         peft_config = self.model.peft_config.get("default")
@@ -1865,25 +1865,25 @@ class TrainingWorker:
 
         # 1. Save old session state (if applicable)
         if old_session_id and old_checkpoint_path:
-            logger.info(f"[TrainingWorker] Saving old session {old_session_id}")
+            logger.info("saving_old_session__s")
             self.save_adapter_state(old_checkpoint_path)
 
         # 2. Load new session state or reset
         if new_checkpoint_path and os.path.exists(new_checkpoint_path):
-            logger.info(f"[TrainingWorker] Loading new session {new_session_id}")
+            logger.info("loading_new_session__s")
             self.load_adapter_state(
                 new_checkpoint_path,
                 actual_rank=new_actual_rank,
                 trainer_rank=trainer_rank,
             )
         else:
-            logger.info(f"[TrainingWorker] Resetting for new session {new_session_id}")
+            logger.info("resetting_for_new_session__s")
             self.reset_optimizer(new_learning_rate)
 
         # 3. Update step count
         self._step_count = 0
 
-        logger.info(f"[TrainingWorker] Session swap complete: now on {new_session_id}")
+        logger.info("session_swap_complete__now_on__s")
         return {
             "status": "ok",
             "old_session": old_session_id,
@@ -1894,7 +1894,7 @@ class TrainingWorker:
     def shutdown(self) -> None:
         """Release GPU resources and stop watchdog thread."""
         torch = _get_torch()
-        logger.info("[TrainingWorker] Shutting down")
+        logger.info("Shutting down")
         # Stop watchdog thread
         self._shutdown_requested = True
         # Release GPU resources
@@ -2004,7 +2004,7 @@ class VerlTrainingEngine:
             model_actor_supervisor.touch(actor_name)
             model_actor_supervisor.set_session(actor_name, session.model_id)
         except Exception:
-            logger.debug("[%s] skip touch_actor for %s", session.model_id, actor_name, exc_info=True)
+            logger.debug("skip_touch_actor_for__s", model_id=session.model_id, exc_info=True)
 
     def _actor_name_for_session(self, session: "TrainingSession") -> str | None:
         return self._actor_recycler.actor_name_for_session(session) or str(getattr(session, "actor_name", "") or "") or None
@@ -3323,7 +3323,7 @@ class VerlTrainingEngine:
                 if timeout_s is not None and timeout_s > 0:
                     remaining = timeout_s - (time.time() - start)
                     if remaining <= 0:
-                        logger.warning(f"[{session.model_id}] Ray call timed out after {timeout_s}s")
+                        logger.warning("ray_call_timed_out_after__ss", model_id=session.model_id)
                         raise asyncio.TimeoutError(f"Ray call timed out after {timeout_s}s")
                     wait_s = min(wait_s, remaining)
 
@@ -3361,12 +3361,12 @@ class VerlTrainingEngine:
         except Exception:
             qwen36_path = None
         if qwen36_path:
-            logger.info("Using Qwen3.6 path override for %s -> %s", hf_model_id, qwen36_path)
+            logger.info("using_qwen3_6_path_override_for__s_____s")
             return qwen36_path
 
         if hf_model_id in MODEL_PATH_OVERRIDES:
             override_path = MODEL_PATH_OVERRIDES[hf_model_id]
-            logger.info(f"Using path override for {hf_model_id} -> {override_path}")
+            logger.info("using_path_override_for__s_____s")
             return override_path
 
         hf_home = os.environ.get("HF_HOME", "/vePFS-Mindverse/share/huggingface")
@@ -3375,18 +3375,18 @@ class VerlTrainingEngine:
         model_dir = Path(hf_home) / "hub" / cache_name / "snapshots"
 
         if not model_dir.exists():
-            logger.warning(f"Model cache not found: {model_dir}")
+            logger.warning("model_cache_not_found___s")
             return None
 
         # Get the latest snapshot (usually only one)
         snapshots = list(model_dir.iterdir())
         if not snapshots:
-            logger.warning(f"No snapshots in: {model_dir}")
+            logger.warning("no_snapshots_in___s")
             return None
 
         # Return the first snapshot path
         snapshot_path = str(snapshots[0])
-        logger.info(f"Resolved {hf_model_id} -> {snapshot_path}")
+        logger.info("resolved__s_____s")
         return snapshot_path
 
     async def create_training_session(self, session: TrainingSession) -> None:
@@ -3433,10 +3433,10 @@ class VerlTrainingEngine:
             if use_verl_fsdp2_lora and requested_model and not requested_model.startswith("/"):
                 base_model = self._resolve_hf_model_path(requested_model)
                 if base_model:
-                    logger.info("[%s] Resolved Qwen3.6 veRL FSDP2 LoRA model to local: %s", model_id, base_model)
+                    logger.info("resolved_qwen3_6_verl_fsdp2_lora_model_to_local___s", model_id=model_id)
                 else:
                     base_model = requested_model
-                    logger.info("[%s] Using Qwen3.6 veRL FSDP2 LoRA model path as requested: %s", model_id, base_model)
+                    logger.info("using_qwen3_6_verl_fsdp2_lora_model_path_as_requested___s", model_id=model_id)
             elif model_uses_distributed_training:
                 resolver = self._resolve_megatron_base_model if use_megatron else self._resolve_bumblebee_base_model
                 base_model, requested_model = resolver(session)
@@ -3451,11 +3451,11 @@ class VerlTrainingEngine:
                 # HuggingFace model ID - resolve to local cache path
                 base_model = self._resolve_hf_model_path(requested_model)
                 if base_model:
-                    logger.info(f"[{model_id}] Resolved HF model to local: {base_model}")
+                    logger.info("resolved_hf_model_to_local___s", model_id=model_id)
                 else:
                     # Fall back to default (works for dense models on same architecture)
                     base_model = self.default_base_model
-                    logger.info(f"[{model_id}] Using default model path: {base_model} (requested: {requested_model})")
+                    logger.info("using_default_model_path___s__requested___s", model_id=model_id)
             else:
                 base_model = requested_model
 
@@ -3482,7 +3482,7 @@ class VerlTrainingEngine:
                 requested_model=requested_model,
                 base_model=base_model,
             )
-            logger.info(f"[{model_id}] Creating MegatronWorkerGroup for MoE model (base={base_model}, actual_rank={lora_rank}, trainer_lora_rank={trainer_lora_rank}, TP={train_tp}, PP={train_pp}, EP={train_ep}, CP={train_cp}, ETP={train_etp}, world_size={distributed_config.world_size}, fp8={use_fp8})")
+            logger.info("creating_megatronworkergroup_for_moe_model", model_id=model_id, base=base_model, actual_rank=lora_rank, trainer_lora_rank=trainer_lora_rank, TP=train_tp, PP=train_pp, EP=train_ep, CP=train_cp, ETP=train_etp, world_size=distributed_config.world_size, fp8=use_fp8)
 
             # Get or create persistent Megatron worker group
             # Uses detached Ray actor pattern like vLLM for crash resilience
@@ -3688,7 +3688,7 @@ class VerlTrainingEngine:
             # Reinitialize LoRA weights for fresh session (statelessness)
             # This ensures each new session starts with fresh random weights
             # instead of inheriting trained weights from previous session
-            logger.info(f"[{model_id}] Reinitializing LoRA weights for new session (lr={session.learning_rate})...")
+            logger.info("reinitializing_lora_weights_for_new_session", model_id=model_id, lr=session.learning_rate)
             reinit_timeout_s = float(server_config.training_reinit_lora_timeout_s)
             effective_reinit_timeout_s = reinit_timeout_s if reinit_timeout_s > 0 else None
             print(
@@ -3723,10 +3723,10 @@ class VerlTrainingEngine:
                 f"[DEBUG {model_id}] dense reinit_lora_weights done",
                 flush=True,
             )
-            logger.info(f"[{model_id}] LoRA weights reinitialized: {result.get('reinit_count', 0)} params, lr_updated={result.get('lr_updated', False)}")
+            logger.info("lora_weights_reinitialized___s_params", model_id=model_id, lr_updated=result.get('reinit_count', 0))
 
             session.backend = "peft"
-            logger.info(f"[{model_id}] Dense trainer ready for {base_model} (max_rank={dense.max_lora_rank})")
+            logger.info("dense_trainer_ready_for__s", model_id=model_id, max_rank=base_model)
 
         # Optional non-blocking create for Megatron actors.
         # Default remains blocking __ray_ready__ wait for deterministic API
@@ -3797,7 +3797,7 @@ class VerlTrainingEngine:
 
         self._workers[model_id] = worker
         session.is_active = True
-        logger.info(f"[{model_id}] TrainingWorker ready (backend={session.backend})")
+        logger.info("trainingworker_ready", model_id=model_id, backend=session.backend)
 
     async def forward_backward(
         self,
@@ -3908,7 +3908,7 @@ class VerlTrainingEngine:
         session.accumulated_gradients += 1
         self._record_megatron_result_metrics(session, result)
 
-        logger.info(f"[{model_id}] forward_backward completed (loss_fn={loss_fn})")
+        logger.info("forward_backward_completed", model_id=model_id, loss_fn=loss_fn)
         return result
 
     async def forward_backward_reverse_kl(
@@ -3984,8 +3984,8 @@ class VerlTrainingEngine:
                         actual_rank=reference_actual_rank,
                     ),
                 )
-                logger.info(f"[{model_id}] reverse_kl prime reference session done: ref_session_id={ref_session_id}")
-                logger.info(f"[{model_id}] reverse_kl reference forward start: ref_session_id={ref_session_id}")
+                logger.info("reverse_kl_prime_reference_session_done", model_id=model_id, ref_session_id=ref_session_id)
+                logger.info("reverse_kl_reference_forward_start", model_id=model_id, ref_session_id=ref_session_id)
                 reference_chunks = await async_get_ray_ref(
                     worker.forward_reference_full_log_probs.remote(
                         data_items=reference_items,
@@ -4002,7 +4002,7 @@ class VerlTrainingEngine:
                     f"[{model_id}] reverse_kl reference forward done: ref_session_id={ref_session_id} "
                     f"chunks={len(reference_chunks) if isinstance(reference_chunks, list) else 'unknown'}"
                 )
-                logger.info(f"[{model_id}] reverse_kl student backward start")
+                logger.info("reverse_kl_student_backward_start", model_id=model_id)
                 pending = worker.forward_backward_reverse_kl.remote(
                     data_items,
                     None,
@@ -4069,7 +4069,7 @@ class VerlTrainingEngine:
                 interval_s=30.0,
             )
         session.accumulated_gradients += 1
-        logger.info(f"[{model_id}] forward_backward_reverse_kl completed")
+        logger.info("forward_backward_reverse_kl_completed", model_id=model_id)
         return result
 
     async def forward(
@@ -4129,7 +4129,7 @@ class VerlTrainingEngine:
         )
         self._record_megatron_result_metrics(session, result)
 
-        logger.info(f"[{model_id}] forward completed")
+        logger.info("forward_completed", model_id=model_id)
         return result
 
     async def get_tokenizer_info(
@@ -4279,7 +4279,7 @@ class VerlTrainingEngine:
         result["metrics"]["step"] = session.current_step
         self._record_megatron_result_metrics(session, result)
 
-        logger.info(f"[{model_id}] optim_step: step={session.current_step}")
+        logger.info("optim_step", model_id=model_id, step=session.current_step)
         return result
 
     async def train_step(
@@ -4470,7 +4470,7 @@ class VerlTrainingEngine:
         result["metrics"]["step"] = session.current_step
         self._record_megatron_result_metrics(session, result)
 
-        logger.info(f"[{model_id}] train_step: step={session.current_step}")
+        logger.info("train_step", model_id=model_id, step=session.current_step)
         return result
 
     async def reset_expert_bias(self, session: TrainingSession) -> dict:
@@ -4496,8 +4496,8 @@ class VerlTrainingEngine:
         model_id = session.model_id
         try:
             worker = await self._get_live_worker(session, op="reset_expert_bias")
-        except Exception as e:
-            logger.warning(f"[{model_id}] reset_expert_bias: No live worker ({type(e).__name__}: {e})")
+        except Exception:
+            logger.warning("reset_expert_bias__no_live_worker___s___s", model_id=model_id)
             return {"modules_reset": 0}
 
         # Mark actor as recently used
@@ -4508,7 +4508,7 @@ class VerlTrainingEngine:
             worker=worker,
         )
 
-        logger.info(f"[{model_id}] reset_expert_bias: calling worker...")
+        logger.info("reset_expert_bias__calling_worker", model_id=model_id)
 
         try:
             traceparent = get_current_traceparent()
@@ -4516,7 +4516,7 @@ class VerlTrainingEngine:
             result = await async_get_ray_ref(result_ref)
             # MegatronWorkerGroup returns 'reset_count', normalize to 'modules_reset'
             modules_reset = result.get("reset_count", result.get("modules_reset", 0))
-            logger.info(f"[{model_id}] reset_expert_bias: reset {modules_reset} modules")
+            logger.info("reset_expert_bias__reset__s_modules", model_id=model_id)
             return {"modules_reset": modules_reset}
         except Exception as e:
             logger.exception(f"[{model_id}] reset_expert_bias failed: {e}")
@@ -4631,7 +4631,7 @@ class VerlTrainingEngine:
             with open(os.path.join(abs_path, "training_meta.json"), "w", encoding="utf-8") as f:
                 json.dump(training_meta, f, indent=2)
 
-        logger.info(f"[{model_id}] save_dense_lora_weights_for_sampler: {abs_path}")
+        logger.info("save_dense_lora_weights_for_sampler___s", model_id=model_id)
         return abs_path
 
     async def save_lora_weights_for_sampler(
@@ -4715,7 +4715,7 @@ class VerlTrainingEngine:
             strict=strict_meta,
         )
 
-        logger.info(f"[{model_id}] save_lora_weights_for_sampler: {abs_path}")
+        logger.info("save_lora_weights_for_sampler___s", model_id=model_id)
         return abs_path
 
     async def save_weights(
@@ -4817,7 +4817,7 @@ class VerlTrainingEngine:
             strict=strict_meta,
         )
 
-        logger.info(f"[{model_id}] save_weights: {abs_path}")
+        logger.info("save_weights___s", model_id=model_id)
         return abs_path
 
     async def load_weights(
@@ -4951,7 +4951,7 @@ class VerlTrainingEngine:
 
         self._actor_recycler.clear_poisoned(session.model_id)
 
-        logger.info(f"[{model_id}] load_weights: step={session.current_step}")
+        logger.info("load_weights", model_id=model_id, step=session.current_step)
         return meta if isinstance(meta, dict) else None
 
     async def shutdown_session(self, session: TrainingSession) -> None:
@@ -5072,7 +5072,7 @@ class VerlTrainingEngine:
                     pass
         else:
             if actor_protected:
-                logger.info(f"[{model_id}] shutdown_session: session deleted; keeping protected actor {actor_name}")
+                logger.info("shutdown_session__session_deleted__keeping_protected_actor__", model_id=model_id)
             else:
                 logger.info(
                     f"[{model_id}] shutdown_session: session deleted; keeping shared actor {actor_name} "
@@ -5080,7 +5080,7 @@ class VerlTrainingEngine:
                 )
 
         session.is_active = False
-        logger.info(f"[{model_id}] TrainingWorker shutdown")
+        logger.info("trainingworker_shutdown", model_id=model_id)
 
     async def delete_session(self, session: TrainingSession) -> None:
         """Backward-compatible alias for session deletion paths."""

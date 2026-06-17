@@ -6,15 +6,16 @@ This module is intentionally ray-free so local tests and repro scripts can impor
 from __future__ import annotations
 
 import asyncio
-import logging
-import os
+import structlog
 import time
+
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from mint_server.runtime_env import env_get
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass

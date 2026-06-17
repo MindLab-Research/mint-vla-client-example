@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 import shutil
 import time
@@ -12,7 +12,7 @@ from mint_server.checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from mint_server.config import config as server_config
 from mint_server.runtime_env import env_get
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 DENSE_SESSION_STATE_DIRNAME = "dense_session_state"
 _SESSION_SUFFIX = "_checkpoint"
@@ -77,7 +77,7 @@ def delete_dense_session_state(session_id: str, *, root: str | None = None) -> b
         _remove_tree(path)
         deleted = True
     if deleted:
-        logger.info("[dense_session_state] deleted session state session_id=%s", session_id)
+        logger.info("deleted_session_state", session_id=session_id)
     return deleted
 
 

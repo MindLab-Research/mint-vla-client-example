@@ -4,6 +4,9 @@ import inspect
 from collections.abc import Iterable
 from typing import Any, Awaitable, Callable
 
+import time
+
+from mint_server.logging_context import record_span_event_otel, start_as_current_span
 from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHealthStatus, EngineObservability
 from mint_server.backend.core.execution_context import ExecutionContext
 
@@ -27,17 +30,30 @@ class ExecutionContextEngineLifecycle:
         self._last_error: str | None = None
 
     async def is_ready(self) -> bool:
-        try:
-            context = await self._context_factory()
-            ready = await self._context_ready(context)
-        except Exception as exc:
-            self._last_error = f"{type(exc).__name__}: {exc}"
-            self._ready = False
-            return False
-        self._ready = bool(ready)
-        if self._ready:
-            self._unhealthy_reason = None
-        return bool(ready)
+        _t0 = time.perf_counter()
+        with start_as_current_span(
+            "engine_lifecycle.is_ready",
+            component="core.engine_lifecycle",
+            op="is_ready",
+        ) as span:
+            try:
+                context = await self._context_factory()
+                ready = await self._context_ready(context)
+            except Exception as exc:
+                self._last_error = f"{type(exc).__name__}: {exc}"
+                self._ready = False
+                if span is not None:
+                    span.set_attribute("ready", False)
+                    span.set_attribute("error", str(self._last_error))
+                record_span_event_otel("engine_lifecycle.is_ready.complete", attributes={"duration_s": time.perf_counter() - _t0, "ready": False})
+                return False
+            self._ready = bool(ready)
+            if self._ready:
+                self._unhealthy_reason = None
+            if span is not None:
+                span.set_attribute("ready", bool(ready))
+            record_span_event_otel("engine_lifecycle.is_ready.complete", attributes={"duration_s": time.perf_counter() - _t0, "ready": bool(ready)})
+            return bool(ready)
 
     async def health(self) -> EngineHealth:
         ready = await self.is_ready()
@@ -78,19 +94,34 @@ class ExecutionContextEngineLifecycle:
                 await out
 
     async def restart(self) -> None:
-        self._restart_count += 1
-        self._ready = False
-        context = await self._context_factory()
-        restarted = False
-        for source in self._restart_sources(context):
-            if await self._restart_source(source):
-                restarted = True
-        if not restarted:
-            # Recreate the runtime-local bindings when no backend exposes a narrower restart hook.
-            new_context = await self._refresh_context_factory()
-            self._ready = await self._context_ready(new_context)
-            return
-        self._ready = await self._context_ready(context)
+        _t0 = time.perf_counter()
+        with start_as_current_span(
+            "engine_lifecycle.restart",
+            component="core.engine_lifecycle",
+            op="restart",
+            attributes={"restart_count_before": self._restart_count},
+        ) as span:
+            self._restart_count += 1
+            self._ready = False
+            if span is not None:
+                span.set_attribute("restart_count_after", self._restart_count)
+            try:
+                context = await self._context_factory()
+                restarted = False
+                for source in self._restart_sources(context):
+                    if await self._restart_source(source):
+                        restarted = True
+                if not restarted:
+                    new_context = await self._refresh_context_factory()
+                    self._ready = await self._context_ready(new_context)
+                    record_span_event_otel("engine_lifecycle.restart.complete", attributes={"duration_s": time.perf_counter() - _t0, "path": "refresh"})
+                    return
+                self._ready = await self._context_ready(context)
+                record_span_event_otel("engine_lifecycle.restart.complete", attributes={"duration_s": time.perf_counter() - _t0, "path": "source"})
+            except Exception as e:
+                if span is not None:
+                    span.record_exception(e)
+                raise
 
     async def _context_ready(self, context: ExecutionContext) -> bool:
         probes = []

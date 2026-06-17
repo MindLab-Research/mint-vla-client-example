@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-import logging
+import structlog
 import json
 import time
 import os
@@ -18,7 +18,7 @@ from mint_server.runtime_env import bootstrap_runtime_pythonpath, validate_runti
 OPENPI_FAST_WORKER_PROTOCOL_VERSION = 1
 OPENPI_FAST_WORKER_MODULE = f"{__package__}.openpi_fast_worker"
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 class OpenPIFastWorkerError(RuntimeError):
     pass

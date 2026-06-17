@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import time
+import structlog
+
+from mint_server.observability.logging_context import record_store_op_otel
 import re
 import uuid
 from contextlib import suppress
@@ -13,7 +16,7 @@ from typing import Any, Literal, Protocol
 
 from mint_server.config import config
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 ChargeItem = Literal["sampling", "inference", "training", "checkpoint_storage"]
 _ALLOWED_CHARGE_ITEMS = {"sampling", "inference", "training", "checkpoint_storage"}
@@ -420,6 +423,7 @@ class PostgresUsageStore:
             raise RuntimeError(f"{self._table} requires a full-table unique index on event_id, expected {self._dedupe_index}")
 
     async def _write_events_to_pg(self, events: list[UsageEvent]) -> list[str]:
+        _t0 = time.perf_counter()
         pool = await self._ensure_pool()
         sql = f"""
         INSERT INTO {self._table}
@@ -454,7 +458,9 @@ class PostgresUsageStore:
                         [event.request_id for event in events],
                         [event.label or "" for event in events],
                     )
-                return [str(row["event_id"]) for row in rows]
+                result = [str(row["event_id"]) for row in rows]
+                record_store_op_otel(store="billing_pg", op="write_events", status="ok", duration_s=time.perf_counter() - _t0)
+                return result
             except Exception as e:
                 last_error = e
                 permanent_error = _is_permanent_pg_write_error(e)
@@ -481,6 +487,7 @@ class PostgresUsageStore:
                 break
 
         if last_error is not None:
+            record_store_op_otel(store="billing_pg", op="write_events", status="error", duration_s=time.perf_counter() - _t0)
             event_detail = _event_detail(events)
             error_detail = _exception_detail(last_error)
             logger.error(

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sys
 import types
@@ -11,7 +12,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 if "structlog" not in sys.modules:
-    sys.modules["structlog"] = types.ModuleType("structlog")
+    _fake_structlog = types.ModuleType("structlog")
+    _fake_structlog.get_logger = lambda name=None: logging.getLogger(name or "mint_server")
+    _fake_structlog.configure = lambda *a, **kw: None
+    _fake_structlog.stdlib = types.ModuleType("structlog.stdlib")
+    _fake_structlog.stdlib.ProcessorFormatter = type("ProcessorFormatter", (), {"__init__": lambda self, *a, **kw: None})
+    _fake_structlog.stdlib.add_log_level = lambda *a, **kw: None
+    _fake_structlog.stdlib.add_logger_name = lambda *a, **kw: None
+    _fake_structlog.stdlib.LoggerFactory = type("LoggerFactory", (), {})
+    _fake_structlog.processors = types.ModuleType("structlog.processors")
+    _fake_structlog.processors.TimeStamper = lambda *a, **kw: None
+    _fake_structlog.processors.StackInfoRenderer = lambda *a, **kw: None
+    _fake_structlog.processors.format_exc_info = lambda *a, **kw: None
+    _fake_structlog.processors.JSONRenderer = type("JSONRenderer", (), {"__init__": lambda self, *a, **kw: None})
+    _fake_structlog.contextvars = types.ModuleType("structlog.contextvars")
+    _fake_structlog.contextvars.merge_contextvars = lambda *a, **kw: None
+    sys.modules["structlog"] = _fake_structlog
 
 
 def _install_fake_ray() -> None:

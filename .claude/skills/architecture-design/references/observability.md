@@ -1,182 +1,181 @@
-# Observability Architecture
+# Observability Practices
 
-This reference defines MinT trace, log, and metric design. It is architecture
-guidance, not an incident-query runbook.
+How to write observable code in MinT. Read this once; refer back when
+reviewing or writing new subsystems.
 
-Primary goal: keep production failures diagnosable within minutes without
-making observability part of the request critical path.
+## Three Signals, Three Questions
 
-## Current Runtime Shape
+| Signal | Answers | When to reach for it |
+|--------|---------|----------------------|
+| **Trace** | "Where did the time go?" | A request is slow or fails and you need to find which hop. |
+| **Metric** | "Is this systemic?" | You need to know if one request is an outlier or a pattern. |
+| **Log** | "What happened?" | You need human-readable detail at a specific decision point. |
 
-- MinT uses OpenTelemetry when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured.
-- Signals are exported by OTLP push from API workers and Ray actors.
-- Exporter setup or export failure must never block service startup or request
-  handling.
-- API and actor processes use distinct `service.instance.id` values; metrics add
-  `mint_instance_id` to separate cumulative counters by process.
-- Do not assume Prometheus scrape is the primary source for MinT application
-  metrics. Ray/GCS global metrics should be pushed by the head
-  `NodeMetricsCollectorActor` from cached snapshots, not collected by dashboard
-  refreshes through `/internal/metrics`.
-- `NodeMetricsCollectorActor` pushes node-local OS/NVML metrics from every ready
-  topology node. The observed Ray head node is also represented as `mint-head`
-  for metrics-daemon purposes so it can push Ray live-state, placement-group,
-  GCS bridge health, selected raw GCS/grpc aggregates, and MinT-derived GCS
-  gauges without entering model placement or worker provisioning semantics.
-- `/internal/metrics` is authenticated, opt-in, and sentinel-only. It must not
-  collect Ray actor snapshots, Ray/GCS state, scheduler state, supervisor state,
-  TaskStateStore state, runtime actor state, or node daemon samples. Production
-  dashboards must read MinT application metrics from OTel push only.
+Don't use logs for timing (use traces). Don't use traces for fleet health
+(use metrics). Don't use metrics for per-request detail (use traces or logs).
 
-Relevant implementation:
-- `mint_server/logging_context.py`
-- `mint_server/config.py::otel_env_vars`
-- route middleware in `mint_server/app.py`
-- node and Ray/GCS metric push in `mint_server/backend/observability/node_metrics_daemon.py`
+## Traceparent: The One Carrier
 
-## Identifier Semantics
+W3C `traceparent` is the sole trace-context carrier across process
+boundaries. If an operation may outlive the HTTP request, you must propagate
+it.
 
-- `request_id`: external/business request identifier. Preserve existing API
-  compatibility.
-- `trace_id`: distributed tracing identifier. It is propagated through W3C
-  `traceparent`.
-- Keep `request_id` and `trace_id` separate. Do not rename or overload one into
-  the other.
-- If no incoming trace context exists, generate a valid 32-character lowercase
-  non-zero hex trace id.
-- Propagate trace context across queue, future, Ray actor, gateway, and webhook
-  boundaries whenever the operation may outlive the HTTP request.
+**Boundaries that always need propagation:**
+- Queue enqueue → dequeue (traceparent goes into the task payload)
+- Ray actor `.remote()` calls (traceparent goes into kwargs)
+- Gateway forward (traceparent goes into HTTP headers)
+- Webhook callbacks
 
-## Trace Standards
+**How to propagate:**
+1. Producer: `get_current_traceparent()` — captures the active trace context.
+2. Pass it through: function arg, dict field, or HTTP header.
+3. Consumer: restore it before doing work — use `start_as_current_span_from_traceparent()`
+   for a span, or `restore_trace_id_from_traceparent()` for log correlation only.
 
-Trace state transitions and uncertain or expensive boundaries:
+If you forget step 1, the consumer starts a new trace and the chain is broken.
+If you forget step 3, the consumer's work is invisible in the original trace.
 
-- HTTP ingress/egress.
-- Queue enqueue/dequeue and wait time.
-- Ray actor calls and worker execution boundaries.
-- Remote HTTP/RPC/gateway calls.
-- Expensive model stages: create, load, sample, forward, forward_backward,
-  optim_step, save_state, save_weights_for_sampler.
-- Retry, fallback, stale-session, and remediation-related paths.
+**Test:** After adding a new boundary, check the trace UI — the consumer span
+should have the same `trace_id` as the HTTP ingress span. If not, propagation
+is broken.
 
-Avoid per-token, per-item, or hot-loop spans. Prefer span events or metrics for
-high-frequency inner-loop signals.
+## Span Granularity
 
-Minimum useful span attributes:
-- HTTP: `http.method`, `http.route`, `http.status_code`, `request_id` when
-  available.
-- Worker or queue stage: `component`, `op`, `model_name` when relevant,
-  `attempt`/`retry_count` when relevant, bounded wait or elapsed timing fields.
+**Span at state transitions, not at hot loops.**
 
-On failure, call `record_exception` when there is an exception object and set
-the span status to error. For framework-converted 5xx responses where no
-exception escapes, add an explicit error event or exception surrogate.
+Good span boundaries:
+- HTTP ingress/egress
+- Queue enqueue/dequeue
+- Ray actor call → result
+- Model lifecycle: create, load, sample, forward, save
+- Retry, fallback, remediation
 
-## Log Standards
+Bad span boundaries:
+- Per-token, per-item, per-batch-element
+- Inner loops that execute thousands of times per request
+- Synchronous in-process function calls (use a log instead)
 
-New logs should include stable fields where available:
-- `request_id`
-- `trace_id`
-- `component`
-- `op`
-- target identifiers such as `model_name`, `actor_name`, `session_id`, or
-  `request_type`
+For high-frequency signals inside a span, use `record_span_event_otel()` —
+it annotates the current span without creating a new one.
 
-Do not assume all existing logs are fully structured. Improve logs at the
-failure boundary being changed.
+## Log Format
 
-Use levels consistently:
-- `INFO`: important lifecycle transitions and successful state changes.
-- `WARNING`: degraded but recoverable conditions, retries, fallback, queue
-  pressure, slow path.
-- `ERROR`: request/job/stage failure or correctness risk. Include sanitized
-  `error_type`, target, correlation ids, timing, and a short operator hint when
-  it is clear.
+**structlog structured calls. Never f-strings. Never `%s` interpolation. Never `[module]` prefix.**
 
-Avoid repeated identical `ERROR` lines in retry loops. One failure should have
-one primary incident-actionable error at the owning boundary.
+```python
+# Do this — event name first, then structured key=value kwargs
+logger.info("task_admitted", op=op, status="admitted", duration_ms=ms)
+logger.warning("request_failed", error_type=type(e).__name__, error=str(e))
 
-Never log secrets, full prompts/responses, logits, vectors, process
-environments, raw auth headers, or full local secret-file contents.
+# Not this — f-string (structlog can't extract structured fields)
+logger.info(f"request_id={request_id} status=admitted")
 
-## Metrics Standards
+# Not this — %s interpolation (key=value buried in format string, not queryable)
+logger.info("request_id=%s status=admitted", request_id)
 
-Metrics are for fleet health, alerting, and blast-radius checks. Use traces and
-logs for per-request detail.
+# Not this — [module] prefix (component is auto-injected)
+logger.info("[admission] request_id=%s status=admitted", ...)
+```
 
-Current HTTP metric names:
-- `mint_http_server_requests_total`
-- `mint_http_server_errors_total`
-- `mint_http_server_request_duration_ms`
+**Why:** structlog's processor chain auto-injects `component` (from `logger.name`),
+`request_id`, `trace_id`, `hostname` into every log event as structured fields.
+The first positional argument is the event name (a short snake_case identifier).
+Business data goes in keyword arguments — they become queryable JSON fields in
+VictoriaLogs, not text buried inside a format string.
 
-Current HTTP attributes emitted by code:
-- `http.method`
-- `http.route`
-- `http.status_code`
-- `mint_instance_id`
+**Convention:**
+- Use `structlog.get_logger(__name__)`, not `logging.getLogger(__name__)`.
+- First arg: concise snake_case event name (`task_admitted`, `lora_loaded`, `nan_detected`).
+- Business data as `key=value` kwargs: `op=`, `status=`, `duration_ms=`, `error_type=`.
+- Do not pass `request_id` or `trace_id` as kwargs — they are auto-injected.
+- `error_type` via `type(e).__name__`, never `str(e)` alone.
 
-Note: Victoria/Grafana may normalize attribute names into label names. When
-editing dashboards, first inspect live label names rather than assuming
-Prometheus-style labels such as `method`, `route`, or `status_code`.
+**Log levels:**
+- `INFO`: lifecycle transitions and successful completions with timing.
+- `WARNING`: degraded but recoverable — retries, fallback, queue pressure.
+- `ERROR`: failure or correctness risk. One per failure at the owning boundary,
+  not one per retry attempt.
 
-Good metric families:
-- request/error counts and endpoint latency
-- queue depth, queue wait, admission decision, timeout counters
-- actor pool occupancy and actor health
-- dependency failure counts and latency
+## What to Log at Each E2E Hop
 
-Avoid metric labels with high-cardinality values:
-- `request_id`
-- `trace_id`
-- raw user text
-- raw URL with IDs
-- free-form error messages
-- unbounded checkpoint/session paths
+Every request passes through: route → admission → enqueue → claim → execute
+→ finalize → resolve. At minimum, each hop should log once:
 
-Use bounded labels such as route template, operation, component, model name,
-actor type, decision, and failure category.
+| Hop | What to log |
+|-----|-------------|
+| Admission | `request_id`, `op`, decision (admitted/rejected), why, duration |
+| Enqueue | `request_id`, `op`, `domain_key`, backlog depth |
+| Claim → Execute | `request_id`, `op`, `actor_name`, queue wait time |
+| Execute result | `request_id`, `op`, outcome (success/failure), exec duration, error type if failed |
+| Resolve | `request_id`, status (done/failed/retrieved) |
 
-## Incident Patterns
+If a hop has zero logging, you have a blind spot. When debugging, you should
+be able to `grep request_id=xxx` and see the request's full lifecycle.
 
-Queue enqueue timeout:
-- Trace: HTTP span plus queue enqueue span.
-- Log once at the owning boundary with `request_id`, `trace_id`, queue actor,
-  timeout, elapsed time, and `next_action=check_actor_health`.
-- Metrics: timeout counter and queue depth/wait signal.
+## Metric Design
 
-Upstream or gateway 5xx:
-- Trace outbound call with peer/upstream alias, route, status, retry count.
-- Warn on retry; error on final failure.
-- Metrics: upstream error count by bounded alias/status class and latency by
-  route template.
+**Metrics answer "is this systemic?" — they must be aggregatable.**
 
-Worker OOM or resource exhausted:
-- Trace the failing stage span.
-- Log `request_id`, `trace_id`, actor/model, operation, error type, and whether
-  the actor/session is contaminated or requires clean reload.
-- Metrics: worker failure counter by bounded reason/component/model and
-  saturation/backlog signals.
+Cardinality is the enemy of aggregation. A metric label with unbounded values
+(request_id, trace_id, error messages, file paths) makes the metric useless for
+fleet dashboards and expensive to store.
 
-Slow request without hard error:
-- Use traces to locate the slow stage.
-- Use metrics to confirm whether the symptom is isolated or systemic.
-- Warn only for thresholded sustained slow paths; avoid alerting on one-off
-  queueing under expected load.
+**Bounded labels (good):**
+- `op`, `component`, `status`, `reason`
+- `base_model`, `actor_name`, `backend`
+- `store`, `domain_key` (when domain set is small)
+
+**Unbounded labels (never):**
+- `request_id`, `trace_id`
+- raw error messages
+- file paths, checkpoint paths
+- user text
+
+**Metric families that matter:**
+- Counters: operation counts, error counts, admission decisions
+- Histograms: latency distributions, queue wait, execution duration
+- Gauges: queue depth, active sessions, GPU memory (via observable callbacks)
+
+**Adding a metric:** create the OTel instrument in `init_otel_logging()`,
+add a `record_*_otel()` helper, and call it at the instrumentation site.
+The helper should be a no-op when `_OTEL_ENABLED` is False.
+
+## Error Observability
+
+**One failure, one primary log, at the owning boundary.**
+
+The "owning boundary" is the layer that has enough context to say what failed
+and what to do next. For a vLLM timeout, that's the inference engine, not the
+HTTP route. For a scheduler conflict, that's the scheduler, not the store.
+
+Anti-patterns:
+- Logging the same error at every layer as it propagates up.
+- Logging inside a retry loop (log once after retries are exhausted).
+- Logging `str(e)` without `type(e).__name__` (loses the exception type).
+
+On spans: call `span.record_exception(e)` so the exception appears in the
+trace. The `start_as_current_span` and `run_async_with_otel_span` helpers do
+this automatically when an exception escapes.
+
+## What Not to Observe
+
+- Secrets, tokens, API keys, auth headers, process environments.
+- Full prompts, responses, logits, weight vectors.
+- Per-token or per-batch-element spans in hot loops.
+- High-cardinality metric labels.
+- Identical repeated ERROR lines in retry loops.
+- Success at every micro-step (log success at the lifecycle boundary, not
+  inside every function call).
 
 ## Review Checklist
 
-For observability-related PRs:
-- Preserve `request_id` and `trace_id` semantics.
-- Propagate `traceparent` across async/worker boundaries touched by the change.
-- Keep spans bounded and attached to meaningful state transitions.
-- Record errors on spans for thrown exceptions and converted 5xx responses.
-- Add or update logs at the owning failure boundary with stable correlation
-  fields.
-- Keep metrics low-cardinality and actionable.
-- Verify dashboard labels against live telemetry when changing Grafana JSON.
-- Confirm exporter/logging/metrics failures cannot break business behavior.
-
-Non-goals:
-- Do not bundle scheduling, retry, or self-healing behavior into an
-  observability-only PR.
-- Do not change external API contracts for observability convenience.
+- [ ] If the change crosses a process/queue boundary, is `traceparent` propagated?
+- [ ] Are spans at state transitions, not in hot loops?
+- [ ] Do logs use structlog structured calls (event name + kwargs, no f-strings/%s/[module])?
+- [ ] Is `request_id` the first key in every log line?
+- [ ] Are error logs at the owning boundary, with `error_type`?
+- [ ] Are metric labels bounded (no `request_id`, no free-form text)?
+- [ ] Is there a `record_*_otel()` helper for any new metric?
+- [ ] Does the failure path record the exception on the span?
+- [ ] Can you `grep request_id=xxx` and see the request's full lifecycle?
+- [ ] Are no secrets, logits, or full prompts in any log line?

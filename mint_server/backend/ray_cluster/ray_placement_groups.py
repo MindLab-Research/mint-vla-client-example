@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import ray
 
+from mint_server.logging_context import record_ray_cluster_op_otel
 from mint_server.runtime_env import env_nonempty
 
 
@@ -121,6 +123,7 @@ def get_named_placement_group(
     namespace: str | None = None,
     expected_bundles: object | None = None,
 ) -> Any:
+    _t0 = time.perf_counter()
     target_namespace = namespace or _ray_namespace()
     pg = None
     try:
@@ -160,21 +163,27 @@ def get_named_placement_group(
                 f"expected_pinned_ips={list(_pinned_ips(expected_bundles))!r}",
             )
 
+    record_ray_cluster_op_otel(op="pg_lookup", status="ok", duration_s=time.perf_counter() - _t0, pg_name=name)
     return pg
 
 
 def remove_named_placement_group(name: str, *, namespace: str | None = None) -> bool:
+    _t0 = time.perf_counter()
     target_namespace = namespace or _ray_namespace()
     try:
         pg = get_named_placement_group(name, namespace=target_namespace)
     except PlacementGroupNotFoundError:
+        record_ray_cluster_op_otel(op="pg_remove", status="ok", duration_s=time.perf_counter() - _t0, pg_name=name, result="not_found")
         return False
     except Exception:
         info = _lookup_named_pg_info(name, target_namespace)
         if info is None:
+            record_ray_cluster_op_otel(op="pg_remove", status="error", duration_s=time.perf_counter() - _t0, pg_name=name)
             raise
         pg = _placement_group_from_info(info)
         if pg is None:
+            record_ray_cluster_op_otel(op="pg_remove", status="ok", duration_s=time.perf_counter() - _t0, pg_name=name, result="no_pg_handle")
             return False
     ray.util.remove_placement_group(pg)
+    record_ray_cluster_op_otel(op="pg_remove", status="ok", duration_s=time.perf_counter() - _t0, pg_name=name, result="removed")
     return True

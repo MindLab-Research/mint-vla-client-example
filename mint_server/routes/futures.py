@@ -6,7 +6,7 @@ Endpoints:
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 import time
 from collections import OrderedDict
@@ -23,7 +23,7 @@ from ..logging_context import record_retrieve_future_wait_metric
 from ..models.types import FutureCancelRequest, FutureRetrieveRequest
 
 router = APIRouter()
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 task_payload_store = TaskPayloadStore()
 
 
@@ -341,7 +341,7 @@ async def retrieve_future(
         # Check cache first for gateway-routed futures
         cached = _recent_get(body.request_id)
         if cached is not None:
-            logger.info("[retrieve_future] request_id=%s gateway_cache_hit=true", body.request_id)
+            logger.info("true", gateway_cache_hit=True)
             _record_retrieve_wait(path="gateway", outcome="ready", waited=False)
             return _apply_cached_response(cached, response)
 
@@ -460,7 +460,7 @@ async def retrieve_future(
 
     cached = _recent_get(body.request_id)
     if cached is not None:
-        logger.info("[retrieve_future] request_id=%s local_cache_hit=true", body.request_id)
+        logger.info("true", local_cache_hit=True)
         _record_retrieve_wait(path="local", outcome="ready", waited=False)
         return _apply_local_cached_response(cached, http_request, response)
 
@@ -473,11 +473,11 @@ async def retrieve_future(
         task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
         if task_state_payload is not None:
             _pending_hint_clear(body.request_id)
-            logger.info("[retrieve_future] request_id=%s legacy_task_state_store_terminal_hit=true", body.request_id)
+            logger.info("true", legacy_task_state_store_terminal_hit=True)
             _record_retrieve_wait(path="local", outcome="ready", waited=False)
             return task_state_payload
         _pending_hint_clear(body.request_id)
-        logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
+        logger.info("unknown", status="unknown")
         detail: object = f"Unknown request_id: {body.request_id}"
         if _is_privileged(http_request):
             detail = {
@@ -502,11 +502,11 @@ async def retrieve_future(
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 _pending_hint_clear(body.request_id)
-                logger.info("[retrieve_future] request_id=%s legacy_task_state_store_terminal_hit=true", body.request_id)
+                logger.info("true", legacy_task_state_store_terminal_hit=True)
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             _pending_hint_clear(body.request_id)
-            logger.info("[retrieve_future] request_id=%s status=unknown", body.request_id)
+            logger.info("unknown", status="unknown")
             detail: object = f"Unknown request_id: {body.request_id}"
             if _is_privileged(http_request):
                 detail = {
@@ -831,14 +831,14 @@ async def retrieve_future(
         return pending.body
     elif status == FutureStatus.EXPIRED:
         _pending_hint_clear(body.request_id)
-        logger.info("[retrieve_future] request_id=%s status=expired", body.request_id)
+        logger.info("expired", status="expired")
         _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return {"error": "Future expired", "category": "system"}
     elif status == FutureStatus.RETRIEVED:
         _pending_hint_clear(body.request_id)
         cached = _recent_get(body.request_id)
         if cached is not None:
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=cached", body.request_id)
+            logger.info("retrieved_cached", status="retrieved", served="cached")
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return _apply_local_cached_response(cached, http_request, response)
         try:
@@ -847,23 +847,23 @@ async def retrieve_future(
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 _pending_hint_clear(body.request_id)
-                logger.info("[retrieve_future] request_id=%s status=retrieved served=legacy_task_state_store", body.request_id)
+                logger.info("retrieved_legacy_task_state_store", status="retrieved", served="legacy_task_state_store")
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             result = None
         if result is not None:
             _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_result", body.request_id)
+            logger.info("retrieved_facade_result", status="retrieved", served="facade_result")
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return result
         error = await task_futures.async_get_error(body.request_id)
         if error is not None:
             payload = _failed_payload(error, http_request)
             _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
-            logger.info("[retrieve_future] request_id=%s status=retrieved served=facade_error", body.request_id)
+            logger.info("retrieved_facade_error", status="retrieved", served="facade_error")
             _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
             return payload
-        logger.info("[retrieve_future] request_id=%s status=retrieved served=error", body.request_id)
+        logger.info("retrieved_error", status="retrieved", served="error")
         _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
         return {"error": "Future already retrieved", "category": "system"}
     elif status == FutureStatus.FAILED:
@@ -871,7 +871,7 @@ async def retrieve_future(
         error = await task_futures.async_get_error(body.request_id)
         payload = _failed_payload(error, http_request)
         _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
-        logger.info("[retrieve_future] request_id=%s status=failed", body.request_id)
+        logger.info("failed", status="failed")
         try:
             await task_futures.async_cleanup(body.request_id)
         except Exception:
@@ -885,18 +885,18 @@ async def retrieve_future(
         except Exception:
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
-                logger.info("[retrieve_future] request_id=%s status=done served=legacy_task_state_store", body.request_id)
+                logger.info("done_legacy_task_state_store", status="done", served="legacy_task_state_store")
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
             raise
         if result is None:
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
-                logger.info("[retrieve_future] request_id=%s status=done served=legacy_task_state_store", body.request_id)
+                logger.info("done_legacy_task_state_store", status="done", served="legacy_task_state_store")
                 _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
                 return task_state_payload
         _recent_put(body.request_id, result, ttl_s=_local_hot_ttl_s())
-        logger.info("[retrieve_future] request_id=%s status=done", body.request_id)
+        logger.info("done", status="done")
         try:
             await task_futures.async_cleanup(body.request_id)
         except Exception:

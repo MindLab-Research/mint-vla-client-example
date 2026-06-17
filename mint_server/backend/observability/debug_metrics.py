@@ -21,11 +21,11 @@ If values exceed 0.01, check:
 - Sequence length
 """
 
-import logging
+import structlog
 
 import torch
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def calculate_token_list_diff(

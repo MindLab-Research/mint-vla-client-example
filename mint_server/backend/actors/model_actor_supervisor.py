@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
+import structlog
+import time
+
 import os
 import re
 import socket
-import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
@@ -60,7 +61,7 @@ from mint_server.backend.stores.supervisor_state_store import (
 )
 from mint_server.backend.ray_cluster.topology import TopologyManager, is_ip_address, load_topology_config_from_env
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 __all__ = [
     "ActorEntry",
@@ -474,7 +475,7 @@ def _is_moe_training_model(model: str) -> bool:
 
         return _uses_distributed_training_backend(model)
     except Exception:
-        logger.debug("training domain model config lookup failed for %s", model, exc_info=True)
+        logger.debug("training_domain_model_config_lookup_failed_for__s", exc_info=True)
         return False
 
 
@@ -489,7 +490,7 @@ def _selected_moe_training_backend(model: str, backend: str | None = None) -> st
 
         return str(_select_moe_training_backend(model)).strip().lower()
     except Exception:
-        logger.debug("MoE training backend lookup failed for %s", model, exc_info=True)
+        logger.debug("moe_training_backend_lookup_failed_for__s", exc_info=True)
         return "megatron"
 
 
@@ -915,7 +916,7 @@ def _observed_free_gpus_by_node() -> dict[str, int]:
             if str(node.node_ip).strip()
         }
     except Exception:
-        logger.debug("[model_actor_supervisor] observed GPU lookup failed", exc_info=True)
+        logger.debug("observed GPU lookup failed", exc_info=True)
         return {}
 
 
@@ -926,7 +927,7 @@ def _placement_group_table() -> dict[str, Any]:
         table = ray.util.placement_group_table()
         return table if isinstance(table, dict) else {}
     except Exception:
-        logger.debug("[model_actor_supervisor] placement group table lookup failed", exc_info=True)
+        logger.debug("placement group table lookup failed", exc_info=True)
         return {}
 
 
@@ -969,7 +970,7 @@ class ModelActorSupervisorCore:
 
             init_actor_observability()
         except Exception:
-            logger.debug("[model_actor_supervisor] actor observability init skipped", exc_info=True)
+            logger.debug("actor observability init skipped", exc_info=True)
         self._desired: dict[tuple[str, str], ModelActorSpec] = {}
         self._launcher_registry = launcher_registry or default_model_actor_launcher_registry()
         self._runtime_factory = runtime_factory
@@ -2102,9 +2103,9 @@ class ModelActorSupervisorCore:
                 },
                 owner=self._state_owner,
             )
-        except Exception as e:
+        except Exception:
             self._state_store_failures_total += 1
-            logger.debug("[model_actor_supervisor] state event append failed: %s: %s", type(e).__name__, e)
+            logger.debug("state_event_append_failed___s___s")
         self._states[key] = {
             "domain_key": spec.domain_key,
             "replica_id": spec.replica_id,

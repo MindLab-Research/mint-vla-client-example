@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-import logging
+import structlog
 import shutil
 import uuid
 from pathlib import Path
@@ -14,7 +14,7 @@ from mint_server.backend.openpi.openpi_ray_runtime import ensure_openpi_ray_init
 from mint_server.backend.openpi.openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 OPENPI_FAST_TRAINING_BACKEND = "openpi_fast"
 OPENPI_FAST_LORA_RANK = 16

@@ -14,13 +14,13 @@ Solution: Pad value tensor from 128→192 before attention, enabling FlashAttent
 Then unpad output from 192→128 after attention.
 """
 
-import logging
+import structlog
 from functools import wraps
 
 import torch
 import torch.nn.functional as F
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _apply_megatron_router_expert_bias_no_stack_patch() -> None:
@@ -649,8 +649,8 @@ def _apply_rope_thd_cp_len_clamp_patch() -> None:
     """
     try:
         from megatron.core.models.common.embeddings import rope_utils
-    except Exception as e:
-        logger.warning(f"Could not import megatron rope_utils; skipping RoPE CP patch: {type(e).__name__}: {e}")
+    except Exception:
+        logger.warning("could_not_import_megatron_rope_utils__skipping_rope_cp_patch")
         return
 
     if getattr(rope_utils, "_mint_rope_thd_cp_full_seqlen_clamp_patched", False):
@@ -742,8 +742,8 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
     """
     try:
         from verl.models.mcore import util as verl_mcore_util
-    except Exception as e:
-        logger.warning(f"Could not import verl.models.mcore.util; skipping CP short-seq patch: {type(e).__name__}: {e}")
+    except Exception:
+        logger.warning("could_not_import_verl_models_mcore_util__skipping_cp_short_s")
         return
 
     if getattr(verl_mcore_util, "_mint_preprocess_thd_no_padding_cp_short_seq_patched", False):
@@ -871,8 +871,8 @@ def _apply_te_triton_get_int_dtype_patch() -> None:
     """
     try:
         import transformer_engine.pytorch.triton.permutation as te_perm
-    except Exception as e:
-        logger.warning(f"Could not import transformer_engine triton permutation; skipping patch: {type(e).__name__}: {e}")
+    except Exception:
+        logger.warning("could_not_import_transformer_engine_triton_permutation__skip")
         return
 
     if getattr(te_perm, "_mint_te_triton_get_int_dtype_patched", False):
@@ -881,8 +881,8 @@ def _apply_te_triton_get_int_dtype_patch() -> None:
     try:
         import triton
         import triton.language as tl
-    except Exception as e:
-        logger.warning(f"Could not import triton; skipping TE permutation patch: {type(e).__name__}: {e}")
+    except Exception:
+        logger.warning("could_not_import_triton__skipping_te_permutation_patch___s__")
         return
 
     @triton.jit
@@ -1285,8 +1285,8 @@ def _enable_megatron_determinism(seed: int = 42):
 
             _patched_version._mint_flash_attn_version_patch = True  # type: ignore[attr-defined]
             _imd.version = _patched_version  # type: ignore[assignment]
-    except Exception as e:
-        logger.warning(f"Failed to patch importlib.metadata.version for flash-attn: {e}")
+    except Exception:
+        logger.warning("failed_to_patch_importlib_metadata_version_for_flash_attn___")
 
     if os.environ.get("NVTE_FLASH_ATTN", "1") != "0":
         # TransformerEngine disables FlashAttention when the installed flash-attn distribution
@@ -1304,8 +1304,8 @@ def _enable_megatron_determinism(seed: int = 42):
                 FlashAttentionUtils.version = PkgVersion(base)
                 print(f"[VERL_PATCH] Normalized TransformerEngine FlashAttentionUtils.version {te_ver} -> {base}")
             FlashAttentionUtils.set_flash_attention_version()
-        except Exception as e:
-            logger.warning(f"Failed to force-enable TransformerEngine FlashAttention: {e}")
+        except Exception:
+            logger.warning("failed_to_force_enable_transformerengine_flashattention___s")
 
     # Set random seeds
     random.seed(seed)

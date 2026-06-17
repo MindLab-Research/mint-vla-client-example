@@ -5,6 +5,7 @@ import gc
 import io
 import json
 import logging
+import structlog
 import os
 import sys
 import time
@@ -19,7 +20,7 @@ from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PR
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _reply(message: dict[str, Any]) -> None:

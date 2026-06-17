@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
+import time
+
 import os
 import shutil
-import time
 
 from mint_server.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _ray_namespace() -> str:
@@ -32,7 +33,7 @@ def _sampling_inactivity_timeout_s() -> float:
     try:
         return max(0.0, float(raw))
     except Exception:
-        logger.warning("Invalid sampling inactivity timeout=%r; defaulting to 1800s", raw)
+        logger.warning("invalid_sampling_inactivity_timeout", raw=raw, default_s=1800)
         return 1800.0
 
 
@@ -50,8 +51,8 @@ def _cleanup_sampler_indices(sampler_id: str) -> None:
         delete_sampler_index(sampler_id)
         if parent_session_id is not None:
             remove_sampler_from_session(parent_session_id, sampler_id)
-    except Exception as e:
-        logger.debug("Failed to cleanup sampler index %s: %s", sampler_id, e)
+    except Exception:
+        logger.debug("failed_to_cleanup_sampler_index__s___s")
 
 
 async def _remove_loaded_lora_if_last_reference(*, base_model: str, lora_int_id: int) -> None:

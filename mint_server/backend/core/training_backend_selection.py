@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _DISTRIBUTED_MOE_BACKENDS = {"megatron", "bumblebee"}
 
@@ -41,7 +41,7 @@ def _uses_distributed_training_backend(requested_model: str | None) -> bool:
         if bool(getattr(get_model_config(requested_model or ""), "is_moe", False)):
             return True
     except Exception:
-        logger.debug("distributed training model config lookup failed for %s", requested_model, exc_info=True)
+        logger.debug("distributed_training_model_config_lookup_failed_for__s", exc_info=True)
     return _is_qwen35_model(requested_model)
 
 

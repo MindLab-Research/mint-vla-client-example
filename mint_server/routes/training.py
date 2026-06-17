@@ -24,7 +24,7 @@ import asyncio
 import hashlib
 import inspect
 import json
-import logging
+import structlog
 import os
 import re
 import shutil
@@ -118,7 +118,7 @@ if TYPE_CHECKING:
     from mint_server.backend.training.training_session_manager import TrainingSessionManager
     from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 
@@ -290,7 +290,7 @@ def _cleanup_generated_checkpoint_dir(path: str | None) -> None:
     if not any(
         real == root or real.startswith(root + os.sep) for root in managed_roots
     ):
-        logger.warning("Refusing to cleanup checkpoint outside managed roots: %s", path)
+        logger.warning("refusing_to_cleanup_checkpoint_outside_managed_roots___s")
         return
     if os.path.isdir(real):
         shutil.rmtree(real, ignore_errors=True)
@@ -2305,8 +2305,8 @@ async def _do_create_model(
                 user_id=user_id,
                 created_at=session.created_at,
             )
-        except Exception as e:
-            logger.warning("[create_model] session index write failed: %s", e)
+        except Exception:
+            logger.warning("session_index_write_failed___s")
 
         response = CreateModelResponse(
             request_id=request_id,
@@ -2942,7 +2942,7 @@ async def forward_backward(
     )
 
     set_request_id(request_id)
-    logger.info(f"forward_backward request received: model_id={request.model_id}")
+    logger.info("forward_backward_request_received", model_id=request.model_id)
 
     inflight_marked = False
     try:
@@ -3505,7 +3505,7 @@ async def _do_forward(
             },
         )
         elapsed_s = time.time() - t0
-        logger.info(f"[{session.model_id}] forward done: elapsed_s={elapsed_s:.3f}")
+        logger.info("forward_done", model_id=session.model_id, elapsed_s=elapsed_s)
         await task_futures.async_resolve(
             request_id,
             result,

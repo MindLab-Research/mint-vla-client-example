@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
-import logging
+import structlog
 import os
 import threading
 from dataclasses import dataclass
@@ -35,7 +35,7 @@ from mint_server.backend.actors.node_placement import (
 )
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 OPENPI_SHARED_TEMPLATE_SESSION_ID = "__mint_initial__"
 
@@ -604,7 +604,7 @@ class OpenPISharedRayRuntimeClient:
                     actor=self._actor,
                 )
                 for note in cleanup_errors:
-                    logger.warning("%s", note)
+                    logger.warning("s")
         else:
             await _pool_call("set_session", self._actor_name, self._session_id)
         await _pool_call("touch", self._actor_name)
@@ -637,7 +637,7 @@ class OpenPISharedRayRuntimeClient:
             actor=self._actor,
         )
         for note in cleanup_errors:
-            logger.warning("%s", note)
+            logger.warning("s")
 
 
 async def start_openpi_shared_ray_runtime(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import structlog
 import os
 import time
 from contextlib import asynccontextmanager
@@ -50,7 +51,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 _DISABLE_MINT_ROUTE = os.environ.get("MINT_DISABLE_MINT_ROUTE", "").strip().lower() in {
     "1",
     "true",
@@ -134,7 +135,7 @@ async def _check_startup_control_plane() -> None:
             error="one or more detached control-plane actors are unavailable",
             details={"failures": failures},
         )
-        logger.warning("Control-plane startup check degraded: %s", failures)
+        logger.warning("control_plane_startup_check_degraded___s")
 
 
 async def _cancel_task(task: asyncio.Task | None) -> None:
@@ -153,17 +154,17 @@ async def _shutdown_local_inference_runtime(inference_manager: SessionManager) -
             continue
         try:
             await engine.shutdown()
-            logger.info("Locally shutdown inference engine for session %s", session_id)
-        except Exception as e:
-            logger.warning("Local inference runtime shutdown failed session=%s: %s", session_id, e)
+            logger.info("locally_shutdown_inference_engine_for_session__s")
+        except Exception:
+            logger.warning("local_inference_runtime_shutdown_failed____s", session=session_id)
 
     shared_engine = getattr(inference_manager, "_shared_engine", None)
     if shared_engine is not None:
         try:
             await shared_engine.shutdown()
             logger.info("Locally shutdown shared inference engine")
-        except Exception as e:
-            logger.warning("Local shared inference engine shutdown failed: %s", e)
+        except Exception:
+            logger.warning("local_shared_inference_engine_shutdown_failed___s")
         inference_manager._shared_engine = None
 
 
@@ -176,9 +177,9 @@ async def _shutdown_local_training_runtime(train_manager) -> None:
             continue
         try:
             await inference_engine.shutdown()
-            logger.info("Locally shutdown training-side inference engine for model %s", model_id)
-        except Exception as e:
-            logger.warning("Local training runtime shutdown failed model=%s: %s", model_id, e)
+            logger.info("locally_shutdown_training_side_inference_engine_for_model__s")
+        except Exception:
+            logger.warning("local_training_runtime_shutdown_failed____s", model=model_id)
 
 
 def _clear_local_execution_route_globals() -> None:
@@ -213,7 +214,7 @@ async def _restore_sampling_sessions(inference_manager: SessionManager) -> int:
                 e,
             )
     if restored:
-        logger.info("Restored %s sampling session(s) from detached store", restored)
+        logger.info("restored__s_sampling_session_s__from_detached_store")
     return restored
 
 

@@ -1042,14 +1042,14 @@ def _patch_verl_sglang_http_server_engine_module(http_server_engine: ModuleType)
                             response.raise_for_status()
                         return await http_server_engine._read_async_response(response)
             except asyncio.TimeoutError:
-                http_server_engine.logger.warning(f"Async request to {endpoint} timed out (attempt {attempt + 1})")
+                http_server_engine.logger.warning("async_request_timeout", endpoint=endpoint, attempt=attempt + 1)
             except aiohttp.ClientConnectorError:
-                http_server_engine.logger.warning(f"Connection error for {endpoint} (attempt {attempt + 1})")
+                http_server_engine.logger.warning("connection_error", endpoint=endpoint, attempt=attempt + 1)
             except aiohttp.ClientResponseError as e:
-                http_server_engine.logger.error(f"HTTP error for {endpoint}: {e}")
+                http_server_engine.logger.error("http_error", endpoint=endpoint, error=str(e))
                 raise
             except Exception as e:
-                http_server_engine.logger.error(f"Unexpected error for {endpoint}: {e}")
+                http_server_engine.logger.error("unexpected_error", endpoint=endpoint, error=str(e))
                 if attempt == self.max_attempts - 1:
                     raise
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import logging
+import structlog
 import os
 import time
 import uuid
@@ -22,7 +22,7 @@ from mint_server.backend.ray_cluster.async_ray_control import _await_with_ray_ge
 
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 _ACTOR_HANDLE = None
 
 

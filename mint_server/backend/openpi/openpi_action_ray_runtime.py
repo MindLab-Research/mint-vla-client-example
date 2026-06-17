@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import logging
+import structlog
 import os
 from typing import Any
 
@@ -32,7 +32,7 @@ from mint_server.backend.actors.node_placement import (
 )
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _action_actor_name(

@@ -10,7 +10,7 @@ import asyncio
 import hashlib
 import importlib
 import json
-import logging
+import structlog
 import os
 import socket
 import sys
@@ -41,7 +41,7 @@ from mint_server.ray_utils import init_ray
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 PERSISTENT_NAMESPACE = RAY_NAMESPACE
 BUMBLEBEE_TRAIN_STATE_CHECKPOINT_FORMAT = "mint_bumblebee_adapter_train_state_checkpoint_v1"
@@ -151,7 +151,7 @@ def _infer_bumblebee_reference_actual_rank(checkpoint_path: str | Path) -> int |
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
-            logger.warning("Failed to read Bumblebee reference rank metadata from %s", path, exc_info=True)
+            logger.warning("failed_to_read_bumblebee_reference_rank_metadata_from__s", exc_info=True)
             continue
         if not isinstance(loaded, dict):
             continue
@@ -175,7 +175,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw)
     except ValueError:
-        logger.warning("Ignoring invalid %s=%r; expected int", name, raw)
+        logger.warning("ignoring_invalid_config", name=name, raw=raw, expected_type="int")
         return default
 
 
@@ -631,11 +631,11 @@ class BumblebeeRankWorker:
                     },
                 },
             )
-            logger.info("Bumblebee rank create_runtime start: rank=%s", self.rank)
+            logger.info("bumblebee_rank_create_runtime_start", rank=self.rank)
             self.rt = create_runtime(RuntimeConfig(backend="bb", hf_path=self.base_model, backend_cfg=bb_cfg))
-            logger.info("Bumblebee rank build_model start: rank=%s", self.rank)
+            logger.info("bumblebee_rank_build_model_start", rank=self.rank)
             self.handle = self.rt.build_model()
-            logger.info("Bumblebee rank initialize done: rank=%s", self.rank)
+            logger.info("bumblebee_rank_initialize_done", rank=self.rank)
             return {"rank": self.rank, "world_size": self.world_size, "backend": "bumblebee", "bumblebee_repo": repo}
         except BaseException:
             logger.exception("Bumblebee rank initialize failed: rank=%s world_size=%s", self.rank, self.world_size)
@@ -1689,7 +1689,7 @@ class BumblebeeRankWorker:
                 if isinstance(loaded_metadata, dict):
                     metadata = loaded_metadata
             except Exception:
-                logger.warning("Failed to read checkpoint metadata.json from %s", metadata_path, exc_info=True)
+                logger.warning("failed_to_read_checkpoint_metadata_json_from__s", exc_info=True)
         if metadata.get("backend") != "megatron" and not has_megatron_shards:
             return None
 
@@ -1736,7 +1736,7 @@ class BumblebeeRankWorker:
             try:
                 session_meta.learning_rate = float(lr)
             except Exception:
-                logger.warning("Ignoring invalid migrated checkpoint learning_rate=%r", lr)
+                logger.warning("ignoring_invalid_migrated_checkpoint_learning_rate", learning_rate=lr)
         session_meta.actual_rank = actual_rank
         self._current_session = session_id
         return {
@@ -1822,7 +1822,7 @@ class BumblebeeRankWorker:
             try:
                 loaded_meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
-                logger.warning("Failed to read Bumblebee training_meta.json from %s", meta_path, exc_info=True)
+                logger.warning("failed_to_read_bumblebee_training_meta_json_from__s", exc_info=True)
         step = loaded_meta.get("current_step", payload.get("step", 0))
         if step is not None:
             session_meta.step_count = int(step)
@@ -2591,7 +2591,7 @@ def get_or_create_bumblebee_worker_group(
             )
             return actor
         except ValueError:
-            logger.info("Creating new detached Bumblebee actor: %s for %s", actor_name, base_model)
+            logger.info("creating_new_detached_bumblebee_actor___s_for__s")
 
         runtime_pythonpath = _bumblebee_runtime_pythonpath(base_model)
         runtime_env = {

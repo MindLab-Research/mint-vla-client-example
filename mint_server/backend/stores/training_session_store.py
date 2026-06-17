@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 import time
 from typing import Any
 
+from mint_server.logging_context import record_store_op_otel
 from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError, task_state_store
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def upsert_training_session(info: dict[str, Any]) -> None:
-    payload = dict(info)
-    model_id = str(payload.get("model_id") or "")
-    if not model_id:
-        raise RuntimeError("Training session store write failed: upsert: missing model_id")
-    payload.setdefault("current_step", 0)
-    payload.setdefault("last_activity", time.time())
-    payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
-    task_state_store.upsert_training_session(model_id=model_id, info=payload)
+    _t0 = time.perf_counter()
+    try:
+        payload = dict(info)
+        model_id = str(payload.get("model_id") or "")
+        if not model_id:
+            raise RuntimeError("Training session store write failed: upsert: missing model_id")
+        payload.setdefault("current_step", 0)
+        payload.setdefault("last_activity", time.time())
+        payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
+        task_state_store.upsert_training_session(model_id=model_id, info=payload)
+    except Exception:
+        record_store_op_otel(store="training_session", op="upsert", status="error", duration_s=time.perf_counter() - _t0)
+        raise
+    finally:
+        record_store_op_otel(store="training_session", op="upsert", status="ok", duration_s=time.perf_counter() - _t0)
 
 
 async def async_upsert_training_session(info: dict[str, Any]) -> None:
@@ -35,12 +43,16 @@ async def async_upsert_training_session(info: dict[str, Any]) -> None:
 
 
 def delete_training_session(model_id: str) -> None:
+    _t0 = time.perf_counter()
     try:
         task_state_store.delete_training_session(model_id=str(model_id))
     except TaskStateStoreUnavailableError:
         logger.warning("Training session store write skipped: TaskStateStore unavailable")
-    except Exception as e:
-        logger.warning("Training session store write failed: delete: %s", e)
+    except Exception:
+        logger.warning("training_session_store_write_failed__delete___s")
+        record_store_op_otel(store="training_session", op="delete", status="error", duration_s=time.perf_counter() - _t0)
+        return
+    record_store_op_otel(store="training_session", op="delete", status="ok", duration_s=time.perf_counter() - _t0)
 
 
 def set_training_session_last_activity(model_id: str, last_activity: float) -> None:
@@ -48,8 +60,8 @@ def set_training_session_last_activity(model_id: str, last_activity: float) -> N
         task_state_store.set_training_session_last_activity(model_id=str(model_id), last_activity=float(last_activity))
     except TaskStateStoreUnavailableError:
         return
-    except Exception as e:
-        logger.debug("Training session store write failed: last_activity: %s", e)
+    except Exception:
+        logger.debug("training_session_store_write_failed__last_activity___s")
 
 
 async def async_set_training_session_last_activity(model_id: str, last_activity: float) -> float | None:

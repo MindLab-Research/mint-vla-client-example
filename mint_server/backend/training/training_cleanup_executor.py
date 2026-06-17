@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 import os
 
 from mint_server.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _ray_namespace() -> str:
@@ -27,7 +27,7 @@ def _training_heartbeat_stale_timeout_s() -> float:
     try:
         return max(0.0, float(raw))
     except Exception:
-        logger.warning("Invalid MINT_TRAINING_HEARTBEAT_STALE_S=%r; defaulting to 300s", raw)
+        logger.warning("invalid_training_heartbeat_stale_s", raw=raw, default_s=300)
         return 300.0
 
 

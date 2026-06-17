@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
+import structlog
 import math
 import os
 import sys
@@ -63,7 +63,7 @@ from mint_server.backend.inference.qwen35_text_vllm_adapter import (
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 VLLM_NO_COMPILED_DAG_ENV = "MINT_VLLM_RAY_EXECUTOR_NO_COMPILED_DAG_SAMPLE"
 
@@ -231,8 +231,8 @@ def _stabilize_vllm_child_environment() -> None:
         preferred_executable = os.environ.get("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", "").strip() or sys.executable
         if preferred_executable and os.path.exists(preferred_executable):
             multiprocessing.set_executable(preferred_executable)
-    except Exception as e:
-        logger.warning("failed to pin multiprocessing executable: %s: %s", type(e).__name__, e)
+    except Exception:
+        logger.warning("failed_to_pin_multiprocessing_executable___s___s")
 
 
 def _patch_vllm_fused_moe_slice_for_fully_sharded_loras() -> None:
@@ -315,7 +315,7 @@ def _node_affinity_scheduling_opts_for_model(
     )
 
     node_res = f"node:{pinned_ip}"
-    logger.info(f"mint_vllm_multinode_pin model={model_name} resources={node_res!r}")
+    logger.info("mint_vllm_multinode_pin", model=model_name, resources=repr(node_res))
     return {"resources": {node_res: 0.001}}
 
 
@@ -591,7 +591,7 @@ class MultiNodeLoRARegistry:
                 )
                 return lora_id, False
             self._id_to_slot.pop(lora_id, None)
-            logger.debug("Removed final session %s for lora_int_id=%s", sampling_session_id, lora_id)
+            logger.debug("removed_final_session__s_for", lora_int_id=sampling_session_id)
             return lora_id, True
 
     async def count(self) -> int:
@@ -1162,8 +1162,8 @@ def _create_mint_vllm_multinode_actor(
                         if self._active_generates > 0:
                             return False
                     return True
-            except Exception as e:
-                logger.warning(f"MultiNodeVLLMEngine is_ready failed: {type(e).__name__}: {e}")
+            except Exception:
+                logger.warning("multinodevllmengine_is_ready_failed___s___s")
                 return False
 
         @traced_async_from_traceparent(
@@ -1267,7 +1267,7 @@ def _create_mint_vllm_multinode_actor(
                     t2 - t1,
                     t2 - t0,
                 )
-            logger.info(f"Added LoRA {lora_name} (id={lora_int_id}) from {lora_path}")
+            logger.info("added_lora__s_____from__s", id=lora_name)
 
         async def remove_lora(self, lora_int_id: int, traceparent: str | None = None) -> None:
             """Remove a LoRA adapter."""
@@ -1286,7 +1286,7 @@ def _create_mint_vllm_multinode_actor(
                     t2 - t1,
                     t2 - t0,
                 )
-            logger.info(f"Removed LoRA id={lora_int_id}")
+            logger.info("removed_lora", id=lora_int_id)
 
         async def list_loras(self) -> set[int]:
             """List loaded LoRA adapter IDs."""
@@ -1414,8 +1414,8 @@ def _create_mint_vllm_multinode_actor(
                     except Exception:
                         pass
                 await self.engine.abort(request_id)
-            except Exception as e:
-                logger.warning(f"MultiNodeVLLMEngine.abort_request failed: {type(e).__name__}: {e}")
+            except Exception:
+                logger.warning("multinodevllmengine_abort_request_failed___s___s")
 
         @traced_async_from_traceparent(
             "sampling.mint_vllm_multinode_actor.generate",
@@ -2423,7 +2423,7 @@ class MultiNodeInferenceEngine:
                 or os.environ.get("MINT_RAY_CGRAPH_GET_TIMEOUT_S")
                 or "1800"
             )
-            logger.info(f"mint_vllm_multinode_init actor={self.actor_name} RAY_CGRAPH_get_timeout={ray_cgraph_get_timeout}")
+            logger.info("mint_vllm_multinode_init", actor=self.actor_name, RAY_CGRAPH_get_timeout=ray_cgraph_get_timeout)
 
             # Large models can spend 10-30+ minutes loading shards across many GPUs.
             if total_required_gpus >= 16:
@@ -2487,7 +2487,7 @@ class MultiNodeInferenceEngine:
                     )
                     is_ready = False
                 if is_ready:
-                    logger.info(f"Connected to existing MultiNodeVLLMEngine: {self.actor_name}")
+                    logger.info("connected_to_existing_multinodevllmengine___s")
                     _attach_existing_actor(existing_actor)
                     return
                 else:
@@ -2515,11 +2515,11 @@ class MultiNodeInferenceEngine:
                             f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}; will recreate"
                         )
                     else:
-                        logger.info(f"Connected to existing MultiNodeVLLMEngine after init: {self.actor_name}")
+                        logger.info("connected_to_existing_multinodevllmengine_after_init___s")
                         _attach_existing_actor(existing_actor)
                         return
             except (ValueError, ray.exceptions.RayActorError):
-                logger.info(f"No existing actor found, creating new: {self.actor_name}")
+                logger.info("no_existing_actor_found__creating_new___s")
 
             # Kill existing actor if any before creating new
             if existing_actor is not None:
@@ -2538,8 +2538,8 @@ class MultiNodeInferenceEngine:
                             ray.get_actor(self.actor_name, namespace=PERSISTENT_NAMESPACE)
                         except ValueError:
                             break  # Actor name is available
-                except Exception as e:
-                    logger.warning(f"Error killing actor {self.actor_name}: {e}")
+                except Exception:
+                    logger.warning("error_killing_actor__s___s")
 
             node_ips: list[str] | None = None
 
@@ -2840,7 +2840,7 @@ class MultiNodeInferenceEngine:
                 self.engine = None
                 raise RuntimeError(f"ray.get(initialize) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
-                logger.error(f"Engine initialization timed out after {init_timeout}s")
+                logger.error("engine_initialization_timed_out_after__ss")
                 ray_kill.kill(
                     self.engine,
                     reason="mint_vllm_multinode_init_timeout",
@@ -2867,7 +2867,7 @@ class MultiNodeInferenceEngine:
                 raise
 
             self._initialized = True
-            logger.info(f"MultiNodeInferenceEngine initialized: {self.actor_name}")
+            logger.info("multinodeinferenceengine_initialized___s")
 
             # Register with unified model actor registry for LRU tracking
             # Multi-node vLLM internally manages GPU workers, but we track total GPUs for eviction
@@ -3035,8 +3035,8 @@ class MultiNodeInferenceEngine:
         try:
             ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
             await async_get_ray_ref(ref, timeout_s=10)
-        except Exception as e:
-            logger.warning(f"MultiNodeInferenceEngine.abort_request failed: {type(e).__name__}: {e}")
+        except Exception:
+            logger.warning("multinodeinferenceengine_abort_request_failed___s___s")
 
     async def generate(
         self,
@@ -3393,8 +3393,8 @@ class MultiNodeInferenceEngine:
             try:
                 ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
                 await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
-            except Exception as e:
-                logger.warning(f"Failed to remove LoRA {removed_lora_id} from engine: {e}")
+            except Exception:
+                logger.warning("failed_to_remove_lora__s_from_engine___s")
 
         logger.info(
             "Removed session %s (lora_int_id=%s should_unload=%s)",
@@ -3429,8 +3429,8 @@ class MultiNodeInferenceEngine:
                     namespace=PERSISTENT_NAMESPACE,
                 )
                 logger.info("Killed MultiNodeVLLMEngine actor")
-            except Exception as e:
-                logger.warning(f"Error killing actor: {e}")
+            except Exception:
+                logger.warning("error_killing_actor___s")
         self.engine = None
         self._initialized = False
         logger.info("MultiNodeInferenceEngine disconnected")

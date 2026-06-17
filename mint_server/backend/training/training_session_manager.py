@@ -7,7 +7,7 @@ session operations for the runtime that instantiated it.
 
 from __future__ import annotations
 
-import logging
+import structlog
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from mint_server.models.types import LoRAConfig
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default training inactivity timeout: 1 hour.
 # Training clients may have long intervals between steps (sampling, reward
@@ -432,7 +432,7 @@ class TrainingSessionManager:
             True if deleted, False if not found.
         """
         if model_id not in self._sessions:
-            logger.warning(f"Attempted to delete non-existent session: {model_id}")
+            logger.warning("attempted_to_delete_non_existent_session___s")
             return False
 
         session = self._sessions.pop(model_id)
@@ -679,15 +679,15 @@ class TrainingSessionManager:
                 if session.is_active:
                     try:
                         await engine.unbind_session(session)
-                        logger.info(f"Shutdown training session: {model_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to shutdown session {model_id}: {e}")
+                        logger.info("shutdown_training_session___s")
+                    except Exception:
+                        logger.error("failed_to_shutdown_session__s___s")
                 # Shutdown per-session inference engine if present
                 if session.inference_engine is not None:
                     try:
                         await session.inference_engine.shutdown()
-                        logger.info(f"Shutdown inference engine for session: {model_id}")
-                    except Exception as e:
-                        logger.error(f"Failed to shutdown inference engine {model_id}: {e}")
+                        logger.info("shutdown_inference_engine_for_session___s")
+                    except Exception:
+                        logger.error("failed_to_shutdown_inference_engine__s___s")
             self._sessions.pop(model_id, None)
-        logger.info(f"Shutdown {len(session_ids)} training sessions")
+        logger.info("shutdown__s_training_sessions")

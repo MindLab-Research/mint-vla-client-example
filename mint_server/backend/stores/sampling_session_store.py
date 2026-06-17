@@ -2,33 +2,47 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 import time
 from typing import Any
 
+from mint_server.logging_context import record_store_op_otel
 from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError, task_state_store
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def upsert_sampling_session(info: dict[str, Any]) -> None:
-    payload = dict(info)
-    session_id = str(payload.get("session_id", ""))
-    if not session_id:
-        raise RuntimeError("Sampling session store write failed: upsert: missing session_id")
-    payload.setdefault("last_activity", time.time())
-    payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
-    task_state_store.upsert_sampling_session(session_id=session_id, info=payload)
+    _t0 = time.perf_counter()
+    try:
+        payload = dict(info)
+        session_id = str(payload.get("session_id", ""))
+        if not session_id:
+            raise RuntimeError("Sampling session store write failed: upsert: missing session_id")
+        payload.setdefault("last_activity", time.time())
+        payload["metadata_version"] = max(1, int(payload.get("metadata_version") or 1))
+        task_state_store.upsert_sampling_session(session_id=session_id, info=payload)
+    except Exception:
+        record_store_op_otel(store="sampling_session", op="upsert", status="error", duration_s=time.perf_counter() - _t0)
+        raise
+    finally:
+        record_store_op_otel(store="sampling_session", op="upsert", status="ok", duration_s=time.perf_counter() - _t0)
 
 
 def delete_sampling_session(session_id: str) -> None:
+    _t0 = time.perf_counter()
     try:
         task_state_store.delete_sampling_session(session_id=str(session_id))
     except TaskStateStoreUnavailableError:
         logger.warning("Sampling session store write skipped: TaskStateStore unavailable")
-    except Exception as e:
-        logger.warning("Sampling session store write failed: delete: %s", e)
+        record_store_op_otel(store="sampling_session", op="delete", status="unavailable", duration_s=time.perf_counter() - _t0)
+        return
+    except Exception:
+        logger.warning("sampling_session_store_write_failed__delete___s")
+        record_store_op_otel(store="sampling_session", op="delete", status="error", duration_s=time.perf_counter() - _t0)
+        return
+    record_store_op_otel(store="sampling_session", op="delete", status="ok", duration_s=time.perf_counter() - _t0)
 
 
 def set_sampling_session_last_activity(session_id: str, last_activity: float) -> None:
@@ -39,8 +53,8 @@ def set_sampling_session_last_activity(session_id: str, last_activity: float) ->
         )
     except TaskStateStoreUnavailableError:
         return
-    except Exception as e:
-        logger.debug("Sampling session store write failed: last_activity: %s", e)
+    except Exception:
+        logger.debug("sampling_session_store_write_failed__last_activity___s")
 
 
 async def async_set_sampling_session_last_activity(session_id: str, last_activity: float) -> float | None:

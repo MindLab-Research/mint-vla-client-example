@@ -6,9 +6,11 @@ import gc
 import io
 import json
 import logging
+import structlog
+import time
+
 import os
 import sys
-import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,7 @@ from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PR
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 _PROTOCOL_STDOUT = None
 
 
@@ -457,7 +459,7 @@ def _dispatch_with_protocol_stdout(
         response, next_session = _dispatch(session, op, payload)
     extra_stdout = capture.getvalue().strip()
     if extra_stdout:
-        logger.warning("Suppressed non-protocol stdout from OpenPI FAST action worker: %s", extra_stdout)
+        logger.warning("suppressed_non_protocol_stdout_from_openpi_fast_action_worke")
     return response, next_session
 
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import glob
 import json
 import os
@@ -15,8 +16,10 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
-import fcntl
 
+import structlog
+
+from mint_server.observability.logging_context import start_as_current_span, record_span_event_otel
 from mint_server.ray.runtime_env import env_get
 from .checkpoint_index import (
     CheckpointNotFoundError,
@@ -24,6 +27,8 @@ from .checkpoint_index import (
     mark_checkpoint_failed,
     publish_checkpoint_catalog,
 )
+
+logger = structlog.get_logger(__name__)
 
 DEFAULT_PERSISTENT_CHECKPOINTS_DIR = "/tos-mindverse/mint_checkpoints"
 DEFAULT_RUNTIME_CHECKPOINTS_DIR = "/vePFS-Mindverse/share/mint/prod/data/runtime-checkpoints"
@@ -938,13 +943,26 @@ def mirror_checkpoint_to_persistent_store(
     checkpoint_name: str,
     checkpoint_type: CheckpointType | None = None,
 ) -> str:
-    dst_dir = build_persistent_checkpoint_dir(
-        user_id=user_id,
-        model_id=model_id,
-        checkpoint_name=checkpoint_name,
-        checkpoint_type=checkpoint_type,
-    )
-    return sync_checkpoint_tree(src_dir, dst_dir)
+    _t0 = time.perf_counter()
+    with start_as_current_span(
+        "checkpoint.mirror",
+        component="checkpoints",
+        op="mirror",
+        attributes={"model_id": str(model_id), "checkpoint_name": str(checkpoint_name)},
+    ):
+        dst_dir = build_persistent_checkpoint_dir(
+            user_id=user_id,
+            model_id=model_id,
+            checkpoint_name=checkpoint_name,
+            checkpoint_type=checkpoint_type,
+        )
+        result = sync_checkpoint_tree(src_dir, dst_dir)
+        record_span_event_otel("checkpoint.mirror.complete", attributes={
+            "model_id": str(model_id),
+            "checkpoint_name": str(checkpoint_name),
+            "duration_s": time.perf_counter() - _t0,
+        })
+        return result
 
 
 def _mirror_target_path(metadata: dict) -> str:
@@ -1016,7 +1034,14 @@ def begin_async_checkpoint_mirror(
 
 
 def _process_pending_checkpoint_mirror(checkpoint_path: str) -> tuple[str, str]:
-    metadata = read_checkpoint_metadata(checkpoint_path)
+    _t0 = time.perf_counter()
+    with start_as_current_span(
+        "checkpoint.mirror_process",
+        component="checkpoints",
+        op="mirror_process",
+        attributes={"checkpoint_path": str(checkpoint_path)},
+    ):
+        metadata = read_checkpoint_metadata(checkpoint_path)
     checkpoint_type = metadata.get("checkpoint_type") or metadata.get("type")
     if checkpoint_type not in ("training", "sampler"):
         raise ValueError(f"invalid checkpoint_type for mirror: {checkpoint_type!r}")

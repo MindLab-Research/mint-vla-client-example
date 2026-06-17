@@ -6,6 +6,8 @@ import dataclasses
 import io
 import json
 import logging
+import structlog
+
 import os
 import shutil
 import sys
@@ -22,7 +24,7 @@ from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PR
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 _PROTOCOL_STDOUT = None
 
 
@@ -248,7 +250,7 @@ class OpenPIFastWorkerSession:
         overrides = OpenPIFastRuntimeInitOverrides.from_env()
         self._seed_assets_dir: Path | None = None
         if overrides.weights_path is not None:
-            logger.info("OpenPI FAST worker using explicit weights path: %s", overrides.weights_path)
+            logger.info("openpi_fast_worker_using_explicit_weights_path___s")
             self._config = dataclasses.replace(
                 self._config,
                 weight_loader=weight_loaders.CheckpointWeightLoader(overrides.weights_path),
@@ -1067,7 +1069,7 @@ def _dispatch_with_protocol_stdout(session: OpenPIFastWorkerSession | None, op: 
         response, should_stop = _dispatch(session, op, payload)
     extra_stdout = capture.getvalue().strip()
     if extra_stdout:
-        logger.warning("Suppressed non-protocol stdout from OpenPI worker: %s", extra_stdout)
+        logger.warning("suppressed_non_protocol_stdout_from_openpi_worker___s")
     return response, should_stop
 
 

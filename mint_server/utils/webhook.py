@@ -1,6 +1,6 @@
 """Webhook 回调模块 - 向 mint-platform 发送事件通知"""
 
-import logging
+import structlog
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -11,7 +11,7 @@ import requests
 
 from mint_server.observability.logging_context import classify_failure_reason, get_otel_tracer
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class EventType(str, Enum):

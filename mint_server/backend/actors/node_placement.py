@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import logging
+import structlog
 import math
 import os
 import re
@@ -13,7 +13,7 @@ import ray
 
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _namespace_suffix(namespace: str) -> str:
@@ -173,17 +173,17 @@ def _actor_used_gpus_by_node_from_state_api(*, context: str) -> tuple[dict[str, 
     except Exception:
         ray_util_state = getattr(getattr(ray, "util", None), "state", None)
     if ray_util_state is None:
-        logger.debug("%s: ray.util.state unavailable for actor fallback", context)
+        logger.debug("s__ray_util_state_unavailable_for_actor_fallback")
         return {}, False
 
     list_actors = getattr(ray_util_state, "list_actors", None)
     if list_actors is None:
-        logger.debug("%s: ray.util.state.list_actors unavailable for actor fallback", context)
+        logger.debug("s__ray_util_state_list_actors_unavailable_for_actor_fallback")
         return {}, False
 
     address = _ray_state_api_address()
     if not address:
-        logger.debug("%s: no Ray state API address configured for actor fallback", context)
+        logger.debug("s__no_ray_state_api_address_configured_for_actor_fallback")
         return {}, False
 
     try:
@@ -192,8 +192,8 @@ def _actor_used_gpus_by_node_from_state_api(*, context: str) -> tuple[dict[str, 
             limit=10000,
             raise_on_missing_output=False,
         )
-    except Exception as e:
-        logger.warning("%s: actor state fallback failed: %s", context, e)
+    except Exception:
+        logger.warning("s__actor_state_fallback_failed___s")
         return {}, False
 
     used_gpus_by_node: dict[str, float] = {}
@@ -239,8 +239,8 @@ def _available_resources_per_node_with_pg_fallback(
 
     try:
         table = ray.util.placement_group_table()
-    except Exception as e:
-        logger.warning("%s: placement_group_table fallback failed: %s", context, e)
+    except Exception:
+        logger.warning("s__placement_group_table_fallback_failed___s")
         infos = ()
     else:
         if isinstance(table, dict):
@@ -302,8 +302,8 @@ def _available_resources_per_node_with_pg_fallback(
                 used_gpus_by_node.get(node_id, 0.0),
                 float(used_gpus),
             )
-    except Exception as e:
-        logger.debug("%s: model_actor_supervisor fallback failed: %s", context, e)
+    except Exception:
+        logger.debug("s__model_actor_supervisor_fallback_failed___s")
 
     # Ray Client mode cannot always access per-node availability via ray._private.state.
     # If actor-state fallback succeeds we can still trust the derived reservations. Otherwise,
@@ -930,8 +930,8 @@ def _check_cross_namespace_conflicts(requested_node_ips: dict[str, int]) -> str:
                 lines.append(f"    * ... and {len(actors) - 5} more")
 
         return "\n".join(lines)
-    except Exception as e:
-        logger.debug(f"Failed to check cross-namespace conflicts: {e}")
+    except Exception:
+        logger.debug("failed_to_check_cross_namespace_conflicts___s")
         return ""
 
 

@@ -5,7 +5,11 @@ import os
 import time
 from dataclasses import dataclass
 
+import structlog
 from fastapi.responses import JSONResponse
+
+
+logger = structlog.get_logger(__name__)
 
 
 PUBLIC_HEALTHZ_CACHE_TTL_S = 30.0
@@ -63,6 +67,7 @@ async def _ping_public_dependencies(*, timeout_s: float) -> None:
 
     component_timeout_s = min(timeout_s, PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S)
 
+    _ping_t0 = time.perf_counter()
     async def _call_ping(fn) -> object:
         try:
             out = fn(timeout_s=component_timeout_s)

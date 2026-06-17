@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 import time
 from typing import Any
 
@@ -11,7 +11,7 @@ from mint_server.config import config as server_config
 from mint_server.backend.ray_cluster.async_ray_control import _ray_ref_to_future, _silence_late_result
 from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 async def ray_get_with_model_actor_supervisor_keepalive(

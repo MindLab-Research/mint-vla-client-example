@@ -11,7 +11,7 @@ Endpoints:
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 import shutil
 import uuid
@@ -89,7 +89,7 @@ if TYPE_CHECKING:
     from mint_server.backend.training.training_session_manager import TrainingSessionManager
     from mint_server.backend.training.verl.verl_training import VerlTrainingEngine
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 # Execution-runtime references (left unbound in API workers).
@@ -1549,7 +1549,7 @@ async def _do_save_state(
             checkpoint_type="training",
         )
 
-        logger.info(f"[{session.model_id}] Saving state to: {save_path}")
+        logger.info("saving_state_to___s", model_id=session.model_id)
 
         # Save training checkpoint on worker, returns path
         async def _save_state_once() -> None:
@@ -1816,7 +1816,7 @@ async def _do_save_weights(
             checkpoint_type="sampler",
         )
 
-        logger.info(f"[{session.model_id}] Saving sampler weights to: {save_path}")
+        logger.info("saving_sampler_weights_to___s", model_id=session.model_id)
 
         async def _save_weights_once() -> None:
             await run_async_with_otel_span(
@@ -2181,7 +2181,7 @@ async def _do_load_state(
             raise RuntimeError("Training engine not initialized")
         load_path = request.path
 
-        logger.info(f"[{session.model_id}] Loading state from: {load_path}")
+        logger.info("loading_state_from___s", model_id=session.model_id)
 
         if request.optimizer:
             from ..checkpoints import validate_checkpoint_load_contract
@@ -2677,7 +2677,7 @@ async def delete_checkpoint(
                     ckpt_id,
                 )
 
-    logger.info(f"[{model_id}] Deleted checkpoint: {checkpoint_id}")
+    logger.info("deleted_checkpoint___s", model_id=model_id)
     return {"status": "deleted", "checkpoint_id": checkpoint_id}
 
 
@@ -2768,7 +2768,7 @@ async def download_checkpoint_archive(
 
     safe_checkpoint_id = checkpoint_id.replace("/", "_")
     filename = f"{model_id}_{safe_checkpoint_id}.tar.gz"
-    logger.info(f"[{model_id}] Streaming checkpoint archive: {checkpoint_id}")
+    logger.info("streaming_checkpoint_archive___s", model_id=model_id)
 
     return StreamingResponse(
         stream_tar_gz(),

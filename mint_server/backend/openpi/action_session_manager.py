@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-import logging
+import structlog
 import uuid
 from typing import Any, Awaitable, Callable
 
@@ -30,7 +30,7 @@ from mint_server.backend.openpi.openpi_pi05_training import (
 )
 from mint_server.backend.actors.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _is_openpi_fast_model(base_model: str) -> bool:

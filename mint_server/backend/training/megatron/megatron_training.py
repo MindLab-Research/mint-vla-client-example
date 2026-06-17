@@ -7,7 +7,7 @@ This module provides:
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 from mint_server.config import config as server_config
 from mint_server.model_input_utils import flatten_encoded_text_chunks
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _wire_data(field: dict | list | None) -> list | None:
@@ -387,7 +387,7 @@ def mint_datum_to_tensordict(
                 "skipping external labels to avoid TensorDict shape mismatch."
             )
     elif has_external_labels and disable_external_label:
-        logger.warning("[mint_datum_to_tensordict] MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
+        logger.warning("MINT_DISABLE_EXTERNAL_LABEL=1; forcing original rolled labels")
 
     require_r3 = (server_config.router_replay_mode == "R3")
     if require_r3:

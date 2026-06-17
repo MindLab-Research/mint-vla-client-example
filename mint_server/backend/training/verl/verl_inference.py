@@ -18,7 +18,7 @@ if os.path.isdir("/vllm"):
     os.environ["PYTHONPATH"] = f"/vllm:{os.environ.get('PYTHONPATH', '').lstrip(':')}".rstrip(":")
 
 import math
-import logging
+import structlog
 import shutil
 import time
 from contextlib import asynccontextmanager
@@ -58,7 +58,7 @@ if TYPE_CHECKING:
     import torch
     from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 VLLM_TOKEN_BUDGET_RATIO = 0.95
 
 
@@ -79,7 +79,7 @@ def _replica_index_from_env(default: int = 0) -> int:
     try:
         return int(value)
     except Exception:
-        logger.warning("Invalid model actor replica env value %r; falling back to %s", raw, default)
+        logger.warning("invalid_model_actor_replica_env", raw=raw, default=default)
         return int(default)
 
 
@@ -1036,16 +1036,15 @@ def _create_extended_server_class(
             verl hardcodes max_loras=1. This modifies the parsed args to use
             our configured values before AsyncEngineArgs.from_cli_args().
             """
-            import logging
-            _logger = logging.getLogger(__name__)
+            _logger = structlog.get_logger(__name__)
 
             if self.MULTI_LORA_MAX_LORAS > 1:
                 args.max_loras = self.MULTI_LORA_MAX_LORAS
-                _logger.info(f"Multi-LoRA: overriding max_loras={args.max_loras}")
+                _logger.info("multi_lora__overriding", max_loras=args.max_loras)
 
             if self.MULTI_LORA_MAX_CPU_LORAS > 0:
                 args.max_cpu_loras = self.MULTI_LORA_MAX_CPU_LORAS
-                _logger.info(f"Multi-LoRA: overriding max_cpu_loras={args.max_cpu_loras}")
+                _logger.info("multi_lora__overriding", max_cpu_loras=args.max_cpu_loras)
 
         def _attach_stats_logger_if_ready(self) -> None:
             engine = getattr(self, "engine", None)
@@ -2835,7 +2834,7 @@ class VerlInferenceEngine:
                     "enable_expert_parallel": True,
                 }
             }
-            logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
+            logger.info("enabling_expert_parallelism_via_vllm", DP=self.data_parallel_size)
 
         # Use model registry as single source of truth for memory constraints.
         cfg = get_model_config(self.model_path)
@@ -2872,7 +2871,7 @@ class VerlInferenceEngine:
         # The sum (total context window) is what matters, not the individual values.
         prompt_length = max_model_len // 2
         response_length = max_model_len - prompt_length
-        logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
+        logger.info("vllm", max_model_len=max_model_len, prompt=prompt_length, response=response_length)
 
         enable_rollout_routing_replay = (server_config.router_replay_mode == "R3")
         logger.info(
@@ -3104,13 +3103,13 @@ class VerlInferenceEngine:
 
         # Pass tensors via Ray to inference worker, which saves locally and loads
         # This handles distributed deployments where nodes have different filesystems
-        worker_path = await self.server.add_lora_from_tensors.remote(
+        await self.server.add_lora_from_tensors.remote(
             state_dict,
             peft_config,
             traceparent=traceparent,
         )
 
-        logger.info(f"Hot-loaded LoRA adapter (API: {adapter_path} -> Worker: {worker_path})")
+        logger.info("hot_loaded_lora_adapter__api___s____worker___s")
 
     async def shutdown(self) -> None:
         """Cleanup Ray actors."""

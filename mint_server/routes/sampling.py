@@ -11,7 +11,7 @@ import asyncio
 import copy
 import array
 import hashlib
-import logging
+import structlog
 import os
 import time
 import uuid
@@ -67,7 +67,7 @@ from ..sampling_utils import (
 if TYPE_CHECKING:
     from mint_server.backend.sessions.session_manager import SessionManager
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 
@@ -1000,7 +1000,7 @@ async def _flush_coalesced_group(key: tuple, delay_s: float) -> None:
     async with _sample_coalesce_lock:
         g = _sample_coalesce_groups.pop(key, None)
     if g is None:
-        logger.warning(f"[coalesce flush task] missing group delay_s={delay_s:.3f}")
+        logger.warning("missing_group", delay_s=delay_s)
         return
     logger.info(
         f"[coalesce flush task] leader={g.get('leader_request_id')} waiters={len(g.get('waiters') or [])} "
@@ -1873,7 +1873,7 @@ async def _do_sample(
                     f"has_generate_many={gen_many is not None} num_samples={request.num_samples}"
                 )
                 if can_coalesce:
-                    logger.info("[sample path] branch=coalesced_generate")
+                    logger.info("branch=coalesced_generate")
                     generate_t0 = time.perf_counter()
                     results = await run_async_with_otel_span(
                         "sampling.generate",
@@ -1902,7 +1902,7 @@ async def _do_sample(
                         },
                     )
                 elif request.num_samples == 1:
-                    logger.info("[sample path] branch=generate_single")
+                    logger.info("branch=generate_single")
                     generate_t0 = time.perf_counter()
                     one_result = await run_async_with_otel_span(
                         "sampling.generate",
@@ -1935,7 +1935,7 @@ async def _do_sample(
                         raise RuntimeError(
                             f"Engine for session {session_id} does not support generate_many()"
                         )
-                    logger.info("[sample path] branch=generate_many")
+                    logger.info("branch=generate_many")
                     generate_t0 = time.perf_counter()
                     results = await run_async_with_otel_span(
                         "sampling.generate",
@@ -2132,7 +2132,7 @@ async def _do_sample(
             workload_status = "ok"
             workload_generated_tokens = generated_tokens
             workload_obs = _vllm_request_observation(results, workload_generated_tokens)
-            logger.info(f"Sampling completed: {len(sequences)} sequences generated")
+            logger.info("sampling_completed___s_sequences_generated")
 
         except asyncio.CancelledError:
             workload_status = "canceled"
@@ -2541,7 +2541,7 @@ async def _do_compute_logprobs(
             billing_observations=billing_observations,
         )
         workload_status = "ok"
-        logger.debug(f"Request {request_id} computed {len(logprobs)} logprobs")
+        logger.debug("request__s_computed__s_logprobs")
 
     except asyncio.CancelledError:
         workload_status = "canceled"

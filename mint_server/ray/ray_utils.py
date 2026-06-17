@@ -3,7 +3,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
-import logging
+import structlog
 import os
 import threading
 import time
@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _RAY_INIT_THREAD_LOCK = threading.Lock()
 _RAY_INIT_LOCK_PATH_ENV = "MINT_RAY_INIT_LOCK_PATH"
@@ -77,7 +77,7 @@ def ray_reconnect_poll_s() -> float:
     try:
         return max(0.1, float(raw))
     except ValueError:
-        logger.warning("Invalid %s=%r, using default", _RAY_RECONNECT_POLL_ENV, raw)
+        logger.warning("invalid_env_using_default", env=_RAY_RECONNECT_POLL_ENV, raw=raw)
         return 5.0
 
 
@@ -257,7 +257,7 @@ def _ray_init_lock_timeout_s() -> float:
     try:
         return max(0.1, float(raw))
     except ValueError:
-        logger.warning("Invalid %s=%r, using default", _RAY_INIT_LOCK_TIMEOUT_ENV, raw)
+        logger.warning("invalid_env_using_default", env=_RAY_INIT_LOCK_TIMEOUT_ENV, raw=raw)
         return 120.0
 
 
@@ -268,7 +268,7 @@ def _ray_init_lock_poll_s() -> float:
     try:
         return max(0.01, float(raw))
     except ValueError:
-        logger.warning("Invalid %s=%r, using default", _RAY_INIT_LOCK_POLL_ENV, raw)
+        logger.warning("invalid_env_using_default", env=_RAY_INIT_LOCK_POLL_ENV, raw=raw)
         return 0.05
 
 

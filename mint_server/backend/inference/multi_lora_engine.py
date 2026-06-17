@@ -8,7 +8,7 @@ Supports GPU slots with CPU cache for overflow (LRU eviction).
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 import os
 import time
 from dataclasses import dataclass
@@ -38,7 +38,7 @@ from mint_server.backend.actors.node_placement import (
 if TYPE_CHECKING:
     pass
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default configuration for 80GB GPU
 DEFAULT_MAX_LORAS = 64  # GPU slots (~2.5GB for rank-32 Qwen-7B)
@@ -134,8 +134,8 @@ def _get_actor_node_id(actor_handle: ray.actor.ActorHandle) -> str | None:
             # NodeID is nested under Address
             address = actor_info.get("Address", {})
             return address.get("NodeID")
-    except Exception as e:
-        logger.debug(f"Could not get node_id for actor: {e}")
+    except Exception:
+        logger.debug("could_not_get_node_id_for_actor___s")
     return None
 
 
@@ -261,8 +261,8 @@ class MultiLoRAInferenceEngine:
                                 namespace=PERSISTENT_NAMESPACE,
                                 no_restart=True,
                             )
-                        except Exception as kill_err:
-                            logger.debug(f"Failed to kill broken actor: {kill_err}")
+                        except Exception:
+                            logger.debug("failed_to_kill_broken_actor___s")
                         self.server = None
                         self._initialized = False
                     else:
@@ -280,7 +280,7 @@ class MultiLoRAInferenceEngine:
                         )
                         total_gpus = self.tensor_parallel_size * self.data_parallel_size
                         actor_node_id = _get_actor_node_id(self.server)
-                        logger.info(f"Publishing existing actor {self.actor_name} through ModelActorSupervisor inventory (node={actor_node_id[:8] if actor_node_id else 'unknown'})")
+                        logger.info("publishing_existing_actor__s_through_modelactorsupervisor_in", node=self.actor_name)
                         publish_backend_model_actor(BackendModelActorLaunch(
                             actor_name=self.actor_name,
                             actor_type=ActorType.VLLM,
@@ -306,9 +306,9 @@ class MultiLoRAInferenceEngine:
                             namespace=PERSISTENT_NAMESPACE,
                             no_restart=True,
                         )
-                        logger.debug(f"Killed dead actor to free name: {self.actor_name}")
-                    except Exception as kill_err:
-                        logger.debug(f"Could not kill dead actor: {kill_err}")
+                        logger.debug("killed_dead_actor_to_free_name___s")
+                    except Exception:
+                        logger.debug("could_not_kill_dead_actor___s")
                     self.server = None
                     # Reset initialized flag so we'll create new actor below
                     self._initialized = False
@@ -375,7 +375,7 @@ class MultiLoRAInferenceEngine:
                         "enable_expert_parallel": True,
                     }
                 }
-                logger.info(f"Enabling expert parallelism via vLLM (DP={self.data_parallel_size})")
+                logger.info("enabling_expert_parallelism_via_vllm", DP=self.data_parallel_size)
 
             # Determine effective context limit for vLLM
             model_cfg = get_model_config(self.model_path)
@@ -394,7 +394,7 @@ class MultiLoRAInferenceEngine:
             # The sum (total context window) is what matters, not the individual values.
             prompt_length = max_model_len // 2
             response_length = max_model_len - prompt_length
-            logger.info(f"vLLM max_model_len={max_model_len} (prompt={prompt_length}, response={response_length})")
+            logger.info("vllm", max_model_len=max_model_len, prompt=prompt_length, response=response_length)
 
             # vLLM V1 engine can fail during multi-GPU init when cudagraph/compile is enabled
             # (worker subprocesses crash before reporting a useful exception). Eager mode trades
@@ -431,7 +431,7 @@ class MultiLoRAInferenceEngine:
                 enable_rollout_routing_replay=enable_rollout_routing_replay,
             )
             if self.quantization:
-                logger.info(f"vLLM quantization enabled: {self.quantization}")
+                logger.info("vllm_quantization_enabled___s")
 
             # Model config with multi-LoRA parameters
             model_config = HFModelConfig(
@@ -548,7 +548,7 @@ class MultiLoRAInferenceEngine:
             else:
                 init_timeout = 300   # 5 min for small models
 
-            logger.info(f"Launching vLLM server (timeout={init_timeout}s for {total_gpus} GPUs)...")
+            logger.info("launching_vllm_server___s_for__s_gpus", timeout=init_timeout)
             try:
                 await async_get_ray_ref(self.server.launch_server.remote(), timeout_s=init_timeout)
             except SystemExit as e:
@@ -567,7 +567,7 @@ class MultiLoRAInferenceEngine:
                 self.server = None
                 raise RuntimeError(f"ray.get(launch_server) triggered SystemExit for {self.actor_name}: {e}") from e
             except ray.exceptions.GetTimeoutError:
-                logger.error(f"vLLM launch timed out after {init_timeout}s for {self.actor_name}")
+                logger.error("vllm_launch_timed_out_after__ss_for__s")
                 # Kill the stuck actor
                 try:
                     ray_kill.kill(
@@ -599,7 +599,7 @@ class MultiLoRAInferenceEngine:
                 raise
 
             self._initialized = True
-            logger.info(f"MultiLoRAInferenceEngine initialized (detached actor: {self.actor_name})")
+            logger.info("multilorainferenceengine_initialized__detached_actor___s")
 
             # Register with unified model actor registry for LRU tracking
             # Include node_id for proper per-node GPU scheduling
@@ -619,7 +619,7 @@ class MultiLoRAInferenceEngine:
                 node_id=actor_node_id,
             ))
             if actor_node_id:
-                logger.info(f"vLLM actor {self.actor_name} running on node {actor_node_id[:8]}")
+                logger.info("vllm_actor__s_running_on_node__s")
 
     async def add_lora_for_session(
         self,
@@ -680,7 +680,7 @@ class MultiLoRAInferenceEngine:
             await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             print("[DEBUG add_lora_for_session] add_lora_with_id.remote returned", flush=True)
         except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
-            logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+            logger.warning("vllm_actor_dead_unresponsive__reinitializing___s")
             print(f"[DEBUG add_lora_for_session] RayActorError/GetTimeoutError: {e}", flush=True)
             self._initialized = False
             self.server = None
@@ -792,7 +792,7 @@ class MultiLoRAInferenceEngine:
                 await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
                 print("[DEBUG add_lora_for_session_from_path] add_lora_from_path.remote returned", flush=True)
             except (ray.exceptions.RayActorError, ray.exceptions.GetTimeoutError) as e:
-                logger.warning(f"vLLM actor dead/unresponsive, reinitializing: {e}")
+                logger.warning("vllm_actor_dead_unresponsive__reinitializing___s")
                 print(f"[DEBUG add_lora_for_session_from_path] RayActorError/GetTimeoutError: {e}", flush=True)
                 self._initialized = False
                 self.server = None
@@ -1149,7 +1149,7 @@ class MultiLoRAInferenceEngine:
                 except Exception as e:
                     msg = f"{type(e).__name__}: {e}"
                     if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
-                        logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                        logger.error("vllm_compute_logprobs_failed__killing_actor__s___s")
                         try:
                             from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
@@ -1176,7 +1176,7 @@ class MultiLoRAInferenceEngine:
             except Exception as e:
                 msg = f"{type(e).__name__}: {e}"
                 if any(s in msg for s in ("OutOfMemoryError", "CUDA out of memory", "EngineDeadError")):
-                    logger.error(f"vLLM compute_logprobs failed; killing actor {self.actor_name}: {msg}")
+                    logger.error("vllm_compute_logprobs_failed__killing_actor__s___s")
                     try:
                         from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
 
@@ -1292,8 +1292,8 @@ class MultiLoRAInferenceEngine:
             try:
                 ref = self.server.remove_lora.remote(lora_id)
                 await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
-            except Exception as e:
-                logger.warning(f"Failed to remove LoRA {lora_id} from engine: {e}")
+            except Exception:
+                logger.warning("failed_to_remove_lora__s_from_engine___s")
 
         logger.info(
             "Removed session %s (lora_int_id=%s should_unload=%s)",
@@ -1333,8 +1333,8 @@ class MultiLoRAInferenceEngine:
                     namespace=PERSISTENT_NAMESPACE,
                 )
                 logger.info("Killed persistent vLLM actor")
-            except Exception as e:
-                logger.warning(f"Error killing server actor: {e}")
+            except Exception:
+                logger.warning("error_killing_server_actor___s")
             try:
                 remove_named_placement_group(f"{self.actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
@@ -1530,7 +1530,7 @@ class MultiModelInferenceManager:
         """
         lock = await self._get_model_lock(model_name)
         async with lock:
-            logger.info("get_engine model=%s stage=entered_lock", model_name)
+            logger.info("entered_lock", model=model_name, stage="entered_lock")
             if model_name in self._engines:
                 engine = self._engines[model_name]
                 # Check if actor is still alive before returning cached engine
@@ -1559,10 +1559,10 @@ class MultiModelInferenceManager:
                                 self._engines.pop(model_name, None)
                                 _invalidate_model_session_loras(model_name)
                             else:
-                                logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
+                                logger.info("return_cached_engine_multinode", model=model_name, stage="return_cached_engine_multinode")
                                 return engine
                         else:
-                            logger.info("get_engine model=%s stage=return_cached_engine_multinode", model_name)
+                            logger.info("return_cached_engine_multinode", model=model_name, stage="return_cached_engine_multinode")
                             return engine
                     try:
                         if hasattr(engine, 'server'):
@@ -1570,7 +1570,7 @@ class MultiModelInferenceManager:
                         else:
                             await async_get_ray_ref(actor_handle.is_ready.remote(), timeout_s=5)
                         # Actor alive, return cached engine
-                        logger.info("get_engine model=%s stage=return_cached_engine", model_name)
+                        logger.info("return_cached_engine", model=model_name, stage="return_cached_engine")
                         return engine
                     except SystemExit as e:
                         if getattr(e, "code", None) == 15:
@@ -1826,9 +1826,9 @@ class MultiModelInferenceManager:
                     quantization=quantization,
                 )
 
-            logger.info("get_engine model=%s stage=before_engine_initialize", model_name)
+            logger.info("before_engine_initialize", model=model_name, stage="before_engine_initialize")
             await engine.initialize()
-            logger.info("get_engine model=%s stage=after_engine_initialize", model_name)
+            logger.info("after_engine_initialize", model=model_name, stage="after_engine_initialize")
 
             self._engines[model_name] = engine
             from mint_server.backend.core.model_registry import is_topology_desired_model
@@ -1841,7 +1841,7 @@ class MultiModelInferenceManager:
                     logger.warning(
                         f"Failed to protect vLLM actor for topology desired model {model_name}: actor={actor_name}"
                     )
-            logger.info(f"Engine created for {model_name}")
+            logger.info("engine_created_for__s")
             return engine
 
     def get_engine_if_exists(self, model_name: str) -> MultiLoRAInferenceEngine | None:
@@ -1855,7 +1855,7 @@ class MultiModelInferenceManager:
             kill_actors: If True, kill the persistent actors. If False, just disconnect.
         """
         for model_name, engine in self._engines.items():
-            logger.info(f"Shutting down engine for {model_name}")
+            logger.info("shutting_down_engine_for__s")
             await engine.shutdown(kill_actor=kill_actors)
         self._engines.clear()
 
@@ -1918,7 +1918,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 actor_name=actor_name,
                 namespace=PERSISTENT_NAMESPACE,
             )
-            logger.info(f"Killed vLLM actor: {actor_name}")
+            logger.info("killed_vllm_actor___s")
             model_actor_supervisor.unregister(actor_name)
             try:
                 remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
@@ -1926,7 +1926,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                 pass
             return True
         except ValueError:
-            logger.info(f"No vLLM actor found: {actor_name}")
+            logger.info("no_vllm_actor_found___s")
             try:
                 remove_named_placement_group(f"{actor_name}_pg", namespace=PERSISTENT_NAMESPACE)
             except Exception:
@@ -1945,7 +1945,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         actor_name=entry.actor_name,
                         namespace=entry.namespace,
                     )
-                    logger.info(f"Killed vLLM actor: {entry.actor_name}")
+                    logger.info("killed_vllm_actor___s")
                     model_actor_supervisor.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
@@ -1956,7 +1956,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         pass
                     killed_any = True
                 except ValueError:
-                    logger.warning(f"vLLM actor not found in Ray: {entry.actor_name}")
+                    logger.warning("vllm_actor_not_found_in_ray___s")
                     model_actor_supervisor.unregister(entry.actor_name)
                     try:
                         remove_named_placement_group(
@@ -1965,8 +1965,8 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
                         )
                     except Exception:
                         pass
-                except Exception as e:
-                    logger.error(f"Error killing vLLM actor {entry.actor_name}: {e}")
+                except Exception:
+                    logger.error("error_killing_vllm_actor__s___s")
         if not killed_any:
             from mint_server.backend.actors.model_actor_supervisor import ModelActorSupervisorStaleError
 

@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 from collections.abc import MutableMapping
 
 from mint_server.ray.runtime_env import env_nonempty
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 CONFIG_ACTOR_DEFAULT_NAME = "mint_config"
 HYDRATE_ENV = "MINT_CONFIG_ACTOR_HYDRATE"

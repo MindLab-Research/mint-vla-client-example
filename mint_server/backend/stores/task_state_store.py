@@ -15,9 +15,6 @@ from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached
 from mint_server.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from mint_server.backend.contracts.control_plane_contracts import (
-    BeginFinalizeResult,
-    ClaimTaskResult,
-    CommitFinalizeResult,
     ConflictReason,
     CreateTaskResult,
     OwnerLeaseResult,
@@ -25,6 +22,7 @@ from mint_server.backend.contracts.control_plane_contracts import (
     WireCompatibleResult,
 )
 from mint_server.backend.core.model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
+from mint_server.logging_context import record_store_op_otel
 from mint_server.backend.stores.billing_outbox import BillingOutbox
 from mint_server.backend.stores.kv_backend import InMemoryKVBackend, KVBackend, RocksKVBackend
 from mint_server.backend.stores.task_hot_kv_store import TaskHotKVStore
@@ -3366,9 +3364,16 @@ class _TaskStateStoreActor:
         return _wire_result(self._store.renew_scheduler_owner(**kwargs))
 
     def create_task(self, **kwargs: Any) -> dict[str, Any]:
-        out = self._store.create_task(**kwargs)
-        self._notify_task_changed(kwargs.get("request_id"))
-        return _wire_result(out)
+        _t0 = time.perf_counter()
+        try:
+            out = self._store.create_task(**kwargs)
+            self._notify_task_changed(kwargs.get("request_id"))
+            return _wire_result(out)
+        except Exception:
+            record_store_op_otel(store="task_state", op="create_task", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="task_state", op="create_task", status="ok", duration_s=time.perf_counter() - _t0)
 
     def ensure_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.ensure_task(**kwargs)
@@ -3470,9 +3475,16 @@ class _TaskStateStoreActor:
         return _wire_result(out)
 
     def claim_task(self, **kwargs: Any) -> dict[str, Any]:
-        out = self._store.claim_task(**kwargs)
-        self._notify_task_changed(kwargs.get("request_id"))
-        return _wire_result(out)
+        _t0 = time.perf_counter()
+        try:
+            out = self._store.claim_task(**kwargs)
+            self._notify_task_changed(kwargs.get("request_id"))
+            return _wire_result(out)
+        except Exception:
+            record_store_op_otel(store="task_state", op="claim_task", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="task_state", op="claim_task", status="ok", duration_s=time.perf_counter() - _t0)
 
     def renew_lease(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.renew_lease(**kwargs)
@@ -3486,9 +3498,16 @@ class _TaskStateStoreActor:
         return [_wire_result(r) for r in results]
 
     def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
-        out = self._store.begin_finalize(**kwargs)
-        self._notify_task_changed(kwargs.get("request_id"))
-        return _wire_result(out)
+        _t0 = time.perf_counter()
+        try:
+            out = self._store.begin_finalize(**kwargs)
+            self._notify_task_changed(kwargs.get("request_id"))
+            return _wire_result(out)
+        except Exception:
+            record_store_op_otel(store="task_state", op="begin_finalize", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="task_state", op="begin_finalize", status="ok", duration_s=time.perf_counter() - _t0)
 
     def stage_payload(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.stage_payload(**kwargs)
@@ -3496,32 +3515,46 @@ class _TaskStateStoreActor:
         return out
 
     def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
-        out = self._store.commit_finalize_success(**kwargs)
-        self._notify_task_changed(kwargs.get("request_id"))
+        _t0 = time.perf_counter()
         try:
-            self._future_store_or_create().complete_task_success(
-                request_id=str(kwargs["request_id"]),
-                result_path=kwargs.get("result_path"),
-                result_checksum=kwargs.get("result_checksum"),
-                result_size_bytes=kwargs.get("result_size_bytes"),
-                metadata={"done_at": _now(None), "final_status": "done", "payload_state": "committed"},
-            )
+            out = self._store.commit_finalize_success(**kwargs)
+            self._notify_task_changed(kwargs.get("request_id"))
+            try:
+                self._future_store_or_create().complete_task_success(
+                    request_id=str(kwargs["request_id"]),
+                    result_path=kwargs.get("result_path"),
+                    result_checksum=kwargs.get("result_checksum"),
+                    result_size_bytes=kwargs.get("result_size_bytes"),
+                    metadata={"done_at": _now(None), "final_status": "done", "payload_state": "committed"},
+                )
+            except Exception:
+                pass
+            return _wire_result(out)
         except Exception:
-            pass
-        return _wire_result(out)
+            record_store_op_otel(store="task_state", op="commit_finalize_success", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="task_state", op="commit_finalize_success", status="ok", duration_s=time.perf_counter() - _t0)
 
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
-        out = self._store.commit_finalize_failure(**kwargs)
-        self._notify_task_changed(kwargs.get("request_id"))
+        _t0 = time.perf_counter()
         try:
-            self._future_store_or_create().complete_task_failure(
-                request_id=str(kwargs["request_id"]),
-                error=str(kwargs.get("error") or "task failed"),
-                metadata={"failed_at": _now(None), "done_at": _now(None), "final_status": "failed"},
-            )
+            out = self._store.commit_finalize_failure(**kwargs)
+            self._notify_task_changed(kwargs.get("request_id"))
+            try:
+                self._future_store_or_create().complete_task_failure(
+                    request_id=str(kwargs["request_id"]),
+                    error=str(kwargs.get("error") or "task failed"),
+                    metadata={"failed_at": _now(None), "done_at": _now(None), "final_status": "failed"},
+                )
+            except Exception:
+                pass
+            return _wire_result(out)
         except Exception:
-            pass
-        return _wire_result(out)
+            record_store_op_otel(store="task_state", op="commit_finalize_failure", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="task_state", op="commit_finalize_failure", status="ok", duration_s=time.perf_counter() - _t0)
 
     def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.requeue_task(**kwargs)

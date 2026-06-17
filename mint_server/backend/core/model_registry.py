@@ -1,7 +1,8 @@
 """Model configuration registry for hardware requirements."""
 
 import json
-import logging
+import structlog
+
 import os
 import types
 from dataclasses import dataclass, replace
@@ -9,7 +10,7 @@ from typing import Any, Literal, get_args, get_origin
 
 from mint_server.runtime_env import env_get
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 @dataclass
@@ -573,7 +574,7 @@ def get_model_config(model_name: str) -> ModelConfig:
         try:
             return int(v)
         except ValueError:
-            logger.warning(f"Ignoring invalid {name}={v!r} (expected int)")
+            logger.warning("ignoring_invalid____expected_int", s=name)
             return None
 
     # Normalize path to model name

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import threading
-import logging
+import structlog
 import re
 import time
 from dataclasses import dataclass
@@ -27,7 +27,7 @@ from mint_server.backend.actors.model_actor_supervisor import ActorType, get_mod
 from mint_server.backend.actors.node_placement import parse_model_gpu_placement
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 PERSISTENT_DENSE_NAMESPACE = RAY_NAMESPACE
@@ -183,7 +183,7 @@ def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str
     preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
     if preferred_ip:
         bundle[f"node:{preferred_ip}"] = 0.001
-        logger.info("Dense trainer pin model=%s node_ip=%s", model_key or base_model, preferred_ip)
+        logger.info("dense_trainer_pin", model=model_key or base_model, node_ip=preferred_ip)
     return get_named_placement_group(
         pg_name,
         namespace=PERSISTENT_DENSE_NAMESPACE,
@@ -199,7 +199,7 @@ def _remove_pg(actor_name: str) -> None:
         return
     try:
         ray.util.remove_placement_group(pg)
-        logger.warning("[dense_trainer] removed placement_group=%s actor_name=%s", pg_name, actor_name)
+        logger.warning("removed", placement_group=pg_name, actor_name=actor_name)
     except Exception:
         logger.warning(
             "[dense_trainer] failed remove placement_group=%s actor_name=%s",

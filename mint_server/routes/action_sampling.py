@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 
 from fastapi import APIRouter
 
 from mint_server.backend.stores.task_state_store import billing_observations_from_input, task_futures
 from ..models.types import ActRequest
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 router = APIRouter()
 

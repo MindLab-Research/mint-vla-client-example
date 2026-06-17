@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import logging
+import structlog
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 class BackgroundLoopSupervisor:

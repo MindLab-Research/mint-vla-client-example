@@ -24,6 +24,7 @@ import contextvars
 import functools
 import inspect
 import logging
+import structlog
 import logging.handlers
 import math
 import os
@@ -86,6 +87,12 @@ _SCHEDULER_QUEUE_WAIT_HISTOGRAM: Any | None = None
 _SCHEDULER_READY_SESSIONS_HISTOGRAM: Any | None = None
 _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM: Any | None = None
 _PUBLIC_HEALTHZ_REFRESH_COUNTER: Any | None = None
+_STORE_OP_COUNTER: Any | None = None
+_STORE_OP_ERROR_COUNTER: Any | None = None
+_STORE_OP_DURATION_HISTOGRAM: Any | None = None
+_RAY_CLUSTER_OP_COUNTER: Any | None = None
+_RAY_CLUSTER_OP_ERROR_COUNTER: Any | None = None
+_RAY_CLUSTER_OP_DURATION_HISTOGRAM: Any | None = None
 _API_PROCESS_OBSERVABLES_REGISTERED = False
 _TRACER: Any | None = None
 _OP_PREFIX_RE = re.compile(r"^\[([A-Za-z0-9_.:-]+)\]")
@@ -772,6 +779,8 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
     global _SCHEDULER_DECISION_COUNTER, _SCHEDULER_SWITCH_COUNTER, _SCHEDULER_QUEUE_WAIT_HISTOGRAM
     global _SCHEDULER_READY_SESSIONS_HISTOGRAM, _SCHEDULER_CHOSEN_QUEUE_DEPTH_HISTOGRAM
     global _PUBLIC_HEALTHZ_REFRESH_COUNTER, _API_PROCESS_OBSERVABLES_REGISTERED, _TRACER
+    global _STORE_OP_COUNTER, _STORE_OP_ERROR_COUNTER, _STORE_OP_DURATION_HISTOGRAM
+    global _RAY_CLUSTER_OP_COUNTER, _RAY_CLUSTER_OP_ERROR_COUNTER, _RAY_CLUSTER_OP_DURATION_HISTOGRAM
 
     if _OTEL_INITIALIZED:
         return
@@ -940,6 +949,36 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             "mint_public_healthz_refresh_total",
             unit="{refresh}",
             description="Public healthz cache refresh attempts by result",
+        )
+        _STORE_OP_COUNTER = meter.create_counter(
+            "mint_store_op_total",
+            unit="{op}",
+            description="Store-level operations (get/put/batch/scan) observed by mint",
+        )
+        _STORE_OP_ERROR_COUNTER = meter.create_counter(
+            "mint_store_op_errors_total",
+            unit="{error}",
+            description="Store-level operation errors observed by mint",
+        )
+        _STORE_OP_DURATION_HISTOGRAM = meter.create_histogram(
+            "mint_store_op_duration_ms",
+            unit="ms",
+            description="Store-level operation duration in milliseconds",
+        )
+        _RAY_CLUSTER_OP_COUNTER = meter.create_counter(
+            "mint_ray_cluster_op_total",
+            unit="{op}",
+            description="Ray cluster lifecycle operations (pg create/remove, actor kill) observed by mint",
+        )
+        _RAY_CLUSTER_OP_ERROR_COUNTER = meter.create_counter(
+            "mint_ray_cluster_op_errors_total",
+            unit="{error}",
+            description="Ray cluster lifecycle operation errors observed by mint",
+        )
+        _RAY_CLUSTER_OP_DURATION_HISTOGRAM = meter.create_histogram(
+            "mint_ray_cluster_op_duration_ms",
+            unit="ms",
+            description="Ray cluster lifecycle operation duration in milliseconds",
         )
         try:
             from opentelemetry.metrics import Observation
@@ -1283,6 +1322,60 @@ def record_training_operation_latency_otel(
         pass
 
 
+def record_store_op_otel(
+    *,
+    store: str,
+    op: str,
+    status: str,
+    duration_s: float,
+) -> None:
+    """Record a store-level operation metric (get/put/batch/scan)."""
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "store": str(store),
+        "op": str(op),
+        "status": str(status),
+    }
+    try:
+        if _STORE_OP_COUNTER is not None:
+            _STORE_OP_COUNTER.add(1, attributes=attrs)
+        if str(status) != "ok" and _STORE_OP_ERROR_COUNTER is not None:
+            _STORE_OP_ERROR_COUNTER.add(1, attributes=attrs)
+        if _STORE_OP_DURATION_HISTOGRAM is not None:
+            _STORE_OP_DURATION_HISTOGRAM.record(float(duration_s) * 1000.0, attributes=attrs)
+    except Exception:
+        pass
+
+
+def record_ray_cluster_op_otel(
+    *,
+    op: str,
+    status: str,
+    duration_s: float,
+    **extra_attrs: str,
+) -> None:
+    """Record a Ray cluster lifecycle operation (pg create/remove, actor kill)."""
+    if not _OTEL_ENABLED:
+        return
+    attrs: dict[str, str] = {
+        "op": str(op),
+        "status": str(status),
+    }
+    for k, v in extra_attrs.items():
+        if v is not None:
+            attrs[str(k)] = str(v)
+    try:
+        if _RAY_CLUSTER_OP_COUNTER is not None:
+            _RAY_CLUSTER_OP_COUNTER.add(1, attributes=attrs)
+        if str(status) != "ok" and _RAY_CLUSTER_OP_ERROR_COUNTER is not None:
+            _RAY_CLUSTER_OP_ERROR_COUNTER.add(1, attributes=attrs)
+        if _RAY_CLUSTER_OP_DURATION_HISTOGRAM is not None:
+            _RAY_CLUSTER_OP_DURATION_HISTOGRAM.record(float(duration_s) * 1000.0, attributes=attrs)
+    except Exception:
+        pass
+
+
 def _configure_stdlib_logging(
     *,
     root_logger: logging.Logger,
@@ -1442,7 +1535,7 @@ def init_actor_observability() -> None:
                 f"Warning: actor observability init failed: {type(e).__name__}: {e}",
                 file=sys.stderr,
             )
-        logger = logging.getLogger(__name__)
+        logger = structlog.get_logger(__name__)
         logger.info(
             "[actor_observability] init=%s structlog_available=%s otel_enabled=%s tracer_set=%s endpoint_set=%s headers_set=%s app_key_set=%s",
             init_state,

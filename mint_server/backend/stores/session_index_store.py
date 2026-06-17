@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import logging
+import structlog
 from typing import Any
 
 from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError, task_state_store
 
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def upsert_session_index(info: dict[str, Any]) -> None:
@@ -62,8 +62,8 @@ def remove_sampler_from_session(session_id: str, sampler_id: str) -> None:
         )
     except TaskStateStoreUnavailableError:
         logger.warning("Session index store write skipped: TaskStateStore unavailable")
-    except Exception as e:
-        logger.warning("Session index store write failed: remove_sampler: %s", e)
+    except Exception:
+        logger.warning("session_index_store_write_failed__remove_sampler___s")
 
 
 def add_heartbeat_sampler_to_session(
@@ -113,8 +113,8 @@ def delete_sampler_index(sampler_id: str) -> None:
         task_state_store.delete_sampler_index(sampler_id=str(sampler_id))
     except TaskStateStoreUnavailableError:
         logger.warning("Session index store write skipped: TaskStateStore unavailable")
-    except Exception as e:
-        logger.warning("Session index store write failed: delete_sampler: %s", e)
+    except Exception:
+        logger.warning("session_index_store_write_failed__delete_sampler___s")
 
 
 def get_sampler_index(sampler_id: str) -> dict[str, Any] | None:

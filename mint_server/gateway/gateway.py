@@ -2,18 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+import structlog
 
-from mint_server.observability.logging_context import get_current_traceparent, get_trace_id
+from mint_server.observability.logging_context import get_current_traceparent, get_trace_id, record_span_event_otel
 from mint_server.ray.runtime_env import env_get
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 _GATEWAY_REQUEST_ID_PREFIX = "gw:"
 
@@ -175,7 +175,27 @@ async def forward_json(
         if client is None or client.is_closed:
             client = httpx.AsyncClient(base_url=upstream.base_url)
             _http_clients[key] = client
-    return await client.request(method, path, headers=headers, json=json_body, timeout=timeout_s)
+    _t0 = time.perf_counter()
+    try:
+        resp = await client.request(method, path, headers=headers, json=json_body, timeout=timeout_s)
+        record_span_event_otel("gateway.forward_json", attributes={
+            "upstream": str(upstream.alias),
+            "method": str(method),
+            "path": str(path),
+            "status_code": int(resp.status_code),
+            "duration_s": time.perf_counter() - _t0,
+        })
+        return resp
+    except Exception as e:
+        record_span_event_otel("gateway.forward_json", attributes={
+            "upstream": str(upstream.alias),
+            "method": str(method),
+            "path": str(path),
+            "status": "error",
+            "error_type": type(e).__name__,
+            "duration_s": time.perf_counter() - _t0,
+        })
+        raise
 
 
 async def forward_request(
@@ -194,8 +214,27 @@ async def forward_request(
     }
     client = httpx.AsyncClient(base_url=upstream.base_url, timeout=timeout_s)
     request = client.build_request(method, path, headers=headers, params=params)
-    response = await client.send(request, stream=stream, follow_redirects=False)
-    return client, response
+    _t0 = time.perf_counter()
+    try:
+        response = await client.send(request, stream=stream, follow_redirects=False)
+        record_span_event_otel("gateway.forward_request", attributes={
+            "upstream": str(upstream.alias),
+            "method": str(method),
+            "path": str(path),
+            "status_code": int(response.status_code),
+            "duration_s": time.perf_counter() - _t0,
+        })
+        return client, response
+    except Exception as e:
+        record_span_event_otel("gateway.forward_request", attributes={
+            "upstream": str(upstream.alias),
+            "method": str(method),
+            "path": str(path),
+            "status": "error",
+            "error_type": type(e).__name__,
+            "duration_s": time.perf_counter() - _t0,
+        })
+        raise
 
 
 async def close_http_clients() -> None:

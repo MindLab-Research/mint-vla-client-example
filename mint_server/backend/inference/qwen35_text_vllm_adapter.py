@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
+import structlog
 import os
 import re
 from pathlib import Path
 from typing import Any
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 QWEN35_MODEL_TYPE = "qwen3_5"
 QWEN35_TEXT_MODEL_TYPE = "qwen3_5_text"
@@ -84,7 +84,7 @@ def read_hf_config_json(model_path: str) -> dict[str, Any] | None:
     except OSError:
         return None
     except json.JSONDecodeError:
-        logger.warning("Unable to parse HF config.json: %s", config_path)
+        logger.warning("unable_to_parse_hf_config_json___s")
         return None
     return raw_config if isinstance(raw_config, dict) else None
 
@@ -435,7 +435,7 @@ def patch_vllm_qwen35_language_model_weight_prefix() -> None:
             return
         original = getattr(cls, "load_weights", None)
         if not callable(original):
-            logger.debug("vLLM qwen3_next class %r has no load_weights method", cls)
+            logger.debug("vllm_qwen3_next_class_missing_load_weights", cls=cls)
             return
         if getattr(original, "_mint_qwen35_text_weight_patch", False):
             return

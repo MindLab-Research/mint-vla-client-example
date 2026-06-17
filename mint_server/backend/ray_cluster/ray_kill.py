@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 import time
 import traceback
@@ -8,10 +8,11 @@ from typing import Any
 
 import ray
 
+from mint_server.logging_context import record_ray_cluster_op_otel
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 from mint_server.backend.ray_cluster.ray_placement_groups import remove_named_placement_group
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 DEFAULT_VERIFY_TIMEOUT_S = 10.0
 DEFAULT_VERIFY_POLL_INTERVAL_S = 0.25
@@ -54,11 +55,11 @@ def _remove_placement_group_for_actor_name(actor_name: str | None, namespace: st
     for pg_name in actor_placement_group_names(actor_name, namespace):
         try:
             removed = remove_named_placement_group(pg_name, namespace=namespace)
-        except Exception as e:
-            logger.warning(f"[ray.kill] failed remove placement_group={pg_name}: {type(e).__name__}: {e}")
+        except Exception:
+            logger.warning("failed_remove____s___s", placement_group=pg_name)
             continue
         if removed:
-            logger.warning(f"[ray.kill] removed placement_group={pg_name}")
+            logger.warning("removed", placement_group=pg_name)
 
 
 def kill(
@@ -87,10 +88,24 @@ def kill(
         msg += "\n" + "".join(traceback.format_stack(limit=30))
     logger.warning(msg)
 
-    if no_restart is None:
-        ray.kill(actor)
-    else:
-        ray.kill(actor, no_restart=no_restart)
+    _kill_t0 = time.perf_counter()
+    _kill_ok = True
+    try:
+        if no_restart is None:
+            ray.kill(actor)
+        else:
+            ray.kill(actor, no_restart=no_restart)
+    except Exception:
+        _kill_ok = False
+        raise
+    finally:
+        record_ray_cluster_op_otel(
+            op="actor_kill",
+            status="ok" if _kill_ok else "error",
+            duration_s=time.perf_counter() - _kill_t0,
+            actor_name=str(actor_name or "unknown"),
+            reason=str(reason),
+        )
 
     _remove_placement_group_for_actor_name(actor_name, namespace)
     if verify_absent:

@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import inspect
 import json
-import logging
+import structlog
 import os
 import re
 import time
@@ -26,6 +26,7 @@ from mint_server.logging_context import (
     extract_trace_id_from_traceparent,
     get_otel_tracer,
     record_scheduler_decision_otel,
+    record_span_event_otel,
     set_request_id,
     set_trace_id,
 )
@@ -43,7 +44,7 @@ from mint_server.backend.core.model_work_execution_context import ModelWorkFinal
 from mint_server.backend.stores.task_payload_store import TaskPayloadStore
 from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateNotFoundError, task_futures, task_state_store
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 ModelWorkExecutor = Callable[[dict[str, Any]], Awaitable[ExecutorOutcome | None] | ExecutorOutcome | None]
 TokenBudgetProvider = Callable[[], Awaitable[int | None]]
@@ -1629,16 +1630,39 @@ class ModelEngineHost:
                 )
                 outcome = await task
             executor_done_at = time.time()
+            _exec_duration_s = max(0.0, executor_done_at - executor_started_at)
             try:
                 await self._task_futures.async_update_meta(
                     request_id,
                     {
                         "executor_done_at": executor_done_at,
-                        "executor_exec_s": max(0.0, executor_done_at - executor_started_at),
+                        "executor_exec_s": _exec_duration_s,
                     },
                 )
             except Exception:
                 pass
+            _extra = item.get("extra") if isinstance(item, dict) else {}
+            _queued_at = _extra.get("queued_at") if isinstance(_extra, dict) else None
+            _queue_wait_s = max(0.0, executor_started_at - float(_queued_at)) if isinstance(_queued_at, (int, float)) else None
+            logger.info(
+                "request_id=%s op=%s actor=%s outcome=%s exec_s=%.3f queue_wait_s=%s",
+                request_id,
+                str(item.get("op") if isinstance(item, dict) else "unknown"),
+                self._config.actor_name,
+                str(outcome.kind),
+                _exec_duration_s,
+                f"{_queue_wait_s:.3f}" if _queue_wait_s is not None else "unknown",
+            )
+            record_span_event_otel(
+                "model_runtime.execute.complete",
+                attributes={
+                    "request_id": str(request_id),
+                    "op": str(item.get("op") if isinstance(item, dict) else "unknown"),
+                    "outcome": str(outcome.kind),
+                    "exec_s": _exec_duration_s,
+                    "actor_name": str(self._config.actor_name),
+                },
+            )
             if outcome.kind in {"retryable_failure", "fatal_backend_death"}:
                 error = outcome.error or f"executor returned {outcome.kind}"
                 if outcome.kind == "fatal_backend_death":
@@ -1694,6 +1718,12 @@ class ModelEngineHost:
                     self._processed_total += 1
                     self._completed_total += 1
                     self._health_snapshot.record_success()
+                    logger.info(
+                        "request_id=%s op=%s actor=%s outcome=success completed=true",
+                        request_id,
+                        str(item.get("op") if isinstance(item, dict) else "unknown"),
+                        self._config.actor_name,
+                    )
                     return
                 await self._task_futures.async_fail(request_id, str(finalization.payload))
                 failed = await self._scheduler.fail(
@@ -1812,6 +1842,12 @@ class ModelEngineHost:
                 self._processed_total += 1
                 self._completed_total += 1
                 self._health_snapshot.record_success()
+                logger.info(
+                    "request_id=%s op=%s actor=%s outcome=success completed=true",
+                    request_id,
+                    str(item.get("op") if isinstance(item, dict) else "unknown"),
+                    self._config.actor_name,
+                )
                 return
             self._processed_total += 1
             self._failed_total += 1

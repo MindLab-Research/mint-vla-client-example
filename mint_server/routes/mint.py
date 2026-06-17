@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import logging
+import structlog
 import os
 import time
 import uuid
@@ -55,7 +55,7 @@ from ..models.types import (
 )
 from .service import _infer_base_model_from_checkpoint
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 router = APIRouter()
 
 training_manager = None

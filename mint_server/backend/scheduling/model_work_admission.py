@@ -3,10 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
+import structlog
+import time
+
+from mint_server.logging_context import get_current_traceparent, record_span_event_otel, start_as_current_span
+
 from mint_server.backend.contracts.control_plane_contracts import AppendWorkResult, SubmitTaskResult
 from mint_server.backend.scheduling.model_work_task_gateway import SchedulerModelWorkTaskGateway
 
 TraceEnqueue = Callable[..., Awaitable[Any]]
+
+logger = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,13 @@ async def enqueue_model_work(
     }
     if payload_hash is not None:
         scheduler_extra["payload_hash"] = str(payload_hash)
+    _admission_t0 = time.perf_counter()
+    # Inject current traceparent so the full dispatch -> actor chain can
+    # restore the original request trace.  model_engine_host reads
+    # extra["_traceparent"] in _restore_item_context and _execute_lease.
+    _tp = get_current_traceparent()
+    if _tp:
+        scheduler_extra["_traceparent"] = _tp
     if gateway_client is None:
         gateway = SchedulerModelWorkTaskGateway(
             scheduler_client=scheduler_client,
@@ -128,10 +142,60 @@ async def enqueue_model_work(
                 "domain_token_budget_exceeded",
             }:
                 raise ModelWorkAdmissionRejectedError(scheduler_result)
+        admission_t1 = time.perf_counter()
+        _assigned = bool((scheduler_result.assigned or {}).get("assigned"))
+        logger.info(
+            "request_id=%s op=%s domain_key=%s status=admitted assigned=%s idempotent=%s backlog_depth=%s admission_ms=%.1f",
+            request_id,
+            op,
+            domain_key,
+            _assigned,
+            bool(scheduler_result.idempotent),
+            int(scheduler_result.backlog_depth or 0),
+            (admission_t1 - _admission_t0) * 1000.0,
+        )
+        with start_as_current_span(
+            "model_work.admission",
+            component="scheduling.admission",
+            op="admit",
+            request_id=str(request_id),
+            attributes={
+                "admission_op": str(op),
+                "domain_key": str(domain_key),
+                "assigned": _assigned,
+                "idempotent": bool(scheduler_result.idempotent),
+                "backlog_depth": int(scheduler_result.backlog_depth or 0),
+            },
+        ):
+            record_span_event_otel("admission.complete", attributes={
+                "request_id": str(request_id),
+                "op": str(op),
+                "status": "admitted",
+            })
         return ModelWorkAdmissionResult(
             request_id=request_id,
             scheduler_result=scheduler_result,
             submit_result=submit,
         )
+    except ModelWorkAdmissionRejectedError:
+        _admission_t1 = time.perf_counter()
+        logger.warning(
+            "request_id=%s op=%s domain_key=%s status=rejected reason=%s admission_ms=%.1f",
+            request_id,
+            op,
+            domain_key,
+            "admission_limit_exceeded",
+            (_admission_t1 - _admission_t0) * 1000.0,
+        )
+        raise
     except Exception:
+        _admission_t1 = time.perf_counter()
+        logger.warning(
+            "request_id=%s op=%s domain_key=%s status=error admission_ms=%.1f",
+            request_id,
+            op,
+            domain_key,
+            (_admission_t1 - _admission_t0) * 1000.0,
+            exc_info=True,
+        )
         raise

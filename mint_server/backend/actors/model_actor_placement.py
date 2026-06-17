@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import logging
-import os
+import structlog
 import time
+
+import os
 from collections.abc import Callable, Iterable
 from functools import lru_cache
 from typing import Any
@@ -10,7 +11,7 @@ from typing import Any
 from mint_server.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 
 def _undesired_gpu_actor_grace_s() -> float:
@@ -310,7 +311,7 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
                 exc,
             )
     except Exception:
-        logger.debug("[model_actor_placement] GPU actor lister unavailable", exc_info=True)
+        logger.debug("GPU actor lister unavailable", exc_info=True)
     return []
 
 def _iter_pg_bundle_items(bundles: object) -> list[tuple[str, dict[str, object]]]:

@@ -9,9 +9,10 @@ actor desired-state reconciliation belongs to ModelActorSupervisor.
 from __future__ import annotations
 
 import asyncio
-import logging
-import threading
+import structlog
 import time
+
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, cast
@@ -22,7 +23,7 @@ from mint_server.config import config as server_config
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 ActorHandle = Any
 
 
@@ -156,7 +157,7 @@ class _ModelActorInventoryState:
     def unregister(self, actor_name: str) -> bool:
         removed = self.entries.pop(actor_name, None) is not None
         if removed:
-            logger.info("[ModelActorInventory] Unregistered actor=%s", actor_name)
+            logger.info("unregistered", actor=actor_name)
         return removed
 
     def get(self, actor_name: str, *, touch: bool) -> ActorEntry | None:
@@ -244,10 +245,10 @@ class _ModelActorInventoryState:
         try:
             actor = ray.get_actor(entry.actor_name, namespace=entry.namespace)
         except ValueError:
-            logger.warning("[ModelActorInventory] Actor not found during eviction: %s", entry.actor_name)
+            logger.warning("actor_not_found_during_eviction___s")
             return False
         except Exception as e:
-            logger.warning("[ModelActorInventory] Actor lookup failed during eviction actor=%s err=%s", entry.actor_name, e)
+            logger.warning("actor_lookup_failed_during_eviction", actor=entry.actor_name, err=e)
             return False
 
         try:
@@ -271,10 +272,10 @@ class _ModelActorInventoryState:
                 age=f"{entry.age():.1f}",
                 session_idle_timeout=self.session_idle_timeout,
             )
-            logger.info("[ModelActorInventory] Killed actor=%s", entry.actor_name)
+            logger.info("killed", actor=entry.actor_name)
             return True
-        except Exception as e:
-            logger.warning("[ModelActorInventory] Error killing actor %s: %s", entry.actor_name, e)
+        except Exception:
+            logger.warning("error_killing_actor__s___s")
             return False
 
     def iter_entries(self) -> list[ActorEntry]:
@@ -287,8 +288,8 @@ class _ModelActorInventoryState:
                 ray.get_actor(entry.actor_name, namespace=entry.namespace)
             except ValueError:
                 stale.append(name)
-            except Exception as e:
-                logger.warning("[ModelActorInventory] Error checking actor %s: %s", name, e)
+            except Exception:
+                logger.warning("error_checking_actor__s___s")
         for name in stale:
             self.entries.pop(name, None)
         return len(stale)
@@ -508,8 +509,8 @@ def actor_observability_metadata(actor_handle: ActorHandle | None, *, timeout_s:
         return None
     try:
         payload = ray.get(getter.remote(), timeout=float(timeout_s))
-    except Exception as e:
-        logger.debug("[ModelActorInventory] get_observability_binding failed: %s", e)
+    except Exception:
+        logger.debug("get_observability_binding_failed___s")
         return None
     return _normalize_actor_observability_payload(payload)
 
@@ -526,8 +527,8 @@ async def async_actor_observability_metadata(
         return None
     try:
         payload = await async_get_ray_ref(getter.remote(), timeout_s=float(timeout_s))
-    except Exception as e:
-        logger.debug("[ModelActorInventory] async get_observability_binding failed: %s", e)
+    except Exception:
+        logger.debug("async_get_observability_binding_failed___s")
         return None
     return _normalize_actor_observability_payload(payload)
 
@@ -1027,8 +1028,8 @@ class ModelActorInventory:
             if actor_info:
                 address = actor_info.get("Address", {})
                 return address.get("NodeID")
-        except Exception as e:
-            logger.debug("[ModelActorInventory] Could not get node_id: %s", e)
+        except Exception:
+            logger.debug("could_not_get_node_id___s")
         return None
 
     def clear(self, kill_actors: bool = True) -> int:

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Protocol
+
+from mint_server.logging_context import record_store_op_otel
 
 
 class KVBackend(Protocol):
@@ -109,20 +112,34 @@ class RocksKVBackend:
         self._write_batch_cls = WriteBatch
 
     def get(self, key: str) -> str | None:
-        if self._fallback is not None:
-            return self._fallback.get(key)
-        value = self._db.get(str(key))
-        if value is None:
-            return None
-        if isinstance(value, bytes):
-            return value.decode("utf-8")
-        return str(value)
+        _t0 = time.perf_counter()
+        try:
+            if self._fallback is not None:
+                return self._fallback.get(key)
+            value = self._db.get(str(key))
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            return str(value)
+        except Exception:
+            record_store_op_otel(store="rocks", op="get", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="rocks", op="get", status="ok", duration_s=time.perf_counter() - _t0)
 
     def put(self, key: str, value: str) -> None:
-        if self._fallback is not None:
-            self._fallback.put(key, value)
-            return
-        self._db[str(key)] = str(value)
+        _t0 = time.perf_counter()
+        try:
+            if self._fallback is not None:
+                self._fallback.put(key, value)
+                return
+            self._db[str(key)] = str(value)
+        except Exception:
+            record_store_op_otel(store="rocks", op="put", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="rocks", op="put", status="ok", duration_s=time.perf_counter() - _t0)
 
     def delete(self, key: str) -> None:
         if self._fallback is not None:
@@ -166,19 +183,26 @@ class RocksKVBackend:
         return out
 
     def apply_batch(self, puts: dict[str, str] | None = None, deletes: list[str] | None = None) -> None:
-        if self._fallback is not None:
-            self._fallback.apply_batch(puts=puts, deletes=deletes)
-            return
-        batch = self._write_batch_cls()
-        op_count = 0
-        for key in deletes or []:
-            batch.delete(str(key))
-            op_count += 1
-        for key, value in (puts or {}).items():
-            batch.put(str(key), str(value))
-            op_count += 1
-        if op_count:
-            self._db.write(batch)
+        _t0 = time.perf_counter()
+        try:
+            if self._fallback is not None:
+                self._fallback.apply_batch(puts=puts, deletes=deletes)
+                return
+            batch = self._write_batch_cls()
+            op_count = 0
+            for key in deletes or []:
+                batch.delete(str(key))
+                op_count += 1
+            for key, value in (puts or {}).items():
+                batch.put(str(key), str(value))
+                op_count += 1
+            if op_count:
+                self._db.write(batch)
+        except Exception:
+            record_store_op_otel(store="rocks", op="batch", status="error", duration_s=time.perf_counter() - _t0)
+            raise
+        finally:
+            record_store_op_otel(store="rocks", op="batch", status="ok", duration_s=time.perf_counter() - _t0)
 
     def close(self) -> None:
         if self._fallback is not None:

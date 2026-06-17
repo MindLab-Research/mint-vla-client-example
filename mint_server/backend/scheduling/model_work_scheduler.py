@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
 import os
 import time
 import traceback
@@ -59,7 +59,7 @@ from mint_server.backend.scheduling.scheduler_metrics import (
 )
 from mint_server.backend.scheduling.scheduler_queue_projection import QueueProjection
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 CURRENT_CODE_IDENTITY = os.environ.get("MINT_GIT_SHA") or _git_sha()
 
@@ -346,7 +346,7 @@ class _ModelWorkSchedulerActor:
 
             init_actor_observability()
         except Exception:
-            logger.debug("[model_work_scheduler] actor observability init skipped", exc_info=True)
+            logger.debug("actor observability init skipped", exc_info=True)
         self._cv = asyncio.Lock()
         self._instance_id = uuid.uuid4().hex
         self._owner_id = owner_id or f"{_ray_model_work_scheduler_actor_name()}:{self._instance_id}"
@@ -3061,13 +3061,13 @@ class ModelWorkSchedulerClient:
                 raise ModelWorkSchedulerUnavailableError(
                     f"Detached Ray ModelWorkScheduler actor unavailable actor_name={actor_name!r}"
                 )
-            logger.info("[model_work_scheduler] actor %s not found; creating", actor_name)
+            logger.info("actor__s_not_found__creating")
         except Exception:
             if not create_if_missing:
                 raise ModelWorkSchedulerUnavailableError(
                     f"Detached Ray ModelWorkScheduler actor unavailable actor_name={actor_name!r}"
                 )
-            logger.info("[model_work_scheduler] failed to fetch actor %s; creating", actor_name)
+            logger.info("failed_to_fetch_actor__s__creating")
 
         try:
             self._ray_actor = await _create_ray_actor_async(require_ready=require_ready)

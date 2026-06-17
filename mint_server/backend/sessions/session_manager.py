@@ -12,7 +12,9 @@ Supports two modes:
 from __future__ import annotations
 
 import asyncio
-import logging
+import structlog
+
+from mint_server.observability.logging_context import record_span_event_otel
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -21,7 +23,7 @@ if TYPE_CHECKING:
     from mint_server.backend.inference.multi_lora_engine import MultiLoRAInferenceEngine, MultiModelInferenceManager
     from mint_server.backend.training.verl.verl_inference import VerlInferenceEngine
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger(__name__)
 
 # Default inactivity timeout: 30 minutes
 DEFAULT_INACTIVITY_TIMEOUT = 1800
@@ -127,8 +129,8 @@ class SessionManager:
                     "metadata_version": int(info.metadata_version),
                 }
             )
-        except Exception as e:
-            logger.debug("Failed to persist sampling session %s: %s", session_id, e)
+        except Exception:
+            logger.debug("failed_to_persist_sampling_session__s___s")
 
     def _touch_info(self, session_id: str, info: SessionInfo) -> None:
         info.last_activity = time.time()
@@ -223,8 +225,10 @@ class SessionManager:
             and (not info.is_shared or info.uses_multi_lora)
         ]
         for sid in inactive:
-            logger.info(f"Auto-cleaning inactive session {sid}")
+            logger.info("auto_cleaning_inactive_session", session_id=sid)
             await self.end_session(sid)
+        if inactive:
+            record_span_event_otel("session.cleanup_inactive", attributes={"cleaned_count": len(inactive)})
 
     def mark_session_inflight(self, session_id: str, delta: int) -> None:
         """Mark a session as having in-flight work to prevent cleanup.
@@ -314,7 +318,7 @@ class SessionManager:
         start_time = time.time()
         await engine.load_lora_from_path(adapter_path)
         reload_time = time.time() - start_time
-        logger.info(f"Hot-reloaded LoRA adapter in {reload_time:.3f}s")
+        logger.info("hot_reloaded_lora_adapter_in___3fs")
 
         # Register session pointing to shared engine
         self._sessions[session_id] = SessionInfo(
@@ -326,9 +330,14 @@ class SessionManager:
         )
         self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         logger.info(
-            f"Created ephemeral session {session_id} using shared engine "
-            f"(reload took {reload_time:.3f}s)"
+            "created_ephemeral_session",
+            session_id=session_id,
+            reload_s=round(reload_time, 3),
         )
+        record_span_event_otel("session.create_ephemeral", attributes={
+            "session_id": str(session_id),
+            "reload_s": round(reload_time, 3),
+        })
         return engine
 
     async def create_session(
@@ -510,8 +519,8 @@ class SessionManager:
             delete_sampler_index(sampler_id)
             if parent_session_id is not None:
                 remove_sampler_from_session(parent_session_id, sampler_id)
-        except Exception as e:
-            logger.debug("Failed to cleanup sampler index %s: %s", sampler_id, e)
+        except Exception:
+            logger.debug("failed_to_cleanup_sampler_index__s___s")
 
     async def end_session(self, session_id: str) -> bool:
         """End a session and shutdown its engine.
@@ -536,8 +545,8 @@ class SessionManager:
             from mint_server.backend.stores.sampling_session_store import delete_sampling_session
 
             delete_sampling_session(session_id)
-        except Exception as e:
-            logger.debug("Failed to delete sampling session %s from store: %s", session_id, e)
+        except Exception:
+            logger.debug("failed_to_delete_sampling_session__s_from_store___s")
 
         if info.uses_multi_lora:
             self._cleanup_sampler_indices(session_id)
@@ -549,8 +558,8 @@ class SessionManager:
                 if engine is not None:
                     try:
                         await engine.remove_session(session_id)
-                    except Exception as e:
-                        logger.warning(f"Failed to remove multi-LoRA session {session_id} from engine: {e}")
+                    except Exception:
+                        logger.warning("failed_to_remove_multi_lora_session__s_from_engine___s")
 
             # Drop per-session sampling locks only after teardown has finished.
             from mint_server.routes.sampling import _drop_lora_load_lock
@@ -565,19 +574,19 @@ class SessionManager:
                 try:
                     if os.path.isdir(adapter_path) and os.path.basename(adapter_path).startswith("_ephemeral_"):
                         await asyncio.to_thread(shutil.rmtree, adapter_path)
-                        logger.info(f"Deleted ephemeral adapter dir for session {session_id}: {adapter_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete adapter dir for session {session_id}: {adapter_path}: {e}")
+                        logger.info("deleted_ephemeral_adapter_dir_for_session__s___s")
+                except Exception:
+                    logger.warning("failed_to_delete_adapter_dir_for_session__s___s___s")
 
-            logger.info(f"Ended multi-LoRA session {session_id}")
+            logger.info("ended_multi_lora_session__s")
             return True
 
         # Only shutdown non-shared engines (shared engine is reused)
         if not info.is_shared:
             await info.engine.shutdown()
-            logger.info(f"Ended session {session_id} (engine shutdown)")
+            logger.info("ended_session__s__engine_shutdown")
         else:
-            logger.info(f"Ended ephemeral session {session_id} (shared engine kept)")
+            logger.info("ended_ephemeral_session__s__shared_engine_kept")
 
         return True
 
@@ -587,7 +596,7 @@ class SessionManager:
         session_ids = list(self._sessions.keys())
         for session_id in session_ids:
             await self.end_session(session_id)
-        logger.info(f"Shutdown {len(session_ids)} sessions")
+        logger.info("shutdown__s_sessions")
 
         # Shutdown shared engine
         if self._shared_engine is not None:
@@ -883,7 +892,7 @@ class SessionManager:
         )
         self._refresh_sampling_observability(before=None, after=self._sessions[session_id])
         self._persist_sampling_session_info(session_id, self._sessions[session_id])
-        logger.info(f"Registered base model session {session_id} (model={base_model})")
+        logger.info("registered_base_model_session__s", model=session_id)
 
     def restore_sampling_session(self, info: dict) -> bool:
         """Restore a multi-LoRA sampling session from detached control-plane state."""
