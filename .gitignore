@@ -223,6 +223,7 @@ __marimo__/
 checkpoints/
 
 # Codex task files (do not commit)
+.claude/scheduled_tasks.lock
 PROMPT.md
 LOG.md
 transcript.txt
