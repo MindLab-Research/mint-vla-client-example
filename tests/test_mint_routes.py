@@ -229,7 +229,7 @@ def test_mint_create_action_session_maps_capacity_runtime_error_to_503(
     monkeypatch,
 ) -> None:
     from mint_server.routes import mint as mint_routes
-    import mint_server.supported_models_gate as supported_models_gate
+    import mint_server.auth.supported_models_gate as supported_models_gate
 
     class _StubActionSessionManager:
         async def create_session(self, **kwargs):
@@ -284,7 +284,7 @@ def test_mint_create_action_session_uses_bypass_cap_for_checkpoint_paths(
     monkeypatch,
 ) -> None:
     from mint_server.routes import mint as mint_routes
-    import mint_server.supported_models_gate as supported_models_gate
+    import mint_server.auth.supported_models_gate as supported_models_gate
 
     captured: dict[str, object] = {}
 

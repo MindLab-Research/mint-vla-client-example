@@ -6,7 +6,7 @@ import os
 import sys
 import types
 
-import mint_server.logging_context as logging_context
+import mint_server.observability.logging_context as logging_context
 
 
 def test_issue_304_otel_resource_attributes_include_process_identity(monkeypatch):

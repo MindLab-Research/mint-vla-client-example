@@ -275,7 +275,7 @@ def test_openai_completions_supports_gateway_routed_base_model(monkeypatch):
         sampling_route, "_async_get_http_sampling_snapshot", _fake_snapshot
     )
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return ("mint-prod-aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")
@@ -496,7 +496,7 @@ def test_openai_completions_ignores_service_session_manager_fallback(monkeypatch
         sampling_route, "build_billing_auth_context", lambda *_a, **_k: None
     )
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
@@ -598,7 +598,7 @@ def test_openai_completions_uses_detached_queue_when_route_session_managers_unbo
     monkeypatch.setattr(sampling_route, "_asample_impl", _fake_asample_impl)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None
@@ -698,7 +698,7 @@ def test_openai_chat_completions_uses_detached_queue_when_route_session_managers
     monkeypatch.setattr(sampling_route, "_asample_impl", _fake_asample_impl)
     monkeypatch.setattr(futures_route, "retrieve_future", _fake_retrieve_future)
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _fake_async_remote_sampling_session(_sid: str):
         return None

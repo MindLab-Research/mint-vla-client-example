@@ -2,7 +2,7 @@ import json
 
 
 def _reset_gateway_module_state():
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     gw._gateway_config = None
     gw._remote_sampling_sessions.clear()
@@ -19,7 +19,7 @@ def test_gateway_config_synonyms(monkeypatch):
     }
     monkeypatch.setenv("MINT_GATEWAY_CONFIG_JSON", json.dumps(cfg))
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     up = gw.upstream_for_model("Qwen/Qwen3-235B-A22B-Instruct-2507")
     assert up is not None
@@ -29,7 +29,7 @@ def test_gateway_config_synonyms(monkeypatch):
 
 
 def test_gateway_request_id_roundtrip():
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     rid = gw.encode_request_id(upstream_alias="mint-prod-aliyun", upstream_request_id="abc123")
     assert gw.decode_request_id(rid) == ("mint-prod-aliyun", "abc123")
@@ -40,7 +40,7 @@ def test_gateway_remote_sampling_session_in_memory(monkeypatch):
     _reset_gateway_module_state()
     monkeypatch.delenv("MINT_GATEWAY_CONFIG_JSON", raising=False)
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     gw.register_remote_sampling_session(
         sampling_session_id="sess1",

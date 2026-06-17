@@ -64,7 +64,7 @@ def test_issue_283_create_model_from_state_queues_resolved_checkpoint_path_witho
     from mint_server.routes import training as training_routes
     from mint_server import checkpoints as checkpoints_module
     import mint_server.backend.scheduling.model_work_scheduler as scheduler_module
-    import mint_server.gateway as gateway_module
+    import mint_server.gateway.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -150,7 +150,7 @@ def test_issue_283_create_model_from_state_missing_checkpoint_returns_404(
 ) -> None:
     from mint_server.routes import training as training_routes
     from mint_server import checkpoints as checkpoints_module
-    import mint_server.gateway as gateway_module
+    import mint_server.gateway.gateway as gateway_module
 
     training_routes.CHECKPOINTS_DIR = str(tmp_path)
     checkpoints_module.CHECKPOINTS_DIR = str(tmp_path)
@@ -1272,7 +1272,7 @@ def test_issue_283_weights_routes_propagate_detached_store_503(monkeypatch, rout
     from mint_server.routes import training as training_routes
     from mint_server.routes import weights as weights_routes
     import mint_server.backend.stores.training_session_store as training_store_module
-    import mint_server.gateway as gateway_module
+    import mint_server.gateway.gateway as gateway_module
 
     async def _async_get_training_session_info(_model_id: str):
         raise RuntimeError("store down")

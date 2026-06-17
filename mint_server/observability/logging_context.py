@@ -193,7 +193,7 @@ def _driver_observability_snapshot() -> dict[str, object]:
     except Exception:
         pass
     try:
-        from .routes import sampling as sampling_route
+        from mint_server.routes import sampling as sampling_route
 
         count_fn = getattr(sampling_route, "_lora_load_lock_count_sync", None)
         if callable(count_fn):
@@ -201,7 +201,7 @@ def _driver_observability_snapshot() -> dict[str, object]:
     except Exception:
         pass
     try:
-        from .routes import service as service_route
+        from mint_server.routes import service as service_route
 
         manager = getattr(service_route, "session_manager", None)
         if manager is not None and hasattr(manager, "observability_snapshot"):
@@ -945,7 +945,7 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
             from opentelemetry.metrics import Observation
 
             def _observe_public_healthz_cache_age(_options):
-                from .health_checks import public_healthz_cache_age_seconds
+                from mint_server.health.health_checks import public_healthz_cache_age_seconds
 
                 age_s = public_healthz_cache_age_seconds()
                 if age_s is None:

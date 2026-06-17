@@ -3,7 +3,7 @@ import types
 from types import SimpleNamespace
 
 import pytest
-import mint_server.logging_context as logging_context
+import mint_server.observability.logging_context as logging_context
 import mint_server.backend.observability.runtime_actor_metrics as runtime_actor_metrics
 import mint_server.backend.observability.vllm_scheduler_observability as vllm_obs_mod
 from mint_server.backend.observability.runtime_observability import RuntimeObservability

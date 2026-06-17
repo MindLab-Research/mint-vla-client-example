@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import HTTPException, Request
 
-from .config import ALLOW_UNSUPPORTED_MODELS
+from mint_server.config import ALLOW_UNSUPPORTED_MODELS
 
 
 def _normalize_local_model_name(base_model: str) -> str | None:
@@ -24,7 +24,7 @@ async def enforce_base_model_allowed(*, base_model: str, http_request: Request) 
         `base_model` for gateway-routed models.
     """
     from mint_server.backend.core.model_registry import MODEL_CONFIGS, list_supported_models
-    from .gateway import get_upstream_capabilities, upstream_for_model
+    from mint_server.gateway import get_upstream_capabilities, upstream_for_model
 
     local_name = _normalize_local_model_name(base_model)
     supported = set(list_supported_models())

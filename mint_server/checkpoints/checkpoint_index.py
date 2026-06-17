@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .runtime_env import env_get
+from mint_server.ray.runtime_env import env_get
 
 _CHECKPOINT_STAGING_TABLE = "checkpoint_staging"
 _CHECKPOINT_CATALOG_TABLE = "checkpoint_catalog"
@@ -37,7 +37,7 @@ def checkpoint_index_enabled() -> bool:
 
 
 def _runtime_config():
-    from . import config as config_module
+    from mint_server import config as config_module
 
     return getattr(config_module, "config", None)
 

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Mapping
 
 from .config import ServerConfig, config as server_config
-from .runtime_env import canonical_mint_env_name
+from mint_server.ray.runtime_env import canonical_mint_env_name
 
 CONFIG_SNAPSHOT_SCHEMA_VERSION = 1
 CONFIG_ACTOR_DEFAULT_NAME = "mint_config"

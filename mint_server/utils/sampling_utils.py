@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Sequence
 
-from .models.types import SampledSequence
+from mint_server.models.types import SampledSequence
 
 StopReason = Literal["length", "stop", "eos"]
 

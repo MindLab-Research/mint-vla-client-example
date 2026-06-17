@@ -347,7 +347,7 @@ def test_issue_593_model_runtime_max_claim_uses_training_override_for_megatron(
 
 def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     calls = {"count": 0}
     monkeypatch.setattr(logging_context, "init_actor_observability", lambda: calls.__setitem__("count", calls["count"] + 1))
@@ -461,7 +461,7 @@ def test_issue_638_supervisor_registers_otel_inventory_and_supervisor_gauges(
     import opentelemetry.metrics as otel_metrics
 
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -519,7 +519,7 @@ def test_issue_638_supervisor_otel_inventory_callbacks_use_cached_snapshot_witho
 
     import mint_server.backend.actors.model_actor_inventory as inventory_module
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -591,7 +591,7 @@ def test_issue_638_supervisor_otel_reports_missing_gpu_uuid_without_high_cardina
     import opentelemetry.metrics as otel_metrics
 
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -639,7 +639,7 @@ def test_issue_638_supervisor_rss_snapshot_populates_otel_cache(
 
     import mint_server.backend.actors.model_actor_inventory as inventory_module
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -718,7 +718,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_supervisor_state(
     import opentelemetry.metrics as otel_metrics
 
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -767,7 +767,7 @@ def test_issue_638_supervisor_otel_callbacks_emit_topology_and_node_daemon_state
     import opentelemetry.metrics as otel_metrics
 
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 

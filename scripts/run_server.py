@@ -36,7 +36,7 @@ def _load_local_runtime_env_module() -> ModuleType:
         return existing
     spec = importlib.util.spec_from_file_location(
         module_name,
-        _REPO_ROOT / "mint_server" / "runtime_env.py",
+        _REPO_ROOT / "mint_server" / "ray" / "runtime_env.py",
     )
     if spec is None or spec.loader is None:
         raise RuntimeError("failed to load local mint_server.runtime_env bootstrap module")

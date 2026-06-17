@@ -121,8 +121,8 @@ def test_create_sampling_session_converts_rank_sharded_bumblebee_lora(tmp_path, 
 
     import mint_server.backend.stores.sampling_session_store as sampling_store
     import mint_server.backend.stores.session_index_store as session_index
-    import mint_server.gateway as gateway
-    import mint_server.supported_models_gate as gate
+    import mint_server.gateway.gateway as gateway
+    import mint_server.auth.supported_models_gate as gate
 
     registered: dict[str, dict] = {}
 

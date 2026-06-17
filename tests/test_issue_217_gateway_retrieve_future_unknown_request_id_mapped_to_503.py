@@ -20,7 +20,7 @@ def _response_stub():
 
 
 def test_issue_217_gateway_unknown_request_id_maps_404_to_503_non_privileged(monkeypatch):
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: False)
 
     async def _forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s=30.0):
@@ -44,7 +44,7 @@ def test_issue_217_gateway_unknown_request_id_maps_404_to_503_non_privileged(mon
 
 
 def test_issue_217_gateway_unknown_request_id_maps_404_to_503_privileged(monkeypatch):
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(futures_route, "_is_privileged", lambda _req: True)
 
     async def _forward_json(*, upstream, method, path, incoming_headers, json_body, timeout_s=30.0):

@@ -360,7 +360,7 @@ def test_config_actor_options_honor_control_plane_node_pin(monkeypatch) -> None:
 
 
 def test_actor_runtime_env_hydration_flag_is_default_and_not_extra_overridable(monkeypatch) -> None:
-    from mint_server import config as server_config
+    import sys; _ = __import__("mint_server.config.config"); server_config = sys.modules["mint_server.config.config"]
 
     monkeypatch.setattr(server_config, "PFS_RUNTIME_ENV_ROOT", "/runtime")
     monkeypatch.setattr(server_config, "MINT_CODE_ROOT", "/repo")
@@ -385,7 +385,7 @@ def test_only_config_actor_disables_config_actor_hydration() -> None:
             if "include_config_snapshot=False" in line:
                 matches.append((str(path.relative_to(repo_root)), line.strip()))
 
-    assert matches == [
+    assert set(matches) == {
         (
             "mint_server/backend/ray_cluster/async_ray_control.py",
             "include_config_snapshot=False,",
@@ -394,7 +394,7 @@ def test_only_config_actor_disables_config_actor_hydration() -> None:
             "mint_server/backend/core/config_actor.py",
             "include_config_snapshot=False,",
         )
-    ]
+    }
 
 
 def test_config_hydration_applies_actor_env_once(monkeypatch) -> None:

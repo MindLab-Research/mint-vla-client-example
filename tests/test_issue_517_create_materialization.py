@@ -230,8 +230,8 @@ def test_issue_517_build_create_scheduler_extra_uses_control_plane_lane_only_for
 async def test_issue_517_create_model_route_enqueues_without_local_training_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import mint_server.gateway as gateway_module
-    import mint_server.supported_models_gate as supported_models_gate_module
+    import mint_server.gateway.gateway as gateway_module
+    import mint_server.auth.supported_models_gate as supported_models_gate_module
 
     enqueued: dict[str, object] = {}
 
