@@ -372,7 +372,7 @@ def _training_model_work_domain_key(
 
         return domain_key_for_training_base_model(base, backend=backend_value)
     if base:
-        return f"training:{base}"
+        return f"{backend_value}:{base}" if backend_value == "verl_fsdp2_lora" else f"training:{base}"
     return f"training_session:{model_id}"
 
 
@@ -1337,6 +1337,8 @@ def _infer_training_backend_for_base_model(base_model: str) -> str:
         return "openpi_fast"
     if training_backend == "openpi_pi05":
         return "openpi_pi05"
+    if training_backend == "verl_fsdp2_lora":
+        return "verl_fsdp2_lora"
     from mint_server.backend.core.training_backend_selection import _select_moe_training_backend, _uses_distributed_training_backend
 
     if _uses_distributed_training_backend(base_model):
@@ -1345,7 +1347,7 @@ def _infer_training_backend_for_base_model(base_model: str) -> str:
 
 
 def _supports_control_plane_tokenizer_metadata(backend: str) -> bool:
-    return str(backend) in {"bumblebee", "megatron", "peft"}
+    return str(backend) in {"bumblebee", "megatron", "peft", "verl_fsdp2_lora"}
 
 
 def _resolve_local_tokenizer_source_path(base_model: str) -> str:
@@ -1824,7 +1826,9 @@ def _build_training_scheduler_extra(
     }
     if openpi_train_step:
         enabled = True
-    if backend in {"bumblebee", "megatron"} and base_model:
+    if backend == "verl_fsdp2_lora" and base_model:
+        domain_key = f"verl_fsdp2_lora:{base_model}"
+    elif backend in {"bumblebee", "megatron"} and base_model:
         domain_key = domain_key_for_training_base_model(base_model, backend=backend)
     else:
         domain_key = (
@@ -1895,7 +1899,12 @@ def _build_create_scheduler_extra(
 ) -> dict[str, Any]:
     from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
 
-    scheduler_domain = domain_key_for_training_base_model(base_model)
+    backend = _infer_training_backend_for_base_model(base_model)
+    scheduler_domain = (
+        f"verl_fsdp2_lora:{base_model}"
+        if backend == "verl_fsdp2_lora"
+        else domain_key_for_training_base_model(base_model)
+    )
     return {
         "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
         .strip()
@@ -1905,6 +1914,7 @@ def _build_create_scheduler_extra(
         "scheduler_session_key": str(model_id),
         "execution_serial_key": f"training_session:{model_id}",
         "training_op": str(training_op),
+        "backend": backend,
     }
 
 

@@ -53,6 +53,32 @@ logger = logging.getLogger(__name__)
 # session shutdown, explicit admin actions, and supervisor reconciliation.
 DEFAULT_IDLE_TIMEOUT = 0
 
+VERL_FSDP2_LORA_BACKEND = "verl_fsdp2_lora"
+
+
+def _is_qwen36_model(model: str | None) -> bool:
+    try:
+        from mint_server.backend.qwen36_verl_fsdp2_lora import is_qwen36_model
+
+        return is_qwen36_model(model)
+    except Exception:
+        return "qwen3.6-27b" in str(model or "").lower()
+
+
+def _uses_verl_fsdp2_lora_backend(requested_model: str | None) -> bool:
+    if _is_qwen36_model(requested_model):
+        return True
+    try:
+        from mint_server.backend.core.model_registry import get_model_config
+
+        return (
+            str(getattr(get_model_config(requested_model or ""), "training_backend", "") or "")
+            == VERL_FSDP2_LORA_BACKEND
+        )
+    except Exception:
+        logger.debug("veRL FSDP2 LoRA model config lookup failed for %s", requested_model, exc_info=True)
+    return False
+
 
 # =====================================================================
 # Session State Manager - Per-iteration state persistence for stateless trainers
@@ -3328,6 +3354,16 @@ class VerlTrainingEngine:
             "moonshotai/Kimi-K2-Thinking": "/vePFS-Mindverse/share/huggingface/hub/models--moonshotai--Kimi-K2-Thinking/snapshots/612681931a8c906ddb349f8ad0f582cb552189cd",
         }
 
+        try:
+            from mint_server.backend.qwen36_verl_fsdp2_lora import qwen36_model_path_override
+
+            qwen36_path = qwen36_model_path_override(hf_model_id)
+        except Exception:
+            qwen36_path = None
+        if qwen36_path:
+            logger.info("Using Qwen3.6 path override for %s -> %s", hf_model_id, qwen36_path)
+            return qwen36_path
+
         if hf_model_id in MODEL_PATH_OVERRIDES:
             override_path = MODEL_PATH_OVERRIDES[hf_model_id]
             logger.info(f"Using path override for {hf_model_id} -> {override_path}")
@@ -3377,6 +3413,7 @@ class VerlTrainingEngine:
         moe_backend = _select_moe_training_backend(requested_model) if model_uses_distributed_training else None
         use_megatron = model_uses_distributed_training and moe_backend == "megatron"
         use_bumblebee = model_uses_distributed_training and moe_backend == "bumblebee"
+        use_verl_fsdp2_lora = _uses_verl_fsdp2_lora_backend(requested_model)
 
         # Resolve model path based on backend
         with start_as_current_span(
@@ -3387,12 +3424,20 @@ class VerlTrainingEngine:
             attributes={
                 "model_id": str(model_id),
                 "requested_model": str(requested_model) if requested_model is not None else None,
+                "use_verl_fsdp2_lora": bool(use_verl_fsdp2_lora),
                 "use_megatron": bool(use_megatron),
                 "use_bumblebee": bool(use_bumblebee),
                 "moe_backend": str(moe_backend or ""),
             },
         ):
-            if model_uses_distributed_training:
+            if use_verl_fsdp2_lora and requested_model and not requested_model.startswith("/"):
+                base_model = self._resolve_hf_model_path(requested_model)
+                if base_model:
+                    logger.info("[%s] Resolved Qwen3.6 veRL FSDP2 LoRA model to local: %s", model_id, base_model)
+                else:
+                    base_model = requested_model
+                    logger.info("[%s] Using Qwen3.6 veRL FSDP2 LoRA model path as requested: %s", model_id, base_model)
+            elif model_uses_distributed_training:
                 resolver = self._resolve_megatron_base_model if use_megatron else self._resolve_bumblebee_base_model
                 base_model, requested_model = resolver(session)
                 logger.info(
@@ -3600,6 +3645,13 @@ class VerlTrainingEngine:
             session.actor_name = actor_name
             session.namespace = RAY_NAMESPACE
             self._touch_actor(session)
+        elif use_verl_fsdp2_lora:
+            session.backend = VERL_FSDP2_LORA_BACKEND
+            raise NotImplementedError(
+                "Qwen3.6-27B is configured for veRL FSDP2 + PEFT LoRA. "
+                "The MinT per-request TrainingWorker API cannot materialize this backend yet; "
+                "launch it through a veRL job with MINT_QWEN36_VERL_FSDP2_LORA_PATCHES=1."
+            )
         else:
             logger.info(
                 f"[{model_id}] Using pooled PEFT trainer actors for dense model (base={base_model}, lora_rank={lora_rank})"
