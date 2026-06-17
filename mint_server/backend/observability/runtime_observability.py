@@ -4,7 +4,7 @@ import threading
 import time
 from dataclasses import dataclass
 
-from mint_server.logging_context import (
+from mint_server.observability.logging_context import (
     record_megatron_actor_lifecycle_otel,
     record_megatron_session_switch_otel,
     record_training_operation_latency_otel,

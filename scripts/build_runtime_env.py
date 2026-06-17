@@ -124,7 +124,7 @@ def _partition_host_requirements(requirements: list[str]) -> tuple[list[str], li
 
 
 def _runtime_env_symbols():
-    from mint_server.runtime_env import (
+    from mint_server.ray.runtime_env import (
         DEFAULT_BASE_PYTHON_DIRNAME,
         DEFAULT_HOST_VENV_DIRNAME,
         DEFAULT_SITE_PACKAGES_DIRNAME,

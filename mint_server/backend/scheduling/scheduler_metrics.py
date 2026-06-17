@@ -182,6 +182,7 @@ class SchedulerMetrics:
                             if not isinstance(lease, dict):
                                 continue
                             item = lease.get("item") if isinstance(lease.get("item"), dict) else {}
+                            assert item is not None
                             base_model = scheduler_domain_base_model(item.get("domain_key") or lease.get("domain_key"))
                             if not base_model:
                                 continue

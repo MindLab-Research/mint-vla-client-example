@@ -118,7 +118,7 @@ def _runtime_manifest() -> dict:
 
 
 def _materialize_runtime_env(root: Path, *, with_host_python: bool) -> object:
-    from mint_server.runtime_env import checkout_runtime_env_layout
+    from mint_server.ray.runtime_env import checkout_runtime_env_layout
 
     layout = checkout_runtime_env_layout(str(root))
     root.mkdir(parents=True, exist_ok=True)
@@ -138,7 +138,7 @@ def _materialize_runtime_env(root: Path, *, with_host_python: bool) -> object:
 
 @pytest.fixture
 def configure_runtime_env(monkeypatch, tmp_path):
-    from mint_server.runtime_env import bootstrap_runtime_pythonpath
+    from mint_server.ray.runtime_env import bootstrap_runtime_pythonpath
 
     def _configure(*, with_host_python: bool = True) -> dict[str, object]:
         env_root = tmp_path / "runtime"

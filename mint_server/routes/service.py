@@ -23,13 +23,13 @@ from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..auth_identity import can_bypass_ownership_user_data
-from ..auth_identity import can_manage_system
-from ..auth_identity import get_user_data as _request_user_data
-from ..auth_identity import get_user_id as _request_user_id
+from ..auth.auth_identity import can_bypass_ownership_user_data
+from ..auth.auth_identity import can_manage_system
+from ..auth.auth_identity import get_user_data as _request_user_data
+from ..auth.auth_identity import get_user_id as _request_user_id
 from mint_server.backend.stores.session_heartbeat_store import session_heartbeat_store
-from ..health_checks import internal_lightweight_healthz_response, public_business_healthz_response
-from ..model_access_control import can_access_model, get_access_denied_error
+from ..health.health_checks import internal_lightweight_healthz_response, public_business_healthz_response
+from ..auth.model_access_control import can_access_model, get_access_denied_error
 from ..models.types import (
     CreateSamplingSessionRequest,
     CreateSamplingSessionResponse,
@@ -330,7 +330,7 @@ async def _create_sampling_session_impl(
             detail="base_model is required. Provide base_model or model_path with adapter_config.json containing base_model_name_or_path.",
         )
 
-    from ..supported_models_gate import enforce_base_model_allowed
+    from ..auth.supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(base_model=base_model, http_request=http_request)
 
@@ -669,7 +669,7 @@ async def get_sampler(sampler_id: str, http_request: Request) -> GetSamplerRespo
             if isinstance(persisted, dict):
                 base_model = persisted.get("base_model")
 
-        from ..client_compat import checkpoint_uri, prefer_tinker_uri
+        from ..utils.client_compat import checkpoint_uri, prefer_tinker_uri
 
         model_path = None
         source_type = info.get("source_type")

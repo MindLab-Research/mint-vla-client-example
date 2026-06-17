@@ -121,7 +121,9 @@ def test_cookbook_openai_completions_example_shape(monkeypatch):
             assert response.model == "mint://exp/sampler_weights/000080"
             assert response.choices[0].text == "11|12"
             assert response.choices[0].finish_reason == "stop"
+            assert response.usage is not None
             assert response.usage.prompt_tokens == 2
+            assert response.usage is not None
             assert response.usage.completion_tokens == 2
 
     anyio.run(_run)
@@ -375,7 +377,9 @@ def test_cookbook_openai_chat_completions_example_shape(monkeypatch):
             assert response.object == "chat.completion"
             assert response.choices[0].message.content == "21|22|23"
             assert response.choices[0].finish_reason == "length"
+            assert response.usage is not None
             assert response.usage.prompt_tokens == 2
+            assert response.usage is not None
             assert response.usage.completion_tokens == 3
 
     anyio.run(_run)

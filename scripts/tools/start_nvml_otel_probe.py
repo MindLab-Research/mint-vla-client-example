@@ -467,7 +467,7 @@ def start(args: argparse.Namespace) -> int:
             lifetime="detached",
             get_if_exists=True,
             resources={f"node:{node_ip}": 0.001},
-        ).remote(interval_s=args.interval_s, runtime_env_vars=_probe_runtime_env().get("env_vars", {}))
+        ).remote(interval_s=args.interval_s, runtime_env_vars=(_probe_runtime_env() or {}).get("env_vars", {}))
         actors[name] = actor
 
     if not args.no_start_loop:

@@ -17,7 +17,7 @@ import ray
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.async_ray_control import _ray_ref_to_future, _silence_late_result, async_get_ray_ref
-from mint_server.logging_context import (
+from mint_server.observability.logging_context import (
     classify_failure_reason,
     get_current_traceparent,
     get_request_id,
@@ -29,7 +29,7 @@ from mint_server.logging_context import (
 )
 from mint_server.config import RAY_NAMESPACE
 from mint_server.config import config as server_config
-from mint_server.ray_utils import init_ray
+from mint_server.ray.ray_utils import init_ray
 from mint_server.backend.core.training_backend_selection import (
     _DISTRIBUTED_MOE_BACKENDS,
     _is_qwen3_30b_model,
@@ -1343,6 +1343,11 @@ class TrainingWorker:
         """
         peft_config = self.model.peft_config.get("default")
         effective_rank = self._resolve_actual_rank(actual_rank)
+        assert peft_config is not None
+        assert peft_config is not None
+        assert peft_config is not None
+        assert peft_config is not None
+        assert peft_config is not None
         alpha_per_rank = peft_config.lora_alpha / peft_config.r
         return {
             "r": effective_rank,

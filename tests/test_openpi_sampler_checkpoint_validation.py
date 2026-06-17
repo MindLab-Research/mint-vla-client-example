@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from mint_server.checkpoints import validate_sampler_checkpoint_for_sampling
+from mint_server.checkpoints.checkpoints import validate_sampler_checkpoint_for_sampling
 
 
 def test_openpi_sampler_checkpoint_is_valid_without_adapter_file(tmp_path: Path) -> None:

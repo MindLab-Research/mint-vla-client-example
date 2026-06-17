@@ -498,8 +498,11 @@ def test_mint_action_route_enqueues_expected_request(monkeypatch) -> None:
     assert task_futures.created == [request_id]
     queued_request_id, queued_meta = task_futures.queued[0]
     assert queued_request_id == request_id
+    assert queued_meta is not None
     assert queued_meta["op"] == "mint.action.act"
+    assert queued_meta is not None
     assert queued_meta["action_session_id"] == "action-session-1"
+    assert queued_meta is not None
     assert queued_meta["queue_state"] == "queued"
     assert len(scheduler.calls) == 1
     queued = scheduler.calls[0]

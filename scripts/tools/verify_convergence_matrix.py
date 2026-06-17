@@ -780,6 +780,7 @@ def run_training(
             elif loss_fn == "dpo":
                 if dpo_dataset is None:
                     raise ValueError("dpo_dataset is required for dpo loss")
+                assert reference_client is not None
                 if training_client is None or reference_client is None:
                     raise RuntimeError("DPO path requires initialized training/reference clients")
                 data, full_sequences = make_dpo_data(tokenizer, dpo_dataset, seed, step)
@@ -798,6 +799,7 @@ def run_training(
                 )
 
             if loss_fn == "dpo":
+                assert reference_client is not None
                 all_ref_logprob_seqs = [
                     torch.tensor(reference_client.compute_logprobs(seq).result()[1:])
                     for seq in full_sequences
@@ -843,12 +845,14 @@ def run_training(
                     )
 
                 print(f"[{_ts()}] Step {step + 1}/{steps}: forward_backward_custom...", flush=True)
+                assert training_client is not None
                 backward_result = training_client.forward_backward_custom(data, dpo_loss_fn).result()
                 fb_result = {
                     "metrics": dict(backward_result.metrics),
                     "loss_fn_outputs": list(backward_result.loss_fn_outputs),
                 }
                 print(f"[{_ts()}] Step {step + 1}/{steps}: optim_step...", flush=True)
+                assert training_client is not None
                 optim_output = training_client.optim_step(
                     tinker.AdamParams(
                         learning_rate=learning_rate,

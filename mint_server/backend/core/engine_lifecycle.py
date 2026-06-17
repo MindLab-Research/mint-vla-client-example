@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable
 
 import time
 
-from mint_server.logging_context import record_span_event_otel, start_as_current_span
+from mint_server.observability.logging_context import record_span_event_otel, start_as_current_span
 from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHealthStatus, EngineObservability
 from mint_server.backend.core.execution_context import ExecutionContext
 

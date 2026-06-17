@@ -37,15 +37,15 @@ from typing import TYPE_CHECKING, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..auth_identity import can_bypass_ownership_user_data
-from ..auth_identity import can_manage_system
-from ..auth_identity import can_write
-from ..auth_identity import get_apikey_id as _request_apikey_id
-from ..auth_identity import get_user_data as _request_user_data
-from ..auth_identity import get_user_id as _request_user_id
+from ..auth.auth_identity import can_bypass_ownership_user_data
+from ..auth.auth_identity import can_manage_system
+from ..auth.auth_identity import can_write
+from ..auth.auth_identity import get_apikey_id as _request_apikey_id
+from ..auth.auth_identity import get_user_data as _request_user_data
+from ..auth.auth_identity import get_user_id as _request_user_id
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
-from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import (
+from ..gateway.gateway_auth import GatewayAuthContext, build_billing_auth_context
+from ..observability.logging_context import (
     classify_failure_reason,
     get_current_traceparent,
     get_otel_tracer,
@@ -61,7 +61,7 @@ from mint_server.backend.stores.task_state_store import (
     billing_observations_from_input,
     task_futures,
 )
-from ..checkpoint_index import (
+from ..checkpoints.checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
     CheckpointAlreadyUploadingError,
@@ -86,8 +86,8 @@ from ..checkpoints import (
     write_checkpoint_metadata,
 )
 from ..config import RAY_NAMESPACE, config as server_config
-from ..model_access_control import can_access_model, get_access_denied_error
-from ..queue_priority import merge_queue_priority_extra
+from ..auth.model_access_control import can_access_model, get_access_denied_error
+from ..utils.queue_priority import merge_queue_priority_extra
 from ..models.types import (
     CreateModelFromStateRequest,
     CreateModelFromStateResponse,
@@ -111,7 +111,7 @@ from ..models.types import (
     TrainStepRequest,
     UntypedAPIFuture,
 )
-from ..webhook import EventType, send_task_event
+from ..utils.webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
     from mint_server.backend.sessions.session_manager import SessionManager
@@ -2028,7 +2028,7 @@ async def create_model(
     """Create a new training model with LoRA."""
     _require_write_access(http_request)
     route_start_s = time.perf_counter()
-    from ..supported_models_gate import enforce_base_model_allowed
+    from ..auth.supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(
         base_model=request.base_model, http_request=http_request
@@ -2423,7 +2423,7 @@ async def create_model_from_state(
     """
     _require_write_access(http_request)
     route_start_s = time.perf_counter()
-    from ..supported_models_gate import enforce_base_model_allowed
+    from ..auth.supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(
         base_model=request.base_model, http_request=http_request
@@ -2701,7 +2701,9 @@ async def _do_create_model_from_state(
         inflight_marked = True
 
         async def _create_and_restore_model():
+            assert engine is not None
             await engine.create_training_session(session)
+            assert engine is not None
             return await engine.load_weights(
                 session=session,
                 load_path=load_path,
@@ -3943,7 +3945,7 @@ async def save_weights_for_sampler(
     backend = str(route_session_info.get("backend") or "unknown")
 
     user_id = _get_user_id(http_request)
-    from ..client_compat import prefer_tinker_uri
+    from ..utils.client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
 
@@ -4227,7 +4229,7 @@ async def _do_save_weights_for_sampler(
                 },
             )
 
-        from ..client_compat import checkpoint_uri
+        from ..utils.client_compat import checkpoint_uri
 
         tinker_uri = checkpoint_uri(
             session.model_id,
@@ -4292,6 +4294,7 @@ async def _do_save_weights_for_sampler(
                         "save_mode": "ephemeral",
                     },
                 ):
+                    assert inf_mgr is not None
                     await inf_mgr.get_engine_for_model(base_model)
 
             pending_warms = getattr(inf_mgr, "_background_engine_warm_tasks", None)

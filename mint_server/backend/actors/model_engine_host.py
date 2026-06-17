@@ -20,8 +20,8 @@ from mint_server.config import (
     otel_env_vars,
     preferred_vllm_python_executable,
 )
-from mint_server.runtime_env import env_nonempty
-from mint_server.logging_context import (
+from mint_server.ray.runtime_env import env_nonempty
+from mint_server.observability.logging_context import (
     classify_failure_reason,
     extract_trace_id_from_traceparent,
     get_otel_tracer,
@@ -287,7 +287,7 @@ def get_or_create_model_engine_host(
         except Exception:
             pass
 
-    from mint_server.ray_utils import strict_ray_gcs_address
+    from mint_server.ray.ray_utils import strict_ray_gcs_address
 
     resolved_ray_address = str(ray_address or "").strip() or strict_ray_gcs_address()
     if resolved_ray_address is None:
@@ -850,6 +850,7 @@ class ModelEngineHost:
     def _recovered_stale_generation_error(self, lease: dict[str, Any]) -> RuntimeError | None:
         item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
+        assert extra is not None
         raw = extra.get("actor_generation")
         if raw is None:
             return None
@@ -996,6 +997,7 @@ class ModelEngineHost:
             return attempt_id
         item = _lease_item_wire(lease)
         extra = item.get("extra") if isinstance(item, dict) and isinstance(item.get("extra"), dict) else {}
+        assert extra is not None
         return str(extra.get("model_work_attempt_id") or "") or None
 
     def _payload_attempt_id_for_lease(self, lease: dict[str, Any]) -> str:

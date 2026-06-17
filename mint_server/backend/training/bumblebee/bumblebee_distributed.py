@@ -36,8 +36,8 @@ from mint_server.backend.actors.node_placement import (
     parse_model_gpu_placement,
 )
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars, config as server_config, otel_env_vars
-from mint_server.logging_context import get_current_traceparent, get_request_id
-from mint_server.ray_utils import init_ray
+from mint_server.observability.logging_context import get_current_traceparent, get_request_id
+from mint_server.ray.ray_utils import init_ray
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 

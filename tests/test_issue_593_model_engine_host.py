@@ -470,6 +470,7 @@ class _FakeTaskFutureService:
         if expected_meta:
             meta = await self.async_get_meta(request_id)
             for key, value in expected_meta.items():
+                assert meta is not None
                 if meta.get(str(key)) != value:
                     return {"failed": False, "reason": "meta_mismatch"}
         await self.async_fail(request_id, error)
@@ -2388,8 +2389,9 @@ async def test_issue_593_default_executor_initializes_execution_bindings(monkeyp
         }
 
     async def _execute_work_item(item, **_kwargs):
-        assert current_execution_context() is not None
-        assert current_execution_context().inference_manager is inference_manager
+        _ctx = current_execution_context()
+        assert _ctx is not None
+        assert _ctx.inference_manager is inference_manager
         assert sampling.session_manager is original_sampling_manager
         calls.append(f"execute:{item.op}")
         return ExecutorOutcome(kind="success")
@@ -2431,8 +2433,9 @@ async def test_issue_616_default_executor_accepts_non_sampling_ops(monkeypatch) 
         }
 
     async def _execute_work_item(item, **_kwargs):
-        assert current_execution_context() is not None
-        assert current_execution_context().train_manager is train_manager
+        _ctx2 = current_execution_context()
+        assert _ctx2 is not None
+        assert _ctx2.train_manager is train_manager
         assert training.training_manager is original_training_manager
         calls.append(f"execute:{item.op}")
         return ExecutorOutcome(kind="success")

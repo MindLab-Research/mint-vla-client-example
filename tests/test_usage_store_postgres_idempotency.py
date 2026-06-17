@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from mint_server.usage_store import PostgresUsageStore, UsageEvent
+from mint_server.billing.usage_store import PostgresUsageStore, UsageEvent
 
 
 class _FakeConn:
@@ -766,7 +766,7 @@ def test_postgres_usage_store_does_not_retry_permanent_pg_constraint_errors(monk
 
 
 def test_issue_640_get_usage_store_is_event_loop_local(monkeypatch):
-    import mint_server.usage_store as usage_store_module
+    import mint_server.billing.usage_store as usage_store_module
 
     created: list[object] = []
 
@@ -797,7 +797,7 @@ def test_issue_640_get_usage_store_is_event_loop_local(monkeypatch):
 
 
 def test_issue_640_close_usage_store_only_closes_current_event_loop_store(monkeypatch):
-    import mint_server.usage_store as usage_store_module
+    import mint_server.billing.usage_store as usage_store_module
 
     closed: list[object] = []
 

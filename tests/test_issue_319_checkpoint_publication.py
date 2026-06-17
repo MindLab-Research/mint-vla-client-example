@@ -563,7 +563,7 @@ async def test_issue_319_save_state_accepts_openpi_training_checkpoint_before_me
 def test_issue_319_list_checkpoints_skips_invalid_sampler_dirs(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.checkpoints.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"
@@ -761,8 +761,11 @@ def test_issue_641_publish_checkpoint_catalog_recovers_valid_failed_staging(
         )
     )
 
+    assert row is not None
     assert row["ckpt_id"] == ckpt_id
+    assert row is not None
     assert row["checkpoint_type"] == "training"
+    assert row is not None
     assert row["size_bytes"] == 235
     assert ckpt_id not in state["staging"]
     assert (
@@ -880,7 +883,7 @@ def test_issue_641_claim_checkpoint_reuses_failed_staging_row(monkeypatch) -> No
 def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.checkpoints.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"
@@ -948,7 +951,7 @@ def test_issue_319_list_checkpoints_skips_shard_only_sampler_dirs(
 def test_issue_319_list_checkpoints_skips_corrupt_sampler_dirs(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.checkpoints import write_checkpoint_metadata
+    from mint_server.checkpoints.checkpoints import write_checkpoint_metadata
     from mint_server.routes import weights as wt
 
     root = tmp_path / "checkpoints"

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 
-from .runtime_env import env_nonempty
+from .ray.runtime_env import env_nonempty
 
 
 STARTED_AT = datetime.now(timezone.utc)

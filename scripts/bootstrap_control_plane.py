@@ -73,7 +73,7 @@ async def _bootstrap_async(args: argparse.Namespace) -> dict:
     from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
     from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
     from mint_server.config import RAY_NAMESPACE
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 

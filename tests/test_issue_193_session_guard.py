@@ -67,7 +67,9 @@ def test_issue_193_prime_session_uses_sidecars_and_detaches_on_dirty(tmp_path: P
     assert not session_path.is_symlink()
     assert marker_path.exists()
     assert not (checkpoint_dir / "actor_only_state.json").exists()
-    assert manager.get_metadata(session_id)["checkpoint_path"] == os.path.realpath(checkpoint_dir)
+    _md = manager.get_metadata(session_id)
+    assert _md is not None
+    assert _md["checkpoint_path"] == os.path.realpath(checkpoint_dir)
 
 
 def test_issue_193_megatron_dirty_noncurrent_session_fails_before_swap(monkeypatch):

@@ -7,7 +7,7 @@ import pytest
 from fastapi import Request
 
 from mint_server.models.types import ComputeLogprobsRequest, ForwardBackwardInput, ForwardBackwardRequest, ModelInput, SampleRequest, SamplingParams
-from mint_server.queue_priority import (
+from mint_server.utils.queue_priority import (
     effective_queue_priority,
     extract_queue_priority_from_headers,
     merge_queue_priority_extra,

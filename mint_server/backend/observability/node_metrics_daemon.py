@@ -12,29 +12,29 @@ from pathlib import Path
 from typing import Any
 
 from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 
 
 def _ray_cluster_snapshot() -> dict[str, Any]:
-    from mint_server.ray_cluster_health import get_ray_cluster_health_snapshot
+    from mint_server.health.ray_cluster_health import get_ray_cluster_health_snapshot
 
     return get_ray_cluster_health_snapshot()
 
 
 def _ray_gcs_snapshot() -> dict[str, Any]:
-    from mint_server.ray_gcs_metrics import get_ray_gcs_metrics_snapshot
+    from mint_server.health.ray_gcs_metrics import get_ray_gcs_metrics_snapshot
 
     return get_ray_gcs_metrics_snapshot()
 
 
 def _ray_gcs_aggregate_metric_names() -> tuple[str, ...]:
-    from mint_server.ray_gcs_metrics import RAY_GCS_AGGREGATE_METRIC_NAMES
+    from mint_server.health.ray_gcs_metrics import RAY_GCS_AGGREGATE_METRIC_NAMES
 
     return RAY_GCS_AGGREGATE_METRIC_NAMES
 
 
 def _ray_gcs_derived_metric_names() -> tuple[str, ...]:
-    from mint_server.ray_gcs_metrics import RAY_GCS_DERIVED_METRIC_NAMES
+    from mint_server.health.ray_gcs_metrics import RAY_GCS_DERIVED_METRIC_NAMES
 
     return RAY_GCS_DERIVED_METRIC_NAMES
 
@@ -271,7 +271,7 @@ class NodeMetricsCollectorActor:
         actor_name: str | None = None,
         is_head_node: bool = False,
     ) -> None:
-        from mint_server.logging_context import init_actor_observability
+        from mint_server.observability.logging_context import init_actor_observability
 
         init_actor_observability()
         self._spec = NodeMetricsDaemonSpec(

@@ -276,7 +276,7 @@ async def test_internal_healthz_degrades_when_cron_unreachable(monkeypatch: pyte
 async def test_internal_healthz_degrades_on_startup_control_plane_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
-    from mint_server.health_state import clear_startup_degraded_state, set_startup_degraded_state
+    from mint_server.health.health_state import clear_startup_degraded_state, set_startup_degraded_state
 
     now = 1000.0
 

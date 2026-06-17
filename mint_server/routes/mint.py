@@ -8,9 +8,9 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request
 
-from ..auth_identity import can_bypass_ownership
-from ..auth_identity import get_user_data as _request_user_data
-from ..auth_identity import get_user_id as _request_user_id
+from ..auth.auth_identity import can_bypass_ownership
+from ..auth.auth_identity import get_user_data as _request_user_data
+from ..auth.auth_identity import get_user_id as _request_user_id
 from mint_server.backend.stores.task_state_store import billing_observations_from_input, task_futures
 from mint_server.backend.core.mintx_ops import interpolate_checkpoints_to_dir
 from ..checkpoints import (
@@ -24,18 +24,18 @@ from ..checkpoints import (
     resolve_checkpoint_path,
     write_checkpoint_metadata,
 )
-from ..client_compat import checkpoint_uri
-from ..checkpoint_index import (
+from ..utils.client_compat import checkpoint_uri
+from ..checkpoints.checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
     CheckpointAlreadyUploadingError,
     claim_checkpoint_publication,
     mark_checkpoint_failed,
 )
-from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import classify_failure_reason, set_request_id
-from ..model_access_control import can_access_model, get_access_denied_error
-from ..queue_priority import merge_queue_priority_extra
+from ..gateway.gateway_auth import GatewayAuthContext, build_billing_auth_context
+from ..observability.logging_context import classify_failure_reason, set_request_id
+from ..auth.model_access_control import can_access_model, get_access_denied_error
+from ..utils.queue_priority import merge_queue_priority_extra
 from ..models.mint_types import (
     ForwardBackwardReverseKLRequest,
     InterpolateCheckpointsRequest,
@@ -364,7 +364,7 @@ async def _mark_checkpoint_failed_safe(
 
 
 def _reverse_kl_token_stats(data: list) -> tuple[int, int]:
-    from ..model_input_utils import flatten_encoded_text_chunks
+    from ..utils.model_input_utils import flatten_encoded_text_chunks
 
     total_tokens = 0
     max_seq_len = 0
@@ -462,7 +462,7 @@ async def create_action_session(
     if not base_model:
         raise HTTPException(status_code=422, detail="base_model is required")
 
-    from ..supported_models_gate import enforce_base_model_allowed
+    from ..auth.supported_models_gate import enforce_base_model_allowed
 
     base_model = await enforce_base_model_allowed(
         base_model=base_model, http_request=http_request

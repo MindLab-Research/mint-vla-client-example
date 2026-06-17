@@ -37,8 +37,8 @@ from mint_server.backend.scheduling.model_work_admission import (
     ModelWorkAdmissionRejectedError,
     enqueue_model_work,
 )
-from ..gateway_auth import GatewayAuthContext, build_billing_auth_context
-from ..logging_context import (
+from ..gateway.gateway_auth import GatewayAuthContext, build_billing_auth_context
+from ..observability.logging_context import (
     classify_failure_reason,
     get_otel_tracer,
     record_sampling_admission_metric,
@@ -46,9 +46,9 @@ from ..logging_context import (
     set_request_id,
     start_as_current_span,
 )
-from ..model_access_control import can_access_model, get_access_denied_error
-from ..queue_priority import merge_queue_priority_extra
-from ..runtime_env import env_get
+from ..auth.model_access_control import can_access_model, get_access_denied_error
+from ..utils.queue_priority import merge_queue_priority_extra
+from ..ray.runtime_env import env_get
 from ..models.types import (
     ComputeLogprobsRequest,
     ComputeLogprobsResponse,
@@ -59,7 +59,7 @@ from ..models.types import (
     SamplingParams,
     UntypedAPIFuture,
 )
-from ..sampling_utils import (
+from ..utils.sampling_utils import (
     normalize_prompt_logprobs_for_tinker,
     sampled_sequence_from_result,
 )
@@ -271,6 +271,7 @@ def _snapshot_from_manager_getters(session_id: str) -> SamplingSessionSnapshot |
     manager = _active_session_manager()
     if manager is None:
         return None
+    assert manager is not None
     is_multi_lora = bool(manager.is_multi_lora_session(session_id))
     get_engine = getattr(manager, "get_engine", None)
     if not is_multi_lora and callable(get_engine):
@@ -1704,6 +1705,7 @@ async def _do_sample(
             )
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
+            assert manager is not None
             is_multi_lora = (
                 bool(snapshot.uses_multi_lora)
                 if snapshot is not None
@@ -1748,9 +1750,11 @@ async def _do_sample(
                         "engine_acquire_started_at": engine_acquire_started_at,
                     },
                 )
+                assert manager is not None
+                assert manager is not None
                 engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),  # type: ignore[reportOptionalMemberAccess]
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -2073,6 +2077,7 @@ async def _do_sample(
                         },
                     )
                 else:
+                    assert engine.server is not None
                     computed_topk = await engine.server.compute_prompt_topk.remote(
                         prompt_ids=token_ids,
                         request_id=f"{request_id}_topk",
@@ -2399,6 +2404,7 @@ async def _do_compute_logprobs(
                 workload_started
 
             # Check if session uses multi-LoRA mode (includes base model sessions)
+            assert manager is not None
             is_multi_lora = (
                 bool(snapshot.uses_multi_lora)
                 if snapshot is not None
@@ -2418,9 +2424,10 @@ async def _do_compute_logprobs(
                     )
 
             if is_multi_lora:
+                assert manager is not None
                 multi_lora_engine = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: manager.get_engine_for_session(session_id),
+                    lambda: manager.get_engine_for_session(session_id),  # type: ignore[reportOptionalMemberAccess]
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -2491,6 +2498,7 @@ async def _do_compute_logprobs(
                     request_id=request_id,
                 )
 
+            assert manager is not None
             engine = manager.get_engine(session_id)
             if engine is None:
                 raise RuntimeError(f"No engine found for session {session_id}")

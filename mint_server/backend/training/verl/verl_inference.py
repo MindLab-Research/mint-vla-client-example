@@ -31,14 +31,14 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from mint_server.backend.core.model_registry import get_model_config
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from mint_server.config import config as server_config
-from mint_server.logging_context import (
+from mint_server.observability.logging_context import (
     get_current_traceparent,
     init_actor_observability,
     restore_trace_id_from_traceparent,
     traced_async_from_traceparent,
 )
-from mint_server.ray_utils import init_ray, strict_ray_gcs_address
-from mint_server.runtime_env import (
+from mint_server.ray.ray_utils import init_ray, strict_ray_gcs_address
+from mint_server.ray.runtime_env import (
     host_only_pythonpath_entries,
     join_pythonpath,
     sanitize_worker_pythonpath,
@@ -2977,6 +2977,7 @@ class VerlInferenceEngine:
         ).remote(**remote_kwargs)
 
         # Launch the server
+        assert self.server is not None
         await self.server.launch_server.remote()
         self._initialized = True
         logger.info("vLLMHttpServer initialized")
@@ -3024,6 +3025,7 @@ class VerlInferenceEngine:
         traceparent = get_current_traceparent()
 
         # Call the Ray actor's generate method
+        assert self.server is not None
         result = await self.server.generate.remote(
             prompt_ids=prompt_ids,
             sampling_params=sampling_params,
@@ -3063,6 +3065,7 @@ class VerlInferenceEngine:
             await self.initialize()
         traceparent = get_current_traceparent()
 
+        assert self.server is not None
         result = await self.server.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
@@ -3103,6 +3106,7 @@ class VerlInferenceEngine:
 
         # Pass tensors via Ray to inference worker, which saves locally and loads
         # This handles distributed deployments where nodes have different filesystems
+        assert self.server is not None
         await self.server.add_lora_from_tensors.remote(
             state_dict,
             peft_config,

@@ -72,7 +72,7 @@ def _headers(args: argparse.Namespace) -> dict[str, str]:
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        (_coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL) or "")
         .rstrip("/")
     )
 

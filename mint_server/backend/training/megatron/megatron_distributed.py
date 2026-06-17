@@ -38,10 +38,10 @@ from mint_server.backend.ray_cluster.ray_placement_groups import get_named_place
 # Import centralized PFS paths from config
 from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE
 from mint_server.config import config as server_config
-from mint_server.model_input_utils import flatten_encoded_text_chunks
-from mint_server.ray_utils import init_ray
+from mint_server.utils.model_input_utils import flatten_encoded_text_chunks
+from mint_server.ray.ray_utils import init_ray
 
-from mint_server.logging_context import (get_current_traceparent, get_request_id,
+from mint_server.observability.logging_context import (get_current_traceparent, get_request_id,
                                init_actor_observability,
                                restore_trace_id_from_traceparent,
                                start_as_current_span,
@@ -916,7 +916,7 @@ class MegatronRankWorker:
         self.lora_rank = lora_rank
         self.learning_rate = learning_rate
         self.config = distributed_config
-        self.engine = None  # Set in initialize()
+        self.engine: Any = None  # Set in initialize()
         self._current_session_id = None
         self._current_actual_rank: int | None = None
         # Per-session gradient storage (CPU).
@@ -1150,6 +1150,7 @@ class MegatronRankWorker:
         #   - All model parameters: CPU -> GPU (PCIe DMA, ~620ms)
         #   - Zero all GPU gradient buffers
         t0 = time.perf_counter()
+        assert self.engine is not None
         ctx = self.engine.train_mode()
         ctx.__enter__()
         enter_s = time.perf_counter() - t0
@@ -1346,6 +1347,7 @@ class MegatronRankWorker:
         grads = []
         want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
+        assert self.engine is not None
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
@@ -1377,6 +1379,7 @@ class MegatronRankWorker:
         idx = 0
         want_total_norm = self.rank == 0 and logger.isEnabledFor(logging.DEBUG)
         total_norm_sq = 0.0
+        assert self.engine is not None
         for model_chunk in self.engine.module:
             if isinstance(model_chunk, DDP):
                 for buffers in [model_chunk.buffers, model_chunk.expert_parallel_buffers]:
@@ -1419,6 +1422,7 @@ class MegatronRankWorker:
 
         if hasattr(self.engine, "optimizer_zero_grad"):
             try:
+                assert self.engine is not None
                 self.engine.optimizer_zero_grad()
                 logger.debug(
                     f"[Rank {self.rank}] Cleared gradients via optimizer_zero_grad "
@@ -1523,6 +1527,7 @@ class MegatronRankWorker:
             return MegatronDistributedOptimizer is not None and isinstance(opt, MegatronDistributedOptimizer)
 
         state_dict = {}
+        assert self.engine is not None
         optimizer = self.engine.optimizer
 
         if optimizer is None:
@@ -1636,6 +1641,7 @@ class MegatronRankWorker:
         except Exception:
             MegatronDistributedOptimizer = None
 
+        assert self.engine is not None
         optimizer = self.engine.optimizer
         if optimizer is None:
             return
@@ -1654,15 +1660,20 @@ class MegatronRankWorker:
             if inner_opt is not None:
                 state = getattr(inner_opt, "state", None)
                 if hasattr(state, "_inner_dicts"):
+                    assert state is not None
                     for inner_dict in state._inner_dicts:
                         inner_dict.clear()
                 elif hasattr(state, "clear"):
+                    assert state is not None
                     state.clear()
                 elif hasattr(state, "keys"):
+                    assert state is not None
+                    assert state is not None
                     for key in list(state.keys()):
                         del state[key]
 
             wrapper_state = entry.get("wrapper_state_dict") if isinstance(entry, dict) else None
+            assert state is not None
             if isinstance(wrapper_state, dict) and hasattr(_opt, "load_state_dict"):
                 _opt.load_state_dict(copy.deepcopy(wrapper_state))
 
@@ -1685,8 +1696,10 @@ class MegatronRankWorker:
         if lr_scheduler is None and hasattr(self.engine, "_build_lr_scheduler"):
             try:
                 self.engine.lr_scheduler = self.engine._build_lr_scheduler()
+                assert self.engine is not None
                 lr_scheduler = self.engine.lr_scheduler
                 for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
+                    assert self.engine is not None
                     manager = getattr(self.engine, attr_name, None)
                     if manager is not None and hasattr(manager, "optimizer_scheduler"):
                         manager.optimizer_scheduler = lr_scheduler
@@ -1712,6 +1725,7 @@ class MegatronRankWorker:
         """
         from megatron.core.optimizer import ChainedOptimizer
 
+        assert self.engine is not None
         optimizer = self.engine.optimizer
         if optimizer is None:
             print(f"[Rank {self.rank}] _reset_optimizer_state: optimizer is None, skipping", flush=True)
@@ -1776,6 +1790,7 @@ class MegatronRankWorker:
                 for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
                     manager = getattr(self.engine, attr_name, None)
                     if manager is not None and hasattr(manager, "optimizer_scheduler"):
+                        assert self.engine is not None
                         manager.optimizer_scheduler = self.engine.lr_scheduler
                 logger.info("reset_lr_scheduler_via__build_lr_scheduler", rank=self.rank)
                 return
@@ -1821,11 +1836,15 @@ class MegatronRankWorker:
                 self.engine.lr_scheduler = self.engine._build_lr_scheduler()
                 # Keep checkpoint manager in sync if present
                 for attr_name in ("checkpoint_mananager", "checkpoint_manager"):
+                    assert self.engine is not None
                     manager = getattr(self.engine, attr_name, None)
                     if manager is not None:
                         if hasattr(manager, "optimizer"):
+                            assert manager is not None
+                            assert self.engine is not None
                             manager.optimizer = self.engine.optimizer
                         if hasattr(manager, "optimizer_scheduler"):
+                            assert self.engine is not None
                             manager.optimizer_scheduler = self.engine.lr_scheduler
                 logger.info("rebuilt_optimizer_and_lr_scheduler", rank=self.rank)
         except Exception:
@@ -2129,6 +2148,7 @@ class MegatronRankWorker:
         incoming_source = "new"
 
         # Must use train_mode to access GPU gradient buffers (required for param_offload)
+        assert self.engine is not None
         with self.engine.train_mode():
             if self._current_session_id is not None:
                 cached = self._session_gradients.get(self._current_session_id)
@@ -2192,6 +2212,7 @@ class MegatronRankWorker:
                 self._restore_gradients(incoming_gradients)
                 logger.debug("restored_gradients_for_session__s", rank=self.rank)
             else:
+                assert self.engine is not None
                 self.engine.optimizer_zero_grad()
                 if incoming_gradients is _GRADIENTS_CONSUMED:
                     logger.debug(
@@ -2232,7 +2253,9 @@ class MegatronRankWorker:
             reason="clear_session_state",
             snapshot_gradients=False,
         )
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             self.engine.optimizer_zero_grad()
             self._reset_optimizer_state()
             self._reset_lr_scheduler()
@@ -2297,6 +2320,7 @@ class MegatronRankWorker:
             self._current_actual_rank = effective_rank
             return {"params": 0, "grads": 0}
         if model is None:
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -2955,12 +2979,14 @@ class MegatronRankWorker:
 
         loss_function = create_loss_fn()
         try:
+            assert self.engine is not None
             self.engine.forward_backward_batch(
                 data=dummy_data,
                 loss_function=loss_function,
                 forward_only=False,
             )
             # Zero gradients after warmup
+            assert self.engine is not None
             self.engine.optimizer.zero_grad()
             logger.info("lora_warmup_complete", rank=self.rank)
         except Exception:
@@ -2998,6 +3024,7 @@ class MegatronRankWorker:
         bias_values_before = []
 
         # self.engine.module is a list (one per pipeline stage)
+        assert self.engine is not None
         for model_chunk in self.engine.module:
             # Iterate through all submodules
             for name, module in model_chunk.named_modules():
@@ -3184,6 +3211,7 @@ class MegatronRankWorker:
                 extra=f"items={len(data_items)} loss_fn={loss_fn}",
             )
             try:
+                assert self.engine is not None
                 result = self.engine.forward_backward_batch(
                     data=data,
                     loss_function=loss_function,
@@ -3267,6 +3295,7 @@ class MegatronRankWorker:
                 raise original_error
         else:
             tm_enter_t0 = time.perf_counter()
+            assert self.engine is not None
             with self.engine.train_mode():
                 train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
@@ -3302,6 +3331,10 @@ class MegatronRankWorker:
             all_log_probs = []
             loss_fn_outputs = []
             per_sample_log_probs = None
+            model_topk_indices = None
+            model_topk_logits = None
+            model_target_logits = None
+            model_logsumexp = None
 
             # verl's forward_backward_batch returns a single dict:
             # {
@@ -3623,9 +3656,11 @@ class MegatronRankWorker:
 
         # Use eval_mode context to load model from CPU to GPU (required for param_offload)
         # eval_mode is used for forward-only operations
+        assert self.engine is not None
         with self.engine.eval_mode():
             # Run forward only (no gradient sync)
             with torch.no_grad():
+                assert self.engine is not None
                 result = self.engine.forward_backward_batch(
                     data=data,
                     loss_function=loss_function,
@@ -3640,6 +3675,10 @@ class MegatronRankWorker:
             all_log_probs = []
             loss_fn_outputs = []
             per_sample_log_probs = None
+            model_topk_indices = None
+            model_topk_logits = None
+            model_target_logits = None
+            model_logsumexp = None
             combined_log_probs = None
 
             # verl's forward_backward_batch returns a single dict (not a list):
@@ -3849,6 +3888,7 @@ class MegatronRankWorker:
                 raise FileNotFoundError(f"Reference adapter checkpoint not found: {adapter_file}")
             checkpoint = torch.load(adapter_file, map_location="cpu", weights_only=False)
             reference_adapter_state = checkpoint.get("adapter_state_dict", {})
+            assert self.engine is not None
             with self.engine.eval_mode():
                 try:
                     self._restore_adapter_state_dict(
@@ -3861,6 +3901,7 @@ class MegatronRankWorker:
                     )
                     extractor = create_vocab_parallel_logits_extractor_fn()
                     with torch.no_grad():
+                        assert self.engine is not None
                         reference_result = self.engine.forward_backward_batch(
                             data=reference_data,
                             loss_function=extractor,
@@ -3922,6 +3963,7 @@ class MegatronRankWorker:
                 extra=f"items={len(data_items)}",
             )
             try:
+                assert self.engine is not None
                 result = self.engine.forward_backward_batch(
                     data=student_data,
                     loss_function=reverse_kl_loss_fn,
@@ -3950,6 +3992,7 @@ class MegatronRankWorker:
                         pass
                     raise original_error
             else:
+                assert self.engine is not None
                 with self.engine.train_mode():
                     cached_grads = self._session_gradients.get(session_id) if session_id else None
                     if cached_grads is not None and cached_grads is not _GRADIENTS_CONSUMED:
@@ -4048,8 +4091,10 @@ class MegatronRankWorker:
         td.set_non_tensor("return_vocab_parallel_logits", True)
 
         extractor = create_vocab_parallel_logits_extractor_fn()
+        assert self.engine is not None
         with self.engine.eval_mode():
             with torch.no_grad():
+                assert self.engine is not None
                 result = self.engine.forward_backward_batch(
                     data=td,
                     loss_function=extractor,
@@ -4125,6 +4170,7 @@ class MegatronRankWorker:
                     except ModuleNotFoundError:
                         ChainedOptimizer = None
 
+                    assert self.engine is not None
                     optimizer = self.engine.optimizer
                     if optimizer is not None:
                         def iter_optimizers(opt):
@@ -4156,6 +4202,9 @@ class MegatronRankWorker:
                 current_lr = self.engine.lr_scheduler_step()
 
                 try:
+                    assert self.engine is not None
+                    assert self.engine is not None
+                    assert self.engine is not None
                     model = _unwrap_megatron_model(self.engine.module)
                     while isinstance(model, list):
                         model = model[0]
@@ -4238,6 +4287,7 @@ class MegatronRankWorker:
                 train_mode_exit_ms = float(released.get("exit_s", 0.0)) * 1000.0
         else:
             tm_enter_t0 = time.perf_counter()
+            assert self.engine is not None
             with self.engine.train_mode():
                 train_mode_enter_ms = (time.perf_counter() - tm_enter_t0) * 1000.0
                 cached_grads = self._session_gradients.get(session_id) if session_id else None
@@ -4751,6 +4801,8 @@ class MegatronRankWorker:
             gloo_debug,
         )
         try:
+            assert self.engine is not None
+            assert self.engine is not None
             with self.engine.eval_mode():
                 for name, tensor in bridge.export_adapter_weights(
                     self.engine.module,
@@ -4798,7 +4850,9 @@ class MegatronRankWorker:
 
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -4818,7 +4872,9 @@ class MegatronRankWorker:
 
     def get_lora_weight_checksum(self) -> dict:
         """Compute checksum stats for LoRA weights (rank 0 only)."""
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -4842,7 +4898,9 @@ class MegatronRankWorker:
 
     def debug_named_parameter(self, needle: str) -> dict:
         """Inspect matching parameters for metadata and basic readback health."""
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -4873,7 +4931,9 @@ class MegatronRankWorker:
 
     def get_base_weight_checksum(self, max_params: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA params (rank 0 only)."""
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -4903,7 +4963,9 @@ class MegatronRankWorker:
 
     def get_buffer_checksum(self, max_buffers: int = 5) -> dict:
         """Compute checksum stats for a small sample of non-LoRA buffers."""
+        assert self.engine is not None
         with self.engine.train_mode():
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             while isinstance(model, list):
                 model = model[0]
@@ -4947,6 +5009,8 @@ class MegatronRankWorker:
             for n, p in mod.named_parameters():
                 id_to_name[id(p)] = n
 
+        assert self.engine is not None
+        assert self.engine is not None
         unwrapped = _unwrap_megatron_model(self.engine.module)
         while isinstance(unwrapped, list):
             unwrapped = unwrapped[0]
@@ -5000,6 +5064,8 @@ class MegatronRankWorker:
                 seen_param_ids.add(id(param))
                 named_params.append((f"module{module_idx}.{name}", param))
 
+        assert self.engine is not None
+        assert self.engine is not None
         unwrapped = _unwrap_megatron_model(self.engine.module)
         unwrapped_modules = unwrapped if isinstance(unwrapped, list) else [unwrapped]
         for module_idx, module in enumerate(unwrapped_modules):
@@ -5107,8 +5173,10 @@ class MegatronRankWorker:
         opt_state_reset_count = 0
         lr_updated = False
 
+        assert self.engine is not None
         with self.engine.train_mode():
             # Access model parameters (unwrap from list/DDP like verl does)
+            assert self.engine is not None
             model = _unwrap_megatron_model(self.engine.module)
             # Unwrap nested lists until we get a module
             while isinstance(model, list):
@@ -5153,7 +5221,9 @@ class MegatronRankWorker:
                 print(f"[Rank 0] reinit_lora_weights: zeroed_rank_tail={tail_zeroed}", flush=True)
 
             # Zero gradients
+            assert self.engine is not None
             if hasattr(self.engine, 'optimizer') and self.engine.optimizer is not None:
+                assert self.engine is not None
                 self.engine.optimizer.zero_grad(set_to_none=True)
 
             # Reset optimizer state (Adam momentum and variance)
@@ -5337,9 +5407,13 @@ class MegatronRankWorker:
             "has_optimizer": self.engine.optimizer is not None,
         }
 
+        assert self.engine is not None
         if self.engine.optimizer is None:
             return info
 
+        assert self.engine is not None
+        assert self.engine is not None
+        assert self.engine is not None
         optimizer = self.engine.optimizer
 
         def iter_optimizers(opt):
@@ -5468,6 +5542,7 @@ class MegatronRankWorker:
         effective_train_attn = True if train_attn is None else bool(train_attn)
         effective_train_mlp = True if train_mlp is None else bool(train_mlp)
         effective_train_unembed = True if train_unembed is None else bool(train_unembed)
+        assert self.engine is not None
         with self.engine.train_mode():
             self._zero_lora_rank_tail(actual_rank=effective_rank, zero_grads=True)
 
@@ -5583,6 +5658,7 @@ class MegatronRankWorker:
         from mint_server.backend.inference.lora_utils import truncate_lora_state_dict
 
         effective_rank = actual_rank if actual_rank is not None else self.lora_rank
+        assert self.engine is not None
         with self.engine.train_mode():
             self._zero_lora_rank_tail(actual_rank=effective_rank, zero_grads=True)
 
@@ -5699,6 +5775,7 @@ class MegatronRankWorker:
             )
 
         state_dict = torch.load(optimizer_file, map_location="cpu")
+        assert self.engine is not None
         with self.engine.train_mode():
             self._restore_optimizer_state(state_dict)
 
@@ -5774,6 +5851,7 @@ class MegatronRankWorker:
         )
 
         # Use train_mode context to ensure model is on GPU for loading
+        assert self.engine is not None
         with self.engine.train_mode():
             # Get rank-specific checkpoint path
             rank_path = peft_utils._get_rank_checkpoint_path(checkpoint_path)
@@ -5797,6 +5875,7 @@ class MegatronRankWorker:
                 )
 
             # Load into model
+            assert self.engine is not None
             model = self.engine.module
             if isinstance(model, list):
                 model = model[0]
@@ -5806,6 +5885,7 @@ class MegatronRankWorker:
 
             get_adapter_state_dict = getattr(peft_utils, "get_adapter_state_dict", None)
             if callable(get_adapter_state_dict):
+                assert self.engine is not None
                 expected_adapter_state = get_adapter_state_dict(self.engine.module)
                 if not isinstance(expected_adapter_state, dict):
                     raise RuntimeError(
@@ -5946,12 +6026,15 @@ class MegatronRankWorker:
         )
 
         # Use train_mode context to ensure model is on GPU for saving
+        assert self.engine is not None
         with self.engine.train_mode():
             if actual_rank is not None:
                 self._zero_lora_rank_tail(actual_rank=actual_rank, zero_grads=True)
             # Get adapter state dict
             adapter_state = get_adapter_state_dict(self.engine.module)
             expert_bias_state = {}
+            assert self.engine is not None
+            assert self.engine is not None
             module_chunks = self.engine.module if isinstance(self.engine.module, list) else [self.engine.module]
             for chunk_idx, module_chunk in enumerate(module_chunks):
                 for module_name, module in module_chunk.named_modules():
@@ -6004,6 +6087,7 @@ class MegatronRankWorker:
         if learning_rate is not None:
             self.learning_rate = learning_rate
             # Update all param groups
+            assert self.engine is not None
             for group in self.engine.optimizer.param_groups:
                 group['lr'] = learning_rate
 
@@ -6032,7 +6116,10 @@ class MegatronRankWorker:
             return {}
 
         lr = self.learning_rate
+        assert self.engine is not None
         if self.engine.optimizer.param_groups:
+            assert self.engine is not None
+            assert self.engine is not None
             lr = self.engine.optimizer.param_groups[0].get('lr', self.learning_rate)
 
         return {
@@ -11342,6 +11429,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
         for entry in model_actor_supervisor.iter_entries():
             if entry.actor_type == ActorType.MEGATRON:
                 try:
+                    assert entry.actor_handle is not None
                     ray.get(entry.actor_handle.get_diagnostics.remote(), timeout=5)
                     return True
                 except ray.exceptions.GetTimeoutError:

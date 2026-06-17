@@ -367,7 +367,7 @@ def main(argv: list[str] | None = None) -> None:
         ld_library_path=ld_library_path,
     )
 
-    from mint_server.logging_context import configure_logging
+    from mint_server.observability.logging_context import configure_logging
 
     configure_logging()
     logging.getLogger("uvicorn.access").addFilter(PollingLogFilter())

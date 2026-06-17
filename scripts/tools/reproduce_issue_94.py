@@ -31,7 +31,7 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
 
-    from mint_server.ray_utils import init_ray  # noqa: E402
+    from mint_server.ray.ray_utils import init_ray  # noqa: E402
 
     calls = _install_ray_stub()
 

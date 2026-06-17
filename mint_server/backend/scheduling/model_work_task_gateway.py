@@ -235,6 +235,7 @@ class SchedulerModelWorkTaskGateway:
         extra = {"record": dict(record)}
         if status in {"done", "retrieved"}:
             metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            assert metadata is not None
             terminal_status = str(metadata.get("terminal_status") or status)
             if terminal_status == "failed" or record.get("error") is not None:
                 return RetrieveTaskResult(

@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 from typing import Protocol
 
-from mint_server.logging_context import record_store_op_otel
+from mint_server.observability.logging_context import record_store_op_otel
 
 
 class KVBackend(Protocol):
@@ -116,6 +116,7 @@ class RocksKVBackend:
         try:
             if self._fallback is not None:
                 return self._fallback.get(key)
+            assert self._db is not None
             value = self._db.get(str(key))
             if value is None:
                 return None
@@ -134,6 +135,7 @@ class RocksKVBackend:
             if self._fallback is not None:
                 self._fallback.put(key, value)
                 return
+            assert self._db is not None
             self._db[str(key)] = str(value)
         except Exception:
             record_store_op_otel(store="rocks", op="put", status="error", duration_s=time.perf_counter() - _t0)
@@ -146,6 +148,7 @@ class RocksKVBackend:
             self._fallback.delete(key)
             return
         try:
+            assert self._db is not None
             del self._db[str(key)]
         except KeyError:
             pass
@@ -160,6 +163,7 @@ class RocksKVBackend:
         if max_rows == 0:
             return out
         if prefix_str is None:
+            assert self._db is not None
             raw_keys = self._db.keys()
             for raw in raw_keys:
                 key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
@@ -170,6 +174,7 @@ class RocksKVBackend:
                     break
             return out
 
+        assert self._db is not None
         raw_keys = self._db.keys(from_key=after_key if after_key is not None else prefix_str)
         for raw in raw_keys:
             key = str(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
@@ -188,6 +193,7 @@ class RocksKVBackend:
             if self._fallback is not None:
                 self._fallback.apply_batch(puts=puts, deletes=deletes)
                 return
+            assert self._write_batch_cls is not None
             batch = self._write_batch_cls()
             op_count = 0
             for key in deletes or []:
@@ -196,8 +202,8 @@ class RocksKVBackend:
             for key, value in (puts or {}).items():
                 batch.put(str(key), str(value))
                 op_count += 1
-            if op_count:
-                self._db.write(batch)
+            assert self._db is not None
+            self._db.write(batch)
         except Exception:
             record_store_op_otel(store="rocks", op="batch", status="error", duration_s=time.perf_counter() - _t0)
             raise

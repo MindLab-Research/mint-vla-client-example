@@ -6,7 +6,7 @@ import structlog
 import time
 from typing import Any
 
-from mint_server.logging_context import record_store_op_otel
+from mint_server.observability.logging_context import record_store_op_otel
 from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError, task_state_store
 
 

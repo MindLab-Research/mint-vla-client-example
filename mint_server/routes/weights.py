@@ -24,13 +24,13 @@ from fastapi import APIRouter, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from starlette.background import BackgroundTask
 
-from ..auth_identity import can_bypass_ownership
-from ..auth_identity import can_manage_system
-from ..auth_identity import can_write
-from ..auth_identity import get_user_data as _request_user_data
-from ..auth_identity import get_user_id as _request_user_id
+from ..auth.auth_identity import can_bypass_ownership
+from ..auth.auth_identity import can_manage_system
+from ..auth.auth_identity import can_write
+from ..auth.auth_identity import get_user_data as _request_user_data
+from ..auth.auth_identity import get_user_id as _request_user_id
 from mint_server.backend.stores.task_state_store import task_futures
-from ..checkpoint_index import (
+from ..checkpoints.checkpoint_index import (
     CheckpointAlreadyExistsError,
     CheckpointAlreadyFailedError,
     CheckpointAlreadyUploadingError,
@@ -41,7 +41,7 @@ from ..checkpoint_index import (
     mark_catalog_checkpoint_deleted,
     mark_checkpoint_failed,
 )
-from ..client_compat import checkpoint_uri, prefer_tinker_uri
+from ..utils.client_compat import checkpoint_uri, prefer_tinker_uri
 from ..checkpoints import (
     CHECKPOINTS_DIR,
     MIRROR_STATUS_PENDING,
@@ -74,15 +74,15 @@ from ..models.types import (
     WeightsInfoRequest,
     WeightsInfoResponse,
 )
-from ..logging_context import (
+from ..observability.logging_context import (
     classify_failure_reason,
     get_otel_tracer,
     run_async_with_otel_span,
     set_request_id,
 )
-from ..model_access_control import can_access_model, get_access_denied_error
-from ..queue_priority import merge_queue_priority_extra
-from ..webhook import EventType, send_task_event
+from ..auth.model_access_control import can_access_model, get_access_denied_error
+from ..utils.queue_priority import merge_queue_priority_extra
+from ..utils.webhook import EventType, send_task_event
 
 if TYPE_CHECKING:
     from mint_server.backend.sessions.session_manager import SessionManager
@@ -1045,7 +1045,7 @@ def _build_sdk_archive_redirect_response(
     checkpoint_id: str,
 ) -> RedirectResponse:
     from ..config import config
-    from ..download_tokens import make_archive_download_token
+    from ..utils.download_tokens import make_archive_download_token
     from starlette.datastructures import URL
 
     secret = config.download_token_secret
@@ -1341,7 +1341,7 @@ async def save_weights(
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-    from ..client_compat import prefer_tinker_uri
+    from ..utils.client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
 
@@ -1459,7 +1459,7 @@ async def save_state(
     await _protect_training_session_enqueue_window(store_info)
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
-    from ..client_compat import prefer_tinker_uri
+    from ..utils.client_compat import prefer_tinker_uri
 
     prefer_tinker = prefer_tinker_uri(http_request)
 
@@ -1681,7 +1681,7 @@ async def _do_save_state(
         # Do not block save_state completion on vLLM engine creation or LoRA hot-load.
         sampling_registered = False
 
-        from ..client_compat import checkpoint_uri
+        from ..utils.client_compat import checkpoint_uri
 
         mint_path = _to_mint_path(session.model_id, checkpoint_name)
         tinker_path = checkpoint_uri(
@@ -1898,7 +1898,7 @@ async def _do_save_weights(
         # Sampler clients can load the returned checkpoint path on demand.
         sampling_registered = False
 
-        from ..client_compat import checkpoint_uri
+        from ..utils.client_compat import checkpoint_uri
 
         mint_path = _to_mint_path(session.model_id, checkpoint_name)
         tinker_path = checkpoint_uri(
@@ -2711,7 +2711,7 @@ async def download_checkpoint_archive(
     if remote_response is not None:
         return remote_response
     from ..config import config
-    from ..download_tokens import verify_download_token
+    from ..utils.download_tokens import verify_download_token
 
     user_id = _get_user_id(request)
     if user_id is None:
@@ -2736,7 +2736,7 @@ async def download_checkpoint_archive(
     # Tinker SDK expects this endpoint to respond with 302 + Location.
     # It does not follow redirects automatically; it treats Location as a signed URL.
     if not direct:
-        from ..client_compat import is_tinker_sdk_user_agent
+        from ..utils.client_compat import is_tinker_sdk_user_agent
 
         if is_tinker_sdk_user_agent(request.headers.get("user-agent")):
             return _build_sdk_archive_redirect_response(
@@ -2758,9 +2758,11 @@ async def download_checkpoint_archive(
             stderr=subprocess.DEVNULL,
         )
         try:
+            assert proc.stdout is not None
             while chunk := proc.stdout.read(65536):
                 yield chunk
         finally:
+            assert proc.stdout is not None
             proc.stdout.close()
             returncode = proc.wait()
             if returncode != 0:

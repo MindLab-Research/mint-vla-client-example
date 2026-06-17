@@ -790,7 +790,9 @@ def test_issue_364_refresh_training_session_drops_stale_worker_binding_when_acto
     )
 
     assert "model-364-binding" not in engine._workers
-    assert manager.get_local_session("model-364-binding").actor_name == "new-actor"
+    _s2 = manager.get_local_session("model-364-binding")
+    assert _s2 is not None
+    assert _s2.actor_name == "new-actor"
 
 
 @pytest.mark.anyio

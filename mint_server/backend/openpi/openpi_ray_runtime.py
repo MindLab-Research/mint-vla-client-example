@@ -9,8 +9,8 @@ from typing import Any
 import ray
 
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars
-from mint_server.ray_utils import init_ray
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.ray_utils import init_ray
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 from mint_server.backend.openpi.openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,

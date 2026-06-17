@@ -583,6 +583,7 @@ class SessionManager:
 
         # Only shutdown non-shared engines (shared engine is reused)
         if not info.is_shared:
+            assert info.engine is not None
             await info.engine.shutdown()
             logger.info("ended_session__s__engine_shutdown")
         else:

@@ -15,8 +15,8 @@ import torch
 import torch.distributed as dist
 from safetensors.torch import load_file, save_file
 
-from mint_server.checkpoints import read_checkpoint_metadata, write_checkpoint_metadata
-from mint_server.model_input_utils import flatten_encoded_text_chunks
+from mint_server.checkpoints.checkpoints import read_checkpoint_metadata, write_checkpoint_metadata
+from mint_server.utils.model_input_utils import flatten_encoded_text_chunks
 
 
 def _isoformat_utc_now() -> str:

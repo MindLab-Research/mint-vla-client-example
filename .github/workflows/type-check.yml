@@ -1,4 +1,4 @@
-name: Type Check (non-blocking)
+name: Type Check
 
 on:
   pull_request:
@@ -7,24 +7,69 @@ on:
   push:
     branches:
       - develop
+  workflow_dispatch:
 
 jobs:
-  pyright:
+  import-gate:
     runs-on: [self-hosted, linux]
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      UV_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+      UV_INDEX_URL: https://mirrors.volces.com/pypi/simple
+      UV_EXTRA_INDEX_URL: https://mirrors.aliyun.com/pypi/simple
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-suffix: type-check
 
-      - name: Install pyright
+      - name: Install dependencies
         run: |
           uv venv --python 3.12
-          uv pip install --python .venv/bin/python --index-url "$UV_INDEX_URL" \
-            pyright==1.1.409
+          uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
+            --index-url "$UV_INDEX_URL" \
+            --extra-index-url "$UV_EXTRA_INDEX_URL" \
+            --extra-index-url https://download.pytorch.org/whl/cpu \
+            pyright==1.1.409 \
+            "ray[default]==2.51.1" \
+            "torch==2.9.1+cpu" \
+            "torchvision==0.24.1+cpu" \
+            "transformers==4.57.0" \
+            "peft==0.18.0" \
+            "accelerate==1.12.0" \
+            "safetensors>=0.6.0" \
+            "fastapi[standard]==0.121.2" \
+            "pydantic==2.12.4" \
+            "httpx==0.27.2" \
+            "omegaconf==2.3.0" \
+            "tensordict==0.11.0" \
+            "opentelemetry-api==1.40.0" \
+            "opentelemetry-sdk==1.40.0" \
+            "structlog==25.5.0" \
+            "tiktoken>=0.6.0" \
+            "cachetools>=6.0.0" \
+            "sentencepiece>=0.2.0" \
+            "msgspec>=0.20.0" \
+            "rocksdict>=0.3.29" \
+            "pyzmq>=27.1.0" \
+            "diskcache==5.6.3" \
+            "openai>=1.99.1" \
+            "anthropic>=0.71.0" \
+            "numpy>=2.3.0" \
+            "pytest>=7.0.0" \
+            "pandas>=2.0.0" \
+            "trio>=0.33.0"
 
-      - name: Run pyright (project-wide)
-        run: uv run --no-sync pyright
+      - name: Run import gate (hard fail)
+        run: |
+          uv run --no-sync pyright --project pyrightconfig.json \
+            --outputjson \
+            | python3 scripts/tools/type_check_gate.py --mode import
+
+      - name: Run signal gate (non-blocking)
+        run: |
+          uv run --no-sync pyright --project pyrightconfig.json \
+            --outputjson \
+            | python3 scripts/tools/type_check_gate.py --mode signal

@@ -713,9 +713,13 @@ def test_issue_193_megatron_load_weights_passes_explicit_session_id_and_keepaliv
     ]
     assert session.current_step == 5
     assert session.learning_rate == pytest.approx(3e-4)
+    assert session.lora_config is not None
     assert session.lora_config.rank == 8
+    assert session.lora_config is not None
     assert session.lora_config.train_attn is False
+    assert session.lora_config is not None
     assert session.lora_config.train_mlp is True
+    assert session.lora_config is not None
     assert session.lora_config.train_unembed is False
 
 

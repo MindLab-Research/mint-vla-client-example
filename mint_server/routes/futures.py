@@ -14,12 +14,12 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ..auth_identity import can_view_internal_errors
+from ..auth.auth_identity import can_view_internal_errors
 from mint_server.backend.scheduling.queue_stage_timing import build_queue_stage_timing
 from mint_server.backend.stores.task_payload_store import TaskPayloadStore
 from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateStoreUnavailableError, task_futures
-from ..futures_utils import pending_future_http_response
-from ..logging_context import record_retrieve_future_wait_metric
+from ..utils.futures_utils import pending_future_http_response
+from ..observability.logging_context import record_retrieve_future_wait_metric
 from ..models.types import FutureCancelRequest, FutureRetrieveRequest
 
 router = APIRouter()

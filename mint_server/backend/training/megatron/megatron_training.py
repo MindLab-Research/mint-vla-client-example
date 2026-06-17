@@ -22,7 +22,7 @@ if TYPE_CHECKING:
     pass
 
 from mint_server.config import config as server_config
-from mint_server.model_input_utils import flatten_encoded_text_chunks
+from mint_server.utils.model_input_utils import flatten_encoded_text_chunks
 
 logger = structlog.get_logger(__name__)
 
@@ -1053,7 +1053,7 @@ def create_reverse_kl_loss_fn(
             getattr(raw_student_logits, "is_nested", False) if raw_student_logits is not None else None,
             type(raw_student_logits).__name__ if raw_student_logits is not None else None,
             list(packed_student_logits.shape) if hasattr(packed_student_logits, "shape") else None,
-            list(raw_student_logits.shape) if hasattr(raw_student_logits, "shape") else None,
+            list(raw_student_logits.shape) if hasattr(raw_student_logits, "shape") else None,  # type: ignore[reportOptionalMemberAccess]
         )
 
         student_logits = _flatten_rows(student_logits)

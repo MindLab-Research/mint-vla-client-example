@@ -6,8 +6,8 @@ from typing import Any
 
 import ray
 
-from mint_server.logging_context import record_ray_cluster_op_otel
-from mint_server.runtime_env import env_nonempty
+from mint_server.observability.logging_context import record_ray_cluster_op_otel
+from mint_server.ray.runtime_env import env_nonempty
 
 
 class PlacementGroupMismatchError(RuntimeError):

@@ -1,4 +1,4 @@
-from mint_server.futures_utils import pending_future_http_response
+from mint_server.utils.futures_utils import pending_future_http_response
 
 
 def test_issue_24_sets_retry_after_header() -> None:

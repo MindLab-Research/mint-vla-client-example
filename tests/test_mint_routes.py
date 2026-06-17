@@ -14,7 +14,7 @@ _APIKEY_ID = "222222222222222222222222"
 
 
 def _install_billing_user(monkeypatch, mint_routes) -> None:
-    from mint_server.gateway_auth import GatewayAuthContext
+    from mint_server.gateway.gateway_auth import GatewayAuthContext
 
     billing_auth = GatewayAuthContext(
         user_id=_USER_ID,

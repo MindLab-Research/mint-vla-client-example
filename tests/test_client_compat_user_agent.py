@@ -1,6 +1,6 @@
 import pytest
 
-from mint_server.client_compat import checkpoint_uri, is_tinker_sdk_user_agent
+from mint_server.utils.client_compat import checkpoint_uri, is_tinker_sdk_user_agent
 
 
 def test_is_tinker_sdk_user_agent():

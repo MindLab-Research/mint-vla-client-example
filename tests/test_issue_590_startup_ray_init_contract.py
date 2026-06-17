@@ -91,7 +91,7 @@ def test_lifespan_checks_control_plane_without_creating_actors(monkeypatch: pyte
     import mint_server.backend.core.config_actor as config_actor_module
     import mint_server.backend.ops.maintenance_cron_actor as cron_module
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.usage_store as usage_store_module
+    import mint_server.billing.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)
     monkeypatch.setattr(config_actor_module, "async_ping", _config_ping)
@@ -191,7 +191,7 @@ def test_lifespan_leaves_execution_route_globals_unbound(monkeypatch: pytest.Mon
     import mint_server.backend.core.config_actor as config_actor_module
     import mint_server.backend.ops.maintenance_cron_actor as cron_module
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.usage_store as usage_store_module
+    import mint_server.billing.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)
     monkeypatch.setattr(config_actor_module, "async_ping", _config_ping)
@@ -225,7 +225,7 @@ def test_lifespan_leaves_execution_route_globals_unbound(monkeypatch: pytest.Mon
 
 def test_lifespan_degrades_but_yields_when_usage_postgres_unhealthy(monkeypatch: pytest.MonkeyPatch) -> None:
     from mint_server import app as app_module
-    from mint_server.health_state import clear_startup_degraded_state, get_startup_degraded_state
+    from mint_server.health.health_state import clear_startup_degraded_state, get_startup_degraded_state
 
     calls: list[str] = []
 
@@ -270,7 +270,7 @@ def test_lifespan_degrades_but_yields_when_usage_postgres_unhealthy(monkeypatch:
     import mint_server.backend.core.config_actor as config_actor_module
     import mint_server.backend.ops.maintenance_cron_actor as cron_module
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
-    import mint_server.usage_store as usage_store_module
+    import mint_server.billing.usage_store as usage_store_module
 
     monkeypatch.setattr(action_manager_module, "ActionSessionRouter", _ActionSessionRouter)
     monkeypatch.setattr(config_actor_module, "async_ping", _config_ping)

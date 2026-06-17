@@ -64,6 +64,7 @@ class _FakeRuntimeClient:
         if op == "create_session":
             return {"session": "created"}
         if op == "forward_backward":
+            assert payload is not None
             batch = payload["batch"]
             return {
                 "loss_fn_output_type": "flow_matching_loss",
@@ -74,8 +75,10 @@ class _FakeRuntimeClient:
                 "metrics": {"loss:mean": 1.25, "num_samples:sum": float(len(batch))},
             }
         if op == "optim_step":
+            assert payload is not None
             return {"metrics": {"learning_rate": payload["learning_rate"]}}
         if op == "save_weights":
+            assert payload is not None
             return {"path": payload["save_path"]}
         if op == "load_weights":
             return {"current_step": 5, "learning_rate": 0.001}
@@ -236,11 +239,17 @@ def test_openpi_pi05_engine_forward_backward_builds_payload_and_updates_grad_sta
     assert result["loss_fn_output_type"] == "flow_matching_loss"
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
+    assert payload is not None
     assert payload["loss_fn"] == "flow_matching"
+    assert payload is not None
     assert len(payload["batch"]) == 1
+    assert payload is not None
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13]
+    assert payload is not None
     assert len(payload["batch"][0]["state"]) == 32
+    assert payload is not None
     assert len(payload["batch"][0]["actions"]) == 10
+    assert payload is not None
     assert all(len(step) == 32 for step in payload["batch"][0]["actions"])
 
 

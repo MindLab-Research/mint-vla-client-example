@@ -418,6 +418,7 @@ def patch_vllm_qwen3next_dense_moe_metadata() -> None:
             self.num_redundant_experts = 0
 
     _set_moe_parameters_allow_qwen35_text_dense._mint_qwen35_text_dense_patch = True  # type: ignore[attr-defined]
+    assert mixin is not None
     mixin.set_moe_parameters = _set_moe_parameters_allow_qwen35_text_dense
 
 

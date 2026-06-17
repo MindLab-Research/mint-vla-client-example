@@ -42,7 +42,7 @@ def _load_env() -> None:
 
 def _base_url(args: argparse.Namespace) -> str:
     return (
-        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        (_coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL) or "")
         .rstrip("/")
     )
 

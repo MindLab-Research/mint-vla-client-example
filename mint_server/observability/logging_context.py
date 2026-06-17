@@ -1170,6 +1170,7 @@ def _record_current_span_event(event_name: str, attrs: dict[str, object]) -> Non
         span_ctx = span.get_span_context() if span is not None else None
         if span_ctx is None or not bool(getattr(span_ctx, "is_valid", False)):
             return
+        assert span is not None
         span.add_event(str(event_name), attributes=attrs)
     except Exception:
         pass
@@ -1535,6 +1536,7 @@ def init_actor_observability() -> None:
                 f"Warning: actor observability init failed: {type(e).__name__}: {e}",
                 file=sys.stderr,
             )
+        assert structlog is not None
         logger = structlog.get_logger(__name__)
         logger.info(
             "[actor_observability] init=%s structlog_available=%s otel_enabled=%s tracer_set=%s endpoint_set=%s headers_set=%s app_key_set=%s",

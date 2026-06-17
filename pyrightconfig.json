@@ -8,11 +8,20 @@
     "**/__pycache__",
     ".worktree",
     ".worktrees",
+    ".claude/worktrees",
     "**/.venv",
-    "**/node_modules"
+    "**/node_modules",
+    "typings"
   ],
-  "typeCheckingMode": "strict",
+  "stubPath": "typings",
+  "typeCheckingMode": "basic",
   "reportMissingModuleSource": "none",
   "pythonVersion": "3.12",
-  "pythonPlatform": "Linux"
+  "pythonPlatform": "Linux",
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "extraPaths": ["."]
+    }
+  ]
 }

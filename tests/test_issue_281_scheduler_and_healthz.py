@@ -315,7 +315,7 @@ async def test_issue_281_save_weights_for_sampler_enqueues_scheduler_metadata(
     monkeypatch,
 ) -> None:
     import mint_server.backend.scheduling.model_work_scheduler as mws
-    import mint_server.client_compat as client_compat
+    import mint_server.utils.client_compat as client_compat
     from mint_server.models.types import SaveWeightsForSamplerRequest
     from mint_server.routes import training as tr
 
@@ -913,7 +913,9 @@ async def test_issue_281_internal_serialized_op_marks_inflight_until_worker_fini
         request_id, ResetExpertBiasRequest(model_id="run-281")
     )
 
-    assert manager.get_local_session("run-281").inflight_ops == 0
+    _s = manager.get_local_session("run-281")
+    assert _s is not None
+    assert _s.inflight_ops == 0
     assert inflight_calls == [("run-281", 1), ("run-281", -1)]
     assert resolved["request_id"] == request_id
     assert resolved["payload"]["modules_reset"] == 1
@@ -926,7 +928,7 @@ async def test_issue_281_public_healthz_ignores_timeout_observation(
     import mint_server.backend.scheduling.model_work_scheduler as mws
     import mint_server.backend.stores.task_state_store as tss
     from mint_server import health_checks
-    from mint_server.health_state import (
+    from mint_server.health.health_state import (
         clear_runtime_degraded_state,
         clear_startup_degraded_state,
     )
@@ -957,7 +959,7 @@ async def test_issue_281_public_healthz_ignores_pending_pg_observation(
     import mint_server.backend.scheduling.model_work_scheduler as mws
     import mint_server.backend.stores.task_state_store as tss
     from mint_server import health_checks
-    from mint_server.health_state import (
+    from mint_server.health.health_state import (
         clear_runtime_degraded_state,
         clear_startup_degraded_state,
     )

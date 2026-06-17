@@ -1,4 +1,5 @@
 import json
+from typing import Any
 import sys
 import types
 from types import MethodType, SimpleNamespace
@@ -6,7 +7,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 import torch
 
-from mint_server.checkpoints import checkpoint_has_optimizer_state, validate_checkpoint_dir
+from mint_server.checkpoints.checkpoints import checkpoint_has_optimizer_state, validate_checkpoint_dir
 from mint_server.backend.training.verl.verl_training import (
     VerlTrainingEngine,
     _select_moe_training_backend,

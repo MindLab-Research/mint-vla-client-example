@@ -11,7 +11,7 @@ import subprocess
 import sys
 
 import mint_server.config as server_config
-from mint_server.runtime_env import (
+from mint_server.ray.runtime_env import (
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
     checkout_runtime_env_layout,
@@ -66,7 +66,7 @@ def _load_actor_runtime_env_payload(env: dict[str, str]) -> dict[str, dict[str, 
             (
                 "import json, os; "
                 "from mint_server.config import PFS_PYTHONPATH, actor_runtime_env_vars; "
-                "from mint_server.runtime_config import actor_env_from_environ; "
+                "from mint_server.config.runtime_config import actor_env_from_environ; "
                 "print(json.dumps({"
                 "'runtime_env': actor_runtime_env_vars(pythonpath=PFS_PYTHONPATH), "
                 "'actor_env': actor_env_from_environ(os.environ)"

@@ -546,7 +546,9 @@ def test_issue_557_parse_checkpoint_time_normalizes_naive_timestamps(tmp_path) -
     fallback.mkdir()
     parsed = wt._parse_checkpoint_time("2026-03-14T00:00:00", fallback_path=str(fallback))
     assert parsed.tzinfo is not None
-    assert parsed.utcoffset().total_seconds() == 0
+    _tz = parsed.utcoffset()
+    assert _tz is not None
+    assert _tz.total_seconds() == 0
 
 
 def test_issue_557_weights_archive_admin_rejects_invalid_owner_id(tmp_path, monkeypatch) -> None:

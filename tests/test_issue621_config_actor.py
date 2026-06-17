@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from mint_server.config import ServerConfig
-from mint_server.runtime_config import (
+from mint_server.config.runtime_config import (
     CONFIG_ACTOR_DEFAULT_NAME,
     CONFIG_CLASS_BOOTSTRAP_RUNTIME_ENV,
     CONFIG_CLASS_OBSERVABILITY,

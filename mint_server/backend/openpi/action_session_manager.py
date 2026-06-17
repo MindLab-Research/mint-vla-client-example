@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable
 
 import ray
 
-from mint_server.checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
+from mint_server.checkpoints.checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 from mint_server.models.types import ActRequest, ModelInput, TensorData
 from mint_server.backend.core.model_registry import get_model_config
 from mint_server.backend.openpi.openpi_action_ray_runtime import (

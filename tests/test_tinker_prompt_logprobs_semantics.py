@@ -1,6 +1,6 @@
 import pytest
 
-from mint_server.sampling_utils import normalize_prompt_logprobs_for_tinker
+from mint_server.utils.sampling_utils import normalize_prompt_logprobs_for_tinker
 
 
 def test_prompt_logprobs_len_equals_prompt_len_sets_first_none() -> None:

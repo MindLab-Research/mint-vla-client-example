@@ -22,9 +22,9 @@ from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 from mint_server.backend.core.model_registry import get_model_config
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE
 from mint_server.config import config as server_config
-from mint_server.logging_context import get_current_traceparent, run_async_with_otel_span
-from mint_server.ray_utils import init_ray
-from mint_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
+from mint_server.observability.logging_context import get_current_traceparent, run_async_with_otel_span
+from mint_server.ray.ray_utils import init_ray
+from mint_server.ray.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.inference.lora_registry import LoRARegistry
@@ -671,6 +671,7 @@ class MultiLoRAInferenceEngine:
         print(f"[DEBUG add_lora_for_session] About to call add_lora_with_id.remote, state_dict has {len(state_dict)} keys", flush=True)
         try:
             print("[DEBUG add_lora_for_session] Calling server.add_lora_with_id.remote", flush=True)
+            assert self.server is not None
             ref = self.server.add_lora_with_id.remote(
                 lora_int_id=lora_id,
                 state_dict=state_dict,
@@ -783,6 +784,7 @@ class MultiLoRAInferenceEngine:
 
         async def _load_from_actor() -> None:
             try:
+                assert self.server is not None
                 ref = self.server.add_lora_from_path.remote(
                     lora_int_id=lora_id,
                     lora_path=lora_path,
@@ -898,6 +900,7 @@ class MultiLoRAInferenceEngine:
                     "[generate dispatch] req=%s actor=%s lora_id=%s prompt_len=%d max_tokens=%d",
                     request_id, self.actor_name, lora_id, len(prompt_ids), max_tokens,
                 )
+                assert self.server is not None
                 ref = self.server.generate_with_lora.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
@@ -915,6 +918,7 @@ class MultiLoRAInferenceEngine:
                     "[generate dispatch] req=%s actor=%s base_model prompt_len=%d max_tokens=%d",
                     request_id, self.actor_name, len(prompt_ids), max_tokens,
                 )
+                assert self.server is not None
                 ref = self.server.generate_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
@@ -1010,6 +1014,7 @@ class MultiLoRAInferenceEngine:
 
         async def _dispatch_generate_many():
             if lora_id is not None:
+                assert self.server is not None
                 ref = self.server.generate_with_lora.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
@@ -1024,6 +1029,7 @@ class MultiLoRAInferenceEngine:
                     traceparent=traceparent,
                 )
             else:
+                assert self.server is not None
                 ref = self.server.generate_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
@@ -1139,6 +1145,7 @@ class MultiLoRAInferenceEngine:
         async def _dispatch_compute_logprobs():
             if lora_id is not None:
                 try:
+                    assert self.server is not None
                     ref = self.server.compute_prompt_logprobs_with_lora.remote(
                         prompt_ids=prompt_ids,
                         request_id=request_id,
@@ -1167,6 +1174,7 @@ class MultiLoRAInferenceEngine:
                         self._initialized = False
                     raise
             try:
+                assert self.server is not None
                 ref = self.server.compute_prompt_logprobs_base.remote(
                     prompt_ids=prompt_ids,
                     request_id=request_id,
@@ -1251,6 +1259,7 @@ class MultiLoRAInferenceEngine:
 
         if lora_id is not None:
             # Compute top-K with session-specific LoRA
+            assert self.server is not None
             ref = self.server.compute_prompt_topk_with_lora.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -1260,6 +1269,7 @@ class MultiLoRAInferenceEngine:
             )
         else:
             # Compute top-K with base model (no LoRA)
+            assert self.server is not None
             ref = self.server.compute_prompt_topk_base.remote(
                 prompt_ids=prompt_ids,
                 request_id=request_id,
@@ -1290,6 +1300,7 @@ class MultiLoRAInferenceEngine:
 
         if should_unload:
             try:
+                assert self.server is not None
                 ref = self.server.remove_lora.remote(lora_id)
                 await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             except Exception:

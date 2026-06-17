@@ -8,7 +8,7 @@ from collections.abc import Callable, Iterable
 from functools import lru_cache
 from typing import Any
 
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
 logger = structlog.get_logger(__name__)

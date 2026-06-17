@@ -3,7 +3,7 @@ import logging
 import pytest
 
 from mint_server import usage_store as usage_store_module
-from mint_server.usage_store import DisabledUsageStore, PostgresUsageStore, UsageEvent
+from mint_server.billing.usage_store import DisabledUsageStore, PostgresUsageStore, UsageEvent
 
 
 def test_usage_event_defaults_include_empty_event_id():

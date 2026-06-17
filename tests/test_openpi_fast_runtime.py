@@ -77,7 +77,9 @@ class _FakeRuntimeClient:
         if op == "create_session":
             return {"session": "created"}
         if op == "forward_backward":
+            assert payload is not None
             batch = payload["batch"]
+            assert payload is not None
             if payload["loss_fn"] == "importance_sampling":
                 return {
                     "loss_fn_output_type": "importance_sampling_loss",
@@ -91,6 +93,7 @@ class _FakeRuntimeClient:
                         "ratio:mean": 1.25,
                     },
                 }
+            assert payload is not None
             if payload["loss_fn"] == "ppo":
                 return {
                     "loss_fn_output_type": "ppo_loss",
@@ -114,8 +117,10 @@ class _FakeRuntimeClient:
                 "metrics": {"loss:mean": 1.0, "num_samples:sum": float(len(batch))},
             }
         if op == "optim_step":
+            assert payload is not None
             return {"metrics": {"learning_rate": payload["learning_rate"]}}
         if op == "save_weights":
+            assert payload is not None
             return {"path": payload["save_path"]}
         if op == "load_weights":
             return {"current_step": 7, "learning_rate": 0.002}
@@ -277,8 +282,11 @@ def test_openpi_fast_engine_forward_backward_builds_payload_and_updates_grad_sta
     assert result["loss_fn_output_type"] == "cross_entropy_loss"
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
+    assert payload is not None
     assert payload["loss_fn"] == "cross_entropy"
+    assert payload is not None
     assert len(payload["batch"]) == 1
+    assert payload is not None
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
 
 
@@ -324,9 +332,13 @@ def test_openpi_fast_engine_importance_sampling_builds_rl_payload_and_updates_gr
     assert result["loss_fn_output_type"] == "importance_sampling_loss"
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
+    assert payload is not None
     assert payload["loss_fn"] == "importance_sampling"
+    assert payload is not None
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
+    assert payload is not None
     assert payload["batch"][0]["old_logprobs"] == [-0.1, -0.2]
+    assert payload is not None
     assert payload["batch"][0]["advantages"] == [1.5, -0.5]
 
 
@@ -358,10 +370,15 @@ def test_openpi_fast_engine_ppo_builds_rl_payload_and_updates_grad_state() -> No
     assert result["metrics"]["clipfrac:mean"] == pytest.approx(0.5)
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
+    assert payload is not None
     assert payload["loss_fn"] == "ppo"
+    assert payload is not None
     assert payload["loss_fn_config"] == {"epsilon": 0.15}
+    assert payload is not None
     assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13, 21, 22]
+    assert payload is not None
     assert payload["batch"][0]["old_logprobs"] == [-0.1, -0.2]
+    assert payload is not None
     assert payload["batch"][0]["advantages"] == [1.5, -0.5]
 
 

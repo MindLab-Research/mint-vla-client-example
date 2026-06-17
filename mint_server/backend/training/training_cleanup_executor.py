@@ -4,7 +4,7 @@ import asyncio
 import structlog
 import os
 
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 
 logger = structlog.get_logger(__name__)

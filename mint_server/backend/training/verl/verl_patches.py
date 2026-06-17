@@ -1611,7 +1611,9 @@ def _apply_mla_get_query_key_value_patch():
 
         if packed_seq_params is not None:
             q_compressed = q_compressed.squeeze(1)
+            assert kv_compressed is not None
             kv_compressed = kv_compressed.squeeze(1)
+            assert k_pos_emb is not None
             k_pos_emb = k_pos_emb.squeeze(1)
 
         if self.config.q_lora_rank is not None:
@@ -1705,6 +1707,7 @@ def _apply_mla_get_query_key_value_patch():
                     k_pos_emb = k_pos_emb.expand(-1, -1, self.num_attention_heads_per_partition, -1)
                     key = torch.cat([k_no_pe, k_pos_emb], dim=-1)
 
+            assert query is not None
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()

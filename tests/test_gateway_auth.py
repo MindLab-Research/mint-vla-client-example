@@ -10,13 +10,13 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 
 from mint_server import app as app_module
-from mint_server.gateway_auth import GatewayAuthContext
-from mint_server.gateway_auth import (
+from mint_server.gateway.gateway_auth import GatewayAuthContext
+from mint_server.gateway.gateway_auth import (
     build_billing_auth_context,
     extract_gateway_auth_context_from_headers,
     has_gateway_auth_headers,
 )
-from mint_server.model_access_control import can_access_model
+from mint_server.auth.model_access_control import can_access_model
 
 
 @pytest.fixture

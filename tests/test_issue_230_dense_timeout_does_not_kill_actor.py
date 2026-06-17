@@ -105,12 +105,16 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     session.namespace = "mint"
 
     observed_inflight: list[int] = []
-    before_last_accessed = pool.get(actor_name).last_accessed
+    _entry = pool.get(actor_name)
+    assert _entry is not None
+    before_last_accessed = _entry.last_accessed
 
     original_touch_actor = engine._touch_actor
 
     def _touch_actor(target_session):
-        observed_inflight.append(pool.get(actor_name).inflight_count)
+        _entry2 = pool.get(actor_name)
+        assert _entry2 is not None
+        observed_inflight.append(_entry2.inflight_count)
         return original_touch_actor(target_session)
 
     monkeypatch.setattr(engine, "_touch_actor", _touch_actor)
@@ -129,8 +133,10 @@ def test_issue_230_keepalive_touches_dense_actor_without_inflight_mark(monkeypat
     asyncio.run(_run())
 
     assert observed_inflight[0] == 0
-    assert pool.get(actor_name).inflight_count == 0
-    assert pool.get(actor_name).last_accessed >= before_last_accessed
+    _e = pool.get(actor_name)
+    assert _e is not None
+    assert _e.inflight_count == 0
+    assert _e.last_accessed >= before_last_accessed
     assert entry.current_session == model_id
 
     pool.unregister(actor_name)
@@ -253,7 +259,9 @@ def test_issue_230_unbind_session_keeps_shared_dense_actor_pinned(monkeypatch: p
     assert model_id not in engine._workers
     assert other_model_id in engine._workers
     assert entry.current_session == other_model_id
-    assert pool.get(actor_name).current_session == other_model_id
+    _e2 = pool.get(actor_name)
+    assert _e2 is not None
+    assert _e2.current_session == other_model_id
 
     pool.unregister(actor_name)
 

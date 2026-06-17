@@ -136,8 +136,10 @@ def main() -> int:
     if not isinstance(first_429, dict):
         return _fail(f"429 body is not JSON: {first_429!r}")
     detail = first_429.get("detail") if isinstance(first_429.get("detail"), dict) else first_429
+    assert detail is not None
     if detail.get("code") != "sampling_principal_backpressure":
         return _fail(f"unexpected 429 code: {first_429!r}")
+    assert detail is not None
     if detail.get("scope") != "api_key":
         return _fail(f"unexpected 429 scope: {first_429!r}")
 

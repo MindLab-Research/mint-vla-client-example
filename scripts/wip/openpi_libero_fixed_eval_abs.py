@@ -294,6 +294,7 @@ def main():
                     train_result = ppo_train_step(BASE_URL, model_id, datums)
             else:
                 train_result = {'metrics': {'loss:mean': 0.0}}
+            assert train_result is not None
             loss_value = float(train_result['metrics']['loss:mean'])
             ckpt_eval = _save_weights_for_sampler(BASE_URL, model_id, f'fixed-eval-{uuid.uuid4().hex[:8]}')
             _delete_action_session(BASE_URL, action_session_id)

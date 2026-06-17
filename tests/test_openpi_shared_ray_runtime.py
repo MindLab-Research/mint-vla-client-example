@@ -977,11 +977,15 @@ def test_openpi_shared_runtime_core_swaps_sessions_on_a_b_a() -> None:
             _ = timeout_s
             self.calls.append((op, payload))
             if op == "create_session":
+                assert payload is not None
                 return {"backend": "openpi_fast", "config_name": payload["config_name"]}
             if op == "save_session_state":
+                assert payload is not None
                 self._saved_sessions.add(str(payload["session_id"]))
+                assert payload is not None
                 return {"path": f"/tmp/{payload['session_id']}"}
             if op == "load_session_state":
+                assert payload is not None
                 session_id = str(payload["session_id"])
                 if session_id not in self._saved_sessions:
                     raise FileNotFoundError(session_id)
@@ -1033,11 +1037,15 @@ def test_openpi_shared_runtime_core_bootstraps_distinct_sessions_when_template_n
             _ = timeout_s
             self.calls.append((op, payload))
             if op == "create_session":
+                assert payload is not None
                 return {"backend": "openpi_fast", "config_name": payload["config_name"]}
             if op == "save_session_state":
+                assert payload is not None
                 self._saved_sessions.add(str(payload["session_id"]))
+                assert payload is not None
                 return {"path": f"/tmp/{payload['session_id']}"}
             if op == "load_session_state":
+                assert payload is not None
                 session_id = str(payload["session_id"])
                 if session_id not in self._saved_sessions:
                     raise FileNotFoundError(session_id)
@@ -1093,8 +1101,10 @@ def test_openpi_shared_runtime_core_surfaces_restore_failures_without_fallback()
             self.calls.append((op, payload))
             if op == "create_session":
                 self.create_calls += 1
+                assert payload is not None
                 return {"backend": "openpi_fast", "config_name": payload["config_name"]}
             if op == "save_session_state":
+                assert payload is not None
                 return {"path": f"/tmp/{payload['session_id']}"}
             if op == "load_session_state":
                 raise RuntimeError("restore failed")

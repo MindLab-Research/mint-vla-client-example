@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from mint_server.runtime_env import bootstrap_runtime_pythonpath, validate_runtime_env_layout
+from mint_server.ray.runtime_env import bootstrap_runtime_pythonpath, validate_runtime_env_layout
 
 
 OPENPI_FAST_WORKER_PROTOCOL_VERSION = 1

@@ -255,7 +255,7 @@ def main() -> None:
 
     _load_env()
     base_url = (
-        _coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL)
+        (_coalesce(args.base_url, os.environ.get("MINT_BASE_URL"), os.environ.get("MINT_BASE_URL"), DEFAULT_BASE_URL) or "")
         .rstrip("/")
     )
     api_key = _coalesce(args.api_key, os.environ.get("MINT_API_KEY"), os.environ.get("MINT_API_KEY"))
@@ -364,7 +364,7 @@ def main() -> None:
         "base_model": str(args.base_model),
         "session_id": session_id,
         "sampling_session_id": sampling_session_id,
-        "start_server_timestamp": _iso(start_server_ts),
+        "start_server_timestamp": since_iso,
         "since_iso": since_iso,
         "requests": int(args.requests),
         "concurrency": int(args.concurrency),

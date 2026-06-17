@@ -42,8 +42,9 @@ def test_model_actor_inventory_list_actors_labels_openpi_backend(monkeypatch: py
     assert listed[0]["metadata"]["actor_id"] == "actor-123"
 
     pool.clear_session("session_openpi", actor_type=ActorType.OPENPI)
-    assert pool.get(actor_name) is not None
-    assert pool.get(actor_name).current_session is None
+    _e = pool.get(actor_name)
+    assert _e is not None
+    assert _e.current_session is None
 
     pool.unregister(actor_name)
     pool.register(
@@ -64,7 +65,8 @@ def test_model_actor_inventory_list_actors_labels_openpi_backend(monkeypatch: py
     assert listed[0]["metadata"]["actual_rank"] == 8
 
     pool.clear_session("session_a", actor_type=ActorType.DENSE)
-    assert pool.get(actor_name) is not None
-    assert pool.get(actor_name).current_session is None
+    _e = pool.get(actor_name)
+    assert _e is not None
+    assert _e.current_session is None
 
     pool.unregister(actor_name)

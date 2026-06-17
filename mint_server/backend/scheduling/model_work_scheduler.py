@@ -18,7 +18,7 @@ from mint_server.config import (
     otel_env_vars,
     preferred_control_plane_resources,
 )
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.server_info import _git_sha
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from mint_server.backend.contracts.control_plane_contracts import (
@@ -342,7 +342,7 @@ class _ModelWorkSchedulerActor:
         same_affinity_multi_claim_domains: tuple[str, ...] | list[str] | None = None,
     ) -> None:
         try:
-            from mint_server.logging_context import init_actor_observability
+            from mint_server.observability.logging_context import init_actor_observability
 
             init_actor_observability()
         except Exception:

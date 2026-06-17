@@ -3,8 +3,8 @@ from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from mint_server.app import external_compatibility_middleware
-from mint_server.compatibility import rewrite_legacy_tinker_uris
-from mint_server.runtime_env import env_get
+from mint_server.utils.compatibility import rewrite_legacy_tinker_uris
+from mint_server.ray.runtime_env import env_get
 
 
 def test_rewrite_legacy_tinker_uris_recurses() -> None:

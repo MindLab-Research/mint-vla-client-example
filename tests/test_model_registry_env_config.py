@@ -130,6 +130,7 @@ def test_qwen35_27b_registry_and_path(monkeypatch, tmp_path):
     assert cfg.num_parameters == 27.0
     assert cfg.is_moe is False
     assert cfg.inference_tp == 4
+    assert cfg.max_loras is not None
     assert cfg.max_loras >= 1
     assert cfg.supported_modalities == ("text",)
 

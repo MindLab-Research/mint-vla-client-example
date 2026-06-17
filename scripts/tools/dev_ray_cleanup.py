@@ -245,7 +245,7 @@ def _ensure_repo_on_path() -> None:
 
 def _init_ray(namespace: str) -> Any:
     _ensure_repo_on_path()
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     init_ray(namespace=namespace, ignore_reinit_error=True)
     import ray
@@ -373,7 +373,7 @@ async def _active_task_probe() -> dict[str, int]:
 
 
 def _expected_config_snapshot(namespace: str) -> Any:
-    from mint_server.runtime_config import build_config_snapshot, config_actor_name
+    from mint_server.config.runtime_config import build_config_snapshot, config_actor_name
 
     return build_config_snapshot(
         ray_namespace=namespace,

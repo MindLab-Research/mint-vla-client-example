@@ -14,21 +14,21 @@ from typing import TYPE_CHECKING
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from .auth_identity import get_apikey_id as get_request_apikey_id
-from .auth_identity import get_request_observability_context
+from .auth.auth_identity import get_apikey_id as get_request_apikey_id
+from .auth.auth_identity import get_request_observability_context
 from mint_server.backend.stores.task_state_store import TaskStateStoreUnavailableError
 from mint_server.backend.sessions.session_manager import SessionManager
 from .config import config
-from .compatibility import rewrite_legacy_tinker_uris
+from .utils.compatibility import rewrite_legacy_tinker_uris
 from .gateway import close_http_clients
-from .health_state import (
+from .health.health_state import (
     clear_runtime_degraded_state,
     clear_startup_degraded_state,
     set_runtime_degraded_state,
     set_startup_degraded_state,
 )
-from .gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
-from .logging_context import (
+from .gateway.gateway_auth import extract_gateway_auth_context, has_gateway_auth_headers
+from .observability.logging_context import (
     classify_failure_reason,
     bind_request_trace_context,
     configure_logging,
@@ -40,7 +40,7 @@ from .logging_context import (
     register_api_process_observable_metrics,
     set_trace_id,
 )
-from .ray_utils import init_ray, ray_connection_epoch, ray_reconnect_poll_s
+from .ray.ray_utils import init_ray, ray_connection_epoch, ray_reconnect_poll_s
 from .routes import action_sampling, futures, internal, openai_compat, sampling, service, training, weights
 from .server_info import _git_sha
 
@@ -240,7 +240,7 @@ async def lifespan(app: FastAPI):
 
     init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
 
-    from .usage_store import get_usage_store
+    from .billing.usage_store import get_usage_store
 
     usage_store = await get_usage_store()
     if not await usage_store.health_check():
@@ -449,7 +449,7 @@ async def lifespan(app: FastAPI):
 
     openai_compat.shutdown_tokenizer_executor()
 
-    from .usage_store import close_usage_store
+    from .billing.usage_store import close_usage_store
 
     await close_usage_store()
 
@@ -721,7 +721,7 @@ async def api_key_auth_middleware(request: Request, call_next):
         download_token = request.query_params.get("download_token")
         if direct and download_token:
             try:
-                from .download_tokens import verify_download_token
+                from .utils.download_tokens import verify_download_token
 
                 secret = config.download_token_secret
                 payload = verify_download_token(str(download_token), secret=secret)

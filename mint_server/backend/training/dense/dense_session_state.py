@@ -8,9 +8,9 @@ import shutil
 import time
 from pathlib import Path
 
-from mint_server.checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
+from mint_server.checkpoints.checkpoints import DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from mint_server.config import config as server_config
-from mint_server.runtime_env import env_get
+from mint_server.ray.runtime_env import env_get
 
 logger = structlog.get_logger(__name__)
 

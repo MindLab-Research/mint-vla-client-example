@@ -160,7 +160,7 @@ def _ray_state_api_address() -> str | None:
             continue
         return raw
     try:
-        from mint_server.ray_utils import strict_ray_gcs_address
+        from mint_server.ray.ray_utils import strict_ray_gcs_address
 
         return strict_ray_gcs_address()
     except Exception:

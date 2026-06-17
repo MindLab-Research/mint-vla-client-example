@@ -17,19 +17,19 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 
-from ..auth_identity import can_bypass_ownership
-from ..auth_identity import get_user_data as _request_user_data
-from ..auth_identity import get_user_id as _request_user_id
-from ..checkpoint_index import (
+from ..auth.auth_identity import can_bypass_ownership
+from ..auth.auth_identity import get_user_data as _request_user_data
+from ..auth.auth_identity import get_user_id as _request_user_id
+from ..checkpoints.checkpoint_index import (
     checkpoint_index_enabled,
     get_catalog_checkpoint,
     list_catalog_checkpoints,
 )
-from ..logging_context import get_otel_tracer
-from ..queue_priority import merge_queue_priority_extra
-from ..ray_cluster_health import get_ray_cluster_health_snapshot
-from ..ray_gcs_metrics import get_ray_gcs_metrics_snapshot
-from ..usage_store import get_usage_store
+from ..observability.logging_context import get_otel_tracer
+from ..utils.queue_priority import merge_queue_priority_extra
+from ..health.ray_cluster_health import get_ray_cluster_health_snapshot
+from ..health.ray_gcs_metrics import get_ray_gcs_metrics_snapshot
+from ..billing.usage_store import get_usage_store
 from mint_server.backend.ops.actor_admin import KillActorsRequest
 from mint_server.backend.stores.task_state_store import task_futures
 
@@ -738,9 +738,11 @@ async def download_checkpoint(checkpoint_id: str, request: Request):
             stderr=subprocess.PIPE,
         )
         try:
+            assert proc.stdout is not None
             while chunk := proc.stdout.read(65536):
                 yield chunk
         finally:
+            assert proc.stdout is not None
             proc.stdout.close()
             proc.wait()
 

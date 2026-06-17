@@ -124,7 +124,9 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         lease_ttl_s=60.0,
         now=104.0,
     )
+    assert renewed.record is not None
     assert renewed.record["status"] == "leased"
+    assert renewed.record is not None
     assert renewed.record["lease_expires_at"] == 164.0
     store.begin_finalize(
         request_id="req-1",
@@ -148,6 +150,7 @@ def test_future_state_store_scheduler_lease_and_finalize() -> None:
         now=106.0,
     )
 
+    assert out.record is not None
     assert out.record["status"] == "done"
     assert store.get_task("req-1")["request_json"] == b'{"x":1}'
 

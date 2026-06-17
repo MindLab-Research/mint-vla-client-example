@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable
 import structlog
 import time
 
-from mint_server.logging_context import get_current_traceparent, record_span_event_otel, start_as_current_span
+from mint_server.observability.logging_context import get_current_traceparent, record_span_event_otel, start_as_current_span
 
 from mint_server.backend.contracts.control_plane_contracts import AppendWorkResult, SubmitTaskResult
 from mint_server.backend.scheduling.model_work_task_gateway import SchedulerModelWorkTaskGateway

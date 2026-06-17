@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from mint_server.logging_context import record_ray_cluster_op_otel
+from mint_server.observability.logging_context import record_ray_cluster_op_otel
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 from mint_server.backend.ray_cluster.ray_placement_groups import remove_named_placement_group
 

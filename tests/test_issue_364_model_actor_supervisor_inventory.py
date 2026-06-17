@@ -21,10 +21,18 @@ def test_issue_364_inventory_tracks_session_protection_and_inflight() -> None:
 
     assert entry.actor_name == "dense-actor"
     assert state.total_gpus_used() == 1
-    assert state.get("dense-actor", touch=False).current_session == "model-b"
-    assert state.get("dense-actor", touch=False).inflight_count == 1
-    assert state.get("dense-actor", touch=False).protected is False
-    assert state.get("dense-actor", touch=False).metadata["hostname"] == "host-a"
+    _s = state.get('dense-actor', touch=False)
+    assert _s is not None
+    assert _s.current_session == "model-b"
+    _s = state.get('dense-actor', touch=False)
+    assert _s is not None
+    assert _s.inflight_count == 1
+    _s = state.get('dense-actor', touch=False)
+    assert _s is not None
+    assert _s.protected is False
+    _s = state.get('dense-actor', touch=False)
+    assert _s is not None
+    assert _s.metadata["hostname"] == "host-a"
 
 
 def test_issue_364_inventory_clear_session_is_scoped_by_actor_type() -> None:
@@ -45,5 +53,9 @@ def test_issue_364_inventory_clear_session_is_scoped_by_actor_type() -> None:
     cleared = state.clear_session("model-a", actor_type=ActorType.DENSE)
 
     assert cleared == 1
-    assert state.get("dense-actor", touch=False).current_session is None
-    assert state.get("vllm-actor", touch=False).current_session == "model-a"
+    _s = state.get('dense-actor', touch=False)
+    assert _s is not None
+    assert _s.current_session is None
+    _v = state.get('vllm-actor', touch=False)
+    assert _v is not None
+    assert _v.current_session == "model-a"

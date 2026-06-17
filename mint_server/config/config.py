@@ -17,7 +17,7 @@ from mint_server.ray.runtime_env import (
     env_nonempty as _runtime_env_nonempty,
     join_pythonpath,
 )
-from mint_server.checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
+from mint_server.checkpoints.checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from .config_hydration import hydrate_from_config_actor
 
 hydrate_from_config_actor()

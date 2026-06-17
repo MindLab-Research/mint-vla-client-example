@@ -26,15 +26,15 @@ import ray
 
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, preferred_torch_lib_dirs
 from mint_server.config import config as server_config
-from mint_server.logging_context import (
+from mint_server.observability.logging_context import (
     get_current_traceparent,
     init_actor_observability,
     restore_trace_id_from_traceparent,
     start_as_current_span,
     traced_async_from_traceparent,
 )
-from mint_server.ray_utils import init_ray
-from mint_server.runtime_env import join_pythonpath, sanitize_worker_pythonpath
+from mint_server.ray.ray_utils import init_ray
+from mint_server.ray.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
@@ -703,7 +703,7 @@ def _create_mint_vllm_multinode_actor(
                 else max_num_batched_tokens
             )
 
-            self.engine = None
+            self.engine: Any = None
             self._initialized = False
             self._rw_lock = _AsyncRWLock()
             self._lock_mode = os.environ.get("MINT_VLLM_ENGINE_LOCK_MODE", "rw").strip().lower()
@@ -1221,6 +1221,7 @@ def _create_mint_vllm_multinode_actor(
                             tensor_parallel_size=self.tensor_parallel_size,
                             fully_sharded_loras=fully_sharded_loras,
                         )
+                        assert self.engine is not None
                         await self.engine.add_lora(lora_request)
                     except Exception:
                         import json
@@ -1276,6 +1277,7 @@ def _create_mint_vllm_multinode_actor(
             async with self._exclusive_engine_op():
                 async with self._lock_write():
                     t1 = time.perf_counter()
+                    assert self.engine is not None
                     await self.engine.remove_lora(lora_int_id)
             t2 = time.perf_counter()
             if self._timing:
@@ -1293,6 +1295,7 @@ def _create_mint_vllm_multinode_actor(
             # NOTE: list_loras must not race active generation on multinode.
             async with self._exclusive_engine_op():
                 async with self._lock_read():
+                    assert self.engine is not None
                     return await self.engine.list_loras()
 
         async def get_debug_env_info(self) -> dict:
@@ -1381,6 +1384,7 @@ def _create_mint_vllm_multinode_actor(
                     "kv_cache_groups": len(groups),
                 }
 
+            assert self.engine is not None
             infos = await self.engine.collective_rpc(_collect_kv_info)
             capacities = [int(x.get("kv_cache_capacity_tokens", 0) or 0) for x in infos]
             block_sizes = [int(x.get("kv_cache_block_size", 0) or 0) for x in infos]
@@ -1413,6 +1417,8 @@ def _create_mint_vllm_multinode_actor(
                         await self.engine.abort(sid)
                     except Exception:
                         pass
+                assert self.engine is not None
+                assert self.engine is not None
                 await self.engine.abort(request_id)
             except Exception:
                 logger.warning("multinodevllmengine_abort_request_failed___s___s")
@@ -1684,6 +1690,7 @@ def _create_mint_vllm_multinode_actor(
                                             await stack.enter_async_context(self._maybe_add_request_lock())
                                         t_before_add_request = time.perf_counter()
                                         add_request_wait_s = t_before_add_request - t_add_request_start
+                                        assert self.engine is not None
                                         result = await self.engine.add_request(
                                             request_id=request_id,
                                             prompt=prompt,
@@ -1709,7 +1716,7 @@ def _create_mint_vllm_multinode_actor(
                                         },
                                     )
 
-                        final_res = None
+                        final_res: Any = None
                         by_index: dict[int, Any] | None = {} if n_req > 1 else None
                         deadline = None
                         if self._generate_timeout_s > 0:
@@ -1736,6 +1743,7 @@ def _create_mint_vllm_multinode_actor(
                                         )
                                 except asyncio.TimeoutError as e:
                                     try:
+                                        assert self.engine is not None
                                         await self.engine.abort(request_id)
                                     except Exception:
                                         pass
@@ -1751,6 +1759,7 @@ def _create_mint_vllm_multinode_actor(
                                         except Exception:
                                             idx = -1
                                         by_index[idx] = oo
+                                assert final_res is not None
                                 final_res = out
                                 try:
                                     if n_req == 1:
@@ -1787,7 +1796,6 @@ def _create_mint_vllm_multinode_actor(
                                     "pp": self.pipeline_parallel_size,
                                 },
                             )
-                    assert final_res is not None
                 finally:
                     try:
                         if generate_registered:
@@ -2094,6 +2102,8 @@ def _create_mint_vllm_multinode_actor(
                         # changing prompt-logprobs semantics for this request.
                         await self.engine.reset_prefix_cache()
                         try:
+                            assert self.engine is not None
+                            assert self.engine is not None
                             collector = await self.engine.add_request(
                                 request_id=request_id,
                                 prompt=prompt,
@@ -2115,6 +2125,7 @@ def _create_mint_vllm_multinode_actor(
                         try:
                             while True:
                                 out = await collector.get()
+                                assert final_res is not None
                                 final_res = out
                                 if out.finished:
                                     break
@@ -2129,7 +2140,6 @@ def _create_mint_vllm_multinode_actor(
                                     "pp": self.pipeline_parallel_size,
                                 },
                             )
-                        assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
                 logger.info(
@@ -2142,6 +2152,7 @@ def _create_mint_vllm_multinode_actor(
                 )
 
             # Extract prompt logprobs
+            assert final_res is not None
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
@@ -2218,6 +2229,7 @@ def _create_mint_vllm_multinode_actor(
                 async with self._lock_read():
                     t1 = time.perf_counter()
                     try:
+                        assert self.engine is not None
                         collector = await self.engine.add_request(
                             request_id=request_id,
                             prompt=prompt,
@@ -2240,6 +2252,7 @@ def _create_mint_vllm_multinode_actor(
                     try:
                         while True:
                             out = await collector.get()
+                            assert final_res is not None
                             final_res = out
                             if out.finished:
                                 break
@@ -2255,7 +2268,6 @@ def _create_mint_vllm_multinode_actor(
                                 "pp": self.pipeline_parallel_size,
                             },
                         )
-                    assert final_res is not None
             t2 = time.perf_counter()
             if self._timing:
                 logger.info(
@@ -2268,6 +2280,7 @@ def _create_mint_vllm_multinode_actor(
                     t2 - t0,
                 )
 
+            assert final_res is not None
             prompt_logprobs = final_res.prompt_logprobs
             if prompt_logprobs is None:
                 return [None] * len(prompt_ids)
@@ -2619,6 +2632,7 @@ class MultiNodeInferenceEngine:
             pg = None
             if distributed_executor_backend == "ray":
                 pg_name = f"{self.actor_name}_pg"
+                assert resources is not None
                 pg_bundles = resources.pg_bundles
                 pg = get_named_placement_group(
                     pg_name,
@@ -2635,6 +2649,7 @@ class MultiNodeInferenceEngine:
                 max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
+            assert resources is not None
             if distributed_executor_backend == "ray":
                 scheduling_opts = {
                     "scheduling_strategy": PlacementGroupSchedulingStrategy(
@@ -2649,6 +2664,7 @@ class MultiNodeInferenceEngine:
             else:
                 # mp backend: no Ray child actors; schedule this actor directly onto 1 node with all GPUs.
                 if mp_pinned_node_ip:
+                    assert resources is not None
                     scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
                 else:
                     scheduling_opts = _node_affinity_scheduling_opts_for_model(
@@ -2926,6 +2942,7 @@ class MultiNodeInferenceEngine:
         # Add to engine (all workers load from shared path)
         start_time = time.time()
         try:
+            assert self.engine is not None
             ref = self.engine.add_lora.remote(
                 lora_int_id=lora_id,
                 lora_path=adapter_dir,
@@ -2982,6 +2999,7 @@ class MultiNodeInferenceEngine:
 
         start_time = time.time()
         try:
+            assert self.engine is not None
             ref = self.engine.add_lora.remote(
                 lora_int_id=lora_id,
                 lora_path=lora_path,
@@ -3033,6 +3051,7 @@ class MultiNodeInferenceEngine:
         traceparent = get_current_traceparent()
 
         try:
+            assert self.engine is not None
             ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
             await async_get_ray_ref(ref, timeout_s=10)
         except Exception:
@@ -3070,6 +3089,7 @@ class MultiNodeInferenceEngine:
         )
         traceparent = get_current_traceparent()
 
+        assert self.engine is not None
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
@@ -3091,6 +3111,7 @@ class MultiNodeInferenceEngine:
             # Avoid killing the actor: killing forces a 60-90s re-init and pollutes latency measurements.
             # Try aborting just this request, then fail loud to the client.
             try:
+                assert self.engine is not None
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await async_get_ray_ref(abort_ref, timeout_s=10)
             except Exception:
@@ -3165,6 +3186,7 @@ class MultiNodeInferenceEngine:
         )
         traceparent = get_current_traceparent()
 
+        assert self.engine is not None
         ref = self.engine.generate.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
@@ -3185,6 +3207,7 @@ class MultiNodeInferenceEngine:
             raw = await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name, timeout_s=timeout_s)
         except asyncio.TimeoutError as e:
             try:
+                assert self.engine is not None
                 abort_ref = self.engine.abort_request.remote(request_id, traceparent=traceparent)
                 await async_get_ray_ref(abort_ref, timeout_s=10)
             except Exception:
@@ -3258,6 +3281,7 @@ class MultiNodeInferenceEngine:
         )
         traceparent = get_current_traceparent()
 
+        assert self.engine is not None
         ref = self.engine.compute_prompt_logprobs.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
@@ -3338,6 +3362,7 @@ class MultiNodeInferenceEngine:
         )
         traceparent = get_current_traceparent()
 
+        assert self.engine is not None
         ref = self.engine.compute_prompt_topk.remote(
             prompt_ids=prompt_ids,
             request_id=request_id,
@@ -3391,6 +3416,7 @@ class MultiNodeInferenceEngine:
         if should_unload:
             traceparent = get_current_traceparent()
             try:
+                assert self.engine is not None
                 ref = self.engine.remove_lora.remote(removed_lora_id, traceparent=traceparent)
                 await ray_get_with_model_actor_supervisor_keepalive(ref, actor_name=self.actor_name)
             except Exception:

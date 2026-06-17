@@ -13,7 +13,7 @@ import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from mint_server.runtime_env import env_get
+from mint_server.ray.runtime_env import env_get
 
 logger = structlog.get_logger(__name__)
 

@@ -9,7 +9,7 @@ from mint_server.backend.stores.task_state_store import task_state_store
 
 def _gateway_store_enabled() -> bool:
     try:
-        from mint_server.gateway import get_gateway_config
+        from mint_server.gateway.gateway import get_gateway_config
 
         cfg = get_gateway_config()
     except Exception:

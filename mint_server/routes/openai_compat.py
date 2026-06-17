@@ -31,7 +31,7 @@ from ..models.types import (
     OAIUsage,
 )
 from mint_server.backend.stores.task_state_store import task_futures
-from ..runtime_env import env_get
+from ..ray.runtime_env import env_get
 from .sampling import build_sample_once_billing_observations, sample_once
 from .service import ensure_sampling_session
 
@@ -768,6 +768,9 @@ async def completions(request: OAICompletionRequest, http_request: Request):
                 _invalidate_cached_session(user_id=user_id, model_path=request.model)
                 if attempt == 1:
                     raise
+        assert sequence is not None
+        assert sequence is not None
+        assert sequence is not None
         text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
         if not await _is_remote_sampling_session(sampling_session_id):
             billing_observations = build_sample_once_billing_observations(
@@ -856,6 +859,9 @@ async def chat_completions(request: OAIChatCompletionRequest, http_request: Requ
                     if attempt == 1:
                         raise
 
+            assert sequence is not None
+            assert sequence is not None
+            assert sequence is not None
             text = tokenizer.decode(sequence.tokens, skip_special_tokens=True)
             if request.tools and request.tool_choice != "none":
                 content, tool_calls = _extract_tool_calls(text)

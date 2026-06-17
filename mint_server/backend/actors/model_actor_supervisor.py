@@ -19,7 +19,7 @@ from mint_server.config import (
     otel_env_vars,
     preferred_control_plane_resources,
 )
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.server_info import _git_sha
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from mint_server.backend.scheduling.cluster_placement_controller import (
@@ -174,7 +174,7 @@ def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str
                 {
                     "actor_name": actor_name,
                     "workload": workload,
-                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),
+                    "hostname": str(binding.get("hostname") or metadata.get("hostname") or "unknown"),  # type: ignore[reportOptionalMemberAccess]
                     "gpu_uuid": gpu_uuid.strip(),
                 }
             )
@@ -978,7 +978,7 @@ class ModelActorSupervisorCore:
         # of attempting a nested ray.init()/direct attach from inside Ray.
         self._ray_address = str(ray_address or "").strip() or None
         try:
-            from mint_server.logging_context import init_actor_observability
+            from mint_server.observability.logging_context import init_actor_observability
 
             init_actor_observability()
         except Exception:
@@ -3191,7 +3191,7 @@ def _create_ray_actor(*, require_ready: bool = True):
         extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
     if "MINT_SUPPORTED_MODELS" in os.environ:
         extra_env["MINT_SUPPORTED_MODELS"] = os.environ["MINT_SUPPORTED_MODELS"]
-    from mint_server.ray_utils import strict_ray_gcs_address
+    from mint_server.ray.ray_utils import strict_ray_gcs_address
 
     ray_address = strict_ray_gcs_address()
     if ray_address is None:

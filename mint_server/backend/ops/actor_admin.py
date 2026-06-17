@@ -10,8 +10,8 @@ from typing import Any
 from fastapi import HTTPException, Request
 from pydantic import BaseModel
 
-from mint_server.auth_identity import can_manage_system_user_data
-from mint_server.auth_identity import get_user_data as _request_user_data
+from mint_server.auth.auth_identity import can_manage_system_user_data
+from mint_server.auth.auth_identity import get_user_data as _request_user_data
 from mint_server.backend.ray_cluster.async_ray_control import (
     async_get_ray_ref,
     async_kill_named_actor,

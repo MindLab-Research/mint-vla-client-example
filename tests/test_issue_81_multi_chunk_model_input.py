@@ -1,4 +1,4 @@
-from mint_server.model_input_utils import flatten_encoded_text_chunks
+from mint_server.utils.model_input_utils import flatten_encoded_text_chunks
 
 
 def test_issue_81_flattens_multi_chunk_model_input() -> None:

@@ -1,7 +1,7 @@
 import pytest
 
 from mint_server.config import ServerConfig
-from mint_server.config_file import load_mint_config_file
+from mint_server.config.config_file import load_mint_config_file
 
 
 def test_config_file_load_ok(tmp_path):

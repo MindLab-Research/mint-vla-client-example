@@ -123,6 +123,7 @@ class TaskQueries:
         for row in rows:
             record = self.row_to_record(row)
             metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            assert metadata is not None
             if all(metadata.get(key) == value for key, value in normalized_filters.items()):
                 out.append(record)
                 if len(out) >= int(limit):
@@ -260,6 +261,7 @@ class TaskQueries:
                         return out
 
             metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            assert metadata is not None
             abandoned = metadata.get("abandoned_staged_payload_paths")
             if not isinstance(abandoned, list):
                 continue
@@ -390,6 +392,7 @@ class TaskQueries:
     def terminal_completed_at(record: dict[str, Any]) -> float:
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         for key in ("done_at", "failed_at"):
+            assert metadata is not None
             value = metadata.get(key)
             if isinstance(value, (int, float)):
                 return float(value)

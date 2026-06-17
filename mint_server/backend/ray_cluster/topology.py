@@ -654,7 +654,7 @@ def _prepend_host_venv_site_packages() -> bool:
     if not env_root:
         return False
     try:
-        from mint_server.runtime_env import host_venv_site_packages
+        from mint_server.ray.runtime_env import host_venv_site_packages
 
         path = host_venv_site_packages(env_root)
     except Exception:
@@ -942,6 +942,7 @@ def default_provider_task_lister_for_config(config: TopologyConfig) -> ProviderT
     providers = {node.provider for node in config.nodes.values()}
     if providers == {"volcano"}:
         provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
+        assert provider_cfg is not None
         provider = VolcanoTopologyProvider(
             region=str(provider_cfg.get("region") or "").strip() or None,
             connect_timeout=_optional_float(provider_cfg.get("connect_timeout_s")),
@@ -959,6 +960,7 @@ def default_provider_task_submitter_for_config(config: TopologyConfig) -> Provid
     providers = {node.provider for node in config.nodes.values()}
     if providers == {"volcano"}:
         provider_cfg = config.providers.get("volcano") if isinstance(config.providers.get("volcano"), dict) else {}
+        assert provider_cfg is not None
         region = str(provider_cfg.get("region") or "").strip() or None
         connect_timeout = _optional_float(provider_cfg.get("connect_timeout_s"))
         read_timeout = _optional_float(provider_cfg.get("read_timeout_s"))

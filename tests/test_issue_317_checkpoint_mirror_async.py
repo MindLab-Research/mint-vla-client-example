@@ -393,7 +393,7 @@ def test_issue_317_failed_mirror_status_is_stable(monkeypatch, tmp_path: Path) -
 
 def test_issue_317_publish_not_found_stays_failed(monkeypatch, tmp_path: Path) -> None:
     from mint_server import checkpoints
-    from mint_server.checkpoint_index import CheckpointNotFoundError
+    from mint_server.checkpoints.checkpoint_index import CheckpointNotFoundError
 
     runtime_root = tmp_path / "runtime"
     persistent_root = tmp_path / "tos"
@@ -835,7 +835,7 @@ async def test_issue_317_named_save_weights_for_sampler_preserves_type(
 async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous(
     monkeypatch, tmp_path: Path
 ) -> None:
-    from mint_server.checkpoints import read_checkpoint_metadata
+    from mint_server.checkpoints.checkpoints import read_checkpoint_metadata
     from mint_server.models.types import SaveWeightsForSamplerRequest
     from mint_server.routes import training as tr
 

@@ -671,6 +671,7 @@ def _leased_task(store: TaskStateStore) -> tuple[int, str, str]:
         lease_ttl_s=30.0,
         now=103.0,
     )
+    assert claimed.record is not None
     assert claimed.record["status"] == "leased"
     return epoch, lease_id, attempt_id
 
@@ -714,7 +715,9 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             scheduler_epoch=epoch,
             now=102.0,
         )
+        assert assigned.record is not None
         assert assigned.record["status"] == "assigned"
+        assert assigned.record is not None
         assert assigned.record["subqueue_id"] == "vllm:Qwen/Qwen3-4B-Instruct-2507::replica-0"
 
         claimed = store.claim_task(
@@ -728,8 +731,11 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             lease_ttl_s=30.0,
             now=103.0,
         )
+        assert claimed.record is not None
         assert claimed.record["status"] == "leased"
+        assert claimed.record is not None
         assert claimed.record["lease_id"] == "lease-1"
+        assert claimed.record is not None
         assert claimed.record["attempt_id"] == "attempt-1"
 
         renewed = store.renew_lease(
@@ -741,7 +747,9 @@ def test_task_state_store_active_load_and_claim_lifecycle() -> None:
             lease_ttl_s=60.0,
             now=104.0,
         )
+        assert renewed.record is not None
         assert renewed.record["status"] == "leased"
+        assert renewed.record is not None
         assert renewed.record["lease_expires_at"] == 164.0
 
         with pytest.raises(TaskStateConflictError):
@@ -788,8 +796,11 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
             staged_payload_path="/vePFS-Mindverse/share/mint-results/req-1.json",
             now=104.0,
         )
+        assert finalizing.record is not None
         assert finalizing.record["status"] == "finalizing"
+        assert finalizing.record is not None
         assert finalizing.record["staged_payload_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert finalizing.record is not None
         assert finalizing.record["result_path"] is None
 
         committed = store.commit_finalize_success(
@@ -805,8 +816,11 @@ def test_finalize_success_is_cas_fenced_and_idempotent() -> None:
         )
         assert committed.ok is True
         assert committed.idempotent is False
+        assert committed.record is not None
         assert committed.record["status"] == "done"
+        assert committed.record is not None
         assert committed.record["result_path"] == "/vePFS-Mindverse/share/mint-results/req-1.json"
+        assert committed.record is not None
         assert committed.record["staged_payload_path"] is None
         assert store.list_active_tasks() == []
 
@@ -897,8 +911,11 @@ def test_failure_commit_after_stage_preserves_abandoned_staged_payload() -> None
             now=3.0,
         )
 
+        assert failed.record is not None
         assert failed.record["status"] == "failed"
+        assert failed.record is not None
         assert failed.record["staged_payload_path"] is None
+        assert failed.record is not None
         assert failed.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-direct-fail/future__stage-a.json"
         ]
@@ -931,8 +948,11 @@ def test_finalize_failure_after_stage_preserves_abandoned_staged_payload() -> No
             now=105.0,
         )
 
+        assert failed.record is not None
         assert failed.record["status"] == "failed"
+        assert failed.record is not None
         assert failed.record["staged_payload_path"] is None
+        assert failed.record is not None
         assert failed.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
         ]
@@ -972,6 +992,7 @@ def test_staged_payload_path_is_not_terminal_payload_until_commit() -> None:
             result_size_bytes=123,
             now=105.0,
         )
+        assert committed.record is not None
         assert committed.record["staged_payload_path"] is None
 
         payloads = store.list_terminal_payloads_for_eviction(
@@ -1015,7 +1036,9 @@ def test_runtime_commit_does_not_require_live_scheduler_owner() -> None:
             now=133.0,
         )
 
+        assert committed.record is not None
         assert committed.record["status"] == "done"
+        assert committed.record is not None
         assert committed.record["staged_payload_path"] is None
     finally:
         store.close()
@@ -1042,8 +1065,11 @@ def test_scheduler_leased_task_can_finalize_after_runtime_marks_running() -> Non
             now=105.0,
         )
 
+        assert finalizing.record is not None
         assert finalizing.record["status"] == "finalizing"
+        assert finalizing.record is not None
         assert finalizing.record["lease_id"] == lease_id
+        assert finalizing.record is not None
         assert finalizing.record["metadata"]["stage"] == "prefill"
     finally:
         store.close()
@@ -1069,10 +1095,15 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
             reason="lease_expired",
             now=104.0,
         )
+        assert requeued.record is not None
         assert requeued.record["status"] == "pending"
+        assert requeued.record is not None
         assert requeued.record["lease_id"] is None
+        assert requeued.record is not None
         assert requeued.record["attempt_id"] is None
+        assert requeued.record is not None
         assert requeued.record["staged_payload_path"] is None
+        assert requeued.record is not None
         assert requeued.record["metadata"]["abandoned_staged_payload_paths"] == [
             "/tmp/payloads/re/req-1/attempt-1__lease-1.json"
         ]
@@ -1094,7 +1125,9 @@ def test_requeue_task_resets_active_record_for_reclaim() -> None:
             lease_ttl_s=30.0,
             now=106.0,
         )
+        assert claimed.record is not None
         assert claimed.record["status"] == "leased"
+        assert claimed.record is not None
         assert claimed.record["lease_id"] == "lease-1-retry"
     finally:
         store.close()
@@ -1166,6 +1199,7 @@ def test_stale_finalizer_uses_distinct_payload_path_and_cannot_overwrite_retry(t
             result_size_bytes=int(retry_meta["size_bytes"]),
             now=109.0,
         )
+        assert committed.record is not None
         assert committed.record["status"] == "done"
 
         payloads.write_json_payload(
@@ -1214,7 +1248,9 @@ def test_future_style_task_lifecycle_and_metadata_lookup() -> None:
             status="running",
             now=101.0,
         )
+        assert running.record is not None
         assert running.record["metadata"]["model_id"] == "model-a"
+        assert running.record is not None
         assert running.record["metadata"]["stage"] == "running"
 
         completed = store.complete_task_success(
@@ -1737,7 +1773,9 @@ def test_finalize_failure_records_terminal_error() -> None:
             now=105.0,
         )
 
+        assert failed.record is not None
         assert failed.record["status"] == "failed"
+        assert failed.record is not None
         assert failed.record["error"] == "executor failed"
         assert store.get_task("req-1")["status"] == "failed"
     finally:
@@ -1964,8 +2002,12 @@ def test_task_state_store_owns_session_and_sampler_indices() -> None:
         }
 
         store.remove_sampler_from_session_index(session_id="root-session", sampler_id="sampler-b")
-        assert store.get_session_index(session_id="root-session")["sampler_ids"] == ["sampler-a"]
-        assert store.get_session_index(session_id="root-session")["heartbeat_sampler_ids"] == []
+        _si3 = store.get_session_index(session_id="root-session")
+        assert _si3 is not None
+        assert _si3["sampler_ids"] == ["sampler-a"]
+        _si = store.get_session_index(session_id="root-session")
+        assert _si is not None
+        assert _si["heartbeat_sampler_ids"] == []
 
         store.delete_sampler_index(sampler_id="sampler-b")
         assert store.get_sampler_index(sampler_id="sampler-b") is None
@@ -2243,20 +2285,28 @@ def test_task_state_store_actor_exposes_session_metadata_methods(tmp_path) -> No
     actor = _TaskStateStoreActor(str(tmp_path / "task-state" / "task_state.sqlite3"))
     try:
         actor.upsert_sampling_session(session_id="sampler-a", info={"session_id": "sampler-a"})
-        assert actor.get_sampling_session(session_id="sampler-a")["session_id"] == "sampler-a"
+        _ss3 = actor.get_sampling_session(session_id="sampler-a")
+        assert _ss3 is not None
+        assert _ss3["session_id"] == "sampler-a"
 
         actor.upsert_training_session(model_id="model-a", info={"model_id": "model-a"})
-        assert actor.get_training_session(model_id="model-a")["model_id"] == "model-a"
+        _ts3 = actor.get_training_session(model_id="model-a")
+        assert _ts3 is not None
+        assert _ts3["model_id"] == "model-a"
 
         actor.upsert_gateway_sampling_session(
             sampling_session_id="sampler-a",
             upstream_alias="upstream-a",
             base_model="Qwen/Test",
         )
-        assert actor.get_gateway_sampling_session(sampling_session_id="sampler-a")["upstream_alias"] == "upstream-a"
+        _gs3 = actor.get_gateway_sampling_session(sampling_session_id="sampler-a")
+        assert _gs3 is not None
+        assert _gs3["upstream_alias"] == "upstream-a"
 
         actor.add_heartbeat_sampler_to_session_index(session_id="root-session", sampler_id="sampler-a")
-        assert actor.get_session_index(session_id="root-session")["heartbeat_sampler_ids"] == ["sampler-a"]
+        _si4 = actor.get_session_index(session_id="root-session")
+        assert _si4 is not None
+        assert _si4["heartbeat_sampler_ids"] == ["sampler-a"]
 
         actor.update_session_heartbeat(session_id="root-session", now=12.0)
         assert actor.get_session_heartbeat(session_id="root-session") == 12.0

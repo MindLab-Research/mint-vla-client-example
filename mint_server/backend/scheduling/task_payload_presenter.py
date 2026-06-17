@@ -11,6 +11,7 @@ ErrorPresenter = Callable[[str | None], dict[str, Any]]
 
 def terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
     meta = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+    assert meta is not None
     done_at = meta.get("done_at") or meta.get("failed_at") or record.get("updated_at")
     retrieved_at = record.get("updated_at") if str(record.get("status") or "") == "retrieved" else None
     try:
@@ -21,6 +22,7 @@ def terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
         retrieved_at_s = None if retrieved_at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(retrieved_at)))
     except Exception:
         retrieved_at_s = None
+        assert meta is not None
     return {
         "error": "Known terminal future evicted",
         "category": "system",

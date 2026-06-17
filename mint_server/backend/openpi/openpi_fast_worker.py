@@ -18,7 +18,7 @@ from typing import Any
 
 import numpy as np
 
-from mint_server.checkpoints import checkpoint_has_openpi_training_state
+from mint_server.checkpoints.checkpoints import checkpoint_has_openpi_training_state
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager

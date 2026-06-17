@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
-from mint_server.runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from mint_server.backend.contracts.control_plane_contracts import (
     ConflictReason,
@@ -24,7 +24,7 @@ from mint_server.backend.contracts.control_plane_contracts import (
     WireCompatibleResult,
 )
 from mint_server.backend.core.model_work_execution_context import ModelWorkFinalize, get_current_model_work_finalize_buffer
-from mint_server.logging_context import record_store_op_otel
+from mint_server.observability.logging_context import record_store_op_otel
 from mint_server.backend.stores.billing_outbox import BillingOutbox
 from mint_server.backend.stores.kv_backend import InMemoryKVBackend, KVBackend, RocksKVBackend
 from mint_server.backend.stores.task_hot_kv_store import TaskHotKVStore
@@ -291,7 +291,7 @@ def billing_observations_from_input(
         return []
     if not isinstance(billing_input, dict):
         raise ValueError("billing input must be a dict")
-    from mint_server.gateway_auth import GatewayAuthContext
+    from mint_server.gateway.gateway_auth import GatewayAuthContext
 
     required = ("charge_item", "quantity", "unit", "route", "dimension")
     missing = [key for key in required if key not in billing_input]
@@ -384,7 +384,7 @@ def _inc_reaper_rows(action: str, count: int) -> None:
     key = str(action)
     _REAPER_METRICS[key] = float(_REAPER_METRICS.get(key, 0.0)) + float(count)
     try:
-        from mint_server.logging_context import record_task_future_reaper_rows_metric
+        from mint_server.observability.logging_context import record_task_future_reaper_rows_metric
 
         record_task_future_reaper_rows_metric(action=key, count=int(count))
     except Exception:
@@ -397,7 +397,7 @@ def _inc_payload_evict_errors(count: int = 1) -> None:
         return
     _REAPER_PAYLOAD_EVICT_ERRORS_TOTAL += float(count)
     try:
-        from mint_server.logging_context import record_task_future_payload_evict_error_metric
+        from mint_server.observability.logging_context import record_task_future_payload_evict_error_metric
 
         record_task_future_payload_evict_error_metric(count=int(count))
     except Exception:
@@ -422,7 +422,7 @@ def _inc_future_timeout(kind: str, *, op: str | None = None, count: int = 1) -> 
                 rec[normalized] = float(rec.get(normalized) or 0.0) + amount
                 rec["total"] = float(rec.get("total") or 0.0) + amount
     try:
-        from mint_server.logging_context import record_task_futures_timeout_metric
+        from mint_server.observability.logging_context import record_task_futures_timeout_metric
 
         record_task_futures_timeout_metric(kind=normalized, op=op)
         record_task_futures_timeout_metric(kind="total", op=op)
@@ -785,6 +785,7 @@ def _require_staged_success_path(record: dict[str, Any], result_path: str | None
 def _terminal_completed_at(record: dict[str, Any]) -> float:
     metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     for key in ("done_at", "failed_at"):
+        assert metadata is not None
         value = metadata.get(key)
         if isinstance(value, (int, float)):
             return float(value)
@@ -883,6 +884,7 @@ class TaskStateStore:
         self._kv.delete(_domain_index_key(str(record.get("domain_key") or ""), request_id))
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         for key in _META_INDEX_KEYS:
+            assert metadata is not None
             value = metadata.get(key, record.get(key))
             if value is not None:
                 self._kv.delete(_meta_index_key(key, value, request_id))
@@ -904,6 +906,7 @@ class TaskStateStore:
         self._kv.put(_domain_index_key(str(record.get("domain_key") or ""), request_id), request_id)
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
         for key in _META_INDEX_KEYS:
+            assert metadata is not None
             value = metadata.get(key, record.get(key))
             if value is not None:
                 self._kv.put(_meta_index_key(key, value, request_id), request_id)
@@ -1898,6 +1901,7 @@ class TaskStateStore:
                     if len(out) >= max(0, int(limit)):
                         break
             metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            assert metadata is not None
             abandoned = metadata.get("abandoned_staged_payload_paths")
             if isinstance(abandoned, list) and float(record.get("updated_at") or 0.0) <= cutoff:
                 for path in abandoned:
@@ -2090,6 +2094,7 @@ class TaskStateStore:
             if status_values and str(record.get("status")) not in status_values:
                 continue
             metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+            assert metadata is not None
             if all(metadata.get(key, record.get(key)) == value for key, value in normalized_filters.items()):
                 out.append(dict(record))
                 if len(out) >= int(limit):
@@ -2659,7 +2664,7 @@ def _future_state_store_db_path(task_state_db_path: str | None = None) -> str:
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
         try:
-            from mint_server.logging_context import init_actor_observability
+            from mint_server.observability.logging_context import init_actor_observability
 
             init_actor_observability()
         except Exception:
@@ -4964,6 +4969,7 @@ class TaskFutureService:
             state_client = self._task_state
         status = str(record.get("status"))
         metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        assert metadata is not None
         if status == "retrieved" and str(metadata.get("terminal_status") or "done") != "done":
             raise KeyError(f"Future already retrieved without result: {request_id}")
         if status not in {"done", "retrieved"}:
@@ -5237,7 +5243,7 @@ class TaskFutureService:
         try:
             from datetime import datetime, timezone
 
-            from mint_server.usage_store import UsageEvent, get_usage_store, is_permanent_usage_write_error
+            from mint_server.billing.usage_store import UsageEvent, get_usage_store, is_permanent_usage_write_error
 
             events: list[UsageEvent] = []
             for row in rows:

@@ -5,7 +5,7 @@ import structlog
 import time
 from typing import Any
 
-from mint_server.logging_context import run_async_with_otel_span
+from mint_server.observability.logging_context import run_async_with_otel_span
 from mint_server.backend.contracts.control_plane_contracts import ExecutorOutcome
 
 logger = structlog.get_logger(__name__)

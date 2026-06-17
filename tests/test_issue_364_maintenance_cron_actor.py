@@ -152,7 +152,7 @@ def test_issue_364_sampling_cleanup_runner_proxies_results(monkeypatch) -> None:
 async def test_issue_364_runtime_degraded_cron_is_internal_health_degraded(monkeypatch) -> None:
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     from mint_server import health_checks
-    from mint_server.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
+    from mint_server.health.health_state import clear_runtime_degraded_state, set_runtime_degraded_state
 
     now = 1000.0
 

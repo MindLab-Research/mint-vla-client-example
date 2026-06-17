@@ -9,14 +9,14 @@ import uuid
 from typing import Any
 
 from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
-from mint_server.runtime_env import env_nonempty
-from mint_server.checkpoints import (
+from mint_server.ray.runtime_env import env_nonempty
+from mint_server.checkpoints.checkpoints import (
     get_checkpoint_mirror_poll_s,
     get_checkpoint_reap_interval_s,
     process_pending_checkpoint_mirrors,
     reap_runtime_checkpoints,
 )
-from mint_server.ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
+from mint_server.ray.ray_utils import register_ray_reconnect_invalidator as _register_ray_reconnect_invalidator
 from mint_server.server_info import _git_sha
 from mint_server.backend.ray_cluster.async_ray_control import _await_with_ray_get_timeout, sync_get_ray_ref
 
@@ -185,7 +185,7 @@ def _get_or_create_actor():
     @ray.remote(num_cpus=0, max_concurrency=64)
     class _MaintenanceCronActor:
         def __init__(self) -> None:
-            from mint_server.logging_context import init_actor_observability
+            from mint_server.observability.logging_context import init_actor_observability
 
             init_actor_observability()
             self._epoch_id = uuid.uuid4().hex

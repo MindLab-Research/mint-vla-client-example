@@ -362,6 +362,7 @@ def _patch_torch_fsdp2_cpu_offload_validation_module(fsdp_param_group: ModuleTyp
 
     _mark(_validate_cpu_offload_params, "_fsdp2_cpu_offload_validation")
     _validate_cpu_offload_params._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls._validate_cpu_offload_params = _validate_cpu_offload_params
 
 
@@ -410,6 +411,7 @@ def _patch_verl_ray_resource_pool_module(ray_base: ModuleType) -> None:
 
     _mark(get_placement_groups, "_verl_resource_pool")
     get_placement_groups._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls.get_placement_groups = get_placement_groups
 
 
@@ -807,6 +809,7 @@ def _patch_verl_fsdp_transformer_impl_module(transformer_impl: ModuleType) -> No
 
     _mark(get_per_tensor_param, "_fsdp_transformer_impl")
     get_per_tensor_param._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls.get_per_tensor_param = get_per_tensor_param
 
 
@@ -909,6 +912,7 @@ def _patch_sglang_scheduler_update_weights_mixin_module(scheduler_update_weights
 
     _mark(resume_memory_occupation, "_sglang_resume_memory")
     resume_memory_occupation._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls.resume_memory_occupation = resume_memory_occupation
 
 
@@ -936,6 +940,7 @@ def _patch_verl_sglang_rollout_module(sglang_rollout: ModuleType) -> None:
         for key in ("task_type", "peft_type"):
             value = peft_config_json.get(key)
             if hasattr(value, "value"):
+                assert value is not None
                 peft_config_json[key] = value.value
             elif value is None:
                 peft_config_json[key] = None
@@ -976,6 +981,7 @@ def _patch_verl_sglang_rollout_module(sglang_rollout: ModuleType) -> None:
 
     _mark(wrap_lora_params, "_sglang_rollout_wrap_lora")
     wrap_lora_params._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls.wrap_lora_params = wrap_lora_params
 
 
@@ -1060,6 +1066,7 @@ def _patch_verl_sglang_http_server_engine_module(http_server_engine: ModuleType)
 
     _mark(_make_async_request, "_sglang_http_error_body")
     _make_async_request._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls._make_async_request = _make_async_request
 
 
@@ -1088,6 +1095,7 @@ def _patch_verl_llm_server_module(llm_server: ModuleType) -> None:
 
     _mark(_init_global_load_balancer, "_llm_server_pin")
     _init_global_load_balancer._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls._init_global_load_balancer = _init_global_load_balancer
 
 
@@ -1133,6 +1141,7 @@ def _patch_verl_agent_loop_module(agent_loop: ModuleType) -> None:
 
     _mark(_init_agent_loop_workers, "_agent_loop_pin")
     _init_agent_loop_workers._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls._init_agent_loop_workers = _init_agent_loop_workers
 
 
@@ -1175,6 +1184,7 @@ def _patch_verl_reward_loop_module(reward_loop: ModuleType) -> None:
 
     _mark(_init_reward_loop_workers, "_reward_loop_pin")
     _init_reward_loop_workers._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls._init_reward_loop_workers = _init_reward_loop_workers
 
 
@@ -1217,7 +1227,9 @@ def _patch_verl_sglang_async_server_module(async_sglang_server: ModuleType) -> N
 
     _mark(patched, "_sglang_generate_lora")
     patched._mint_qwen36_original = original  # type: ignore[attr-defined]
+    assert cls is not None
     cls.generate = patched
+    assert patched is not None
     print(
         "MinT Qwen3.6 veRL FSDP2 LoRA patch: SGLangHttpServer.generate "
         f"patched ({patched._mint_qwen36_patch_mode})",

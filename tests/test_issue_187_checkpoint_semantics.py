@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from mint_server.checkpoints import (
+from mint_server.checkpoints.checkpoints import (
     checkpoint_has_optimizer_state,
     validate_checkpoint_dir,
     validate_checkpoint_load_contract,

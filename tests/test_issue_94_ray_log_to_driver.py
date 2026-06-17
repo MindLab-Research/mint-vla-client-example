@@ -84,7 +84,7 @@ def test_issue_94_init_ray_injects_log_to_driver(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.37.185:6379")
     monkeypatch.delenv("MINT_RAY_LOG_TO_DRIVER", raising=False)
@@ -102,7 +102,7 @@ def test_issue_94_init_ray_does_not_override_explicit_kwarg(monkeypatch) -> None
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("MINT_RAY_LOG_TO_DRIVER", "1")
     init_ray(address="127.0.0.1:6379", namespace="ns", ignore_reinit_error=True, log_to_driver=False)
@@ -114,7 +114,7 @@ def test_issue_94_init_ray_does_not_package_shared_mint_code_root(monkeypatch) -
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.143:10001")
     monkeypatch.setenv("MINT_CODE_ROOT", "/vePFS-Mindverse/share/code/conley/mint-server")
@@ -131,7 +131,7 @@ def test_issue_94_init_ray_merges_runtime_env_without_overriding_working_dir(mon
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.143:10001")
     init_ray(
@@ -149,7 +149,7 @@ def test_issue_94_init_ray_prefers_mint_client_address(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
@@ -162,7 +162,7 @@ def test_issue_94_init_ray_preserves_explicit_runtime_env(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
     init_ray(namespace="ns", ignore_reinit_error=True, runtime_env={"py_modules": ["x"]})
@@ -175,7 +175,7 @@ def test_issue_94_init_ray_requires_explicit_address(monkeypatch) -> None:
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import MissingRayAddressError, init_ray
+    from mint_server.ray.ray_utils import MissingRayAddressError, init_ray
 
     monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
     monkeypatch.delenv("RAY_CLIENT_ADDRESS", raising=False)
@@ -188,7 +188,7 @@ def test_issue_94_init_ray_prefers_client_address(monkeypatch, tmp_path: Path) -
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("RAY_ADDRESS", "legacy-ignored:6379")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10001")
@@ -207,7 +207,7 @@ def test_issue_94_init_ray_prefers_configured_head_address_path(monkeypatch, tmp
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     head_address = tmp_path / "ray-head.txt"
     head_address.write_text("192.168.50.10\n", encoding="utf-8")
@@ -250,18 +250,20 @@ def test_issue_94_init_ray_reconnects_when_head_address_path_changes(monkeypatch
 
 
 def test_issue_94_client_job_runtime_env_uses_working_dir(monkeypatch, tmp_path: Path) -> None:
-    from mint_server.ray_utils import client_job_runtime_env
+    from mint_server.ray.ray_utils import client_job_runtime_env
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
     monkeypatch.setenv("MINT_RAY_JOB_WORKING_DIR", str(tmp_path))
 
     runtime_env = client_job_runtime_env()
+    assert runtime_env is not None
     assert runtime_env["working_dir"] == str(tmp_path)
+    assert runtime_env is not None
     _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
 def test_issue_94_client_job_runtime_env_uses_pythonpath_without_packaging_code_root(monkeypatch, tmp_path: Path) -> None:
-    from mint_server.ray_utils import client_job_runtime_env
+    from mint_server.ray.ray_utils import client_job_runtime_env
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
     monkeypatch.setenv("MINT_CODE_ROOT", str(tmp_path))
@@ -278,7 +280,7 @@ def test_issue_94_client_job_runtime_env_uses_pythonpath_without_packaging_code_
 
 
 def test_issue_94_client_job_runtime_env_allows_explicit_short_pythonpath(monkeypatch) -> None:
-    from mint_server.ray_utils import client_job_runtime_env
+    from mint_server.ray.ray_utils import client_job_runtime_env
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.39.23:10002")
     monkeypatch.setenv("MINT_CODE_ROOT", "/shared/full-runtime-path-should-not-win")
@@ -286,7 +288,9 @@ def test_issue_94_client_job_runtime_env_allows_explicit_short_pythonpath(monkey
 
     runtime_env = client_job_runtime_env()
 
+    assert runtime_env is not None
     assert runtime_env["env_vars"]["PYTHONPATH"] == "/shared/mint-code"
+    assert runtime_env is not None
     _assert_removed_attach_hints(runtime_env["env_vars"])
 
 
@@ -294,7 +298,7 @@ def test_issue_94_init_ray_uses_explicit_client_working_dir(monkeypatch, tmp_pat
     calls: list[dict] = []
     _install_ray_stub(calls, monkeypatch)
 
-    from mint_server.ray_utils import init_ray
+    from mint_server.ray.ray_utils import init_ray
 
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.143:10001")
     monkeypatch.setenv("MINT_RAY_WORKING_DIR", str(tmp_path))

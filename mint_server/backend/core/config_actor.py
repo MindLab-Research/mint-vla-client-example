@@ -10,8 +10,8 @@ from typing import Any
 import ray
 
 from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
-from mint_server.config_hydration import CONFIG_ACTOR_SELF_ENV
-from mint_server.runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
+from mint_server.config.config_hydration import CONFIG_ACTOR_SELF_ENV
+from mint_server.config.runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
 
 logger = structlog.get_logger(__name__)
 
@@ -114,6 +114,7 @@ def get_snapshot(*, timeout_s: float = 10.0) -> dict[str, object]:
             raise ConfigActorUnavailableError(
                 f"ConfigActor unavailable actor_name={actor_name!r} namespace={_ray_namespace()!r}"
             ) from e
+    assert _ACTOR_HANDLE is not None
     return ray.get(_ACTOR_HANDLE.get_snapshot.remote(), timeout=timeout_s)
 
 
@@ -131,6 +132,7 @@ def ping(*, timeout_s: float = 5.0) -> dict[str, object]:
             raise ConfigActorUnavailableError(
                 f"ConfigActor unavailable actor_name={actor_name!r} namespace={_ray_namespace()!r}"
             ) from e
+    assert _ACTOR_HANDLE is not None
     out = ray.get(_ACTOR_HANDLE.ping.remote(), timeout=timeout_s)
     if not isinstance(out, dict):
         raise TypeError(f"ConfigActor.ping returned non-dict: {type(out)}")

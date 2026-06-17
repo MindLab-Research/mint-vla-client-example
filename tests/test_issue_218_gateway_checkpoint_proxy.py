@@ -93,7 +93,7 @@ def test_issue_218_async_checkpoint_archive_cancels_ray_task_on_timeout(tmp_path
 
 def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
     import mint_server.gateway.gateway as gw
-    from mint_server.gateway import Upstream
+    from mint_server.gateway.gateway import Upstream
     from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
     from mint_server.routes import training as tr
 
@@ -164,7 +164,7 @@ def test_issue_218_gateway_create_model_from_state_proxies_local_checkpoint_dir(
 
 def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, monkeypatch):
     import mint_server.gateway.gateway as gw
-    from mint_server.gateway import Upstream
+    from mint_server.gateway.gateway import Upstream
     from mint_server.models.types import LoadStateRequest
     from mint_server.routes import weights as wt
 
@@ -230,7 +230,7 @@ def test_issue_218_gateway_load_state_proxies_local_checkpoint_dir(tmp_path, mon
 
 def test_issue_218_gateway_create_model_from_state_forwards_owner_scope(tmp_path, monkeypatch):
     import mint_server.gateway.gateway as gw
-    from mint_server.gateway import Upstream
+    from mint_server.gateway.gateway import Upstream
     from mint_server.models.types import CreateModelFromStateRequest, LoRAConfig
     from mint_server.routes import training as tr
 
@@ -291,7 +291,7 @@ def test_issue_218_gateway_create_model_from_state_forwards_owner_scope(tmp_path
 
 def test_issue_218_gateway_load_state_forwards_owner_scope(tmp_path, monkeypatch):
     import mint_server.gateway.gateway as gw
-    from mint_server.gateway import Upstream
+    from mint_server.gateway.gateway import Upstream
     from mint_server.models.types import LoadStateRequest
     from mint_server.routes import weights as wt
 
