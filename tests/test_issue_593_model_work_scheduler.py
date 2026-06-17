@@ -614,7 +614,7 @@ def test_scheduler_client_forwards_sync_replicas_hydration_flag(monkeypatch: pyt
 
 
 def test_issue_638_scheduler_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     calls = {"count": 0}
     monkeypatch.setattr(logging_context, "init_actor_observability", lambda: calls.__setitem__("count", calls["count"] + 1))
@@ -627,7 +627,7 @@ def test_issue_638_scheduler_registers_actor_observability(monkeypatch: pytest.M
 def test_issue_638_scheduler_registers_otel_gauges(monkeypatch: pytest.MonkeyPatch) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -659,7 +659,7 @@ def test_issue_638_scheduler_otel_callbacks_emit_existing_dashboard_metrics(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 
@@ -725,7 +725,7 @@ def test_issue_638_scheduler_otel_callbacks_do_not_start_assignment_loop(
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     gauges: dict[str, list] = {}
 

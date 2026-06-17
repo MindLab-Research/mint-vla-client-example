@@ -384,7 +384,7 @@ def test_issue_638_task_state_store_registers_otel_future_and_billing_gauges(
     import opentelemetry.metrics as otel_metrics
 
     import mint_server.backend.stores.task_state_store as task_state_store_module
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     task_state_store_module._FUTURE_TIMEOUT_METRICS.clear()
     task_state_store_module._FUTURE_TIMEOUT_METRICS.update(

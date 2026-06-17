@@ -13,7 +13,7 @@ from mint_server.routes import futures as futures_route
 
 def _reset_gateway_and_cache():
     """Reset gateway config and _recent cache."""
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     gw._gateway_config = None
     gw._remote_sampling_sessions.clear()
     gw._remote_training_models.clear()
@@ -63,7 +63,7 @@ async def test_gateway_retrieve_future_caches_terminal_response(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(200, {"result": "success", "data": "test_data"})
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
     monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
@@ -107,7 +107,7 @@ async def test_gateway_retrieve_future_caches_error_response(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(200, {"error": "Future already retrieved", "category": "system"})
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:xyz789")
@@ -148,7 +148,7 @@ async def test_gateway_retrieve_future_does_not_cache_pending(monkeypatch):
         forward_call_count += 1
         return _mock_upstream_response(408, {})
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
     monkeypatch.setattr(futures_route, "record_retrieve_future_wait_metric", lambda **kwargs: metrics.append(kwargs))
 
@@ -193,7 +193,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_public_error_an
             {"error": "sensitive internal detail", "category": "system", "request_id": "upstream-123"},
         )
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-123")
@@ -235,7 +235,7 @@ async def test_gateway_retrieve_future_cached_response_preserves_terminal_status
         forward_call_count += 1
         return _mock_upstream_response(503, {"detail": "internal upstream detail"})
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     monkeypatch.setattr(gw, "forward_json", mock_forward_json)
 
     body = FutureRetrieveRequest(request_id="gw:test-upstream:upstream-503")

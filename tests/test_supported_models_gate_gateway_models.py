@@ -19,8 +19,8 @@ def _gateway_cfg() -> dict:
 
 @pytest.mark.anyio
 async def test_enforce_base_model_allowed_accepts_supported_gateway_model(monkeypatch):
-    import mint_server.gateway as gw
-    import mint_server.supported_models_gate as gate
+    import mint_server.gateway.gateway as gw
+    import mint_server.auth.supported_models_gate as gate
 
     gw._gateway_config = None
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B,zai-org/GLM-5")
@@ -43,8 +43,8 @@ async def test_enforce_base_model_allowed_accepts_supported_gateway_model(monkey
 
 @pytest.mark.anyio
 async def test_enforce_base_model_allowed_rejects_unadvertised_gateway_model(monkeypatch):
-    import mint_server.gateway as gw
-    import mint_server.supported_models_gate as gate
+    import mint_server.gateway.gateway as gw
+    import mint_server.auth.supported_models_gate as gate
 
     gw._gateway_config = None
     monkeypatch.setenv("MINT_SUPPORTED_MODELS", "Qwen/Qwen3-0.6B")

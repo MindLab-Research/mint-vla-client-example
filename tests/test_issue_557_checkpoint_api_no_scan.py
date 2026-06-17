@@ -270,7 +270,7 @@ def test_issue_557_mint_helper_requires_owner_id_for_admin() -> None:
 def test_issue_557_mint_action_session_admin_missing_owner_id_returns_400(tmp_path, monkeypatch) -> None:
     from mint_server import checkpoints
     from mint_server.routes import mint as mint_routes
-    import mint_server.supported_models_gate as model_gate
+    import mint_server.auth.supported_models_gate as model_gate
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -319,7 +319,7 @@ def test_issue_557_mint_action_session_admin_missing_owner_id_returns_400(tmp_pa
 def test_issue_557_mint_action_session_admin_accepts_owner_id(tmp_path, monkeypatch) -> None:
     from mint_server import checkpoints
     from mint_server.routes import mint as mint_routes
-    import mint_server.supported_models_gate as model_gate
+    import mint_server.auth.supported_models_gate as model_gate
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"
     _touch(ckpt_dir / "adapter_model.safetensors")
@@ -370,7 +370,7 @@ def test_issue_557_mint_action_session_admin_accepts_owner_id(tmp_path, monkeypa
 
 def test_issue_557_weights_archive_sdk_redirect_token_uses_owner_scope(tmp_path, monkeypatch) -> None:
     from mint_server import checkpoints
-    import mint_server.config as config_module
+    import mint_server.config.config as config_module
     from mint_server.routes import weights as wt
 
     ckpt_dir = tmp_path / "owner-a" / "run-557" / "ckpt-a" / "training"

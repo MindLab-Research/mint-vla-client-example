@@ -261,7 +261,7 @@ def test_ensure_sampling_session_generates_parent_session_id(monkeypatch):
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager("Qwen/Qwen3-4B-Instruct-2507"))
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return None
@@ -292,7 +292,7 @@ def test_ensure_sampling_session_uses_base_model_for_plain_model_names(monkeypat
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager("Qwen/Qwen3-30B-A3B-Instruct-2507"))
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return None
@@ -319,7 +319,7 @@ def test_ensure_sampling_session_returns_gateway_session_base_model(monkeypatch)
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager(None))
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return ("aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")
@@ -347,7 +347,7 @@ def test_ensure_sampling_session_allows_routed_base_model_creation(monkeypatch):
     monkeypatch.setattr(service_route, "create_sampling_session", _fake_create_sampling_session)
     monkeypatch.setattr(service_route, "session_manager", _StubSessionManager(None))
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
 
     async def _remote_sampling_session(_sid):
         return ("mint-prod-aliyun", "Qwen/Qwen3-235B-A22B-Instruct-2507")

@@ -183,8 +183,8 @@ def test_create_sampling_session_deterministic_idempotent(monkeypatch):
     monkeypatch.setattr(service_route, "session_manager", stub)
     _install_detached_sampling_store(monkeypatch)
 
-    import mint_server.supported_models_gate as gate
-    import mint_server.gateway as gw
+    import mint_server.auth.supported_models_gate as gate
+    import mint_server.gateway.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model
@@ -211,8 +211,8 @@ def test_create_sampling_session_conflict(monkeypatch):
     monkeypatch.setattr(service_route, "session_manager", stub)
     _install_detached_sampling_store(monkeypatch)
 
-    import mint_server.supported_models_gate as gate
-    import mint_server.gateway as gw
+    import mint_server.auth.supported_models_gate as gate
+    import mint_server.gateway.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model
@@ -251,8 +251,8 @@ def test_create_sampling_session_keeps_generic_samplers_out_of_heartbeat_fanout(
     monkeypatch.setattr(service_route, "session_manager", stub)
 
     import mint_server.backend.stores.session_index_store as sis
-    import mint_server.supported_models_gate as gate
-    import mint_server.gateway as gw
+    import mint_server.auth.supported_models_gate as gate
+    import mint_server.gateway.gateway as gw
 
     async def _allow(base_model: str, http_request=None):
         return base_model

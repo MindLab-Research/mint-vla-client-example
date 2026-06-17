@@ -266,7 +266,7 @@ def test_issue_182_pending_payload_training_correlation_fields(monkeypatch):
 
 def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
     import httpx
-    import mint_server.gateway as gateway
+    import mint_server.gateway.gateway as gateway
 
     monkeypatch.setattr(gateway, "decode_request_id", lambda rid: ("upstream-a", "raw-123"))
     monkeypatch.setattr(
@@ -295,7 +295,7 @@ def test_issue_182_gateway_request_id_overrides_upstream(monkeypatch):
 
 def test_issue_182_gateway_request_id_overrides_upstream_200(monkeypatch):
     import httpx
-    import mint_server.gateway as gateway
+    import mint_server.gateway.gateway as gateway
 
     monkeypatch.setattr(gateway, "decode_request_id", lambda rid: ("upstream-a", "raw-123"))
     monkeypatch.setattr(

@@ -88,7 +88,7 @@ def _build_client(monkeypatch, pool: _FakePool, *, patch_placement_groups: bool 
 
 
 def test_list_actors_uses_startup_ray_driver_without_request_path_init(monkeypatch) -> None:
-    import mint_server.ray_utils as ray_utils
+    import mint_server.ray.ray_utils as ray_utils
 
     _install_ray_stub(monkeypatch)
     init_ray_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
@@ -343,7 +343,7 @@ def test_kill_dense_actors_returns_503_when_pg_removal_fails(monkeypatch) -> Non
 
 def test_infer_base_model_from_checkpoint_passes_admin_scope(monkeypatch, tmp_path) -> None:
     from mint_server.routes import service as service_routes
-    import mint_server.checkpoints as checkpoints
+    import mint_server.checkpoints.checkpoints as checkpoints
 
     checkpoint_dir = tmp_path / "admin-ckpt"
     checkpoint_dir.mkdir()

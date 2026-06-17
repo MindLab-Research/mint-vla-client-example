@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-import mint_server.logging_context as logging_context
+import mint_server.observability.logging_context as logging_context
 
 
 def test_issue_301_configure_logging_fallback_without_structlog(monkeypatch):

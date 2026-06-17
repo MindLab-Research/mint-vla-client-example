@@ -77,7 +77,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
     dense_root = tmp_path / "runtime" / "dense_session_state"
     monkeypatch.setattr(server_config, "training_dense_session_state_root", str(dense_root))
 
-    import mint_server.config as config_module
+    import mint_server.config.config as config_module
 
     runtime_env_root = (tmp_path / "runtime_env").resolve()
     runtime_env_root.mkdir(parents=True, exist_ok=True)
@@ -147,7 +147,7 @@ def test_issue_413_shutdown_session_reclaims_dense_state_for_shared_actor(
 def test_issue_413_otel_metrics_include_dense_session_state(monkeypatch: pytest.MonkeyPatch) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     callbacks: dict[str, object] = {}
 
@@ -194,7 +194,7 @@ def test_issue_413_configure_logging_does_not_register_api_process_gauges_for_ac
 ) -> None:
     import opentelemetry.metrics as otel_metrics
 
-    import mint_server.logging_context as logging_context
+    import mint_server.observability.logging_context as logging_context
 
     created: list[str] = []
 

@@ -22,7 +22,7 @@ def main() -> None:
         os.environ["MINT_CHECKPOINT_DIR"] = str(root)
 
         from importlib import reload
-        import mint_server.checkpoints as checkpoints
+        import mint_server.checkpoints.checkpoints as checkpoints
 
         reload(checkpoints)
 

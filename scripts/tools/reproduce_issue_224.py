@@ -23,7 +23,7 @@ def main() -> int:
         }
     )
 
-    import mint_server.gateway as gw
+    import mint_server.gateway.gateway as gw
     import mint_server.backend as backend
 
     gw._gateway_config = None
