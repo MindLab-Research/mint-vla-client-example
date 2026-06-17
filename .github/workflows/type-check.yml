@@ -1,0 +1,30 @@
+name: Type Check (non-blocking)
+
+on:
+  pull_request:
+    branches:
+      - develop
+  push:
+    branches:
+      - develop
+
+jobs:
+  pyright:
+    runs-on: [self-hosted, linux]
+    timeout-minutes: 15
+    env:
+      UV_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install pyright
+        run: |
+          uv venv --python 3.12
+          uv pip install --python .venv/bin/python --index-url "$UV_INDEX_URL" \
+            pyright==1.1.409
+
+      - name: Run pyright (project-wide)
+        run: uv run --no-sync pyright

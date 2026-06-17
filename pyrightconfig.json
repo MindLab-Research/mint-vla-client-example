@@ -1,0 +1,18 @@
+{
+  "include": [
+    "mint_server",
+    "tests",
+    "scripts"
+  ],
+  "exclude": [
+    "**/__pycache__",
+    ".worktree",
+    ".worktrees",
+    "**/.venv",
+    "**/node_modules"
+  ],
+  "typeCheckingMode": "strict",
+  "reportMissingModuleSource": "none",
+  "pythonVersion": "3.12",
+  "pythonPlatform": "Linux"
+}
