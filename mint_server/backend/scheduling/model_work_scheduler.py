@@ -363,6 +363,7 @@ class _ModelWorkSchedulerActor:
         )
         self._scheduler_epoch: int | None = None
         self._task_state_hydrated = False
+        self._last_owner_ensure_at = 0.0
         self._domain_backlog: dict[str, deque[ModelWorkItem]] = {}
         self._replicas: dict[tuple[str, str], ModelReplicaRegistration] = {}
         self._replica_queues: dict[tuple[str, str], deque[_AssignedWork]] = {}
@@ -651,6 +652,7 @@ class _ModelWorkSchedulerActor:
     async def _ensure_task_state_owner(self) -> int | None:
         if not self._use_task_state_store:
             return None
+        now = time.monotonic()
         ttl_s = float(getattr(server_config, "task_state_store_owner_ttl_s", 30.0))
         while True:
             async with self._task_state_owner_lock:
@@ -667,6 +669,7 @@ class _ModelWorkSchedulerActor:
                     async with self._task_state_owner_lock:
                         if self._scheduler_epoch in {None, int(current_epoch)}:
                             self._scheduler_epoch = int(current_epoch)
+                            self._last_owner_ensure_at = now
                             return int(current_epoch)
                     continue
 
@@ -686,6 +689,7 @@ class _ModelWorkSchedulerActor:
             acquired_epoch = int(acquired.epoch or 0)
             async with self._task_state_owner_lock:
                 self._scheduler_epoch = acquired_epoch
+                self._last_owner_ensure_at = time.monotonic()
             return acquired_epoch
 
     async def _owner_heartbeat_loop(self) -> None:
@@ -976,21 +980,24 @@ class _ModelWorkSchedulerActor:
         item: ModelWorkItem,
         *,
         append_attempt_id: str,
+        _durable: dict[str, object] | None = None,
     ) -> None:
         if not self._use_task_state_store:
             return
         if not append_attempt_id:
             return
-        try:
-            task_record = await self._task_state_call("get_task", request_id=item.request_id)
-        except Exception as exc:
-            if self._task_not_found_cause(exc) is not None:
+        task_record: object | None = _durable
+        if task_record is None:
+            try:
+                task_record = await self._task_state_call("get_task", request_id=item.request_id)
+            except Exception as exc:
+                if self._task_not_found_cause(exc) is not None:
+                    return
+                logger.exception(
+                    "[model_work_scheduler] failed to inspect task before append cancellation rollback request_id=%s",
+                    item.request_id,
+                )
                 return
-            logger.exception(
-                "[model_work_scheduler] failed to inspect task before append cancellation rollback request_id=%s",
-                item.request_id,
-            )
-            return
         if not isinstance(task_record, (TaskRecord, dict)):
             return
         record = self._task_record_data(task_record)
@@ -1047,26 +1054,41 @@ class _ModelWorkSchedulerActor:
     def _restore_assigning_to_backlog_locked(self, assigned: _AssignedWork) -> bool:
         return self._queue_projection.restore_assigning_to_backlog_locked(assigned)
 
-    async def _restore_or_commit_assigning_after_cancel(self, pending: list[_AssignedWork]) -> None:
+    async def _restore_or_commit_assigning_after_cancel(
+        self,
+        pending: list[_AssignedWork],
+        *,
+        _durable_results: dict[str, dict[str, object]] | None = None,
+    ) -> None:
         async with self._cv:
             if not self._use_task_state_store:
                 for assigned in reversed(pending):
                     self._restore_assigning_to_backlog_locked(assigned)
                 return
+        durable_map = _durable_results or {}
         for assigned in pending:
             durable_assigned = False
-            try:
-                task_record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
-                record = self._task_record_data(task_record)
+            rid = assigned.item.request_id
+            if rid in durable_map:
+                record = durable_map[rid]
                 durable_assigned = (
                     str(record.get("status") or "") == "assigned"
                     and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
                     and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
                 )
-            except Exception:
-                durable_assigned = False
+            else:
+                try:
+                    task_record = await self._task_state_call("get_task", request_id=rid)
+                    record = self._task_record_data(task_record)
+                    durable_assigned = (
+                        str(record.get("status") or "") == "assigned"
+                        and str(record.get("subqueue_id") or "") == str(assigned.queue_id)
+                        and int(record.get("scheduler_epoch") or 0) == int(self._scheduler_epoch or 0)
+                    )
+                except Exception:
+                    durable_assigned = False
             async with self._cv:
-                if self._request_locations.get(assigned.item.request_id) != "assigning":
+                if self._request_locations.get(rid) != "assigning":
                     continue
                 if durable_assigned:
                     self._commit_assigned_locked(assigned)
@@ -1082,17 +1104,23 @@ class _ModelWorkSchedulerActor:
             if not pending:
                 return AssignPendingResult(ok=True, assigned=0, skipped_domains=skipped_domains)
         assigned_count = 0
+        assign_results: dict[str, dict[str, object]] = {}
         for index, assigned in enumerate(pending):
             try:
                 if self._use_task_state_store:
-                    await self._task_state_call(
+                    result = await self._task_state_call(
                         "assign_task",
                         request_id=assigned.item.request_id,
                         subqueue_id=assigned.queue_id,
                         scheduler_epoch=int(self._scheduler_epoch or 0),
                     )
+                    if isinstance(result, TaskMutationResult) and result.record:
+                        assign_results[assigned.item.request_id] = result.record
             except asyncio.CancelledError:
-                await self._restore_or_commit_assigning_after_cancel(pending[index:])
+                await self._restore_or_commit_assigning_after_cancel(
+                    pending[index:],
+                    _durable_results=assign_results,
+                )
                 raise
             except Exception as exc:
                 conflict = self._claim_conflict_cause(exc)
@@ -1190,9 +1218,10 @@ class _ModelWorkSchedulerActor:
         consumer_id: str,
         consumer_generation: int,
         lease_ttl_s: float,
+        _durable: dict[str, object] | None = None,
     ) -> None:
-        durable_record: dict[str, Any] | None = None
-        if self._use_task_state_store:
+        durable_record: dict[str, Any] | None = _durable  # type: ignore[assignment]
+        if _durable is None and self._use_task_state_store:
             try:
                 task_record = await self._task_state_call(
                     "get_task",
@@ -1517,6 +1546,7 @@ class _ModelWorkSchedulerActor:
                 await self._forget_created_task_after_append_cancel(
                     work,
                     append_attempt_id=append_attempt_id,
+                    _durable=created.record if isinstance(created, CreateTaskResult) else None,
                 )
                 raise
             if isinstance(created, CreateTaskResult) and not created.created:
@@ -1561,6 +1591,7 @@ class _ModelWorkSchedulerActor:
                 await self._forget_created_task_after_append_cancel(
                     work,
                     append_attempt_id=append_attempt_id,
+                    _durable=created.record,
                 )
             raise
         except Exception:
@@ -1570,6 +1601,7 @@ class _ModelWorkSchedulerActor:
                 await self._forget_created_task_after_append_cancel(
                     work,
                     append_attempt_id=append_attempt_id,
+                    _durable=created.record,
                 )
             raise
         return AppendWorkResult(
@@ -1597,17 +1629,13 @@ class _ModelWorkSchedulerActor:
                         "cancel_reason": str(reason),
                     },
                 )
+            except TaskStateConflictError:
+                # Task is already in a conflicting state (e.g. already terminal).
+                # Treat as success — no need for a second get_task call.
+                pass
             except Exception as exc:
-                if self._task_not_found_cause(exc) is not None:
-                    pass
-                else:
-                    try:
-                        task_record = await self._task_state_call("get_task", request_id=request_id)
-                        record = self._task_record_data(task_record)
-                    except Exception:
-                        raise exc
-                    if str(record.get("status") or "") not in TERMINAL_TASK_STATUSES:
-                        raise exc
+                if self._task_not_found_cause(exc) is None:
+                    raise
         async with self._cv:
             removed = self._remove_request_from_memory_locked(request_id)
             if removed:
@@ -1914,8 +1942,9 @@ class _ModelWorkSchedulerActor:
                 queue.popleft()
                 self._request_locations[assigned.item.request_id] = "claiming"
             if self._use_task_state_store:
+                claim_durable: dict[str, object] | None = None
                 try:
-                    await self._task_state_call(
+                    claim_result = await self._task_state_call(
                         "claim_task",
                         request_id=item.request_id,
                         subqueue_id=assigned.queue_id,
@@ -1926,6 +1955,8 @@ class _ModelWorkSchedulerActor:
                         runtime_generation=int(consumer_generation),
                         lease_ttl_s=max(1.0, float(lease_ttl_s)),
                     )
+                    if isinstance(claim_result, TaskMutationResult) and claim_result.record:
+                        claim_durable = claim_result.record
                 except asyncio.CancelledError:
                     await self._restore_or_commit_claiming_after_cancel(
                         assigned,
@@ -1934,6 +1965,7 @@ class _ModelWorkSchedulerActor:
                         consumer_id=consumer_id,
                         consumer_generation=int(consumer_generation),
                         lease_ttl_s=lease_ttl_s,
+                        _durable=claim_durable,
                     )
                     raise
                 except Exception as e:
@@ -2016,8 +2048,9 @@ class _ModelWorkSchedulerActor:
             scheduler_epoch = int(self._scheduler_epoch or 0)
             self._request_locations[request_id] = "finalizing"
         if self._use_task_state_store:
+            finalize_result: Any = None
             try:
-                await self._task_state_call(
+                finalize_result = await self._task_state_call(
                     "begin_finalize",
                     request_id=request_id,
                     lease_id=str(lease_id),
@@ -2029,18 +2062,32 @@ class _ModelWorkSchedulerActor:
                 )
             except asyncio.CancelledError:
                 durable_finalizing = False
-                try:
-                    task_record = await self._task_state_call("get_task", request_id=request_id)
-                    record = self._task_record_data(task_record)
+                _fr: dict[str, object] | None = (
+                    finalize_result.record
+                    if isinstance(finalize_result, TaskMutationResult)
+                    else None
+                )
+                if _fr is not None:
                     durable_finalizing = (
-                        str(record.get("status") or "") == "finalizing"
-                        and str(record.get("lease_id") or "") == str(lease_id)
-                        and str(record.get("attempt_id") or "") == str(attempt_id)
-                        and int(record.get("scheduler_epoch") or 0) == scheduler_epoch
-                        and int(record.get("runtime_generation") or 0) == int(consumer_generation)
+                        str(_fr.get("status") or "") == "finalizing"
+                        and str(_fr.get("lease_id") or "") == str(lease_id)
+                        and str(_fr.get("attempt_id") or "") == str(attempt_id)
+                        and int(_fr.get("scheduler_epoch") or 0) == scheduler_epoch
+                        and int(_fr.get("runtime_generation") or 0) == int(consumer_generation)
                     )
-                except Exception:
-                    durable_finalizing = False
+                else:
+                    try:
+                        task_record = await self._task_state_call("get_task", request_id=request_id)
+                        record = self._task_record_data(task_record)
+                        durable_finalizing = (
+                            str(record.get("status") or "") == "finalizing"
+                            and str(record.get("lease_id") or "") == str(lease_id)
+                            and str(record.get("attempt_id") or "") == str(attempt_id)
+                            and int(record.get("scheduler_epoch") or 0) == scheduler_epoch
+                            and int(record.get("runtime_generation") or 0) == int(consumer_generation)
+                        )
+                    except Exception:
+                        durable_finalizing = False
                 async with self._cv:
                     lease = self._leases_by_id.get(str(lease_id))
                     if (
@@ -2151,6 +2198,35 @@ class _ModelWorkSchedulerActor:
             lease.lease_expires_at = new_expires_at
             return LeaseResult(ok=True, lease=lease.to_dict())
 
+    async def batch_renew_leases(
+        self,
+        *,
+        items: list[dict[str, object]],
+    ) -> list[dict[str, Any]]:
+        """Batch-renew multiple leases in a single call.
+
+        Each item must contain: lease_id, consumer_id, consumer_generation,
+        and lease_ttl_s.
+        """
+        results: list[dict[str, Any]] = []
+        for item in items:
+            try:
+                result = await self.renew_lease(
+                    lease_id=str(item["lease_id"]),
+                    consumer_id=str(item["consumer_id"]),
+                    consumer_generation=int(item["consumer_generation"]),
+                    lease_ttl_s=float(item["lease_ttl_s"]),
+                )
+                results.append(result.to_wire())
+            except Exception as exc:
+                results.append({
+                    "ok": False,
+                    "reason": "unknown",
+                    "lease_id": item.get("lease_id"),
+                    "error": str(exc),
+                })
+        return results
+
     async def _terminal_task_state_for_lease(self, lease: ModelWorkLease) -> _TerminalTaskState:
         if not self._use_task_state_store:
             return _TerminalTaskState(ok=True, status="unknown")
@@ -2236,27 +2312,7 @@ class _ModelWorkSchedulerActor:
                 return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
         if self._use_task_state_store:
             try:
-                task_record = await self._task_state_call("get_task", request_id=request_id)
-                if not isinstance(task_record, TaskRecord):
-                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
-                record = self._task_record_data(task_record)
-                status = str(record.get("status") or "")
-                expected_status = "done" if success else "failed"
-                if status in TERMINAL_TASK_STATUSES and status != expected_status:
-                    return FinishResult(ok=False, reason=ConflictReason.TASK_STATE_INVALID)
-                if status != "finalizing" and status not in TERMINAL_TASK_STATUSES:
-                    return FinishResult(ok=False, reason=ConflictReason.NOT_FINALIZING)
-                elif str(record.get("lease_id") or "") != lease_id:
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                elif str(record.get("attempt_id") or "") != attempt_id:
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                elif int(record.get("scheduler_epoch") or 0) != scheduler_epoch:
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                elif int(record.get("runtime_generation") or 0) != consumer_generation:
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                elif str(record.get("consumer_id") or "") != str(consumer_id):
-                    return FinishResult(ok=False, reason=ConflictReason.STALE_CONSUMER)
-                elif success:
+                if success:
                     committed = await self._task_state_call(
                         "commit_finalize_success",
                         request_id=request_id,
@@ -2758,6 +2814,14 @@ def _create_ray_actor_handle():
             )
             return out.to_wire()
 
+        async def batch_renew_leases(
+            self,
+            *,
+            items: list[dict[str, object]],
+            **kwargs: Any,
+        ) -> list[dict[str, Any]]:
+            return await super().batch_renew_leases(items=items, **kwargs)
+
         async def begin_finalize_lease(
             self,
             *,
@@ -3234,6 +3298,21 @@ class ModelWorkSchedulerClient:
             lease_ttl_s=lease_ttl_s,
             timeout_s=timeout_s,
         )
+
+    async def batch_renew_leases(
+        self,
+        *,
+        items: list[dict[str, object]],
+        timeout_s: float = 10.0,
+    ) -> list[dict[str, Any]]:
+        actor = await self._get_ray_actor_async(create_if_missing=False)
+        out = await self._await_ray_ref(
+            actor.batch_renew_leases.remote(items=items),
+            timeout_s=timeout_s,
+        )
+        if not isinstance(out, list):
+            raise TypeError(f"ModelWorkScheduler.batch_renew_leases returned non-list: {type(out)}")
+        return out
 
     async def finish_lease_success(
         self,

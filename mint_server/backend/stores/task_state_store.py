@@ -2208,6 +2208,36 @@ class TaskStateStore:
             self._save_indexed(record, old_record=old_record)
             return TaskMutationResult.from_wire({"ok": True, "record": dict(record)})
 
+    def batch_renew_leases(
+        self,
+        *,
+        items: list[dict[str, object]],
+    ) -> list[TaskMutationResult]:
+        """Batch-renew multiple leases in a single call.
+
+        Each item must contain: request_id, lease_id, attempt_id,
+        scheduler_epoch, runtime_generation, lease_ttl_s.
+        """
+        results: list[TaskMutationResult] = []
+        for item in items:
+            try:
+                result = self.renew_lease(
+                    request_id=str(item["request_id"]),
+                    lease_id=str(item["lease_id"]),
+                    attempt_id=str(item["attempt_id"]),
+                    scheduler_epoch=int(item["scheduler_epoch"]),
+                    runtime_generation=int(item["runtime_generation"]),
+                    lease_ttl_s=float(item["lease_ttl_s"]),
+                )
+            except Exception as exc:
+                result = TaskMutationResult(
+                    ok=False,
+                    reason=ConflictReason.UNKNOWN,
+                    record={"error": str(exc)},
+                )
+            results.append(result)
+        return results
+
     def begin_finalize(
         self,
         *,
@@ -3448,6 +3478,12 @@ class _TaskStateStoreActor:
         out = self._store.renew_lease(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
         return _wire_result(out)
+
+    def batch_renew_leases(self, **kwargs: Any) -> list[dict[str, Any]]:
+        results = self._store.batch_renew_leases(**kwargs)
+        for item in kwargs.get("items", []):
+            self._notify_task_changed(item.get("request_id"))
+        return [_wire_result(r) for r in results]
 
     def begin_finalize(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.begin_finalize(**kwargs)

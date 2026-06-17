@@ -76,7 +76,7 @@ async def test_scheduler_component_stale_finish_cannot_clear_new_attempt_project
             ),
         )
 
-        block = world.faults.block("task_state.get_task.after")
+        block = world.faults.block("task_state.commit_finalize_failure.after")
         complete_task = asyncio.create_task(
             world.runtime_queue.finish_failure(
                 lease=token(old_lease, consumer_id=world.consumer_id, consumer_generation=world.generation),
@@ -328,7 +328,7 @@ async def test_scheduler_component_finish_success_requires_begin_finalize(tmp_pa
             result_path=str(world.tmp_path / "result.json"),
         )
 
-        assert finished.ok is False and finished.reason == "not_finalizing"
+        assert finished.ok is False and finished.reason == "task_state_invalid"
         assert (await world.observe_task(request_id))["status"] == "leased"
         assert (
             await world.runtime_queue.validate(

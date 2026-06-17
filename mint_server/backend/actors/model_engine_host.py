@@ -1405,6 +1405,40 @@ class ModelEngineHost:
         interval_s = max(0.1, min(float(self._config.lease_ttl_s) / 3.0, 10.0))
         while pending_leases:
             await asyncio.sleep(interval_s)
+            batch_started = time.monotonic()
+            # Try batch renewal first; fall back to individual calls
+            batch_method = getattr(self._scheduler, "batch_renew_leases", None)
+            if callable(batch_method):
+                items: list[dict[str, object]] = [
+                    {
+                        "lease_id": str(token.lease_id),
+                        "consumer_id": str(token.consumer_id),
+                        "consumer_generation": int(token.consumer_generation),
+                        "lease_ttl_s": self._config.lease_ttl_s,
+                    }
+                    for token in list(pending_leases.values())
+                ]
+                try:
+                    results = await batch_method(items=items)
+                    if isinstance(results, list):
+                        for i, (lease_id, _token) in enumerate(list(pending_leases.items())):
+                            ok = False
+                            if i < len(results):
+                                r = results[i]
+                                ok = bool(r.get("ok")) if isinstance(r, dict) else False
+                            self._record_renew_result(
+                                ok=ok,
+                                latency_s=(time.monotonic() - batch_started) / max(1, len(pending_leases)),
+                                lease_ttl_s=self._config.lease_ttl_s,
+                            )
+                        continue
+                except Exception as e:
+                    self._record_error(e)
+                    logger.warning(
+                        "[model_runtime] batch lease renew failed, falling back actor=%s error=%s",
+                        self._config.actor_name, e,
+                    )
+            # Fallback: individual renew calls
             for lease_id, token in list(pending_leases.items()):
                 renew_started = time.monotonic()
                 try:
