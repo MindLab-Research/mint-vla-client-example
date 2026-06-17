@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 
 import requests
 
-from .logging_context import classify_failure_reason, get_otel_tracer
+from mint_server.observability.logging_context import classify_failure_reason, get_otel_tracer
 
 logger = logging.getLogger(__name__)
 

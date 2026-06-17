@@ -136,7 +136,7 @@ async def public_business_healthz_response() -> dict | JSONResponse:
 
 def _record_public_healthz_refresh_metric(result: str) -> None:
     try:
-        from .logging_context import record_public_healthz_refresh_metric
+        from mint_server.observability.logging_context import record_public_healthz_refresh_metric
 
         record_public_healthz_refresh_metric(result=result)
     except Exception:

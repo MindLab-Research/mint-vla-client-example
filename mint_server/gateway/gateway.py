@@ -10,8 +10,8 @@ from typing import Any
 
 import httpx
 
-from .logging_context import get_current_traceparent, get_trace_id
-from .runtime_env import env_get
+from mint_server.observability.logging_context import get_current_traceparent, get_trace_id
+from mint_server.ray.runtime_env import env_get
 
 logger = logging.getLogger(__name__)
 

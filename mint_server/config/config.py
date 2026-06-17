@@ -11,13 +11,13 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .config_file import MintConfigFile
 
-from .runtime_env import (
+from mint_server.ray.runtime_env import (
     build_runtime_pythonpath,
     env_get as _runtime_env_get,
     env_nonempty as _runtime_env_nonempty,
     join_pythonpath,
 )
-from .checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
+from mint_server.checkpoints import DEFAULT_PERSISTENT_CHECKPOINTS_DIR, DEFAULT_RUNTIME_CHECKPOINTS_DIR
 from .config_hydration import hydrate_from_config_actor
 
 hydrate_from_config_actor()
@@ -249,7 +249,7 @@ def actor_runtime_env_vars(
         raise RuntimeError("MINT_CODE_ROOT is required")
     if not PFS_HF_MODULES_PATH:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
-    from .ray_utils import strict_ray_gcs_address
+    from mint_server.ray.ray_utils import strict_ray_gcs_address
 
     direct_ray_address = strict_ray_gcs_address()
     if include_ray_attach_hints and direct_ray_address is None:

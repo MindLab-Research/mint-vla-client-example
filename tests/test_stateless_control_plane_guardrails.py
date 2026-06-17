@@ -315,7 +315,7 @@ def test_backend_runtime_paths_do_not_require_ray_address_env() -> None:
 
 def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> None:
     expectations = {
-        "mint_server/config.py": ["actor_runtime_env_vars"],
+        "mint_server/config/config.py": ["actor_runtime_env_vars"],
         "mint_server/backend/actors/model_engine_host.py": ["get_or_create_model_engine_host"],
         "mint_server/backend/actors/model_actor_supervisor.py": ["_create_ray_actor"],
         "mint_server/backend/training/verl/verl_inference.py": ["initialize"],
@@ -335,11 +335,11 @@ def test_actor_runtime_paths_use_strict_gcs_hint_not_legacy_ray_address() -> Non
 
 def test_ray_address_production_references_are_explicitly_owned() -> None:
     allowed_files = {
-        "mint_server/config.py",  # actor env builder and no-attach runtime env keys.
+        "mint_server/config/config.py",  # actor env builder and no-attach runtime env keys.
         "mint_server/backend/actors/model_engine_host.py",  # no-attach runtime env keys and fallback error text.
         "mint_server/backend/inference/multi_lora_engine.py",  # no-attach runtime env key.
         "mint_server/backend/inference/multinode_inference.py",  # no-attach runtime env key.
-        "mint_server/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
+        "mint_server/ray/ray_utils.py",  # driver Ray init and job-level worker env cleanup.
         "ops/backend/config.py",  # explicit MINT_OPS_RAY_ADDRESS / MINT_RAY_GCS_ADDRESS config names.
         "scripts/start_dev_server.sh",  # dev launcher explicitly unsets it.
         "scripts/vllm_worker_python.py",  # subprocess cleanup wrapper.
@@ -370,7 +370,7 @@ def test_ray_address_production_references_are_explicitly_owned() -> None:
 
 
 def test_runtime_config_does_not_treat_ray_address_as_actor_bootstrap_env() -> None:
-    source = (REPO_ROOT / "mint_server" / "runtime_config.py").read_text(encoding="utf-8")
+    source = (REPO_ROOT / "mint_server" / "config" / "runtime_config.py").read_text(encoding="utf-8")
     assert '"MINT_RAY_GCS_ADDRESS"' in source
     assert '"RAY_ADDRESS"' not in source
 
@@ -409,7 +409,7 @@ def test_control_plane_helper_tasks_use_no_attach_runtime_env() -> None:
         "mint_server/backend/actors/model_actor_placement.py": [
             "_default_gpu_actor_killer",
         ],
-        "mint_server/checkpoints.py": [
+        "mint_server/checkpoints/checkpoints.py": [
             "async_create_checkpoint_archive",
         ],
     }

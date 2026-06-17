@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 
-from .config import config
+from mint_server.config import config
 
 logger = logging.getLogger(__name__)
 

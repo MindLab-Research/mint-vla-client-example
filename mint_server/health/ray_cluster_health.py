@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
-from .runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT_MONO = 0.0
@@ -184,7 +184,7 @@ def _resource_snapshot(ray: Any) -> dict[str, Any]:
 def _collect_ray_cluster_health() -> dict[str, Any]:
     import ray
 
-    from .config import RAY_NAMESPACE
+    from mint_server.config import RAY_NAMESPACE
 
     max_pending_pg_names = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_PENDING_PG_NAMES", 20)
     max_dead_node_sample = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_DEAD_NODE_SAMPLE", 10)

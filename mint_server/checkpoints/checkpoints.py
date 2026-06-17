@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Literal
 import fcntl
 
-from .runtime_env import env_get
+from mint_server.ray.runtime_env import env_get
 from .checkpoint_index import (
     CheckpointNotFoundError,
     checkpoint_index_enabled,

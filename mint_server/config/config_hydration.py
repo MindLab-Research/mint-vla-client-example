@@ -6,7 +6,7 @@ import logging
 import os
 from collections.abc import MutableMapping
 
-from .runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 
 logger = logging.getLogger(__name__)
 

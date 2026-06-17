@@ -8,7 +8,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-from .runtime_env import env_nonempty
+from mint_server.ray.runtime_env import env_nonempty
 
 _CACHE_LOCK = threading.Lock()
 _CACHE_AT_MONO = 0.0
@@ -195,7 +195,7 @@ def _scrape_selected_metrics(addresses: list[str], *, timeout_s: float) -> tuple
 def _collect_ray_gcs_metrics() -> dict[str, Any]:
     import ray
 
-    from .config import RAY_NAMESPACE
+    from mint_server.config import RAY_NAMESPACE
 
     timeout_s = _float_env("MINT_RAY_GCS_METRICS_TIMEOUT_S", 2.0)
     if not ray.is_initialized():
