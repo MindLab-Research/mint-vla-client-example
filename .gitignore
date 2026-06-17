@@ -221,6 +221,7 @@ __marimo__/
 # Serena
 .serena/
 checkpoints/
+!mint_server/checkpoints/
 
 # Codex task files (do not commit)
 PROMPT.md

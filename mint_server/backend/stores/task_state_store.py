@@ -21,7 +21,6 @@ from mint_server.backend.contracts.control_plane_contracts import (
     ConflictReason,
     CreateTaskResult,
     OwnerLeaseResult,
-    RequeueTaskResult,
     TaskMutationResult,
     WireCompatibleResult,
 )
@@ -1396,13 +1395,13 @@ class TaskStateStore:
         with self._owner_lock:
             row = self._owner(str(name))
             if row is not None and str(row.get("owner_id")) != owner_id and float(row.get("expires_at") or 0.0) > ts:
-                return OwnerLeaseResult.from_wire({
-                    "ok": False,
-                    "reason": "owner_active",
-                    "owner_id": str(row.get("owner_id")),
-                    "epoch": int(row.get("epoch") or 0),
-                    "expires_at": float(row.get("expires_at") or 0.0),
-                })
+                return OwnerLeaseResult(
+                    ok=False,
+                    reason=ConflictReason.OWNER_ACTIVE,
+                    owner_id=str(row.get("owner_id")),
+                    epoch=int(row.get("epoch") or 0),
+                    expires_at=float(row.get("expires_at") or 0.0),
+                )
             epoch = 1 if row is None else int(row.get("epoch") or 0) + (0 if str(row.get("owner_id")) == owner_id else 1)
             fencing_token = f"{name}:{epoch}:{owner_id}"
             out = {
@@ -1414,7 +1413,13 @@ class TaskStateStore:
                 "fencing_token": fencing_token,
             }
             self._kv.put(_owner_key(name), _json_dumps(out))
-            return OwnerLeaseResult.from_wire(dict(out))
+            return OwnerLeaseResult(
+                ok=True,
+                owner_id=owner_id,
+                epoch=epoch,
+                expires_at=expires_at,
+                fencing_token=fencing_token,
+            )
 
     def renew_scheduler_owner(
         self,
@@ -1430,10 +1435,10 @@ class TaskStateStore:
         with self._owner_lock:
             row = self._owner(str(name))
             if row is None or str(row.get("owner_id")) != str(owner_id) or int(row.get("epoch") or 0) != int(epoch):
-                return OwnerLeaseResult.from_wire({"ok": False, "reason": "stale_owner"})
+                return OwnerLeaseResult(ok=False, reason=ConflictReason.STALE_OWNER)
             row.update({"renewed_at": ts, "expires_at": expires_at})
             self._kv.put(_owner_key(str(name)), _json_dumps(row))
-            return OwnerLeaseResult.from_wire({"ok": True, "owner_id": str(owner_id), "epoch": int(epoch), "expires_at": expires_at})
+            return OwnerLeaseResult(ok=True, owner_id=str(owner_id), epoch=int(epoch), expires_at=expires_at)
 
     def assert_scheduler_owner(
         self,
@@ -2190,7 +2195,7 @@ class TaskStateStore:
             old_record = dict(record)
             status = str(record.get("status"))
             if status in TERMINAL_TASK_STATUSES:
-                return TaskMutationResult.from_wire({"ok": False, "reason": "terminal", "record": dict(record)})
+                return TaskMutationResult(ok=False, reason=ConflictReason.TERMINAL, record=dict(record))
             if (
                 status not in {"leased", "running"}
                 or str(record.get("lease_id")) != str(lease_id)
@@ -2320,14 +2325,14 @@ class TaskStateStore:
         scheduler_epoch: int,
         reason: str,
         now: float | None = None,
-    ) -> RequeueTaskResult:
+    ) -> TaskMutationResult:
         ts = _now(now)
         with self._lock_for_request(request_id):
             self._assert_scheduler_owner(scheduler_epoch=scheduler_epoch, now=ts)
             record = self._load(str(request_id))
             old_record = dict(record)
             if str(record.get("status")) in TERMINAL_TASK_STATUSES:
-                return RequeueTaskResult.from_wire({"ok": False, "reason": "terminal", "record": dict(record)})
+                return TaskMutationResult(ok=False, reason=ConflictReason.TERMINAL, record=dict(record))
             record["metadata"] = _merge_metadata_with_abandoned_staged_payload(record)
             record.update({
                 "status": "pending",
@@ -2347,7 +2352,7 @@ class TaskStateStore:
                 "updated_at": ts,
             })
             self._save_indexed(record, old_record=old_record)
-            return RequeueTaskResult.from_wire({"ok": True, "record": dict(record)})
+            return TaskMutationResult(ok=True, record=dict(record))
 
     def _commit_finalize_kv(
         self,
