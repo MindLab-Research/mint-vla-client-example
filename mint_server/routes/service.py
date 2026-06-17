@@ -125,6 +125,29 @@ def _infer_base_model_from_checkpoint(
     return None
 
 
+@router.post("/client/config")
+async def client_config(request: Request) -> dict:
+    """Return default client feature flags for tinker SDK init.
+
+    Production returns real flags from the platform layer; dev returns defaults
+    so the SDK skips JWT auth, credential_cmd, and pyqwest.
+    """
+    return {
+        "pjwt_auth_enabled": False,
+        "credential_default_source": "api_key",
+        "sample_dispatch_bytes_semaphore_size": 10 * 1024 * 1024,
+        "inflight_response_bytes_semaphore_size": 50 * 1024 * 1024,
+        "parallel_fwdbwd_chunks": True,
+        "proto_write_fwdbwd": False,
+        "proto_compress_fwdbwd": False,
+        "fwd_via_fwdbwd": False,
+        "billing_exception_max_pause_duration_sec": 3600,
+        "sample_no_retries": False,
+        "sample_enable_stuck_detection": True,
+        "use_pyqwest_transport": False,
+    }
+
+
 @router.get("/healthz", response_model=None)
 async def healthz() -> dict:
     """Public business health endpoint for client readiness."""

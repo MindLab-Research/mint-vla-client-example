@@ -3457,11 +3457,29 @@ class _TaskStateStoreActor:
     def commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_success(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
+        try:
+            self._future_store_or_create().complete_task_success(
+                request_id=str(kwargs["request_id"]),
+                result_path=kwargs.get("result_path"),
+                result_checksum=kwargs.get("result_checksum"),
+                result_size_bytes=kwargs.get("result_size_bytes"),
+                metadata={"done_at": _now(None), "final_status": "done", "payload_state": "committed"},
+            )
+        except Exception:
+            pass
         return _wire_result(out)
 
     def commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         out = self._store.commit_finalize_failure(**kwargs)
         self._notify_task_changed(kwargs.get("request_id"))
+        try:
+            self._future_store_or_create().complete_task_failure(
+                request_id=str(kwargs["request_id"]),
+                error=str(kwargs.get("error") or "task failed"),
+                metadata={"failed_at": _now(None), "done_at": _now(None), "final_status": "failed"},
+            )
+        except Exception:
+            pass
         return _wire_result(out)
 
     def requeue_task(self, **kwargs: Any) -> dict[str, Any]:
