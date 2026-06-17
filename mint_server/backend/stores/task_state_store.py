@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import StrEnum
+
 import base64
 import json
 import os
@@ -73,12 +75,40 @@ _TASK_STATE_STATS_METRICS: dict[str, float] = {
 _TASK_STATE_STATS_METRICS_LOCK = threading.Lock()
 
 
+class TaskStateConflictReason(StrEnum):
+    """Structured reason codes for TaskStateConflictError.
+
+    These replace fragile string-matching on error messages.
+    New raise sites MUST supply an appropriate reason code.
+    """
+
+    STALE_SCHEDULER_OWNER = "stale_scheduler_owner"
+    CANNOT_ASSIGN_FROM_PENDING = "cannot_assign_from_pending"
+    CANNOT_CLAIM_ASSIGNED = "cannot_claim_assigned"
+    CANNOT_RENEW_LEASE = "cannot_renew_lease"
+    CANNOT_BEGIN_FINALIZE = "cannot_begin_finalize"
+    CANNOT_MARK_RETRIEVED = "cannot_mark_retrieved"
+    CANNOT_COMMIT_FINALIZE = "cannot_commit_finalize"
+    CANNOT_EVICT_PAYLOAD = "cannot_evict_payload"
+    CANNOT_STAGE_FOR_TERMINAL = "cannot_stage_for_terminal"
+    DUPLICATE_REQUEST_ID = "duplicate_request_id"
+    TERMINAL_COMMIT_PAYLOAD_MISMATCH = "terminal_commit_payload_mismatch"
+    STAGED_PAYLOAD_MISMATCH = "staged_payload_mismatch"
+    GENERIC_CONFLICT = "generic_conflict"
+
 class TaskStateStoreError(RuntimeError):
     pass
 
 
 class TaskStateConflictError(TaskStateStoreError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: TaskStateConflictReason | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class TaskStateNotFoundError(TaskStateStoreError, KeyError):
@@ -1457,7 +1487,7 @@ class TaskStateStore:
         ts = _now(now)
         row = self._owner(name)
         if row is None or int(row.get("epoch") or 0) != int(scheduler_epoch) or float(row.get("expires_at") or 0.0) <= ts:
-            raise TaskStateConflictError("stale scheduler owner epoch")
+            raise TaskStateConflictError("stale scheduler owner epoch", reason=TaskStateConflictReason.STALE_SCHEDULER_OWNER)
 
     def create_task(
         self,
@@ -1507,9 +1537,9 @@ class TaskStateStore:
                 self._save_indexed(record)
                 return CreateTaskResult.from_wire({"ok": True, "created": True, "record": dict(record)})
             if payload_hash is not None and existing.get("payload_hash") not in (None, payload_hash):
-                raise TaskStateConflictError("duplicate request_id with different payload hash")
+                raise TaskStateConflictError("duplicate request_id with different payload hash", reason=TaskStateConflictReason.DUPLICATE_REQUEST_ID)
             if str(existing.get("op")) != str(op) or str(existing.get("domain_key")) != str(domain_key):
-                raise TaskStateConflictError("duplicate request_id with different task identity")
+                raise TaskStateConflictError("duplicate request_id with different task identity", reason=TaskStateConflictReason.DUPLICATE_REQUEST_ID)
             if "model_work_scheduler_append_attempt_id" in (existing.get("metadata") or {}):
                 return CreateTaskResult.from_wire({"ok": True, "created": False, "record": dict(existing)})
             old_record = dict(existing)
@@ -1657,7 +1687,7 @@ class TaskStateStore:
             record = self._load(str(request_id))
             old_record = dict(record)
             if str(record.get("status")) in TERMINAL_TASK_STATUSES:
-                raise TaskStateConflictError("cannot stage payload for terminal task")
+                raise TaskStateConflictError("cannot stage payload for terminal task", reason=TaskStateConflictReason.CANNOT_STAGE_FOR_TERMINAL)
             record["staged_payload_path"] = str(staged_payload_path)
             record["staged_payload_checksum"] = None
             record["staged_payload_size_bytes"] = None
@@ -1705,7 +1735,7 @@ class TaskStateStore:
             if str(record.get("status")) == "retrieved":
                 return {"ok": True, "record": dict(record)}
             if str(record.get("status")) not in {"done", "failed", "expired", "cancelled"}:
-                raise TaskStateConflictError(f"cannot mark retrieved; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot mark retrieved; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_MARK_RETRIEVED)
             metadata = dict(record.get("metadata") or {})
             metadata.setdefault("terminal_status", str(record.get("status")))
             record["metadata"] = metadata
@@ -1817,7 +1847,7 @@ class TaskStateStore:
             record = self._load(str(request_id))
             old_record = dict(record)
             if str(record.get("status")) not in TERMINAL_TASK_STATUSES:
-                raise TaskStateConflictError(f"cannot evict payload; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot evict payload; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_EVICT_PAYLOAD)
             if str(record.get("result_path") or "") != str(expected_result_path):
                 return {"ok": False, "reason": "payload_changed", "record": dict(record)}
             metadata = dict(record.get("metadata") or {})
@@ -2094,9 +2124,9 @@ class TaskStateStore:
                     and record.get("error") == error
                 ):
                     return {"ok": True, "idempotent": True, "record": dict(record)}
-                raise TaskStateConflictError("terminal task commit payload mismatch")
+                raise TaskStateConflictError("terminal task commit payload mismatch", reason=TaskStateConflictReason.TERMINAL_COMMIT_PAYLOAD_MISMATCH)
             if str(status) == "done" and not _require_staged_success_path(record, result_path):
-                raise TaskStateConflictError(f"cannot complete task {status}; staged payload mismatch")
+                raise TaskStateConflictError(f"cannot complete task {status}; staged payload mismatch", reason=TaskStateConflictReason.STAGED_PAYLOAD_MISMATCH)
             record["metadata"] = (
                 _merge_metadata(record, metadata)
                 if str(status) == "done"
@@ -2134,7 +2164,7 @@ class TaskStateStore:
             record = self._load(str(request_id))
             old_record = dict(record)
             if str(record.get("status")) != "pending":
-                raise TaskStateConflictError(f"cannot assign from pending; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot assign from pending; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_ASSIGN_FROM_PENDING)
             record.update({"status": "assigned", "subqueue_id": str(subqueue_id), "scheduler_epoch": int(scheduler_epoch), "assigned_at": ts, "updated_at": ts})
             self._save_indexed(record, old_record=old_record)
             return TaskMutationResult.from_wire({"ok": True, "record": dict(record)})
@@ -2159,7 +2189,7 @@ class TaskStateStore:
             record = self._load(str(request_id))
             old_record = dict(record)
             if str(record.get("status")) != "assigned" or str(record.get("subqueue_id")) != str(subqueue_id) or int(record.get("scheduler_epoch") or 0) != int(scheduler_epoch):
-                raise TaskStateConflictError(f"cannot claim assigned task; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot claim assigned task; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_CLAIM_ASSIGNED)
             record.update({
                 "status": "leased",
                 "lease_id": str(lease_id),
@@ -2201,7 +2231,7 @@ class TaskStateStore:
                 or int(record.get("scheduler_epoch") or 0) != int(scheduler_epoch)
                 or int(record.get("runtime_generation") or 0) != int(runtime_generation)
             ):
-                raise TaskStateConflictError(f"cannot renew lease; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot renew lease; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_RENEW_LEASE)
             record.update({"lease_expires_at": expires_at, "updated_at": ts})
             self._save_indexed(record, old_record=old_record)
             return TaskMutationResult.from_wire({"ok": True, "record": dict(record)})
@@ -2261,7 +2291,7 @@ class TaskStateStore:
                 or int(record.get("scheduler_epoch") or 0) != int(scheduler_epoch)
                 or int(record.get("runtime_generation") or 0) != int(runtime_generation)
             ):
-                raise TaskStateConflictError(f"cannot begin finalize; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot begin finalize; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_BEGIN_FINALIZE)
             record["metadata"] = _merge_metadata_with_abandoned_staged_payload(record, new_staged_payload_path=staged_payload_path)
             record.update({
                 "status": "finalizing",
@@ -2413,7 +2443,7 @@ class TaskStateStore:
                     and record.get("error") == error
                 ):
                     return {"ok": True, "idempotent": True, "record": dict(record)}
-                raise TaskStateConflictError("terminal task commit payload mismatch")
+                raise TaskStateConflictError("terminal task commit payload mismatch", reason=TaskStateConflictReason.TERMINAL_COMMIT_PAYLOAD_MISMATCH)
             if (
                 str(record.get("status")) != "finalizing"
                 or str(record.get("lease_id")) != str(lease_id)
@@ -2421,9 +2451,9 @@ class TaskStateStore:
                 or int(record.get("scheduler_epoch") or 0) != int(scheduler_epoch)
                 or int(record.get("runtime_generation") or 0) != int(runtime_generation)
             ):
-                raise TaskStateConflictError(f"cannot commit finalize {status}; current status={record.get('status')!r}")
+                raise TaskStateConflictError(f"cannot commit finalize {status}; current status={record.get('status')!r}", reason=TaskStateConflictReason.CANNOT_COMMIT_FINALIZE)
             if str(status) == "done" and not _require_staged_success_path(record, result_path):
-                raise TaskStateConflictError(f"cannot commit finalize {status}; staged payload mismatch")
+                raise TaskStateConflictError(f"cannot commit finalize {status}; staged payload mismatch", reason=TaskStateConflictReason.STAGED_PAYLOAD_MISMATCH)
             record["metadata"] = (
                 _merge_metadata(record, metadata)
                 if str(status) == "done"
@@ -2565,7 +2595,7 @@ class TaskStateStore:
 
     def _raise_task_transition_error(self, request_id: str, action: str) -> None:
         record = self.get_task(request_id)
-        raise TaskStateConflictError(f"cannot {action}; current status={record.get('status')!r}")
+        raise TaskStateConflictError(f"cannot {action}; current status={record.get('status')!r}", reason=TaskStateConflictReason.GENERIC_CONFLICT)
 
     def _row_to_record(self, row: Any) -> dict[str, Any]:
         if isinstance(row, dict):

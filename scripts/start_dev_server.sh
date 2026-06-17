@@ -156,6 +156,15 @@ unset MINT_RAY_HEAD_ADDRESS_PATH || true
 unset RAY_ADDRESS || true
 export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint/dev/tmp}"
 
+# Dev defaults for optional services. Set to "postgres" only when a billing
+# database is available; "disabled" avoids the startup health-check dependency.
+export MINT_USAGE_BACKEND="${MINT_USAGE_BACKEND:-disabled}"
+
+# Models the supervisor should pre-create workers for (comma-separated).
+# Empty by default; set via deployment env or explicit override for the
+# models you want to test.
+export MINT_SUPPORTED_MODELS="${MINT_SUPPORTED_MODELS:-}"
+
 deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
 source_env_file "MINT_DEV_DEPLOYMENT_ENV" "${deployment_env}"
 

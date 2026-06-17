@@ -39,10 +39,10 @@ from mint_server.backend.actors.model_actor_supervisor import consumer_id_for_re
 from mint_server.backend.actors.model_engine_active_lease import ActiveLeaseTracker
 from mint_server.backend.actors.model_engine_health_snapshot import EngineHealthSnapshot
 from mint_server.backend.actors.model_engine_token_budget import TokenBudgetController
-from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerClient, model_work_scheduler
+from mint_server.backend.scheduling.model_work_scheduler import ModelWorkSchedulerClient, ModelWorkSchedulerConflictError, model_work_scheduler
 from mint_server.backend.core.model_work_execution_context import ModelWorkFinalizeBuffer, model_work_execution_context
 from mint_server.backend.stores.task_payload_store import TaskPayloadStore
-from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateNotFoundError, task_futures, task_state_store
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskStateConflictError, TaskStateConflictReason, TaskStateNotFoundError, task_futures, task_state_store
 
 logger = structlog.get_logger(__name__)
 
@@ -792,9 +792,28 @@ class ModelEngineHost:
         return isinstance(context, (KeyError, TaskStateNotFoundError))
 
     @staticmethod
+    @staticmethod
     def _is_scheduler_not_claimable_error(exc: BaseException) -> bool:
-        text = f"{type(exc).__name__}: {exc}".lower()
-        return "modelworkschedulerconflicterror" in text and "not claimable" in text
+        # Structural matching: ModelWorkSchedulerConflictError with "not claimable".
+        if isinstance(exc, ModelWorkSchedulerConflictError):
+            return "not claimable" in str(exc).lower()
+        # TaskStateConflictError with transient reasons (e.g. stale scheduler owner).
+        if isinstance(exc, TaskStateConflictError):
+            transient_reasons = {
+                TaskStateConflictReason.STALE_SCHEDULER_OWNER,
+            }
+            reason = getattr(exc, "reason", None)
+            return reason in transient_reasons
+        return False
+
+    @staticmethod
+    def _is_task_not_found_error(exc: BaseException) -> bool:
+        if isinstance(exc, TaskStateNotFoundError):
+            return True
+        if isinstance(exc, ModelWorkSchedulerConflictError):
+            if isinstance(getattr(exc, "cause", None), TaskStateNotFoundError):
+                return True
+        return False
 
     def _clear_transient_scheduler_error(self) -> None:
         self._health_snapshot.clear_transient_scheduler_error()

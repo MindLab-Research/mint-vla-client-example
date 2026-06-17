@@ -17,7 +17,6 @@ from openpi_libero_fast_rl import (
     _create_model_from_state,
     _delete_action_session,
     _delete_model,
-    _forward_logprobs,
     _http_post,
     _make_rl_datum,
     _poll_future,

@@ -5,7 +5,6 @@ import json
 import os
 import sys
 import time
-import uuid
 from dataclasses import asdict, dataclass
 from typing import Any
 

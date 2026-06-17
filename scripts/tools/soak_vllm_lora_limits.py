@@ -5,7 +5,6 @@ import argparse
 import json
 import os
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from typing import Any

@@ -42,7 +42,7 @@ from mint_server.backend.contracts.control_plane_contracts import (
     ValidateLeaseResult,
     as_task_ledger,
 )
-from mint_server.backend.stores.task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateNotFoundError
+from mint_server.backend.stores.task_state_store import TERMINAL_TASK_STATUSES, TaskStateConflictError, TaskStateConflictReason, TaskStateNotFoundError
 from mint_server.backend.scheduling.scheduler_admission import (
     AdmissionAccounting,
     sampling_inflight_admission_mode,
@@ -1275,7 +1275,24 @@ class _ModelWorkSchedulerActor:
         *,
         conflict: TaskStateConflictError,
     ) -> str | None:
-        if "cannot claim assigned task" not in str(conflict):
+        # Structural matching with backward compat for old-style errors.
+        reason = getattr(conflict, "reason", None)
+        if reason == TaskStateConflictReason.STALE_SCHEDULER_OWNER:
+            # Transient: restore to queue without raising; heartbeat will fix epoch.
+            async with self._cv:
+                if self._request_locations.get(assigned.item.request_id) == "claiming":
+                    self._restore_assigned_to_queue_locked(assigned)
+            logger.warning(
+                "skipped_claim_transient_stale_owner",
+                request_id=assigned.item.request_id,
+                queue_id=assigned.queue_id,
+            )
+            return "transient_stale_owner"
+        if reason == TaskStateConflictReason.CANNOT_CLAIM_ASSIGNED:
+            pass  # proceed to reconciliation below
+        elif reason is None and "cannot claim assigned task" in str(conflict):
+            pass  # backward compat: old-style error without reason code
+        else:
             return None
         try:
             task_record = await self._task_state_call("get_task", request_id=assigned.item.request_id)
@@ -1328,7 +1345,11 @@ class _ModelWorkSchedulerActor:
         *,
         conflict: TaskStateConflictError,
     ) -> str | None:
-        if "cannot assign from pending" not in str(conflict):
+        # Structural matching with backward compat for old-style errors.
+        reason = getattr(conflict, "reason", None)
+        if reason is None and "cannot assign from pending" in str(conflict):
+            pass  # backward compat
+        elif reason != TaskStateConflictReason.CANNOT_ASSIGN_FROM_PENDING:
             return None
         try:
             task_record = await self._task_state_call("get_task", request_id=item.request_id)
