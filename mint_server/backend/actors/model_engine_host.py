@@ -6,7 +6,6 @@ import inspect
 import json
 import structlog
 import os
-import re
 import time
 from dataclasses import dataclass
 from enum import StrEnum
@@ -31,6 +30,7 @@ from mint_server.observability.logging_context import (
     set_trace_id,
 )
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
+from mint_server.backend.ray_cluster.model_actor_names import default_model_actor_name, sanitize_actor_name_part, vllm_actor_name
 from mint_server.backend.contracts.control_plane_contracts import ExecutorOutcome, LeaseToken, as_task_ledger
 from mint_server.backend.contracts.engine_adapter import EngineHealth, EngineHealthStatus, EngineObservability
 from mint_server.backend.contracts.engine_liveness import EngineLivenessPush
@@ -195,13 +195,10 @@ class ModelEngineHostConfig:
         return queue_id_for_replica(self.domain_key, self.replica_id)
 
 
-def _sanitize_actor_name_part(value: str) -> str:
-    out = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
-    return out or "unknown"
+_sanitize_actor_name_part = sanitize_actor_name_part
 
 
-def default_model_engine_host_name(domain_key: str, replica_id: str) -> str:
-    return f"mint_model_runtime_{_sanitize_actor_name_part(domain_key).lower()}_{_sanitize_actor_name_part(replica_id).lower()}"
+default_model_engine_host_name = default_model_actor_name
 
 
 def _ray_namespace() -> str:
@@ -751,8 +748,7 @@ class ModelEngineHost:
             base_model = str(self._config.domain_key).removeprefix("vllm:").strip()
         if not base_model:
             return None
-        model_part = base_model.split("/")[-1] if "/" in base_model else base_model
-        return f"mint_vllm_{model_part.lower().replace(' ', '_')}"
+        return vllm_actor_name(base_model)
 
     @staticmethod
     def _positive_int(value: Any) -> int | None:

@@ -9,6 +9,7 @@ from functools import lru_cache
 from typing import Any
 
 from mint_server.ray.runtime_env import env_nonempty
+from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
 logger = structlog.get_logger(__name__)
@@ -77,8 +78,7 @@ def _owned_actor_names_for_spec(spec: Any) -> set[str]:
     if domain_key.startswith("vllm:"):
         base_model = _base_model_from_spec(spec)
         if base_model:
-            model_part = base_model.split("/")[-1] if "/" in base_model else base_model
-            legacy_name = f"mint_vllm_{model_part.lower().replace(' ', '_')}".strip()
+            legacy_name = vllm_actor_name(base_model)
             if legacy_name != "mint_vllm_":
                 names.add(legacy_name)
     return names

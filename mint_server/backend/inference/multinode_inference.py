@@ -40,6 +40,7 @@ import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from mint_server.backend.ray_cluster.multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
+from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name
 from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
 from mint_server.backend.actors.ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from mint_server.backend.observability.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
@@ -2317,10 +2318,7 @@ def _create_mint_vllm_multinode_actor(
     return MultiNodeVLLMEngine
 
 
-def _model_to_mint_vllm_actor_name(model_name: str) -> str:
-    model_part = model_name.split("/")[-1] if "/" in model_name else model_name
-    return f"mint_vllm_{model_part.lower().replace(' ', '_')}"
-
+_model_to_mint_vllm_actor_name = vllm_actor_name
 
 @dataclass
 class GenerateResult:
@@ -2380,7 +2378,7 @@ class MultiNodeInferenceEngine:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.quantization = quantization
         self.kv_cache_dtype = kv_cache_dtype
-        self.actor_name = actor_name or _model_to_mint_vllm_actor_name(model_name)
+        self.actor_name = actor_name or vllm_actor_name(model_name)
         self.shared_adapter_dir = shared_adapter_dir
         self.distributed_executor_backend = distributed_executor_backend.strip().lower()
         if self.distributed_executor_backend not in ("ray", "mp"):

@@ -1,4 +1,5 @@
 import importlib
+from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name
 import importlib.machinery
 import sys
 import types
@@ -174,7 +175,7 @@ def test_kill_megatron_actor_unregisters_only_after_verified_disappearance(monke
 
     assert dist.kill_megatron_actor("Qwen/Qwen3-30B-A3B-Instruct-2507") is True
     assert kill_kwargs["verify_absent"] is True
-    assert pool.unregistered == [dist._make_megatron_actor_name("Qwen/Qwen3-30B-A3B-Instruct-2507")]
+    assert pool.unregistered == [megatron_actor_name("Qwen/Qwen3-30B-A3B-Instruct-2507")]
 
 
 def test_kill_megatron_actor_does_not_unregister_when_actor_stays_resolvable(monkeypatch):

@@ -22,6 +22,7 @@ from typing import Any
 
 import ray
 
+from mint_server.backend.ray_cluster.model_actor_names import bumblebee_actor_name
 from mint_server.backend.training.megatron.megatron_distributed import (
     DistributedConfig,
     _bundle_node_ip,
@@ -270,17 +271,12 @@ def _model_key_from_base_model(base_model: str) -> str:
     return str(base_model)
 
 
-def _make_bumblebee_actor_name(base_model: str) -> str:
-    import re
+_make_bumblebee_actor_name = bumblebee_actor_name
 
-    match = re.search(r"models--([^/]+)--([^/]+)/snapshots", str(base_model))
-    model_name = match.group(2) if match else str(base_model).split("/")[-1]
-    model_name = model_name.lower().replace("-", "_").replace(".", "_")
-    return f"mint_bumblebee_{model_name}"
 
 
 def _make_bumblebee_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
-    return f"{_make_bumblebee_actor_name(base_model)}_{_make_namespace_pg_suffix(namespace)}_pg"
+    return f"{bumblebee_actor_name(base_model)}_{_make_namespace_pg_suffix(namespace)}_pg"
 
 
 def _is_qwen3_235b_model(model: str | None) -> bool:
@@ -2518,7 +2514,7 @@ def get_or_create_bumblebee_worker_group(
         init_ray(namespace=PERSISTENT_NAMESPACE, ignore_reinit_error=True)
 
     config = distributed_config or DistributedConfig()
-    actor_name = _make_bumblebee_actor_name(base_model)
+    actor_name = bumblebee_actor_name(base_model)
     observability_model = str(observability_base_model or base_model or "unknown")
     rank_metadata = {
         "backend": "bumblebee",

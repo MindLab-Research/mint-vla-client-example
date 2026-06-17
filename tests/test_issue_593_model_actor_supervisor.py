@@ -2380,7 +2380,7 @@ def test_issue_593_topology_specs_accept_bumblebee_training_alias(
             gpu_count=4,
         )
     ]
-    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee_")
 
 
 def test_issue_593_topology_specs_accept_qwen35_bumblebee_training_alias(
@@ -2419,7 +2419,7 @@ def test_issue_593_topology_specs_accept_qwen35_bumblebee_training_alias(
             gpu_count=8,
         )
     ]
-    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee_")
 
 
 def test_topology_legacy_megatron_launcher_follows_selected_moe_backend(
@@ -2462,7 +2462,7 @@ def test_topology_legacy_megatron_launcher_follows_selected_moe_backend(
             gpu_count=4,
         )
     ]
-    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee-")
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_bumblebee_")
 
 
 def test_topology_legacy_megatron_launcher_can_roll_back_to_megatron_backend(
@@ -2487,7 +2487,7 @@ def test_topology_legacy_megatron_launcher_can_roll_back_to_megatron_backend(
     training_specs = [spec for spec in specs if spec.base_model == base_model and spec.launcher_key == "training"]
 
     assert training_specs[0].domain_key == "megatron:mint_megatron_qwen3_30b_a3b_instruct_2507"
-    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_megatron-")
+    assert training_specs[0].normalized_actor_name().startswith("mint_model_runtime_megatron_")
 
 
 def test_issue_593_topology_specs_preserve_multi_node_placement(
@@ -2691,8 +2691,8 @@ def test_issue_593_placement_reconciler_uses_node_pin_and_removes_owned_orphan_p
             "required": {"10.0.0.17": 4},
             "context": "model_actor_supervisor placement domain='vllm:Qwen/Test' replica='replica-1'",
             "ignore_pg_names": {
-                "mint_model_runtime_vllm-Qwen-Test_replica-1_pg",
-                "mint_model_runtime_vllm-Qwen-Test_replica-1_mint_pg",
+                "mint_model_runtime_vllm_qwen_test_replica_1_pg",
+                "mint_model_runtime_vllm_qwen_test_replica_1_mint_pg",
                 "mint_vllm_test_pg",
                 "mint_vllm_test_mint_pg",
             },
@@ -2771,7 +2771,7 @@ def test_issue_593_placement_reconciler_protects_vllm_child_actor_for_desired_ru
         actor_lister=lambda: [],
         gpu_actor_lister=lambda: [
             {
-                "name": "mint_model_runtime_vllm-Qwen-Qwen3-4B-Instruct-2507_replica-0",
+                "name": "mint_model_runtime_vllm_qwen_qwen3_4b_instruct_2507_replica_0",
                 "namespace": "mint",
                 "node_ip": "10.0.0.8",
                 "gpu": 1,
@@ -2911,7 +2911,7 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
                 _Row(
                     {
                         "state": "ALIVE",
-                        "name": "mint_model_runtime_vllm-Qwen-Test_replica-1",
+                        "name": "mint_model_runtime_vllm_qwen_test_replica_1",
                         "ray_namespace": "mint-ns",
                         "required_resources": {"GPU": 4},
                         "node_id": "node-1",
@@ -2959,7 +2959,7 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
     ]
     assert out == [
         {
-            "name": "mint_model_runtime_vllm-Qwen-Test_replica-1",
+            "name": "mint_model_runtime_vllm_qwen_test_replica_1",
             "namespace": "mint-ns",
             "node_ip": "10.0.0.17",
             "gpu": 4.0,
@@ -3139,7 +3139,7 @@ def test_issue_593_placement_reconciler_does_not_evict_foreign_blockers_when_tar
     killed: list[tuple[str, str, str]] = []
 
     def _actor_exists(name: str, _namespace: str) -> bool:
-        return name == "mint_model_runtime_vllm-Qwen-Test_replica-1"
+        return name == "mint_model_runtime_vllm_qwen_test_replica_1"
 
     def _capacity(required, context, ignore_pg_names, namespace):
         capacity_checks.append(
@@ -3284,7 +3284,7 @@ async def test_issue_593_supervisor_precreates_controller_pg_before_runtime() ->
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-0",
                 base_model="Qwen/Test",
-                actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+                actor_name="mint_model_runtime_vllm_qwen_test_replica_0",
                 node_pin="10.0.0.7",
                 gpu_count=1,
             )
@@ -3301,7 +3301,7 @@ async def test_issue_593_supervisor_precreates_controller_pg_before_runtime() ->
 
     assert len(created) == 1
     assert len(pg_calls) == 1
-    assert pg_calls[0]["name"] == "mint_model_runtime_vllm-qwen-test_replica-0_pg"
+    assert pg_calls[0]["name"] == "mint_model_runtime_vllm_qwen_test_replica_0_pg"
     assert pg_calls[0]["bundles"] == [{"CPU": 1, "GPU": 1, "node:10.0.0.7": 0.001}, {"CPU": 1}]
     replica = out["snapshot"]["replicas"]["vllm:Qwen/Test::replica-0"]
     assert replica["state"] == "starting"
@@ -3349,7 +3349,7 @@ async def test_issue_593_supervisor_blocks_when_controller_pg_create_blocks() ->
                 domain_key="vllm:Qwen/Test",
                 replica_id="replica-0",
                 base_model="Qwen/Test",
-                actor_name="mint_model_runtime_vllm-qwen-test_replica-0",
+                actor_name="mint_model_runtime_vllm_qwen_test_replica_0",
                 node_pin="10.0.0.7",
                 gpu_count=1,
             )

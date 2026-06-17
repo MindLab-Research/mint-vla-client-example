@@ -2041,7 +2041,8 @@ class VerlTrainingEngine:
         if not isinstance(cause, RuntimeError) or "missing worker" not in str(cause):
             return None
 
-        from mint_server.backend.training.megatron.megatron_distributed import MegatronSessionStateManager, _make_megatron_actor_name
+        from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name as _make_megatron_actor_name
+        from mint_server.backend.training.megatron.megatron_distributed import MegatronSessionStateManager
 
         session_manager = MegatronSessionStateManager()
         actor_name = self._actor_name_for_session(session)
@@ -2617,7 +2618,7 @@ class VerlTrainingEngine:
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
         if not actor_name:
-            from mint_server.backend.training.megatron.megatron_distributed import _make_megatron_actor_name
+            from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name as _make_megatron_actor_name
 
             actor_name = _make_megatron_actor_name(session.base_model or "")
         lock = await self._get_actor_recycle_lock(actor_name)
@@ -2638,7 +2639,7 @@ class VerlTrainingEngine:
     ) -> ray.actor.ActorHandle:
         actor_name = self._actor_name_for_session(session)
         if not actor_name:
-            from mint_server.backend.training.bumblebee.bumblebee_distributed import _make_bumblebee_actor_name
+            from mint_server.backend.ray_cluster.model_actor_names import bumblebee_actor_name as _make_bumblebee_actor_name
 
             actor_name = _make_bumblebee_actor_name(session.base_model or "")
         lock = await self._get_actor_recycle_lock(actor_name)
@@ -3530,7 +3531,7 @@ class VerlTrainingEngine:
                 )
             except asyncio.TimeoutError:
                 # Best-effort: kill the persistent Megatron actor to unblock retries.
-                from mint_server.backend.training.megatron.megatron_distributed import _make_megatron_actor_name
+                from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name as _make_megatron_actor_name
 
                 actor_name = _make_megatron_actor_name(base_model or requested_model or "")
                 try:
@@ -3552,7 +3553,7 @@ class VerlTrainingEngine:
                 flush=True,
             )
             session.backend = "megatron"
-            from mint_server.backend.training.megatron.megatron_distributed import _make_megatron_actor_name
+            from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name as _make_megatron_actor_name
 
             actor_name = _make_megatron_actor_name(base_model or "")
             self._actor_recycler.bind_session_actor(model_id, actor_name)

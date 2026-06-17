@@ -27,6 +27,7 @@ from mint_server.ray.ray_utils import init_ray
 from mint_server.ray.runtime_env import join_pythonpath, sanitize_worker_pythonpath
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
+from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name
 from mint_server.backend.inference.lora_registry import LoRARegistry
 from mint_server.backend.ray_cluster.ray_placement_groups import remove_named_placement_group
 from mint_server.backend.actors.ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
@@ -1355,21 +1356,8 @@ class MultiLoRAInferenceEngine:
         logger.info("MultiLoRAInferenceEngine disconnected")
 
 
-def _model_to_actor_name(model_name: str) -> str:
-    """Convert model name to a valid Ray actor name.
+_model_to_actor_name = vllm_actor_name
 
-    Examples:
-        "Qwen/Qwen2.5-7B-Instruct" -> "mint_vllm_qwen2.5-7b-instruct"
-        "Qwen/Qwen3-30B-A3B-Instruct-2507" -> "mint_vllm_qwen3-30b-a3b-instruct-2507"
-    """
-    # Extract model part after "/"
-    if "/" in model_name:
-        model_part = model_name.split("/")[-1]
-    else:
-        model_part = model_name
-    # Lowercase and replace invalid chars
-    safe_name = model_part.lower().replace(" ", "_")
-    return f"mint_vllm_{safe_name}"
 
 
 def _resolve_model_path(model_name: str) -> str:
@@ -1615,7 +1603,7 @@ class MultiModelInferenceManager:
             config = get_model_config(model_name)
 
             # Create unique actor name for this model
-            actor_name = _model_to_actor_name(model_name)
+            actor_name = vllm_actor_name(model_name)
             model_path = _resolve_model_path(model_name)
 
             existing_named_actor = False
@@ -1920,7 +1908,7 @@ def kill_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if model_name:
         # Kill specific model's actor
-        actor_name = _model_to_actor_name(model_name)
+        actor_name = vllm_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             ray_kill.kill(
@@ -2036,7 +2024,7 @@ def check_persistent_vllm_actor(model_name: str | None = None) -> bool:
 
     if model_name:
         # Check specific model's actor
-        actor_name = _model_to_actor_name(model_name)
+        actor_name = vllm_actor_name(model_name)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             return _is_actor_ready(actor)

@@ -32,6 +32,7 @@ from mint_server.backend.core.model_registry import get_model_config
 from mint_server.backend.actors.node_placement import (ModelGpuPlacement,
                                                 assert_node_ip_capacity,
                                                 parse_model_gpu_placement)
+from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name
 from mint_server.backend.ray_cluster.model_actor_pg_names import (
     namespace_actor_placement_group_name, namespace_pg_suffix)
 from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
@@ -552,31 +553,8 @@ def _model_gpu_placement_for_model(base_model: str) -> ModelGpuPlacement | None:
     return placement
 
 
-def _make_megatron_actor_name(base_model: str) -> str:
-    """Generate per-model Megatron actor name.
+_make_megatron_actor_name = megatron_actor_name
 
-    Normalizes input to handle both:
-    - HuggingFace model ID: "Qwen/Qwen3-30B-A3B-Instruct-2507"
-    - Resolved cache path: "/vePFS/.../models--Qwen--Qwen3-30B-A3B-Instruct-2507/snapshots/..."
-
-    Both produce the same actor name for consistent lookup.
-    """
-    import re
-
-    # Check if this is a resolved HuggingFace cache path
-    # Pattern: models--{org}--{model}/snapshots/{hash}
-    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
-    match = re.search(hf_cache_pattern, base_model)
-
-    if match:
-        # Extract org and model from cache path
-        org, model = match.groups()
-        model_name = model.lower().replace("-", "_").replace(".", "_")
-    else:
-        # HuggingFace model ID or plain path - take last component
-        model_name = base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-
-    return f"mint_megatron_{model_name}"
 
 
 def _infer_lora_train_flags_from_target_modules(
@@ -670,7 +648,7 @@ def _make_megatron_pg_name_from_actor_name(
 
 
 def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
-    actor_name = _make_megatron_actor_name(base_model)
+    actor_name = megatron_actor_name(base_model)
     return _make_megatron_pg_name_from_actor_name(actor_name, namespace=namespace)
 
 
@@ -7928,7 +7906,7 @@ class MegatronWorkerGroup:
         if save_persisted_actor_only_state is not None:
             save_persisted_actor_only_state(
                 outgoing_session_id,
-                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 worker_entries=persisted_entries,
             )
         clear_actor_only_state = getattr(session_manager, "clear_actor_only_state", None)
@@ -8692,7 +8670,7 @@ class MegatronWorkerGroup:
                 mark_actor_only_state(
                     effective_session_id,
                     reason="forward_backward",
-                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                    actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
             self._invalidate_session_durability(
                 effective_session_id,
@@ -9189,7 +9167,7 @@ class MegatronWorkerGroup:
             mark_actor_only_state(
                 effective_session_id,
                 reason="optim_step",
-                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
         self._invalidate_session_durability(
             effective_session_id,
@@ -9747,7 +9725,7 @@ class MegatronWorkerGroup:
                     session_manager.mark_actor_only_state(
                         effective_session_id,
                         reason="load_weights",
-                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                        actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                         checkpoint_path=load_path,
                     )
 
@@ -9773,7 +9751,7 @@ class MegatronWorkerGroup:
                         effective_session_id,
                         checkpoint_path=load_path,
                         reason="load_checkpoint",
-                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                        actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                         checkpoint_identity=checkpoint_identity,
                     )
                 mark_trusted_recovery_baseline = getattr(
@@ -9787,7 +9765,7 @@ class MegatronWorkerGroup:
                         checkpoint_path=load_path,
                         checkpoint_identity=checkpoint_identity,
                         reason="load_checkpoint",
-                        actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                        actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                     )
 
             mark_refs = [
@@ -9920,7 +9898,7 @@ class MegatronWorkerGroup:
                     effective_session_id,
                     checkpoint_path=save_path,
                     reason="save_checkpoint",
-                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                    actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                     checkpoint_identity=checkpoint_identity,
                 )
             except TypeError:
@@ -9928,7 +9906,7 @@ class MegatronWorkerGroup:
                     effective_session_id,
                     checkpoint_path=save_path,
                     reason="save_checkpoint",
-                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                    actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                 )
         mark_trusted_recovery_baseline = getattr(
             session_manager,
@@ -9941,7 +9919,7 @@ class MegatronWorkerGroup:
                 checkpoint_path=save_path,
                 checkpoint_identity=checkpoint_identity,
                 reason="save_checkpoint",
-                actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
             )
         if session_manager is not None:
             prime_session = getattr(session_manager, "prime_session", None)
@@ -10041,7 +10019,7 @@ class MegatronWorkerGroup:
         )
 
     def _get_session_cache_store_diagnostics(self) -> dict:
-        actor_name = _make_megatron_actor_name(str(getattr(self, "base_model", "unknown")))
+        actor_name = megatron_actor_name(str(getattr(self, "base_model", "unknown")))
         get_cache_usage = getattr(self._session_manager, "get_cache_usage", None)
         if get_cache_usage is None:
             return {
@@ -10098,7 +10076,7 @@ class MegatronWorkerGroup:
             ),
             None,
         )
-        actor_name = _make_megatron_actor_name(str(getattr(self, "base_model", "unknown")))
+        actor_name = megatron_actor_name(str(getattr(self, "base_model", "unknown")))
         persisted = getattr(
             self._session_manager,
             "list_persisted_actor_only_state",
@@ -10642,7 +10620,7 @@ class MegatronWorkerGroup:
                 session_manager.mark_actor_only_state(
                     session_id,
                     reason="load_weights",
-                    actor_name=_make_megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
+                    actor_name=megatron_actor_name(str(getattr(self, "base_model", "unknown"))),
                     checkpoint_path=checkpoint_path,
                 )
             else:
@@ -10919,7 +10897,7 @@ def get_or_create_megatron_worker_group(
             ignore_reinit_error=True,
         )
 
-    actor_name = _make_megatron_actor_name(base_model)
+    actor_name = megatron_actor_name(base_model)
 
     create_lock = _get_megatron_create_lock(actor_name)
     with create_lock:
@@ -11338,7 +11316,7 @@ def kill_megatron_actor(base_model: str | None = None) -> bool:
 
     if base_model:
         # Kill specific model's actor
-        actor_name = _make_megatron_actor_name(base_model)
+        actor_name = megatron_actor_name(base_model)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             try:
@@ -11412,7 +11390,7 @@ def is_megatron_actor_running(base_model: str | None = None) -> bool:
         )
 
     if base_model:
-        actor_name = _make_megatron_actor_name(base_model)
+        actor_name = megatron_actor_name(base_model)
         try:
             actor = ray.get_actor(actor_name, namespace=PERSISTENT_NAMESPACE)
             ray.get(actor.get_diagnostics.remote(), timeout=5)

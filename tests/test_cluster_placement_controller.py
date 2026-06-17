@@ -180,7 +180,7 @@ def test_cluster_placement_controller_builds_backend_attach_compatible_pg_reques
             gpu_count=1,
         )
     )
-    assert dense.placement_group_name == "mint_dense_qwen__test_mint_pg"
+    assert dense.placement_group_name == "mint_dense_test_mint_pg"
     assert dense.required_gpus_by_node == (("10.0.0.7", 1),)
 
     vllm = placement_group_bundle_request_for_spec(

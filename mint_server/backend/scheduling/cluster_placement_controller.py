@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import re
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterable, Mapping
@@ -14,6 +13,16 @@ from mint_server.backend.contracts.model_placement_topology import (
     EnginePlacementTopology,
     ParallelTopology,
     PlacementBundle,
+)
+from mint_server.backend.ray_cluster.model_actor_names import (
+    bumblebee_actor_name,
+    default_model_actor_name,
+    dense_actor_name,
+    megatron_actor_name,
+    sanitize_actor_name_part,
+)
+from mint_server.backend.ray_cluster.model_actor_pg_names import (
+    namespace_actor_placement_group_name,
 )
 
 CLUSTER_GPU_KEY = "__cluster__"
@@ -714,7 +723,7 @@ def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRe
         dense_actor_name = _dense_actor_name(base_model or domain_key)
         return PlacementGroupBundleRequest.for_dense(
             replica_key=replica_key,
-            placement_group_name=_namespace_actor_pg_name(dense_actor_name, namespace),
+            placement_group_name=namespace_actor_placement_group_name(dense_actor_name, namespace),
             node_ip=node_pins[0] if node_pins else None,
             namespace=namespace,
         )
@@ -727,7 +736,7 @@ def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRe
         )
         return PlacementGroupBundleRequest.for_distributed_training(
             replica_key=replica_key,
-            placement_group_name=_namespace_actor_pg_name(training_actor_name, namespace),
+            placement_group_name=namespace_actor_placement_group_name(training_actor_name, namespace),
             parallel=_parallel_topology_from_spec(spec),
             placement_slices=placement_slices,
             namespace=namespace,
@@ -786,55 +795,18 @@ def _spec_placement_slices(spec: Any) -> tuple[tuple[str, str, int], ...]:
     return tuple(out)
 
 
-def _default_model_actor_name(domain_key: str, replica_id: str) -> str:
-    return f"mint_model_runtime_{_sanitize_actor_name_part(domain_key).lower()}_{_sanitize_actor_name_part(replica_id).lower()}"
+_default_model_actor_name = default_model_actor_name
 
 
-def _sanitize_actor_name_part(value: str) -> str:
-    out = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
-    return out or "unknown"
+_sanitize_actor_name_part = sanitize_actor_name_part
+
+_dense_actor_name = dense_actor_name
 
 
-def _sanitize_pg_component(value: str | None) -> str:
-    cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", (value or "").strip())
-    cleaned = cleaned.strip("_")
-    return cleaned or "default"
+_megatron_actor_name = megatron_actor_name
 
 
-def _namespace_actor_pg_name(actor_name: str, namespace: str) -> str:
-    return f"{actor_name}_{_sanitize_pg_component(namespace)}_pg"
-
-
-def _dense_actor_name(base_model: str) -> str:
-    model_key = str(base_model or "").strip()
-    if model_key.startswith("/"):
-        model_key = model_key.split("/")[-1]
-    else:
-        model_key = model_key.replace("/", "__")
-    model_key = (
-        model_key.replace("-", "_")
-        .replace(".", "_")
-        .replace(":", "_")
-        .replace(" ", "_")
-        .lower()
-    )
-    return f"mint_dense_{model_key or 'unknown'}"
-
-
-def _megatron_actor_name(base_model: str) -> str:
-    match = re.search(r"models--([^/]+)--([^/]+)/snapshots", str(base_model))
-    if match:
-        model_name = match.group(2).lower().replace("-", "_").replace(".", "_")
-    else:
-        model_name = str(base_model).split("/")[-1].lower().replace("-", "_").replace(".", "_")
-    return f"mint_megatron_{model_name}"
-
-
-def _bumblebee_actor_name(base_model: str) -> str:
-    match = re.search(r"models--([^/]+)--([^/]+)/snapshots", str(base_model))
-    model_name = match.group(2) if match else str(base_model).split("/")[-1]
-    model_name = model_name.lower().replace("-", "_").replace(".", "_")
-    return f"mint_bumblebee_{model_name}"
+_bumblebee_actor_name = bumblebee_actor_name
 
 
 def _parallel_topology_from_spec(spec: Any) -> ParallelTopology:

@@ -69,6 +69,12 @@ def _namespace_from_pg_info(info: object) -> str | None:
     return None
 
 
+def _placement_group_removed(info: object) -> bool:
+    if not isinstance(info, dict):
+        return False
+    return str(info.get("state") or info.get("State") or "").upper() == "REMOVED"
+
+
 def _pinned_ips(raw: object) -> tuple[str, ...]:
     pinned: set[str] = set()
     for bundle in _bundle_dicts(raw):
@@ -144,6 +150,11 @@ def get_named_placement_group(
         info = ray.util.placement_group_table(pg)
     except Exception:
         info = _lookup_named_pg_info(name, target_namespace)
+        if info is None:
+            raise PlacementGroupNotFoundError(f"placement group {name!r} not found") from None
+
+    if _placement_group_removed(info):
+        raise PlacementGroupNotFoundError(f"placement group {name!r} not found")
 
     info_namespace = _namespace_from_pg_info(info)
     if info_namespace is not None and info_namespace != target_namespace:
@@ -165,6 +176,45 @@ def get_named_placement_group(
 
     record_ray_cluster_op_otel(op="pg_lookup", status="ok", duration_s=time.perf_counter() - _t0, pg_name=name)
     return pg
+
+
+def get_or_create_named_placement_group(
+    name: str,
+    *,
+    namespace: str | None = None,
+    bundles: list[dict[str, int | float]],
+    strategy: str = "PACK",
+    lifetime: str = "detached",
+) -> Any:
+    target_namespace = namespace or _ray_namespace()
+    try:
+        return get_named_placement_group(
+            name,
+            namespace=target_namespace,
+            expected_bundles=bundles,
+        )
+    except PlacementGroupNotFoundError:
+        try:
+            pg = ray.util.placement_group(
+                bundles,
+                strategy=strategy,
+                name=name,
+                lifetime=lifetime,
+                namespace=target_namespace,
+            )
+        except TypeError:
+            pg = ray.util.placement_group(
+                bundles,
+                strategy=strategy,
+                name=name,
+                lifetime=lifetime,
+            )
+        ray.get(pg.ready())
+        return get_named_placement_group(
+            name,
+            namespace=target_namespace,
+            expected_bundles=bundles,
+        )
 
 
 def remove_named_placement_group(name: str, *, namespace: str | None = None) -> bool:

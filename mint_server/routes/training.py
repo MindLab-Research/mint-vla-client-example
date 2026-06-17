@@ -44,6 +44,7 @@ from ..auth.auth_identity import get_apikey_id as _request_apikey_id
 from ..auth.auth_identity import get_user_data as _request_user_data
 from ..auth.auth_identity import get_user_id as _request_user_id
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, async_lookup_actor_handle
+from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name
 from ..gateway.gateway_auth import GatewayAuthContext, build_billing_auth_context
 from ..observability.logging_context import (
     classify_failure_reason,
@@ -1304,18 +1305,7 @@ async def _protect_training_session_enqueue_window(
         ) from e
 
 
-def _normalize_megatron_scheduler_domain_key(base_model: str) -> str:
-    hf_cache_pattern = r"models--([^/]+)--([^/]+)/snapshots"
-    match = re.search(hf_cache_pattern, base_model)
-    if match:
-        _org, model = match.groups()
-        model_name = model.lower().replace("-", "_").replace(".", "_")
-    else:
-        model_name = (
-            base_model.split("/")[-1].lower().replace("-", "_").replace(".", "_")
-        )
-    return f"mint_megatron_{model_name}"
-
+_normalize_megatron_scheduler_domain_key = megatron_actor_name
 
 _TOKENIZER_METADATA_FILES = (
     "tokenizer.json",

@@ -58,7 +58,8 @@ def _cleanup_sampler_indices(sampler_id: str) -> None:
 async def _remove_loaded_lora_if_last_reference(*, base_model: str, lora_int_id: int) -> None:
     import ray
 
-    from mint_server.backend.inference.multi_lora_engine import PERSISTENT_NAMESPACE, _model_to_actor_name
+    from mint_server.backend.inference.multi_lora_engine import PERSISTENT_NAMESPACE
+    from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name as _model_to_actor_name
 
     actor_name = _model_to_actor_name(base_model)
     try:

@@ -1694,7 +1694,7 @@ async def test_issue_648_default_token_budget_provider_uses_kv_debug_fallback(mo
     class _Ray:
         @staticmethod
         def get_actor(name, namespace=None):
-            assert name == "mint_vllm_model-a"
+            assert name == "mint_vllm_model_a"
             assert namespace is not None
             return _VllmActor()
 
@@ -2364,7 +2364,7 @@ async def test_issue_593_model_runtime_success_clears_previous_error() -> None:
 def test_issue_593_model_runtime_default_actor_name_is_stable() -> None:
     assert (
         default_model_engine_host_name("vllm:Qwen/Qwen3-30B-A3B-Instruct-2507", "replica-0")
-        == "mint_model_runtime_vllm-qwen-qwen3-30b-a3b-instruct-2507_replica-0"
+        == "mint_model_runtime_vllm_qwen_qwen3_30b_a3b_instruct_2507_replica_0"
     )
 
 

@@ -6,7 +6,6 @@ import structlog
 import time
 
 import os
-import re
 import socket
 import uuid
 from dataclasses import dataclass
@@ -59,6 +58,7 @@ from mint_server.backend.stores.supervisor_state_store import (
     SupervisorStateOwnerConflictError,
     create_supervisor_state_store,
 )
+from mint_server.backend.ray_cluster.model_actor_names import default_model_actor_name as _default_model_actor_name_impl, megatron_actor_name
 from mint_server.backend.ray_cluster.topology import TopologyManager, is_ip_address, load_topology_config_from_env
 
 logger = structlog.get_logger(__name__)
@@ -464,9 +464,9 @@ def domain_key_for_vllm_base_model(base_model: str) -> str:
 
 
 def _normalize_megatron_domain_key(base_model: str) -> str:
-    model_name = str(base_model or "").split("/")[-1]
-    model_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").lower()
-    return f"mint_megatron_{model_name}" if model_name else "mint_megatron_model"
+    if not str(base_model or "").strip():
+        return "mint_megatron_model"
+    return megatron_actor_name(base_model)
 
 
 def _is_moe_training_model(model: str) -> bool:
@@ -509,8 +509,7 @@ def domain_key_for_internal_runtime() -> str:
 
 
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
-    raw = f"mint_model_runtime_{domain_key}_{replica_id}"
-    return re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-")
+    return _default_model_actor_name_impl(domain_key, replica_id)
 
 
 def _replica_id(value: Any) -> str:
