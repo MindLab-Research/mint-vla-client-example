@@ -39,6 +39,10 @@ def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
     if env:
         merged.update(env)
     merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
+    # Use mirror for faster downloads in CN
+    merged.setdefault("UV_INDEX_URL", "https://mirrors.aliyun.com/pypi/simple/")
+    merged.setdefault("PIP_INDEX_URL", "https://mirrors.aliyun.com/pypi/simple/")
+    merged.setdefault("PIP_TRUSTED_HOST", "mirrors.aliyun.com")
     xdg_cache_home = merged.get("XDG_CACHE_HOME")
     if "UV_CACHE_DIR" not in merged and xdg_cache_home:
         uv_cache_dir = Path(xdg_cache_home) / "uv"
@@ -786,13 +790,13 @@ def main(argv: list[str]) -> int:
     if args.mint_env:
         mint_root = Path(args.mint_root).resolve()
         build_id = args.build_id or _default_build_id()
-        env_root = _mint_runtime_build_root(mint_root, args.mint_env, build_id).resolve()
+        env_root = _mint_runtime_build_root(mint_root, args.mint_env, build_id, tier=args.tier).resolve()
         if args.copy_from:
             copy_runtime_env(Path(args.copy_from), env_root)
         else:
             build_runtime_env(env_root, tier=args.tier)
         if args.promote:
-            _promote_runtime_symlink(env_root, _mint_runtime_link(mint_root, args.mint_env))
+            _promote_runtime_symlink(env_root, _mint_runtime_link(mint_root, args.mint_env), tier=args.tier)
         print(json.dumps({"env_root": str(env_root), "promoted": bool(args.promote)}, indent=2))
         return 0
 

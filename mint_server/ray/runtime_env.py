@@ -204,11 +204,18 @@ def _tiers_for(tier: str) -> frozenset[str]:
 
 
 def runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
-    return _layout_from_settings(env_root, _runtime_env_settings_from_manifest(env_root), tier=tier)
+    # Tiered layout: manifest lives in <env_root>/<tier>/manifest.json
+    # Fallback: if <tier>/manifest.json doesn't exist, use <env_root>/manifest.json
+    # (backwards compat with flat layout)
+    tiered_root = os.path.join(env_root, tier) if tier else env_root
+    manifest_root = tiered_root if os.path.exists(os.path.join(tiered_root, "manifest.json")) else env_root
+    return _layout_from_settings(manifest_root, _runtime_env_settings_from_manifest(manifest_root), tier=tier)
 
 
 def checkout_runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
-    return _layout_from_settings(env_root, _checkout_runtime_env_settings(), tier=tier)
+    tiered_root = os.path.join(env_root, tier) if tier else env_root
+    manifest_root = tiered_root if os.path.exists(os.path.join(tiered_root, "manifest.json")) else env_root
+    return _layout_from_settings(manifest_root, _checkout_runtime_env_settings(), tier=tier)
 
 
 def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = True) -> RuntimeEnvLayout:
@@ -295,6 +302,7 @@ def build_tiered_pythonpath(
     GPU_VLA tier: GPU_RL + openpi
     """
     layout = runtime_env_layout(env_root, tier=tier)
+    # layout already resolved from <env_root>/<tier>/manifest.json
     if tier == TIER_CPU:
         return join_pythonpath(
             layout.site_packages,
