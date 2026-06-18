@@ -336,13 +336,12 @@ def actor_runtime_env_vars(
         out.update(extra)
     out.pop("RAY_ADDRESS", None)
     if not include_ray_attach_hints:
+        # Do NOT emit attach-hint keys with empty string values — setting
+        # TMPDIR="" or TEMP="" breaks Ray worker process temp file handling.
+        # Instead, simply omit these keys so actors inherit the head node's
+        # default environment.
         for key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
-            # Ray runtime_env env_vars overlay the job/worker environment; they
-            # do not reliably delete inherited variables. Empty values make
-            # env_nonempty()/Ray attach helpers treat these as absent inside
-            # detached actor workers. RAY_ADDRESS is intentionally not emitted;
-            # worker entry wrappers delete any inherited value before bootstrap.
-            out[key] = ""
+            out.pop(key, None)
     if include_config_snapshot:
         out["MINT_CONFIG_ACTOR_HYDRATE"] = "1"
     return out
