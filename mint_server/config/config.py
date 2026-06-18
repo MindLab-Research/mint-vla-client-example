@@ -370,6 +370,9 @@ def actor_runtime_env(
 ) -> dict[str, object]:
     if pythonpath is None:
         pythonpath = PFS_CONTROL_PLANE_PYTHONPATH if tier == TIER_CPU else PFS_PYTHONPATH
+    if tier == TIER_CPU:
+        extra = dict(extra or {})
+        extra["MINT_CPU_TIER"] = "1"
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=pythonpath,
