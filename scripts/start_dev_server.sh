@@ -280,6 +280,8 @@ if [ -n "${MINT_DEV_TOPOLOGY_SOURCE_DIR:-}" ]; then
     "${MINT_DEV_TOPOLOGY_SOURCE_DIR}/" "${topology_target_dir}/"
 fi
 
+export PYTHONPATH="${PFS_RUNTIME_ENV_ROOT}/cpu/site-packages:${MINT_CODE_ROOT}:${PYTHONPATH:-}"
+
 "${py}" - <<'PY' >&2
 import json
 import os

@@ -19,7 +19,7 @@ from scripts.run_server import (  # noqa: E402
     _reexec_to_runtime_host_python_if_needed,
     _seed_runtime_env_from_config,
     _set_exact_pythonpath,
-    _set_exact_torch_ld_library_path,
+    _set_exact_ld_library_path,
 )
 
 
@@ -59,7 +59,7 @@ def _prepare_runtime(config_path: str | None) -> None:
             repo_root=str(_REPO_ROOT),
         )
     )
-    ld_library_path = _set_exact_torch_ld_library_path()
+    ld_library_path = _set_exact_ld_library_path()
     _reexec_if_env_mismatch(
         pythonpath=pythonpath,
         ld_library_path=ld_library_path,
