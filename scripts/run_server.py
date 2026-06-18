@@ -125,40 +125,25 @@ def _set_exact_pythonpath(entries: str) -> str:
     return normalized
 
 
-def _exact_torch_ld_library_path() -> str:
-    torch_spec = importlib.util.find_spec("torch")
-    if torch_spec is None or torch_spec.origin is None:
-        raise RuntimeError("torch is not importable from the configured host runtime")
-    torch_lib = pathlib.Path(torch_spec.origin).resolve().parent / "lib"
-    if not torch_lib.is_dir():
-        raise RuntimeError(
-            f"Host torch lib directory missing for interpreter {sys.executable}: {torch_lib}"
-        )
-    return ":".join(
-        [
-            str(torch_lib),
-            "/usr/local/cuda/compat/lib",
-            "/usr/local/nvidia/lib",
-            "/usr/local/nvidia/lib64",
-            "/usr/local/cuda/lib64",
-        ]
-    )
+def _set_exact_ld_library_path() -> str:
+    """Set LD_LIBRARY_PATH for the driver process.
 
-
-def _set_exact_torch_ld_library_path() -> str:
-    value = _exact_torch_ld_library_path()
-    os.environ["LD_LIBRARY_PATH"] = value
+    The driver itself does not import torch. GPU worker actors get their
+    LD_LIBRARY_PATH from ``actor_ld_library_path()`` in config.py, which
+    reads from MINT_ACTOR_LD_LIBRARY_PATH or uses CUDA system paths.
+    """
+    # Preserve existing LD_LIBRARY_PATH if set (e.g. by Docker image or env).
+    # Do NOT import torch — the driver runs on CPU-only runtime.
+    value = os.environ.get("LD_LIBRARY_PATH", "")
     return value
 
 
 def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
     desired = {
         "PYTHONPATH": pythonpath,
-        "LD_LIBRARY_PATH": ld_library_path,
         "MINT_SERVER_EXACT_ENV": "1",
     }
     current_pythonpath = _normalize_pythonpath(os.environ.get("PYTHONPATH", ""))
-    current_ld_library_path = os.environ.get("LD_LIBRARY_PATH", "")
     current_matches = all(
         _env_get(os.environ, k) == v for k, v in desired.items() if k != "MINT_SERVER_EXACT_ENV"
     )
@@ -167,13 +152,13 @@ def _reexec_if_env_mismatch(*, pythonpath: str, ld_library_path: str) -> None:
     if _env_get(os.environ, "MINT_SERVER_EXACT_ENV") == "1":
         raise RuntimeError(
             "MINT_SERVER_EXACT_ENV=1 but runtime environment is still incorrect: "
-            f"PYTHONPATH={os.environ.get('PYTHONPATH')!r} LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH')!r}"
+            f"PYTHONPATH={os.environ.get('PYTHONPATH')!r}"
         )
     new_env = dict(os.environ)
     new_env.update(desired)
     new_env["MINT_SERVER_ENV_NORMALIZED"] = "1"
     new_env["MINT_SERVER_PYTHONPATH_CHANGED"] = "1" if current_pythonpath != pythonpath else "0"
-    new_env["MINT_SERVER_LD_LIBRARY_PATH_CHANGED"] = "1" if current_ld_library_path != ld_library_path else "0"
+    new_env["MINT_SERVER_LD_LIBRARY_PATH_CHANGED"] = "0"
     os.execvpe(sys.executable, [sys.executable, *sys.argv], new_env)
 
 
@@ -361,7 +346,7 @@ def main(argv: list[str] | None = None) -> None:
             repo_root=str(_REPO_ROOT),
         )
     )
-    ld_library_path = _set_exact_torch_ld_library_path()
+    ld_library_path = _set_exact_ld_library_path()
     _reexec_if_env_mismatch(
         pythonpath=pythonpath,
         ld_library_path=ld_library_path,

@@ -233,7 +233,7 @@ if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
   exit 1
 fi
 
-py="${PFS_RUNTIME_ENV_ROOT}/host-venv/bin/python"
+py="${PFS_RUNTIME_ENV_ROOT}/gpu_rl/host-venv/bin/python"
 if [ ! -x "${py}" ]; then
   echo "error: runtime python not found: ${py}" >&2
   exit 1

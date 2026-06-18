@@ -147,20 +147,7 @@ def _checkout_runtime_env_settings() -> RuntimeEnvSettings:
 def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings:
     manifest_path = Path(os.path.abspath(env_root)) / "manifest.json"
     if not manifest_path.exists():
-        # Tiered layout: env_root might be runtime/ (parent of tier dirs)
-        # Try parent (if env_root is runtime/<tier>/)
-        root = Path(os.path.abspath(env_root))
-        candidates = [
-            root.parent / "manifest.json",  # runtime/<tier>/ -> runtime/manifest.json
-            root / "gpu_rl" / "manifest.json",  # runtime/ -> runtime/gpu_rl/manifest.json
-            root / "cpu" / "manifest.json",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                manifest_path = candidate
-                break
-        else:
-            raise RuntimeError(f"PFS runtime env root is missing manifest.json: {manifest_path}")
+        raise RuntimeError(f"PFS runtime env root is missing manifest.json: {manifest_path}")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     runtime = data.get("runtime_env")
     sources = data.get("sources")
@@ -216,23 +203,19 @@ def _tiers_for(tier: str) -> frozenset[str]:
     return frozenset({TIER_GPU_RL, TIER_GPU_VLA})
 
 
-def runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
-    # Tiered layout: manifest lives in <env_root>/<tier>/manifest.json
-    # Fallback: if <tier>/manifest.json doesn't exist, use <env_root>/manifest.json
-    # (backwards compat with flat layout)
-    tiered_root = os.path.join(env_root, tier) if tier else env_root
-    manifest_root = tiered_root if os.path.exists(os.path.join(tiered_root, "manifest.json")) else env_root
-    return _layout_from_settings(manifest_root, _runtime_env_settings_from_manifest(manifest_root), tier=tier)
+def runtime_env_layout(env_root: str, *, tier: str = TIER_GPU_RL) -> RuntimeEnvLayout:
+    # Tiered layout: <env_root>/<tier>/manifest.json
+    tiered_root = os.path.join(env_root, tier)
+    return _layout_from_settings(tiered_root, _runtime_env_settings_from_manifest(tiered_root), tier=tier)
 
 
-def checkout_runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
-    tiered_root = os.path.join(env_root, tier) if tier else env_root
-    manifest_root = tiered_root if os.path.exists(os.path.join(tiered_root, "manifest.json")) else env_root
-    return _layout_from_settings(manifest_root, _checkout_runtime_env_settings(), tier=tier)
+def checkout_runtime_env_layout(env_root: str, *, tier: str = TIER_GPU_RL) -> RuntimeEnvLayout:
+    tiered_root = os.path.join(env_root, tier)
+    return _layout_from_settings(tiered_root, _checkout_runtime_env_settings(), tier=tier)
 
 
-def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = True) -> RuntimeEnvLayout:
-    layout = runtime_env_layout(env_root)
+def validate_runtime_env_layout(env_root: str, *, tier: str = TIER_GPU_RL, require_host_python: bool = True) -> RuntimeEnvLayout:
+    layout = runtime_env_layout(env_root, tier=tier)
     required = [layout.site_packages, *layout.pythonpath_entries[1:]]
     if require_host_python:
         required.extend(
@@ -252,13 +235,13 @@ def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = Tr
     return layout
 
 
-def host_only_pythonpath_entries(env_root: str) -> tuple[str, ...]:
-    layout = runtime_env_layout(env_root)
+def host_only_pythonpath_entries(env_root: str, *, tier: str = TIER_GPU_RL) -> tuple[str, ...]:
+    layout = runtime_env_layout(env_root, tier=tier)
     return tuple(layout.host_pythonpath_entries)
 
 
-def host_venv_site_packages(env_root: str) -> str:
-    layout = runtime_env_layout(env_root)
+def host_venv_site_packages(env_root: str, *, tier: str = TIER_GPU_RL) -> str:
+    layout = runtime_env_layout(env_root, tier=tier)
     return os.path.join(
         layout.host_venv_root,
         "lib",
@@ -292,8 +275,9 @@ def build_runtime_pythonpath(
     env_root: str,
     mint_code_root: str,
     pfs_hf_modules_path: str,
+    tier: str = TIER_GPU_RL,
 ) -> str:
-    layout = validate_runtime_env_layout(env_root, require_host_python=False)
+    layout = validate_runtime_env_layout(env_root, tier=tier, require_host_python=False)
     return join_pythonpath(
         layout.pythonpath_entries,
         mint_code_root,
@@ -315,7 +299,6 @@ def build_tiered_pythonpath(
     GPU_VLA tier: GPU_RL + openpi
     """
     layout = runtime_env_layout(env_root, tier=tier)
-    # layout already resolved from <env_root>/<tier>/manifest.json
     if tier == TIER_CPU:
         return join_pythonpath(
             layout.site_packages,
@@ -335,6 +318,7 @@ def bootstrap_runtime_pythonpath(
     *,
     repo_root: str,
     default_hf_modules_path: str = DEFAULT_HF_MODULES_PATH,
+    tier: str = TIER_GPU_RL,
 ) -> str:
     env_root = env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT")
     if not env_root:
@@ -345,7 +329,7 @@ def bootstrap_runtime_pythonpath(
     pfs_hf_modules_path = env_nonempty(environ, "PFS_HF_MODULES_PATH")
     if not pfs_hf_modules_path:
         raise RuntimeError("PFS_HF_MODULES_PATH is required")
-    layout = runtime_env_layout(env_root)
+    layout = runtime_env_layout(env_root, tier=tier)
     return join_pythonpath(
         layout.pythonpath_entries,
         layout.host_pythonpath_entries,
