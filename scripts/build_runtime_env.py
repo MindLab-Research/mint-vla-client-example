@@ -123,6 +123,29 @@ def _partition_host_requirements(requirements: list[str]) -> tuple[list[str], li
     return torch_backend_requirements, generic_requirements
 
 
+def _tiered_shared_deps(pyproject: dict[str, Any], tier: str = "gpu_rl") -> list[str]:
+    """Return shared dependencies for a specific runtime tier.
+
+    CPU tier: only lightweight packages (ray, fastapi, pydantic, etc.) — no torch,
+    transformers, or other GPU-heavy packages.
+    GPU_RL tier: all shared dependencies (full set).
+    GPU_VLA tier: all shared dependencies (same as GPU_RL; VLA-specific deps
+    come from host_requirements).
+    """
+    all_deps = list(pyproject["project"]["dependencies"])
+    if tier == "cpu":
+        # Exclude GPU-heavy packages from CPU tier
+        _cpu_excluded = frozenset({
+            "torch", "torchvision", "torchaudio",
+            "transformers", "accelerate", "peft",
+            "tensordict", "torchdata",
+            "datasets", "sentencepiece",
+            "onnxscript", "einops",
+        })
+        return [dep for dep in all_deps if _requirement_name(dep) not in _cpu_excluded]
+    return all_deps
+
+
 def _runtime_env_symbols():
     from mint_server.ray.runtime_env import (
         DEFAULT_BASE_PYTHON_DIRNAME,
@@ -277,6 +300,15 @@ def _export_host_requirements(pyproject: dict[str, Any], output: Path) -> None:
     output.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _export_shared_requirements_tiered(pyproject: dict[str, Any], output: Path, tier: str = "gpu_rl") -> None:
+    """Export shared requirements filtered by tier."""
+    if tier == "cpu":
+        deps = _tiered_shared_deps(pyproject, tier=tier)
+        output.write_text("\n".join(deps) + "\n", encoding="utf-8")
+    else:
+        _export_shared_requirements(pyproject, output)
+
+
 def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
@@ -402,30 +434,41 @@ def _runtime_env_metadata(pyproject: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str]) -> None:
+def _write_manifest(env_root: Path, pyproject: dict[str, Any], host_python: Path, shared_deps: list[str], *, tier: str = "gpu_rl") -> None:
     runtime = _runtime_table(pyproject)
+    # Filter sources by tier for the manifest
+    from mint_server.ray.runtime_env import _tiers_for, TIER_CPU
+    allowed_tiers = _tiers_for(tier)
+    all_sources = runtime["sources"]
+    if tier == TIER_CPU:
+        # CPU tier manifest has no GPU sources at all
+        sources = []
+    else:
+        sources = [s for s in all_sources if s.get("tier", "gpu_rl") in allowed_tiers]
     manifest = {
         "python_version": runtime["python_version"],
         "env_root": str(env_root),
         "host_python": str(host_python),
         "shared_dependencies": shared_deps,
-        "host_dependencies": _host_deps(pyproject),
+        "host_dependencies": _host_deps(pyproject) if tier != "cpu" else [],
         "runtime_env": _runtime_env_metadata(pyproject),
-        "sources": runtime["sources"],
+        "sources": sources,
         "image_managed": runtime["image_managed"],
+        "tier": tier,
     }
     (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 def _rewrite_copied_runtime_metadata(env_root: Path) -> None:
     manifest = _load_manifest(env_root)
-    layout = _runtime_env_symbols()["runtime_env_layout"](str(env_root))
+    tier = manifest.get("tier", "gpu_rl")
+    layout = _runtime_env_symbols()["runtime_env_layout"](str(env_root), tier=tier)
     manifest["env_root"] = str(env_root)
     manifest["host_python"] = layout.host_python
     if "runtime_env" not in manifest:
         manifest["runtime_env"] = _runtime_env_metadata(_load_pyproject())
     (env_root / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
-    _write_host_pth(env_root, Path(layout.host_python))
+    _write_host_pth(env_root, Path(layout.host_python), tier=tier)
     _write_activation(env_root)
 
 
@@ -620,11 +663,11 @@ def inspect_runtime_env(
     return snapshot
 
 
-def build_runtime_env(env_root: Path) -> None:
+def build_runtime_env(env_root: Path, *, tier: str = "gpu_rl") -> None:
     pyproject = _load_pyproject()
     runtime = _runtime_table(pyproject)
     runtime_env = _runtime_env_symbols()
-    shared_deps = _shared_deps(pyproject)
+    shared_deps = _tiered_shared_deps(pyproject, tier=tier)
     env_root.mkdir(parents=True, exist_ok=True)
     shared_site_packages = env_root / runtime.get(
         "site_packages_dir", runtime_env["DEFAULT_SITE_PACKAGES_DIRNAME"]
@@ -635,13 +678,29 @@ def build_runtime_env(env_root: Path) -> None:
     shared_requirements = env_root / "shared-requirements.txt"
     host_requirements = env_root / "host-requirements.txt"
 
+    if tier == "cpu":
+        # CPU tier: no host venv (no torch), just shared site-packages
+        base_python = _materialize_base_python(runtime["python_version"], base_python_root)
+        _export_shared_requirements_tiered(pyproject, shared_requirements, tier)
+        _install_target(base_python, shared_site_packages, shared_requirements)
+        host_python = base_python
+        _write_host_pth(env_root, host_python, tier=tier)
+        _write_manifest(env_root, pyproject, host_python, shared_deps, tier=tier)
+        _write_activation(env_root)
+        return
+
+    # GPU tier: full build with host venv
     _export_host_requirements(pyproject, host_requirements)
     base_python = _materialize_base_python(runtime["python_version"], base_python_root)
     host_python = _create_host_venv(base_python, host_venv, host_requirements)
-    _export_shared_requirements(pyproject, shared_requirements)
+    _export_shared_requirements_tiered(pyproject, shared_requirements, tier)
     _install_target(host_python, shared_site_packages, shared_requirements)
 
+    from mint_server.ray.runtime_env import _tiers_for
+    allowed_tiers = _tiers_for(tier)
     for source in runtime["sources"]:
+        if source.get("tier", "gpu_rl") not in allowed_tiers:
+            continue
         _clone_checkout(
             source_root / source["name"],
             repo=source["repo"],
@@ -649,10 +708,10 @@ def build_runtime_env(env_root: Path) -> None:
         )
 
     _write_host_source_version_files(pyproject, env_root)
-    _write_host_pth(env_root, host_python)
+    _write_host_pth(env_root, host_python, tier=tier)
     _write_host_source_dist_info(pyproject, host_python)
     _write_host_wrappers(env_root, host_python)
-    _write_manifest(env_root, pyproject, host_python, shared_deps)
+    _write_manifest(env_root, pyproject, host_python, shared_deps, tier=tier)
     _write_activation(env_root)
 
 
@@ -681,6 +740,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         "--promote",
         action="store_true",
         help="Atomically update <mint-root>/<env>/runtime to the built or copied runtime root.",
+    )
+    p.add_argument(
+        "--tier",
+        default="gpu_rl",
+        choices=("cpu", "gpu_rl", "gpu_vla"),
+        help="Runtime tier to build (default: gpu_rl). CPU tier excludes torch/vllm/megatron.",
     )
     p.add_argument("--inspect", action="store_true", help="Inspect an existing runtime env root")
     p.add_argument(
@@ -725,14 +790,14 @@ def main(argv: list[str]) -> int:
         if args.copy_from:
             copy_runtime_env(Path(args.copy_from), env_root)
         else:
-            build_runtime_env(env_root)
+            build_runtime_env(env_root, tier=args.tier)
         if args.promote:
             _promote_runtime_symlink(env_root, _mint_runtime_link(mint_root, args.mint_env))
         print(json.dumps({"env_root": str(env_root), "promoted": bool(args.promote)}, indent=2))
         return 0
 
     env_root = Path(args.env_root).resolve()
-    build_runtime_env(env_root)
+    build_runtime_env(env_root, tier=args.tier)
     return 0
 
 
