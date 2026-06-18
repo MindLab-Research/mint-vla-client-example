@@ -6,32 +6,40 @@ import re
 from mint_server.config import otel_env_vars
 
 
-def test_issue_290_otel_env_vars_include_app_key_and_skip_empty(monkeypatch):
+def test_issue_290_otel_env_vars_forward_endpoint_and_api_key_header(monkeypatch):
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=secret-key")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_INSECURE", "false")
     monkeypatch.setenv("OTEL_SERVICE_NAME", "mint")
-    monkeypatch.setenv("MINT_APMPLUS_APP_KEY", "secret-key")
     monkeypatch.setenv("MINT_DEPLOYMENT_ENV", "prod")
     monkeypatch.setenv("MINT_CLUSTER_ID", "volcano")
-    # Empty headers should be treated as unset and not forwarded.
+
+    out = otel_env_vars()
+
+    assert out["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector:4317"
+    assert out["OTEL_EXPORTER_OTLP_HEADERS"] == "x-api-key=secret-key"
+    assert out["OTEL_EXPORTER_OTLP_INSECURE"] == "false"
+    assert out["OTEL_SERVICE_NAME"] == "mint"
+    assert out["MINT_DEPLOYMENT_ENV"] == "prod"
+    assert out["MINT_CLUSTER_ID"] == "volcano"
+
+
+def test_issue_290_otel_env_vars_skip_empty_header(monkeypatch):
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://collector:4317")
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "")
 
     out = otel_env_vars()
 
     assert out["OTEL_EXPORTER_OTLP_ENDPOINT"] == "http://collector:4317"
-    assert out["OTEL_SERVICE_NAME"] == "mint"
-    assert out["MINT_APMPLUS_APP_KEY"] == "secret-key"
-    assert out["MINT_DEPLOYMENT_ENV"] == "prod"
-    assert out["MINT_CLUSTER_ID"] == "volcano"
     assert "OTEL_EXPORTER_OTLP_HEADERS" not in out
 
 
-def test_issue_290_otel_env_vars_supports_legacy_apmplus_alias(monkeypatch):
-    monkeypatch.delenv("MINT_APMPLUS_APP_KEY", raising=False)
-    monkeypatch.setenv("OTEL_APMPLUS_APP_KEY", "legacy-secret-key")
+def test_issue_290_otel_env_vars_do_not_forward_unlisted_keys(monkeypatch):
+    monkeypatch.setenv("OTEL_UNLISTED_KEY", "value")
 
     out = otel_env_vars()
 
-    assert out["MINT_APMPLUS_APP_KEY"] == "legacy-secret-key"
+    assert "OTEL_UNLISTED_KEY" not in out
 
 
 def test_issue_290_all_actor_runtime_env_call_otel_env_vars():

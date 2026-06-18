@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping, MutableMapping
 
 if TYPE_CHECKING:
     from .config_file import MintConfigFile
@@ -25,11 +25,11 @@ from .config_hydration import hydrate_from_config_actor
 hydrate_from_config_actor()
 
 
-def _env_nonempty(environ: dict[str, str], name: str) -> str | None:
+def _env_nonempty(environ: Mapping[str, str], name: str) -> str | None:
     return _runtime_env_nonempty(environ, name)
 
 
-def _env_get(environ: dict[str, str], name: str, default: str = "") -> str:
+def _env_get(environ: Mapping[str, str], name: str, default: str = "") -> str:
     value = _runtime_env_get(environ, name)
     return default if value is None else value
 
@@ -52,7 +52,7 @@ def _default_task_state_store_db_path(*, auth_enabled: bool) -> str:
     return "/vePFS-Mindverse/share/mint/dev/data/task-state/task_state.sqlite3"
 
 
-def _deployment_env_for_defaults(environ: dict[str, str], *, auth_enabled: bool) -> str:
+def _deployment_env_for_defaults(environ: Mapping[str, str], *, auth_enabled: bool) -> str:
     raw = _env_nonempty(environ, "MINT_DEPLOYMENT_ENV")
     if raw is not None:
         return raw
@@ -64,7 +64,7 @@ def _default_supervisor_state_db_path(deployment_env: str) -> str:
     return f"/vePFS-Mindverse/share/mint/{env}/runtime/supervisor_state.sqlite3"
 
 
-def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, object | None]:
+def _load_config_file_for_process(environ: Mapping[str, str]) -> tuple[str | None, MintConfigFile | None]:
     path = _env_nonempty(environ, "MINT_CONFIG_PATH")
     if not path:
         return None, None
@@ -79,6 +79,36 @@ def _load_config_file_for_process(environ: dict[str, str]) -> tuple[str | None, 
 
 
 _CONFIG_PATH, _CONFIG_FILE = _load_config_file_for_process(os.environ)
+
+
+def _hydrate_otel_env(environ: MutableMapping[str, str], config_file: MintConfigFile | None) -> None:
+    if config_file is None:
+        return
+    otel = config_file.otel
+
+    api_key = (otel.api_key or "").strip()
+    if api_key and _env_nonempty(environ, "OTEL_EXPORTER_OTLP_HEADERS") is None:
+        environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"x-api-key={api_key}"
+
+    headers = (otel.headers or "").strip()
+    if headers and _env_nonempty(environ, "OTEL_EXPORTER_OTLP_HEADERS") is None:
+        environ["OTEL_EXPORTER_OTLP_HEADERS"] = headers
+
+    endpoint = (otel.endpoint or "").strip()
+    if endpoint and _env_nonempty(environ, "OTEL_EXPORTER_OTLP_ENDPOINT") is None:
+        environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = endpoint
+
+    if otel.insecure is not None and _env_nonempty(environ, "OTEL_EXPORTER_OTLP_INSECURE") is None:
+        environ["OTEL_EXPORTER_OTLP_INSECURE"] = "true" if otel.insecure else "false"
+
+    if (
+        otel.metric_export_interval_ms is not None
+        and _env_nonempty(environ, "OTEL_METRIC_EXPORT_INTERVAL_MS") is None
+    ):
+        environ["OTEL_METRIC_EXPORT_INTERVAL_MS"] = str(int(otel.metric_export_interval_ms))
+
+
+_hydrate_otel_env(os.environ, _CONFIG_FILE)
 
 # Ray namespace for all server-owned actors (vLLM, Megatron, trainer pools).
 # Override for concurrent dev runs on a shared Ray cluster.
@@ -189,7 +219,6 @@ _OTEL_FORWARD_KEYS = (
     "OTEL_SERVICE_NAME",
     "OTEL_RESOURCE_ATTRIBUTES",
     "OTEL_LOG_LEVEL",
-    "MINT_APMPLUS_APP_KEY",
     "MINT_DEPLOYMENT_ENV",
     "MINT_CLUSTER_ID",
 )
@@ -202,12 +231,6 @@ def otel_env_vars() -> dict[str, str]:
         v = _env_nonempty(os.environ, k)
         if v is not None:
             out[k] = v
-    # Support legacy alias used by some deployments' .env files.
-    app_key = _env_nonempty(os.environ, "MINT_APMPLUS_APP_KEY") or _env_nonempty(
-        os.environ, "OTEL_APMPLUS_APP_KEY"
-    )
-    if app_key is not None:
-        out["MINT_APMPLUS_APP_KEY"] = app_key
     return out
 
 
@@ -234,7 +257,7 @@ def preferred_control_plane_resources(cluster_resources: dict[str, float] | None
         return {driver_node_key: 0.001}
     return None
 
-def _env_nonempty_any(environ: dict[str, str], *names: str) -> tuple[str | None, str | None]:
+def _env_nonempty_any(environ: Mapping[str, str], *names: str) -> tuple[str | None, str | None]:
     for name in names:
         value = _env_nonempty(environ, name)
         if value is not None:
@@ -441,11 +464,11 @@ def preferred_vllm_python_executable() -> str | None:
     return _worker_visible_py_executable(_env_nonempty(os.environ, "MINT_VLLM_CHILD_PYTHON_EXECUTABLE"))
 
 
-def preferred_torch_lib_dirs(environ: dict[str, str] | None = None) -> list[str]:
+def preferred_torch_lib_dirs(environ: Mapping[str, str] | None = None) -> list[str]:
     """Return torch lib directories in priority order for this Python runtime."""
-    environ = os.environ if environ is None else environ
+    env_source: Mapping[str, str] = os.environ if environ is None else environ
     pyver = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    env_root = _env_nonempty(environ, "PFS_RUNTIME_ENV_ROOT") or PFS_RUNTIME_ENV_ROOT
+    env_root = _env_nonempty(env_source, "PFS_RUNTIME_ENV_ROOT") or PFS_RUNTIME_ENV_ROOT
     candidates: list[str] = []
     if env_root:
         candidates.extend(
@@ -603,7 +626,7 @@ class ServerConfig:
     def from_sources(
         cls,
         *,
-        environ: dict[str, str],
+        environ: Mapping[str, str],
         config_path: str | None,
         config_file: MintConfigFile | None,
     ) -> "ServerConfig":

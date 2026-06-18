@@ -76,6 +76,16 @@ class _PathsSection(BaseModel):
     pfs_hf_modules_path: str | None = None
 
 
+class _OtelSection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    endpoint: str | None = None
+    api_key: str | None = None
+    insecure: bool | None = None
+    headers: str | None = None
+    metric_export_interval_ms: int | None = None
+
+
 class _MegatronBridgeSection(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -158,6 +168,7 @@ class MintConfigFile(BaseModel):
     sampling: _SamplingSection = Field(default_factory=_SamplingSection)
     ray: _RaySection = Field(default_factory=_RaySection)
     paths: _PathsSection = Field(default_factory=_PathsSection)
+    otel: _OtelSection = Field(default_factory=_OtelSection)
     megatron_bridge: _MegatronBridgeSection = Field(default_factory=_MegatronBridgeSection)
     model_actor_inventory: _ModelActorInventorySection = Field(default_factory=_ModelActorInventorySection)
     supervisor_state: _SupervisorStateSection = Field(default_factory=_SupervisorStateSection)

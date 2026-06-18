@@ -271,8 +271,6 @@ OBSERVABILITY_ENV_KEYS = frozenset(
         "OTEL_SERVICE_NAME",
         "OTEL_RESOURCE_ATTRIBUTES",
         "OTEL_LOG_LEVEL",
-        "MINT_APMPLUS_APP_KEY",
-        "OTEL_APMPLUS_APP_KEY",
         "MINT_DEPLOYMENT_ENV",
         "MINT_CLUSTER_ID",
     }

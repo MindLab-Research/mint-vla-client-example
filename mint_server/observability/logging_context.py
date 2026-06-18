@@ -4,16 +4,14 @@ Environment Variables:
     MINT_LOG_FILE: Log file path (default: /tmp/mint_server.log)
     MINT_LOG_MAX_BYTES: Max log file size before rotation (default: 100MB)
     MINT_LOG_BACKUP_COUNT: Number of backup files to keep (default: 5)
-    OTEL_EXPORTER_OTLP_ENDPOINT: Collector or APM endpoint (default: disabled)
-    OTEL_EXPORTER_OTLP_HEADERS: OTLP headers (e.g. "x-byteapm-appkey=xxx")
+    OTEL_EXPORTER_OTLP_ENDPOINT: Collector endpoint (default: disabled)
+    OTEL_EXPORTER_OTLP_HEADERS: OTLP headers (requires "x-api-key=xxx")
     OTEL_EXPORTER_OTLP_INSECURE: grpc insecure transport (default: true)
     OTEL_SERVICE_NAME: service.name resource attribute (default: mint-server)
     OTEL_SERVICE_INSTANCE_ID: optional service.instance.id override
     MINT_SERVICE_INSTANCE_ID: optional service.instance.id override
     OTEL_METRIC_EXPORT_INTERVAL_MS: metrics export interval (default: 60000)
     OTEL_LOG_LEVEL: OTLP log handler level (default: INFO)
-    MINT_APMPLUS_APP_KEY: optional shortcut for x-byteapm-appkey header
-    OTEL_APMPLUS_APP_KEY: legacy alias for MINT_APMPLUS_APP_KEY
     MINT_DEPLOYMENT_ENV: deployment.env resource attribute, e.g. dev or prod
     MINT_CLUSTER_ID: mint.cluster_id resource attribute, e.g. volcano or aliyun
 """
@@ -134,12 +132,12 @@ def _otel_service_instance_id(pid: int | None = None) -> str:
     return f"{_HOSTNAME}:{actual_pid}:{_PROCESS_INSTANCE_TOKEN}"
 
 
-def _otel_resource_attributes() -> dict[str, object]:
+def _otel_resource_attributes() -> dict[str, str | int]:
     service_name = (os.getenv("OTEL_SERVICE_NAME") or "mint-server").strip() or "mint-server"
     pid = os.getpid()
     # OTel metrics use cumulative counters. API workers and Ray actors must not
     # share one resource identity or the backend will merge independent counters.
-    resource_attributes: dict[str, object] = {
+    resource_attributes: dict[str, str | int] = {
         "service.name": service_name,
         "service.instance.id": _otel_service_instance_id(pid),
         "process.pid": pid,
@@ -766,7 +764,7 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
 
 
 def _configure_opentelemetry(root_logger: logging.Logger) -> None:
-    """Configure OTLP trace/metric/log export (APMPlus or collector)."""
+    """Configure OTLP trace/metric/log export."""
     global _OTEL_ENABLED, _OTEL_INITIALIZED, _OTEL_LOG_HANDLER_ATTACHED, _OTEL_RESOURCE_LOGGED
     global _HTTP_REQUEST_COUNTER, _HTTP_DURATION_HISTOGRAM, _HTTP_ERROR_COUNTER
     global _RETRIEVE_FUTURE_WAIT_COUNTER
@@ -787,6 +785,11 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
 
     endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
     if not endpoint:
+        return
+
+    headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
+    if "x-api-key" not in headers:
+        root_logger.info("[otel] no api key configured; skipping OTLP export")
         return
 
     try:
@@ -817,14 +820,6 @@ def _configure_opentelemetry(root_logger: logging.Logger) -> None:
         )
         _OTEL_RESOURCE_LOGGED = True
     resource = Resource(attributes=resource_attributes)
-    headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
-    app_key = (
-        os.getenv("MINT_APMPLUS_APP_KEY")
-        or os.getenv("OTEL_APMPLUS_APP_KEY")
-        or ""
-    ).strip()
-    if app_key and "x-byteapm-appkey" not in headers:
-        headers["x-byteapm-appkey"] = app_key
     insecure = _parse_bool_env("OTEL_EXPORTER_OTLP_INSECURE", default=True)
 
     try:
@@ -1539,15 +1534,12 @@ def init_actor_observability() -> None:
         assert structlog is not None
         logger = structlog.get_logger(__name__)
         logger.info(
-            "[actor_observability] init=%s structlog_available=%s otel_enabled=%s tracer_set=%s endpoint_set=%s headers_set=%s app_key_set=%s",
+            "[actor_observability] init=%s structlog_available=%s otel_enabled=%s tracer_set=%s endpoint_set=%s headers_set=%s",
             init_state,
             structlog is not None,
             is_otel_enabled(),
             get_otel_tracer() is not None,
             bool((os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()),
             bool((os.getenv("OTEL_EXPORTER_OTLP_HEADERS") or "").strip()),
-            bool(
-                (os.getenv("MINT_APMPLUS_APP_KEY") or os.getenv("OTEL_APMPLUS_APP_KEY") or "").strip()
-            ),
         )
         _ACTOR_OBS_INITIALIZED = True

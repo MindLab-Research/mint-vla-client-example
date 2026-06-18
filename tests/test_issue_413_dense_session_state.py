@@ -209,6 +209,7 @@ def test_issue_413_configure_logging_does_not_register_api_process_gauges_for_ac
             created.append(name)
 
     monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://otel.example:4317")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_HEADERS", "x-api-key=test")
     monkeypatch.setattr(otel_metrics, "get_meter", lambda _name: _FakeMeter())
     monkeypatch.setattr(logging_context, "_OTEL_INITIALIZED", False)
     monkeypatch.setattr(logging_context, "_OTEL_ENABLED", False)

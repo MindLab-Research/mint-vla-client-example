@@ -30,6 +30,24 @@ METER_NAME = "mint.nvml_probe"
 DEFAULT_INTERVAL_S = 5.0
 
 
+class _NoopGauge:
+    def set(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class _NoopMeter:
+    def create_gauge(self, *_args: Any, **_kwargs: Any) -> _NoopGauge:
+        return _NoopGauge()
+
+
+class _NoopProvider:
+    def force_flush(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def shutdown(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
 @dataclass(frozen=True)
 class GpuRow:
     hostname: str
@@ -191,10 +209,22 @@ def _parse_headers(raw: str | None) -> dict[str, str]:
     return out
 
 
-def _configure_otel() -> Any:
+def _otel_disabled_reason() -> str | None:
     endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
     if not endpoint:
-        raise RuntimeError("OTEL_EXPORTER_OTLP_ENDPOINT is not set")
+        return "OTEL_EXPORTER_OTLP_ENDPOINT is not set"
+    headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
+    if "x-api-key" not in headers:
+        return "OTEL_EXPORTER_OTLP_HEADERS missing x-api-key"
+    return None
+
+
+def _configure_otel() -> tuple[Any, Any] | None:
+    disabled_reason = _otel_disabled_reason()
+    if disabled_reason is not None:
+        return None
+    endpoint = (os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT") or "").strip()
+    headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
 
     from opentelemetry import metrics
     from opentelemetry.exporter.otlp.proto.grpc.metric_exporter import OTLPMetricExporter
@@ -206,11 +236,6 @@ def _configure_otel() -> Any:
     if os.getenv("MINT_NVML_PROBE_RESOURCE_ATTRS_JSON"):
         attrs.update(json.loads(os.environ["MINT_NVML_PROBE_RESOURCE_ATTRS_JSON"]))
     attrs.setdefault("mint.component", "nvml_probe")
-
-    headers = _parse_headers(os.getenv("OTEL_EXPORTER_OTLP_HEADERS"))
-    app_key = (os.getenv("MINT_APMPLUS_APP_KEY") or os.getenv("OTEL_APMPLUS_APP_KEY") or "").strip()
-    if app_key and "x-byteapm-appkey" not in headers:
-        headers["x-byteapm-appkey"] = app_key
 
     interval_ms = max(1000, int(os.getenv("OTEL_METRIC_EXPORT_INTERVAL_MS", "5000")))
     exporter = OTLPMetricExporter(
@@ -244,7 +269,10 @@ class NvmlOtelProbe:
         self._last_emit_ts = 0.0
         self._samples = 0
         self._last_process_classes: dict[str, int] = {}
-        self._meter, self._provider = _configure_otel()
+        configured = _configure_otel()
+        self._otel_enabled = configured is not None
+        self._otel_disabled_reason = "" if configured is not None else (_otel_disabled_reason() or "OTel disabled")
+        self._meter, self._provider = configured if configured is not None else (_NoopMeter(), _NoopProvider())
         self._gpu_present = self._meter.create_gauge(
             "mint_nvml_gpu_present",
             unit="1",
@@ -333,6 +361,8 @@ class NvmlOtelProbe:
             "samples": self._samples,
             "last_process_classes": self._last_process_classes,
             "interval_s": self._interval_s,
+            "otel_enabled": self._otel_enabled,
+            "otel_disabled_reason": self._otel_disabled_reason,
         }
 
     def start_loop(self) -> dict[str, Any]:
@@ -428,12 +458,11 @@ def _probe_runtime_env() -> dict[str, object] | None:
     try:
         from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
 
-        env_vars = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()).get("env_vars", {})
+        raw_env_vars = actor_runtime_env(pythonpath=PFS_PYTHONPATH, extra=otel_env_vars()).get("env_vars", {})
+        env_vars = raw_env_vars if isinstance(raw_env_vars, dict) else {}
     except Exception:
         env_vars = {k: v for k, v in os.environ.items() if k.startswith("OTEL_")}
     for key in (
-        "MINT_APMPLUS_APP_KEY",
-        "OTEL_APMPLUS_APP_KEY",
         "MINT_RAY_GCS_ADDRESS",
         "PFS_RUNTIME_ENV_ROOT",
         "MINT_CODE_ROOT",
