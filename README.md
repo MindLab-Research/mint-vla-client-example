@@ -12,6 +12,7 @@ config file passed with `MINT_CONFIG_PATH`:
 endpoint = "otel.macaron.xin:4317"
 api_key = "<OTEL_API_KEY>"
 insecure = false
+deployment_env = "prod"  # dev or prod; exported as deployment.env
 # metric_export_interval_ms = 60000
 ```
 
@@ -21,6 +22,7 @@ Environment variables still take precedence over the TOML file:
 export OTEL_EXPORTER_OTLP_ENDPOINT="otel.macaron.xin:4317"
 export OTEL_EXPORTER_OTLP_HEADERS="x-api-key=${OTEL_API_KEY}"
 export OTEL_EXPORTER_OTLP_INSECURE="false"
+export MINT_DEPLOYMENT_ENV="prod"
 ```
 
 If `x-api-key` is missing, Mint skips OTLP export and continues serving. Do not

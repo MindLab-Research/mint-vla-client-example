@@ -86,6 +86,10 @@ def _hydrate_otel_env(environ: MutableMapping[str, str], config_file: MintConfig
         return
     otel = config_file.otel
 
+    deployment_env = (otel.deployment_env or "").strip()
+    if deployment_env and _env_nonempty(environ, "MINT_DEPLOYMENT_ENV") is None:
+        environ["MINT_DEPLOYMENT_ENV"] = deployment_env
+
     api_key = (otel.api_key or "").strip()
     if api_key and _env_nonempty(environ, "OTEL_EXPORTER_OTLP_HEADERS") is None:
         environ["OTEL_EXPORTER_OTLP_HEADERS"] = f"x-api-key={api_key}"

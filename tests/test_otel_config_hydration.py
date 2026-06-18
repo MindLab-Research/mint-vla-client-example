@@ -22,6 +22,7 @@ def test_config_file_otel_section_loads(tmp_path):
                 "insecure = false",
                 'headers = "x-api-key=header-key,foo=bar"',
                 "metric_export_interval_ms = 5000",
+                'deployment_env = "prod"',
             ]
         )
         + "\n",
@@ -35,6 +36,7 @@ def test_config_file_otel_section_loads(tmp_path):
     assert cfg.otel.insecure is False
     assert cfg.otel.headers == "x-api-key=header-key,foo=bar"
     assert cfg.otel.metric_export_interval_ms == 5000
+    assert cfg.otel.deployment_env == "prod"
 
 
 def test_config_file_otel_defaults_empty_section(tmp_path):
@@ -48,6 +50,7 @@ def test_config_file_otel_defaults_empty_section(tmp_path):
     assert cfg.otel.insecure is None
     assert cfg.otel.headers is None
     assert cfg.otel.metric_export_interval_ms is None
+    assert cfg.otel.deployment_env is None
 
 
 def test_config_file_otel_unknown_key_fails(tmp_path):
@@ -70,6 +73,7 @@ def test_hydrate_otel_env_from_config_file(tmp_path):
                 'api_key = " secret-key "',
                 "insecure = false",
                 "metric_export_interval_ms = 7000",
+                'deployment_env = " prod "',
             ]
         )
         + "\n",
@@ -85,6 +89,7 @@ def test_hydrate_otel_env_from_config_file(tmp_path):
         "OTEL_EXPORTER_OTLP_ENDPOINT": "otel.macaron.xin:4317",
         "OTEL_EXPORTER_OTLP_INSECURE": "false",
         "OTEL_METRIC_EXPORT_INTERVAL_MS": "7000",
+        "MINT_DEPLOYMENT_ENV": "prod",
     }
 
 
@@ -98,6 +103,7 @@ def test_hydrate_otel_env_does_not_override_existing_env(tmp_path):
                 'api_key = "file-key"',
                 "insecure = false",
                 "metric_export_interval_ms = 7000",
+                'deployment_env = "file-prod"',
             ]
         )
         + "\n",
@@ -109,6 +115,7 @@ def test_hydrate_otel_env_does_not_override_existing_env(tmp_path):
         "OTEL_EXPORTER_OTLP_ENDPOINT": "env-endpoint:4317",
         "OTEL_EXPORTER_OTLP_INSECURE": "true",
         "OTEL_METRIC_EXPORT_INTERVAL_MS": "3000",
+        "MINT_DEPLOYMENT_ENV": "env-prod",
     }
 
     _hydrate_otel_env(environ, cfg)
@@ -118,6 +125,7 @@ def test_hydrate_otel_env_does_not_override_existing_env(tmp_path):
         "OTEL_EXPORTER_OTLP_ENDPOINT": "env-endpoint:4317",
         "OTEL_EXPORTER_OTLP_INSECURE": "true",
         "OTEL_METRIC_EXPORT_INTERVAL_MS": "3000",
+        "MINT_DEPLOYMENT_ENV": "env-prod",
     }
 
 

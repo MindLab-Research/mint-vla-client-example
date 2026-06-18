@@ -60,6 +60,15 @@ actor/runtime dependency assembly.
 
 - `use_mbridge_lora_export` (bool) [env: `MINT_USE_MBRIDGE_LORA_EXPORT`]
 
+### `[otel]`
+
+- `endpoint` (str) [env: `OTEL_EXPORTER_OTLP_ENDPOINT`]
+- `api_key` (str) [env: `OTEL_EXPORTER_OTLP_HEADERS` as `x-api-key=...`]
+- `headers` (str) [env: `OTEL_EXPORTER_OTLP_HEADERS`]
+- `insecure` (bool) [env: `OTEL_EXPORTER_OTLP_INSECURE`]
+- `metric_export_interval_ms` (int) [env: `OTEL_METRIC_EXPORT_INTERVAL_MS`]
+- `deployment_env` (str) [env: `MINT_DEPLOYMENT_ENV`; exported as OTel `deployment.env`]
+
 ### `[model_actor_inventory]`
 
 - `session_idle_timeout_s` (int) [env: `MINT_MODEL_ACTOR_INVENTORY_SESSION_IDLE_TIMEOUT_S`]

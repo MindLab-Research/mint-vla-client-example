@@ -84,6 +84,7 @@ class _OtelSection(BaseModel):
     insecure: bool | None = None
     headers: str | None = None
     metric_export_interval_ms: int | None = None
+    deployment_env: str | None = None
 
 
 class _MegatronBridgeSection(BaseModel):
