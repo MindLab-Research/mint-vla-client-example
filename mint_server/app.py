@@ -115,12 +115,15 @@ def _should_preload_openai_tokenizers() -> bool:
 
 async def _check_startup_control_plane() -> None:
     from mint_server.backend.core.config_actor import async_ping as async_ping_config_actor
-    from mint_server.backend.actors.model_actor_supervisor import model_actor_supervisor
 
     checks: list[tuple[str, object]] = [
         ("config_actor", async_ping_config_actor(timeout_s=5.0)),
-        ("model_actor_supervisor", model_actor_supervisor.async_snapshot(timeout_s=5.0)),
     ]
+
+    _skip_supervisor = str(os.environ.get("MINT_SKIP_SUPERVISOR", "")).strip().lower() in ("1", "true", "yes")
+    if not _skip_supervisor:
+        from mint_server.backend.actors.model_actor_supervisor import model_actor_supervisor
+        checks.append(("model_actor_supervisor", model_actor_supervisor.async_snapshot(timeout_s=5.0)))
 
     failures: dict[str, str] = {}
     for name, awaitable in checks:

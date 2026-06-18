@@ -368,18 +368,33 @@ def actor_runtime_env(
     tier: str = TIER_GPU_RL,
 ) -> dict[str, object]:
     if pythonpath is None:
-        pythonpath = PFS_CONTROL_PLANE_PYTHONPATH if tier == TIER_CPU else PFS_PYTHONPATH
-    if tier == TIER_CPU:
-        extra = dict(extra or {})
-        extra["MINT_CPU_TIER"] = "1"
-    runtime_env: dict[str, object] = {
-        "env_vars": actor_runtime_env_vars(
-            pythonpath=pythonpath,
+        if tier == TIER_CPU:
+            # Control-plane actors: use lightweight CPU-only PYTHONPATH
+            # (site-packages + mint_code_root + hf_modules, no torch/vllm/megatron).
+            # This is needed because packages like rocksdict are only in PFS
+            # cpu/site-packages, not in the Docker image /opt/venv.
+            pythonpath = PFS_CONTROL_PLANE_PYTHONPATH
+        else:
+            pythonpath = PFS_PYTHONPATH
+    if pythonpath:
+        runtime_env: dict[str, object] = {
+            "env_vars": actor_runtime_env_vars(
+                pythonpath=pythonpath,
+                extra=extra,
+                include_config_snapshot=include_config_snapshot,
+                include_ray_attach_hints=include_ray_attach_hints,
+            )
+        }
+    else:
+        # No PYTHONPATH: build env_vars without it
+        _env = actor_runtime_env_vars(
+            pythonpath="",
             extra=extra,
             include_config_snapshot=include_config_snapshot,
             include_ray_attach_hints=include_ray_attach_hints,
         )
-    }
+        _env.pop("PYTHONPATH", None)
+        runtime_env: dict[str, object] = {"env_vars": _env}
     allow_local_paths = _actor_runtime_env_allows_local_paths()
     py_modules_csv = _env_nonempty(os.environ, "MINT_RAY_PY_MODULES_CSV")
     if py_modules_csv:

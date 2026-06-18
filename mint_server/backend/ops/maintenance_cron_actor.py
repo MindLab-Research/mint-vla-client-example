@@ -330,7 +330,8 @@ def _get_or_create_actor():
     options["runtime_env"] = actor_runtime_env(
         extra=extra_env,
         include_ray_attach_hints=False,
-        tier=TIER_CPU,
+        include_config_snapshot=False,
+            tier=TIER_CPU,
     )
 
     try:

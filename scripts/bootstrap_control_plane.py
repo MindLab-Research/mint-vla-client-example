@@ -91,7 +91,11 @@ async def _bootstrap_async(args: argparse.Namespace) -> dict:
         timeout_s=float(args.timeout_s)
     )
 
-    supervisor_snapshot = model_actor_supervisor.ensure_started(timeout_s=float(args.timeout_s))
+    skip_supervisor = str(os.environ.get("MINT_SKIP_SUPERVISOR", "")).strip().lower() in ("1", "true", "yes")
+    if skip_supervisor:
+        supervisor_snapshot = {"desired_total": 0, "managed_total": 0, "reconcile_loop_running": False, "skipped": True}
+    else:
+        supervisor_snapshot = model_actor_supervisor.ensure_started(timeout_s=float(args.timeout_s))
 
     return {
         "ok": True,
@@ -140,6 +144,10 @@ def main(argv: list[str] | None = None) -> None:
             f"scheduler={summary['model_work_scheduler']['actor_name']} "
             f"cron={summary['maintenance_cron_actor']['actor_name']}"
         )
+
+    # Disconnect Ray Client so run_server.py can re-init without allow_multiple conflict
+    import ray
+    ray.shutdown()
 
 
 if __name__ == "__main__":

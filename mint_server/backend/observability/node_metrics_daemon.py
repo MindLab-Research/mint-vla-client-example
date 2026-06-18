@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, otel_env_vars
+from mint_server.config import PFS_PYTHONPATH, PFS_CONTROL_PLANE_PYTHONPATH, actor_runtime_env, otel_env_vars
+from mint_server.ray.runtime_env import TIER_CPU
 from mint_server.ray.runtime_env import env_nonempty
 
 
@@ -845,7 +846,7 @@ def get_or_create_node_metrics_collector_actor(spec: NodeMetricsDaemonSpec) -> A
         return ray.get_actor(name, namespace=namespace)
     except ValueError:
         pass
-    remote_cls = ray.remote(num_cpus=0, max_concurrency=4, max_restarts=-1)(NodeMetricsCollectorActor)
+    remote_cls = ray.remote(num_cpus=0, max_concurrency=4, max_restarts=2)(NodeMetricsCollectorActor)
     options: dict[str, Any] = {
         "name": name,
         "namespace": namespace,
@@ -853,7 +854,8 @@ def get_or_create_node_metrics_collector_actor(spec: NodeMetricsDaemonSpec) -> A
         "get_if_exists": True,
         "resources": {f"node:{spec.node_ip}": 0.001},
         "runtime_env": actor_runtime_env(
-            pythonpath=PFS_PYTHONPATH,
+            pythonpath=PFS_CONTROL_PLANE_PYTHONPATH if spec.is_head_node else PFS_PYTHONPATH,
+            tier=TIER_CPU if spec.is_head_node else None,
             extra={
                 **otel_env_vars(),
                 "OTEL_SERVICE_NAME": "mint-node-metrics",

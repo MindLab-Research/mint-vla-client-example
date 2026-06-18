@@ -140,6 +140,23 @@ case "${MINT_RAY_NAMESPACE}" in
     ;;
 esac
 
+# Derive a stable port from the username if MINT_PORT is not set.
+# Hash the namespace to a port in [30000, 40000) so multiple users
+# can run dev servers concurrently without port conflicts.
+if [ -z "${MINT_PORT:-}" ]; then
+  _port_hash=0
+  _port_ns="${MINT_RAY_NAMESPACE}"
+  _port_i=1
+  while [ "$_port_i" -le "${#_port_ns}" ]; do
+    _port_c=$(printf '%d' "'$(printf '%.1s' "$_port_ns" "$_port_i")")
+    _port_hash=$(( (_port_hash * 31 + _port_c) % 10000 ))
+    _port_i=$(( _port_i + 1 ))
+  done
+  MINT_PORT=$(( 30000 + _port_hash ))
+  echo "MINT_PORT derived from namespace: ${MINT_PORT} (override with MINT_PORT=<n>)" >&2
+fi
+export MINT_PORT
+
 export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
 export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
 # Do NOT set MINT_RAY_JOB_WORKING_DIR. Even PFS paths cause Ray to package and
@@ -216,20 +233,23 @@ ray_head_ip=""
 if [ -r "${ray_head_ip_path}" ]; then
   ray_head_ip=$(tr -d '[:space:]' < "${ray_head_ip_path}")
 fi
-# Driver attaches as a Ray client; Mint control-plane code gets the direct GCS
-# address only through an explicit non-Ray bootstrap variable.
-if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
-  export MINT_RAY_CLIENT_ADDRESS="ray://${ray_head_ip}:10001"
-fi
-if [ -z "${RAY_CLIENT_ADDRESS:-}" ] && [ -n "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
-  export RAY_CLIENT_ADDRESS="${MINT_RAY_CLIENT_ADDRESS}"
-fi
+# Connection mode: Ray Client (ray://) or direct attach (GCS address).
+# Default: direct attach via MINT_RAY_GCS_ADDRESS — no Ray Client proxy.
+# Set MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 to force Ray Client mode.
 if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
   export MINT_RAY_GCS_ADDRESS="${ray_head_ip}:6379"
 fi
-if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ]; then
+if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -z "${RAY_CLIENT_ADDRESS:-}" ]; then
+  # Direct attach mode: do NOT set RAY_CLIENT_ADDRESS.
+  # ray.init(address=MINT_RAY_GCS_ADDRESS) connects directly to GCS.
+  unset RAY_CLIENT_ADDRESS 2>/dev/null || true
+elif [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -n "${RAY_CLIENT_ADDRESS:-}" ]; then
+  export MINT_RAY_CLIENT_ADDRESS="${RAY_CLIENT_ADDRESS}"
+fi
+if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -z "${MINT_RAY_GCS_ADDRESS:-}" ]; then
   echo "error: no Ray head address. Expected an IP in ${ray_head_ip_path}" >&2
-  echo "       or set MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 explicitly." >&2
+  echo "       or set MINT_RAY_GCS_ADDRESS=<head>:6379 for direct attach," >&2
+  echo "       or MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 for Ray Client." >&2
   exit 1
 fi
 
@@ -252,9 +272,10 @@ echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
 echo "MINT_DEV_SOURCE_CHECKOUT  ${MINT_DEV_SOURCE_CHECKOUT:-<none>}" >&2
 echo "MINT_GIT_SHA             ${MINT_GIT_SHA:-<unknown>}" >&2
 echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
+echo "MINT_PORT                 ${MINT_PORT}" >&2
 echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
 echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2
-echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS}" >&2
+echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS:-<unset, direct attach>}" >&2
 echo "MINT_RAY_GCS_ADDRESS      ${MINT_RAY_GCS_ADDRESS:-<unset>}" >&2
 echo "MINT_CONTROL_PLANE_NODE   ${MINT_CONTROL_PLANE_NODE_IP:-<auto>}" >&2
 echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 
 import structlog
 import time
@@ -286,30 +287,44 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
 
         if not ray.is_initialized():
             return []
-        from ray.util import state as ray_state
+
+        if _is_ray_worker_process():
+            logger.warning('[model_actor_placement] cluster_state_unavailable_in_worker: skipping GPU actor listing (degraded mode)')
+            return []
 
         namespace = _ray_namespace()
-        node_id_to_ip = {
-            str(node.get("NodeID") or ""): str(node.get("NodeManagerAddress") or "")
-            for node in ray.nodes()
-            if node.get("NodeID") and node.get("NodeManagerAddress")
-        }
+
+        # Use ray.util.list_named_actors instead of ray.nodes()+ray_state.list_actors().
+        # NOTE: list_named_actors is also @wrap_auto_init decorated, but is
+        # less likely to trigger auto_init in practice. This is NOT a guarantee.
+        # See issue #752 for the full auto_init bug analysis.
         try:
-            rows = ray_state.list_actors(
-                detail=True,
-                limit=10000,
-                raise_on_missing_output=False,
-                filters=[("ray_namespace", "=", namespace)],
-            )
-            return _gpu_actor_records_from_rows(rows, node_id_to_ip=node_id_to_ip)
-        except Exception as exc:
-            logger.warning(
-                "[model_actor_placement] GPU actor state listing failed"
-                " namespace=%s error_type=%s error=%s; skipping surviving actor adoption",
-                namespace,
-                type(exc).__name__,
-                exc,
-            )
+            named_actors = ray.util.list_named_actors(all_namespaces=True)
+        except Exception:
+            named_actors = []
+
+        records: list[dict[str, Any]] = []
+        for actor_info in named_actors:
+            if not isinstance(actor_info, dict):
+                continue
+            actor_namespace = str(actor_info.get("namespace") or "")
+            if actor_namespace and actor_namespace != namespace:
+                continue
+            name = str(actor_info.get("name") or "")
+            if not name:
+                continue
+            # Only include mint-managed GPU actors
+            if not _is_mint_gpu_actor_name(name):
+                continue
+            records.append({
+                "name": name,
+                "namespace": actor_namespace,
+                "state": str(actor_info.get("state") or "ALIVE"),
+                "node_id": str(actor_info.get("node_id") or ""),
+                "pid": actor_info.get("pid"),
+                "gpu": 0,
+            })
+        return records
     except Exception:
         logger.debug("GPU actor lister unavailable", exc_info=True)
     return []
@@ -334,12 +349,16 @@ def _default_placement_group_lister() -> Iterable[dict[str, Any]]:
 
         if not ray.is_initialized():
             return []
-        table = ray.util.placement_group_table()
-        node_id_to_ip = {
-            str(node.get("NodeID") or ""): str(node.get("NodeManagerAddress") or "")
-            for node in ray.nodes()
-            if node.get("NodeID") and node.get("NodeManagerAddress")
-        }
+        if _is_ray_worker_process():
+            logger.warning('[model_actor_placement] cluster_state_unavailable_in_worker: skipping placement group listing (degraded mode)')
+            return []
+        try:
+            table = ray.util.placement_group_table()
+        except Exception:
+            return []
+        # Do not call ray.nodes() — it triggers auto_init in Ray Client mode.
+        # Node IP is not needed for placement group listing in detached actors.
+        node_id_to_ip = {}
     except Exception:
         return []
 

@@ -172,8 +172,8 @@ def test_issue_729_get_or_create_model_engine_host_blanks_actor_attach_hints(mon
     assert out == {"created": True}
     env_vars = created[-1]["options"]["runtime_env"]["env_vars"]
     assert "RAY_ADDRESS" not in env_vars
-    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
-    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "RAY_CLIENT_ADDRESS" not in env_vars
+    assert "MINT_RAY_CLIENT_ADDRESS" not in env_vars
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.40.99:6379"
     assert env_vars["MINT_VLLM_CHILD_PYTHON_EXECUTABLE"] == "/repo/scripts/vllm_worker_python.py"
     assert env_vars["MINT_ENABLE_VLLM_IMPORT_PATCHES"] == "1"

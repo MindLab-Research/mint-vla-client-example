@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import structlog
+from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 import time
 
 import os
@@ -919,6 +920,9 @@ def _is_ray_get_timeout_error(exc: BaseException) -> bool:
 
 def _observed_free_gpus_by_node() -> dict[str, int]:
     try:
+        if _is_ray_worker_process():
+            logger.warning("[supervisor] cluster_state_unavailable_in_worker: skipping placement group table (degraded mode)")
+            return {}
         from mint_server.backend.actors.node_placement import _list_alive_gpu_nodes
 
         return {
@@ -935,6 +939,9 @@ def _placement_group_table() -> dict[str, Any]:
     try:
         import ray
 
+        if _is_ray_worker_process():
+            logger.warning("[supervisor] cluster_state_unavailable_in_worker: skipping placement group table (degraded mode)")
+            return {}
         table = ray.util.placement_group_table()
         return table if isinstance(table, dict) else {}
     except Exception:
@@ -3204,6 +3211,7 @@ def _create_ray_actor(*, require_ready: bool = True):
         "runtime_env": actor_runtime_env(
             extra=extra_env,
             include_ray_attach_hints=False,
+            include_config_snapshot=False,
             tier=TIER_CPU,
         ),
     }

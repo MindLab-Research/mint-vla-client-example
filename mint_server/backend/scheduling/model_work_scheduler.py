@@ -2723,6 +2723,7 @@ def _create_ray_actor_handle():
         "runtime_env": actor_runtime_env(
             extra=extra_env,
             include_ray_attach_hints=False,
+            include_config_snapshot=False,
             tier=TIER_CPU,
         ),
     }

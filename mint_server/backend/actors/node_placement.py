@@ -10,6 +10,7 @@ from hashlib import sha1
 from urllib.parse import urlsplit
 
 import ray
+from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 
 from mint_server.backend.ray_cluster.model_actor_pg_names import actor_placement_group_names
 
@@ -219,6 +220,9 @@ def _available_resources_per_node_with_pg_fallback(
     *,
     context: str,
 ) -> tuple[dict[str, dict[str, float]], bool]:
+    if _is_ray_worker_process():
+        logger.warning("[node_placement] cluster_state_unavailable_in_worker: skipping available resources (degraded mode)")
+        return {}, False
     try:
         from ray._private import state as ray_state
 
@@ -337,6 +341,10 @@ def _available_gpus_for_node(
 def _list_alive_gpu_nodes() -> list[GpuNode]:
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
+
+    if _is_ray_worker_process():
+        logger.warning("[node_placement] cluster_state_unavailable_in_worker: skipping GPU node listing (degraded mode)")
+        return []
 
     avail, fail_closed_on_missing = _available_resources_per_node_with_pg_fallback(
         context="_list_alive_gpu_nodes",

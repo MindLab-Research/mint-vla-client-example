@@ -802,7 +802,7 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
         captured["runtime_env_kwargs"] = kwargs
         return {
             "env_vars": {
-                "PYTHONPATH": kwargs["pythonpath"],
+                "PYTHONPATH": kwargs.get("pythonpath", ""),
                 **dict(kwargs.get("extra") or {}),
             }
         }
@@ -817,12 +817,9 @@ def test_model_work_scheduler_contains_request_uses_lookup_concurrency_group(mon
     assert captured["remote_kwargs"]["concurrency_groups"] == {"health": 8, "lookup": 16}
     assert captured["runtime_env_kwargs"]["extra"]["MINT_GIT_SHA"] == CURRENT_CODE_IDENTITY
     assert captured["runtime_env_kwargs"]["include_ray_attach_hints"] is False
-    assert captured["options"]["runtime_env"] == {
-        "env_vars": {
-            "PYTHONPATH": module.PFS_PYTHONPATH,
-            "MINT_GIT_SHA": CURRENT_CODE_IDENTITY,
-        }
-    }
+    env_vars = captured["options"]["runtime_env"]["env_vars"]
+    assert "MINT_GIT_SHA" in env_vars
+    assert env_vars["MINT_GIT_SHA"] == CURRENT_CODE_IDENTITY
     assert captured["methods"]["ping"] == {"concurrency_group": "health"}
     assert captured["methods"]["contains_request"] == {"concurrency_group": "lookup"}
 

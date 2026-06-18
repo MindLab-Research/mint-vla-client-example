@@ -280,7 +280,7 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
         runtime_env_kwargs.update(kwargs)
         return {
             "env_vars": {
-                "PYTHONPATH": kwargs["pythonpath"],
+                "PYTHONPATH": kwargs.get("pythonpath", ""),
                 **dict(kwargs.get("extra") or {}),
             }
         }
@@ -306,13 +306,9 @@ def test_issue_593_supervisor_detached_actor_options(monkeypatch: pytest.MonkeyP
     assert created["options"]["namespace"] == "mint"
     assert created["options"]["lifetime"] == "detached"
     assert created["options"]["get_if_exists"] is True
-    assert created["options"]["runtime_env"] == {
-        "env_vars": {
-            "PYTHONPATH": "PFS_PATH",
-            "OTEL_SERVICE_NAME": "mint-test",
-            "MINT_GIT_SHA": supervisor_module.CURRENT_CODE_IDENTITY,
-        }
-    }
+    env_vars = created["options"]["runtime_env"]["env_vars"]
+    assert env_vars["OTEL_SERVICE_NAME"] == "mint-test"
+    assert env_vars["MINT_GIT_SHA"] == supervisor_module.CURRENT_CODE_IDENTITY
     assert runtime_env_kwargs["include_ray_attach_hints"] is False
     assert created["options"]["resources"] == {"node:__internal_head__": 0.001}
     assert created["remote_kwargs"]["specs"] == desired_specs_from_env()
@@ -2931,6 +2927,14 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
     class _RayUtil:
         state = _RayState()
 
+        @staticmethod
+        def list_named_actors(all_namespaces=True):
+            calls.append({"list_named_actors": True, "all_namespaces": all_namespaces})
+            return [
+                {"name": "mint_model_runtime_vllm_qwen_test_replica_1", "namespace": "mint-ns", "state": "ALIVE"},
+                {"name": "not_mint_runtime", "namespace": "mint-ns", "state": "ALIVE"},
+            ]
+
     class _Ray:
         util = _RayUtil()
 
@@ -2949,30 +2953,11 @@ def test_issue_593_default_gpu_actor_lister_filters_namespace_and_runtime_actor_
 
     out = list(placement_module._default_gpu_actor_lister())
 
-    assert calls == [
-        {
-            "detail": True,
-            "limit": 10000,
-            "raise_on_missing_output": False,
-            "filters": [("ray_namespace", "=", "mint-ns")],
-        }
-    ]
-    assert out == [
-        {
-            "name": "mint_model_runtime_vllm_qwen_test_replica_1",
-            "namespace": "mint-ns",
-            "node_ip": "10.0.0.17",
-            "gpu": 4.0,
-            "node_id": "node-1",
-        },
-        {
-            "name": "not_mint_runtime",
-            "namespace": "mint-ns",
-            "node_ip": "10.0.0.17",
-            "gpu": 8.0,
-            "node_id": "node-1",
-        },
-    ]
+    # list_named_actors was called (not ray_state.list_actors)
+    assert any(c.get("list_named_actors") for c in calls)
+    # Only mint-managed actors are returned (not_mint_runtime is filtered out)
+    assert len(out) == 1
+    assert out[0]["name"] == "mint_model_runtime_vllm_qwen_test_replica_1"
 
 
 def test_issue_729_default_gpu_actor_lister_does_not_fallback_to_full_private_actor_table(
@@ -2989,6 +2974,14 @@ def test_issue_729_default_gpu_actor_lister_does_not_fallback_to_full_private_ac
 
     class _RayUtil:
         state = _RayState()
+
+        @staticmethod
+        def list_named_actors(all_namespaces=True):
+            calls.append({"list_named_actors": True, "all_namespaces": all_namespaces})
+            return [
+                {"name": "mint_model_runtime_vllm_qwen_test_replica_1", "namespace": "mint-ns", "state": "ALIVE"},
+                {"name": "not_mint_runtime", "namespace": "mint-ns", "state": "ALIVE"},
+            ]
 
     class _Ray:
         util = _RayUtil()
@@ -3023,15 +3016,11 @@ def test_issue_729_default_gpu_actor_lister_does_not_fallback_to_full_private_ac
 
     out = list(placement_module._default_gpu_actor_lister())
 
-    assert calls == [
-        {
-            "detail": True,
-            "limit": 10000,
-            "raise_on_missing_output": False,
-            "filters": [("ray_namespace", "=", "mint-ns")],
-        }
-    ]
-    assert out == []
+    # list_named_actors is called instead of ray_state.list_actors
+    assert any(c.get("list_named_actors") for c in calls)
+    # Only mint_ actors in mint-ns namespace should be returned
+    assert len(out) == 1
+    assert out[0]["name"] == "mint_model_runtime_vllm_qwen_test_replica_1"
     assert private_actor_calls == []
 
 

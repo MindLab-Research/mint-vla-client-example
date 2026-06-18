@@ -395,12 +395,20 @@ def init_ray(**kwargs: Any) -> Any:
 
     existing_runtime_env = kwargs.get("runtime_env")
     if existing_runtime_env is None:
-        runtime_env = client_job_runtime_env(address=desired_address)
+        # Ray Client + runtime_env causes ray.is_initialized() to return False
+        # when runtime_env contains py_modules/working_dir. However, env_vars-only
+        # runtime_env works fine. Use a minimal env_vars-only runtime_env so
+        # head node workers can resolve mint_server via PYTHONPATH.
+        pfs_pythonpath = os.environ.get("MINT_RAY_JOB_PYTHONPATH", "").strip()
+        if not pfs_pythonpath:
+            pfs_pythonpath = os.environ.get("MINT_CODE_ROOT", "").strip()
+        if pfs_pythonpath:
+            kwargs["runtime_env"] = {"env_vars": {"PYTHONPATH": pfs_pythonpath}}
     else:
         runtime_env = _job_level_runtime_env(desired_address, existing_runtime_env)
         runtime_env = _blank_ray_worker_bootstrap_attach_env(desired_address, runtime_env)
-    if runtime_env is not None:
-        kwargs["runtime_env"] = runtime_env
+        if runtime_env is not None:
+            kwargs["runtime_env"] = runtime_env
 
     node_ip = os.environ.get("MINT_RAY_NODE_IP_ADDRESS", "").strip()
     if node_ip and "_node_ip_address" not in kwargs:
