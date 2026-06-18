@@ -150,30 +150,35 @@ host_requirements = [
 [[tool.mint.runtime_env.sources]]
 name = "Megatron-LM"
 repo = "https://github.com/NVIDIA/Megatron-LM.git"
+tier = "gpu_rl"
 commit = "2d398b42fd4237fffb553109563d73ac099751c3"
 pythonpath = ["."]
 
 [[tool.mint.runtime_env.sources]]
 name = "Megatron-Bridge"
 repo = "https://github.com/HollowMan6/Megatron-Bridge.git"
+tier = "gpu_rl"
 commit = "762fc5d3b717d24327c00ae37ce2be573e3f343b"
 pythonpath = ["src", "."]
 
 [[tool.mint.runtime_env.sources]]
 name = "verl"
 repo = "https://github.com/verl-project/verl.git"
+tier = "gpu_rl"
 commit = "d2916f5a0ed346464d8999e040e0ebb05bb8fadf"
 pythonpath = ["."]
 
 [[tool.mint.runtime_env.sources]]
 name = "openpi"
 repo = "https://github.com/Physical-Intelligence/openpi.git"
+tier = "gpu_vla"
 commit = "e6b044115c075dc64a2e4e23d33ea3a3c293f123"
 pythonpath = ["src", "packages/openpi-client/src"]
 
 [[tool.mint.runtime_env.sources]]
 name = "vllm"
 repo = "https://github.com/vllm-project/vllm.git"
+tier = "gpu_rl"
 commit = "89a77b10846fd96273cce78d86d2556ea582d26e"
 pythonpath = ["."]
 host_only = true

@@ -12,7 +12,9 @@ if TYPE_CHECKING:
     from .config_file import MintConfigFile
 
 from mint_server.ray.runtime_env import (
-    build_runtime_pythonpath,
+    TIER_CPU,
+    TIER_GPU_RL,
+    build_tiered_pythonpath,
     env_get as _runtime_env_get,
     env_nonempty as _runtime_env_nonempty,
     join_pythonpath,
@@ -150,10 +152,28 @@ def ensure_runtime_env_configured() -> str:
 PFS_PYTHONPATH = (
     join_pythonpath(
         MINT_ACTOR_EXTRA_PYTHONPATH,
-        build_runtime_pythonpath(
+        build_tiered_pythonpath(
             env_root=PFS_RUNTIME_ENV_ROOT,
             mint_code_root=MINT_CODE_ROOT,
             pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+            tier=TIER_GPU_RL,
+        ),
+    )
+    if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
+    else ""
+)
+
+# Lightweight PYTHONPATH for control-plane actors (ConfigActor, Scheduler, etc.)
+# that run on CPU-only head nodes.  Excludes torch/vllm/megatron/verl/openpi
+# to avoid loading GB of GPU libraries on a 4-vCPU head node.
+PFS_CONTROL_PLANE_PYTHONPATH = (
+    join_pythonpath(
+        MINT_ACTOR_EXTRA_PYTHONPATH,
+        build_tiered_pythonpath(
+            env_root=PFS_RUNTIME_ENV_ROOT,
+            mint_code_root=MINT_CODE_ROOT,
+            pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+            tier=TIER_CPU,
         ),
     )
     if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
@@ -325,11 +345,14 @@ def _actor_runtime_env_allows_local_paths() -> bool:
 
 def actor_runtime_env(
     *,
-    pythonpath: str,
+    pythonpath: str | None = None,
     extra: dict[str, str] | None = None,
     include_config_snapshot: bool = True,
     include_ray_attach_hints: bool = True,
+    tier: str = TIER_GPU_RL,
 ) -> dict[str, object]:
+    if pythonpath is None:
+        pythonpath = PFS_CONTROL_PLANE_PYTHONPATH if tier == TIER_CPU else PFS_PYTHONPATH
     runtime_env: dict[str, object] = {
         "env_vars": actor_runtime_env_vars(
             pythonpath=pythonpath,

@@ -13,7 +13,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars
+from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars, TIER_CPU
 from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref, sync_get_ray_ref
 from mint_server.backend.contracts.control_plane_contracts import (
@@ -3748,6 +3748,7 @@ def _create_ray_actor_handle():
             pythonpath=PFS_PYTHONPATH,
             extra=otel_env_vars(),
             include_ray_attach_hints=False,
+            tier=TIER_CPU,
         ),
     }
     apply_detached_actor_resources(options, ray)

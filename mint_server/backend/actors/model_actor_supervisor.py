@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
 from mint_server.config import (
+    TIER_CPU,
     PFS_PYTHONPATH,
     actor_runtime_env,
     config as server_config,
@@ -3205,6 +3206,7 @@ def _create_ray_actor(*, require_ready: bool = True):
             pythonpath=PFS_PYTHONPATH,
             extra=extra_env,
             include_ray_attach_hints=False,
+            tier=TIER_CPU,
         ),
     }
     resources = _model_actor_supervisor_actor_resources()

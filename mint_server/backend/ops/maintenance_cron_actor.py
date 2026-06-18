@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from mint_server.config import PFS_PYTHONPATH, actor_runtime_env, apply_detached_actor_resources, otel_env_vars, TIER_CPU
 from mint_server.ray.runtime_env import env_nonempty
 from mint_server.checkpoints.checkpoints import (
     get_checkpoint_mirror_poll_s,
@@ -331,6 +331,7 @@ def _get_or_create_actor():
         pythonpath=PFS_PYTHONPATH,
         extra=extra_env,
         include_ray_attach_hints=False,
+        tier=TIER_CPU,
     )
 
     try:

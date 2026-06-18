@@ -19,6 +19,15 @@ DEFAULT_SOURCE_DIRNAME = "src"
 DEFAULT_BASE_PYTHON_DIRNAME = "base-python"
 DEFAULT_HOST_VENV_DIRNAME = "host-venv"
 
+# Runtime tiers — sources are tagged with a tier in pyproject.toml / manifest.json.
+# Control-plane actors (ConfigActor, Scheduler, TaskStateStore, etc.) only need
+# CPU-tier dependencies (ray, fastapi, pydantic).  GPU worker actors need the
+# full set including torch, vllm, megatron, etc.
+TIER_CPU = "cpu"
+TIER_GPU_RL = "gpu_rl"
+TIER_GPU_VLA = "gpu_vla"
+_ALL_TIERS = frozenset({TIER_CPU, TIER_GPU_RL, TIER_GPU_VLA})
+
 
 def canonical_mint_env_name(name: str) -> str:
     if name.startswith("TINKER_"):
@@ -88,13 +97,13 @@ class RuntimeEnvSettings:
     source_dir: str
     base_python_dir: str
     host_venv_dir: str
-    sources: tuple[tuple[str, tuple[str, ...]], ...]
-    host_sources: tuple[tuple[str, tuple[str, ...]], ...]
+    sources: tuple[tuple[str, tuple[str, ...], str], ...]  # (name, pythonpath_parts, tier)
+    host_sources: tuple[tuple[str, tuple[str, ...], str], ...]
 
 
-def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    deduped: list[tuple[str, tuple[str, ...]]] = []
-    seen: set[tuple[str, tuple[str, ...]]] = set()
+def _dedupe(entries: list[tuple[str, tuple[str, ...], str]]) -> tuple[tuple[str, tuple[str, ...], str], ...]:
+    deduped: list[tuple[str, tuple[str, ...], str]] = []
+    seen: set[tuple[str, tuple[str, ...], str]] = set()
     for entry in entries:
         if entry in seen:
             continue
@@ -104,17 +113,18 @@ def _dedupe(entries: list[tuple[str, tuple[str, ...]]]) -> tuple[tuple[str, tupl
 
 
 def _settings_from_runtime_metadata(runtime: Mapping[str, object], sources: Sequence[Mapping[str, object]]) -> RuntimeEnvSettings:
-    shared_entries: list[tuple[str, tuple[str, ...]]] = []
-    host_entries: list[tuple[str, tuple[str, ...]]] = []
+    shared_entries: list[tuple[str, tuple[str, ...], str]] = []
+    host_entries: list[tuple[str, tuple[str, ...], str]] = []
     for source in sources:
         if "name" not in source:
             raise RuntimeError(f"runtime source missing name: {source!r}")
         name = str(source["name"])
+        tier = str(source.get("tier", TIER_GPU_RL))
         bucket = host_entries if bool(source.get("host_only", False)) else shared_entries
         for rel in source.get("pythonpath", ["."]):
             rel_str = str(rel).strip()
             parts = () if rel_str in ("", ".") else tuple(part for part in rel_str.split("/") if part)
-            bucket.append((name, parts))
+            bucket.append((name, parts, tier))
     return RuntimeEnvSettings(
         site_packages_dir=str(runtime.get("site_packages_dir", DEFAULT_SITE_PACKAGES_DIRNAME)),
         source_dir=str(runtime.get("source_dir", DEFAULT_SOURCE_DIRNAME)),
@@ -148,18 +158,21 @@ def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings:
     return _settings_from_runtime_metadata(runtime, sources)
 
 
-def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings) -> RuntimeEnvLayout:
+def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings, *, tier: str | None = None) -> RuntimeEnvLayout:
     root = os.path.abspath(env_root)
     source_root = os.path.join(root, settings.source_dir)
     site_packages = os.path.join(root, settings.site_packages_dir)
     base_python_root = os.path.join(root, settings.base_python_dir)
     host_venv_root = os.path.join(root, settings.host_venv_dir)
     entries = [site_packages]
-    for repo_name, rel_parts in settings.sources:
+    for repo_name, rel_parts, src_tier in settings.sources:
+        if tier is not None and src_tier not in _tiers_for(tier):
+            continue
         entries.append(os.path.join(source_root, repo_name, *rel_parts))
     host_entries = [
         os.path.join(source_root, repo_name, *rel_parts)
-        for repo_name, rel_parts in settings.host_sources
+        for repo_name, rel_parts, src_tier in settings.host_sources
+        if tier is None or src_tier in _tiers_for(tier)
     ]
     host_python = os.path.join(host_venv_root, "bin", "python")
     return RuntimeEnvLayout(
@@ -174,12 +187,28 @@ def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings) -> Runtim
     )
 
 
-def runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
-    return _layout_from_settings(env_root, _runtime_env_settings_from_manifest(env_root))
+def _tiers_for(tier: str) -> frozenset[str]:
+    """Return the set of source tiers included by the given actor tier.
+
+    CPU actors get only CPU-tier sources (which is empty — all sources are
+    GPU-tier).  GPU_RL actors get gpu_rl sources.  GPU_VLA actors get both
+    gpu_rl and gpu_vla sources.
+    """
+    if tier == TIER_CPU:
+        return frozenset()
+    if tier == TIER_GPU_RL:
+        return frozenset({TIER_GPU_RL})
+    if tier == TIER_GPU_VLA:
+        return frozenset({TIER_GPU_RL, TIER_GPU_VLA})
+    return frozenset({TIER_GPU_RL, TIER_GPU_VLA})
 
 
-def checkout_runtime_env_layout(env_root: str) -> RuntimeEnvLayout:
-    return _layout_from_settings(env_root, _checkout_runtime_env_settings())
+def runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
+    return _layout_from_settings(env_root, _runtime_env_settings_from_manifest(env_root), tier=tier)
+
+
+def checkout_runtime_env_layout(env_root: str, *, tier: str | None = None) -> RuntimeEnvLayout:
+    return _layout_from_settings(env_root, _checkout_runtime_env_settings(), tier=tier)
 
 
 def validate_runtime_env_layout(env_root: str, *, require_host_python: bool = True) -> RuntimeEnvLayout:
@@ -247,6 +276,34 @@ def build_runtime_pythonpath(
     layout = validate_runtime_env_layout(env_root, require_host_python=False)
     return join_pythonpath(
         layout.pythonpath_entries,
+        mint_code_root,
+        pfs_hf_modules_path,
+    )
+
+
+def build_tiered_pythonpath(
+    *,
+    env_root: str,
+    mint_code_root: str,
+    pfs_hf_modules_path: str,
+    tier: str = TIER_GPU_RL,
+) -> str:
+    """Build PYTHONPATH for a specific runtime tier.
+
+    CPU tier: site-packages + mint_code_root + hf_modules (no Megatron/vLLM/etc.)
+    GPU_RL tier: CPU + Megatron-LM + Megatron-Bridge + verl + vllm
+    GPU_VLA tier: GPU_RL + openpi
+    """
+    layout = runtime_env_layout(env_root, tier=tier)
+    if tier == TIER_CPU:
+        return join_pythonpath(
+            layout.site_packages,
+            mint_code_root,
+            pfs_hf_modules_path,
+        )
+    return join_pythonpath(
+        layout.pythonpath_entries,
+        layout.host_pythonpath_entries,
         mint_code_root,
         pfs_hf_modules_path,
     )

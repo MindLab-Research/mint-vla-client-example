@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from mint_server.config import (
+    TIER_CPU,
     PFS_PYTHONPATH,
     actor_runtime_env,
     apply_detached_actor_resources,
@@ -2724,6 +2725,7 @@ def _create_ray_actor_handle():
             pythonpath=PFS_PYTHONPATH,
             extra=extra_env,
             include_ray_attach_hints=False,
+            tier=TIER_CPU,
         ),
     }
     resources = _model_work_scheduler_actor_resources()
