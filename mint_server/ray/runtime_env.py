@@ -153,7 +153,7 @@ def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings:
     sources = data.get("sources")
     if not isinstance(runtime, dict):
         raise RuntimeError(f"runtime manifest missing runtime_env table: {manifest_path}")
-    if not isinstance(sources, list) or not sources:
+    if not isinstance(sources, list):
         raise RuntimeError(f"runtime manifest missing sources list: {manifest_path}")
     return _settings_from_runtime_metadata(runtime, sources)
 
