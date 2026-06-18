@@ -12,7 +12,6 @@ from typing import Any
 
 from mint_server.config import (
     TIER_CPU,
-    PFS_PYTHONPATH,
     actor_runtime_env,
     apply_detached_actor_resources,
     config as server_config,
@@ -2722,7 +2721,6 @@ def _create_ray_actor_handle():
         "lifetime": "detached",
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(
-            pythonpath=PFS_PYTHONPATH,
             extra=extra_env,
             include_ray_attach_hints=False,
             tier=TIER_CPU,

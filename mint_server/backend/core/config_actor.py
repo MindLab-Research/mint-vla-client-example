@@ -9,7 +9,7 @@ from typing import Any
 
 import ray
 
-from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, TIER_CPU, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
+from mint_server.config import RAY_NAMESPACE, TIER_CPU, actor_runtime_env, apply_detached_actor_resources, otel_env_vars
 from mint_server.config.config_hydration import CONFIG_ACTOR_SELF_ENV
 from mint_server.config.runtime_config import ConfigSnapshot, build_config_snapshot, config_actor_name
 
@@ -37,7 +37,6 @@ def _actor_options(*, actor_name: str) -> dict[str, object]:
         "lifetime": "detached",
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(
-            pythonpath=PFS_PYTHONPATH,
             extra={**otel_env_vars(), CONFIG_ACTOR_SELF_ENV: "1"},
             include_config_snapshot=False,
             include_ray_attach_hints=False,

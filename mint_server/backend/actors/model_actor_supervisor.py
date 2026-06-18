@@ -13,7 +13,6 @@ from typing import Any, Awaitable, Callable, Iterable
 
 from mint_server.config import (
     TIER_CPU,
-    PFS_PYTHONPATH,
     actor_runtime_env,
     config as server_config,
     otel_env_vars,
@@ -3203,7 +3202,6 @@ def _create_ray_actor(*, require_ready: bool = True):
         "lifetime": "detached",
         "get_if_exists": True,
         "runtime_env": actor_runtime_env(
-            pythonpath=PFS_PYTHONPATH,
             extra=extra_env,
             include_ray_attach_hints=False,
             tier=TIER_CPU,
