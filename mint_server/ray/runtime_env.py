@@ -137,7 +137,7 @@ def _settings_from_runtime_metadata(runtime: Mapping[str, object], sources: Sequ
 
 @lru_cache(maxsize=1)
 def _checkout_runtime_env_settings() -> RuntimeEnvSettings:
-    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
     runtime = data["tool"]["mint"]["runtime_env"]
@@ -147,7 +147,20 @@ def _checkout_runtime_env_settings() -> RuntimeEnvSettings:
 def _runtime_env_settings_from_manifest(env_root: str) -> RuntimeEnvSettings:
     manifest_path = Path(os.path.abspath(env_root)) / "manifest.json"
     if not manifest_path.exists():
-        raise RuntimeError(f"PFS runtime env root is missing manifest.json: {manifest_path}")
+        # Tiered layout: env_root might be runtime/ (parent of tier dirs)
+        # Try parent (if env_root is runtime/<tier>/)
+        root = Path(os.path.abspath(env_root))
+        candidates = [
+            root.parent / "manifest.json",  # runtime/<tier>/ -> runtime/manifest.json
+            root / "gpu_rl" / "manifest.json",  # runtime/ -> runtime/gpu_rl/manifest.json
+            root / "cpu" / "manifest.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                manifest_path = candidate
+                break
+        else:
+            raise RuntimeError(f"PFS runtime env root is missing manifest.json: {manifest_path}")
     data = json.loads(manifest_path.read_text(encoding="utf-8"))
     runtime = data.get("runtime_env")
     sources = data.get("sources")

@@ -41,7 +41,7 @@ Entrypoint: |
   exec "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_LOCAL_SERVICE_DIR}"
 
 ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
-ResourceQueueID: "q-20251225183621-m2297"  # CPU queue
+ResourceQueueID: "q-20260519151516-zh4nt"  # CPU queue (dedicated)
 Framework: "Custom"
 
 TaskRoleSpecs:

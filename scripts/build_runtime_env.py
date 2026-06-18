@@ -317,7 +317,7 @@ def _install_target(python: Path, target: Path, requirements_file: Path) -> None
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
-    _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    _run([str(python), "-m", "pip", "install", "--break-system-packages", "--upgrade", "pip", "setuptools", "wheel"])
     _run(
         [
             str(python),
@@ -382,7 +382,7 @@ def _create_host_venv(
         shutil.rmtree(host_venv)
     _run([str(base_python), "-m", "venv", "--copies", str(host_venv)])
     python = host_venv / "bin" / "python"
-    _run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    _run([str(python), "-m", "pip", "install", "--break-system-packages", "--upgrade", "pip", "setuptools", "wheel"])
     requirements = [
         line.strip()
         for line in host_requirements.read_text(encoding="utf-8").splitlines()
@@ -489,8 +489,8 @@ def _write_activation(env_root: Path) -> None:
     (env_root / "activate_runtime_env.sh").write_text(text, encoding="utf-8")
 
 
-def _write_host_pth(env_root: Path, host_python: Path) -> None:
-    layout = _runtime_env_symbols()["checkout_runtime_env_layout"](str(env_root))
+def _write_host_pth(env_root: Path, host_python: Path, *, tier: str = "gpu_rl") -> None:
+    layout = _runtime_env_symbols()["checkout_runtime_env_layout"](str(env_root), tier=tier)
     purelib = subprocess.check_output(
         [str(host_python), "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
         text=True,
