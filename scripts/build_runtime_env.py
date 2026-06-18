@@ -40,7 +40,7 @@ def _subprocess_env(env: dict[str, str] | None = None) -> dict[str, str]:
         merged.update(env)
     merged.setdefault("UV_HTTP_TIMEOUT", DEFAULT_UV_HTTP_TIMEOUT)
     # Use mirror for faster downloads in CN
-    merged.setdefault("UV_INDEX_URL", "https://mirrors.aliyun.com/pypi/simple/")
+    merged["UV_DEFAULT_INDEX"] = "https://mirrors.aliyun.com/pypi/simple/"
     merged.setdefault("PIP_INDEX_URL", "https://mirrors.aliyun.com/pypi/simple/")
     merged.setdefault("PIP_TRUSTED_HOST", "mirrors.aliyun.com")
     xdg_cache_home = merged.get("XDG_CACHE_HOME")
@@ -305,32 +305,54 @@ def _export_host_requirements(pyproject: dict[str, Any], output: Path) -> None:
 
 
 def _export_shared_requirements_tiered(pyproject: dict[str, Any], output: Path, tier: str = "gpu_rl") -> None:
-    """Export shared requirements filtered by tier."""
+    """Export shared requirements filtered by tier.
+
+    Uses uv export for full dependency resolution, then filters out
+    GPU-heavy packages for CPU tier.
+    """
+    # First export the full resolved requirements (same as GPU tier)
+    full_output = output.parent / (output.stem + "-full.txt")
+    _export_shared_requirements(pyproject, full_output)
+
     if tier == "cpu":
-        deps = _tiered_shared_deps(pyproject, tier=tier)
-        output.write_text("\n".join(deps) + "\n", encoding="utf-8")
+        # Read full requirements and filter out GPU-heavy packages
+        full_deps = full_output.read_text(encoding="utf-8").strip().split("\n")
+        _cpu_excluded = frozenset({
+            "torch", "torchvision", "torchaudio",
+            "transformers", "accelerate", "peft",
+            "tensordict", "torchdata",
+            "datasets", "sentencepiece",
+            "onnxscript", "einops",
+            "nvidia", "nvidia-cublas-cu12", "nvidia-cuda-cupti-cu12",
+            "nvidia-cuda-nvcc-cu12", "nvidia-cuda-nvrtc-cu12", "nvidia-cuda-runtime-cu12",
+            "nvidia-cudnn-cu12", "nvidia-cufft-cu12", "nvidia-cusolver-cu12",
+            "nvidia-cusparse-cu12", "nvidia-nccl-cu12", "nvidia-nvjitlink-cu12",
+            "nvidia-nvtx-cu12", "nvidia-cuda-cccl-cu12", "triton",
+        })
+        filtered = []
+        for line in full_deps:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Extract package name from requirement line
+            name = line.split("[")[0].split("=")[0].split(">")[0].split("<")[0].split("!")[0].split(";")[0].split("@")[0].strip().lower().replace("_", "-")
+            if name in _cpu_excluded or name.startswith("nvidia-"):
+                continue
+            filtered.append(line)
+        output.write_text("\n".join(filtered) + "\n", encoding="utf-8")
+        # Clean up temp file
+        full_output.unlink(missing_ok=True)
     else:
-        _export_shared_requirements(pyproject, output)
+        # GPU tier: just use the full export
+        full_output.rename(output)
 
 
 def _install_target(python: Path, target: Path, requirements_file: Path) -> None:
     if target.exists():
         shutil.rmtree(target)
     target.mkdir(parents=True, exist_ok=True)
-    _run([str(python), "-m", "pip", "install", "--break-system-packages", "--upgrade", "pip", "setuptools", "wheel"])
-    _run(
-        [
-            str(python),
-            "-m",
-            "pip",
-            "install",
-            "--no-deps",
-            "--target",
-            str(target),
-            "-r",
-            str(requirements_file),
-        ]
-    )
+    uv = _resolve_uv()
+    _run([uv, "pip", "install", "--no-deps", "--python", str(python), "--target", str(target), "-r", str(requirements_file)])
 
 
 def _materialize_base_python(

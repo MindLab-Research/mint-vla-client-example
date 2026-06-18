@@ -179,36 +179,30 @@ def ensure_runtime_env_configured() -> str:
     return PFS_RUNTIME_ENV_ROOT
 
 
-PFS_PYTHONPATH = (
-    join_pythonpath(
-        MINT_ACTOR_EXTRA_PYTHONPATH,
-        build_tiered_pythonpath(
-            env_root=PFS_RUNTIME_ENV_ROOT,
-            mint_code_root=MINT_CODE_ROOT,
-            pfs_hf_modules_path=PFS_HF_MODULES_PATH,
-            tier=TIER_GPU_RL,
-        ),
-    )
-    if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
-    else ""
-)
+def _safe_build_pythonpath(tier: str) -> str:
+    if not (PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH):
+        return ""
+    try:
+        return join_pythonpath(
+            MINT_ACTOR_EXTRA_PYTHONPATH,
+            build_tiered_pythonpath(
+                env_root=PFS_RUNTIME_ENV_ROOT,
+                mint_code_root=MINT_CODE_ROOT,
+                pfs_hf_modules_path=PFS_HF_MODULES_PATH,
+                tier=tier,
+            ),
+        )
+    except Exception:
+        # Manifest may not exist yet (e.g. during runtime build).
+        return ""
+
+
+PFS_PYTHONPATH = _safe_build_pythonpath(TIER_GPU_RL)
 
 # Lightweight PYTHONPATH for control-plane actors (ConfigActor, Scheduler, etc.)
 # that run on CPU-only head nodes.  Excludes torch/vllm/megatron/verl/openpi
 # to avoid loading GB of GPU libraries on a 4-vCPU head node.
-PFS_CONTROL_PLANE_PYTHONPATH = (
-    join_pythonpath(
-        MINT_ACTOR_EXTRA_PYTHONPATH,
-        build_tiered_pythonpath(
-            env_root=PFS_RUNTIME_ENV_ROOT,
-            mint_code_root=MINT_CODE_ROOT,
-            pfs_hf_modules_path=PFS_HF_MODULES_PATH,
-            tier=TIER_CPU,
-        ),
-    )
-    if PFS_RUNTIME_ENV_ROOT and MINT_CODE_ROOT and PFS_HF_MODULES_PATH
-    else ""
-)
+PFS_CONTROL_PLANE_PYTHONPATH = _safe_build_pythonpath(TIER_CPU)
 
 # OTEL env vars forwarded into Ray actors so actor-side logging/tracing
 # can use the same collector/auth as the API server process.
