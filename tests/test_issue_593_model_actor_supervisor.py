@@ -1120,9 +1120,48 @@ async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
         reconcile_interval_s=3600.0,
     )
 
+    # Reconcile loop is disabled by default (issue #753).
+    # When disabled, ensure_reconcile_loop_started should return snapshot
+    # with reconcile_loop_running=False and NOT start a background task.
     out = await supervisor.ensure_reconcile_loop_started()
     try:
         assert calls == []
+        assert out["reconcile_loop_running"] is False
+        assert supervisor._reconcile_task is None
+    finally:
+        task = supervisor._reconcile_task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+
+
+@pytest.mark.anyio
+async def test_issue_593_supervisor_reconcile_loop_enabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When MINT_SUPERVISOR_RECONCILE_LOOP=1, the loop should start normally."""
+    calls: list[str] = []
+
+    async def _ensure_dependency() -> dict:
+        calls.append("ensure")
+        return {"ok": True}
+
+    dependency = ControlPlaneDependency(
+        "task_state_store",
+        _ensure_dependency,
+        lambda: {"ok": True},
+    )
+    supervisor = ModelActorSupervisor(
+        specs=[],
+        control_plane_dependencies=[dependency],
+        scheduler_sync=lambda _registrations: None,
+        reconcile_interval_s=3600.0,
+    )
+
+    monkeypatch.setenv("MINT_SUPERVISOR_RECONCILE_LOOP", "1")
+    try:
+        out = await supervisor.ensure_reconcile_loop_started()
         assert out["reconcile_loop_running"] is True
     finally:
         task = supervisor._reconcile_task

@@ -234,6 +234,7 @@ class TestAdoption:
             raise AssertionError("startup adoption should be opt-in")
 
         monkeypatch.delenv("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS", raising=False)
+        monkeypatch.setenv("MINT_SUPERVISOR_RECONCILE_LOOP", "1")
         monkeypatch.setattr(pool, "_adopt_surviving_gpu_actors", _unexpected_adoption)
 
         try:
@@ -255,6 +256,7 @@ class TestAdoption:
             calls += 1
 
         monkeypatch.setenv("MINT_SUPERVISOR_ADOPT_SURVIVING_GPU_ACTORS", "true")
+        monkeypatch.setenv("MINT_SUPERVISOR_RECONCILE_LOOP", "1")
         monkeypatch.setattr(pool, "_adopt_surviving_gpu_actors", _record_adoption)
 
         try:

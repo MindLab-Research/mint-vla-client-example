@@ -133,6 +133,24 @@ def _adopt_surviving_gpu_actors_enabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _reconcile_loop_enabled() -> bool:
+    """Whether the periodic reconcile loop should run.
+
+    Defaults to **disabled** to avoid the head-node memory explosion
+    documented in issue #753.  The supervisor actor is still created and
+    provides actor registration, inventory management, and snapshot — only
+    the periodic reconcile loop (which calls Ray cluster-state APIs and
+    creates NodeMetricsCollectorActor on every node) is skipped.
+
+    Set ``MINT_SUPERVISOR_RECONCILE_LOOP=1`` to re-enable the loop.
+    """
+    raw = str(os.environ.get("MINT_SUPERVISOR_RECONCILE_LOOP") or "").strip().lower()
+    # Default: disabled. Only enable when explicitly requested.
+    if not raw:
+        return False
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _otel_metric_attrs() -> dict[str, str]:
     attrs = {
         "deployment.env": os.getenv("MINT_DEPLOYMENT_ENV", "").strip(),
@@ -2719,6 +2737,18 @@ class ModelActorSupervisorCore:
         return {"ok": True, "replicas": results, "snapshot": self.snapshot()}
 
     async def ensure_reconcile_loop_started(self) -> dict[str, Any]:
+        if not _reconcile_loop_enabled():
+            logger.info(
+                "[model_actor_supervisor] reconcile loop disabled by default"
+                " (set MINT_SUPERVISOR_RECONCILE_LOOP=1 to enable)"
+            )
+            # Still perform one-time GPU actor adoption if enabled, so that
+            # surviving actors are registered in the inventory even without
+            # the periodic loop.
+            if _adopt_surviving_gpu_actors_enabled():
+                await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+            return self.snapshot()
+
         if self._reconcile_task is not None and not self._reconcile_task.done():
             return self.snapshot()
         # Re-entrancy guard: ModelActorSupervisorCore has max_concurrency=128,
