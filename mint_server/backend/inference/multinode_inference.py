@@ -41,7 +41,7 @@ from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
 from mint_server.backend.ray_cluster.gpu_binding_helpers import gpu_bindings_from_ray_gpu_ids
 from mint_server.backend.ray_cluster.multinode_resources import MultiNodeEngineResources, compute_multinode_engine_resources
 from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name
-from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
+from mint_server.backend.ray_cluster.ray_placement_groups import get_or_create_named_placement_group
 from mint_server.backend.actors.ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from mint_server.backend.observability.runtime_actor_metrics import current_ray_actor_name, init_vllm_runtime_otel_metrics
 from mint_server.backend.observability.vllm_scheduler_observability import (
@@ -1419,7 +1419,6 @@ def _create_mint_vllm_multinode_actor(
                     except Exception:
                         pass
                 assert self.engine is not None
-                assert self.engine is not None
                 await self.engine.abort(request_id)
             except Exception:
                 logger.warning("multinodevllmengine_abort_request_failed___s___s")
@@ -1760,7 +1759,6 @@ def _create_mint_vllm_multinode_actor(
                                         except Exception:
                                             idx = -1
                                         by_index[idx] = oo
-                                assert final_res is not None
                                 final_res = out
                                 try:
                                     if n_req == 1:
@@ -1855,10 +1853,11 @@ def _create_mint_vllm_multinode_actor(
                     first_tok_s,
                 )
 
+            assert final_res is not None
             if n_req == 1:
-                token_ids = list(final_res.outputs[0].token_ids)  # type: ignore[union-attr]
+                token_ids = list(final_res.outputs[0].token_ids)
                 log_probs = None
-                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:  # type: ignore[union-attr]
+                if sampling_params.logprobs is not None and final_res.outputs[0].logprobs:
                     log_probs = []
                     non_finite_count = 0
                     non_finite_samples: list[tuple[int, int, float]] = []
@@ -2126,7 +2125,6 @@ def _create_mint_vllm_multinode_actor(
                         try:
                             while True:
                                 out = await collector.get()
-                                assert final_res is not None
                                 final_res = out
                                 if out.finished:
                                     break
@@ -2253,7 +2251,6 @@ def _create_mint_vllm_multinode_actor(
                     try:
                         while True:
                             out = await collector.get()
-                            assert final_res is not None
                             final_res = out
                             if out.finished:
                                 break
@@ -2632,10 +2629,10 @@ class MultiNodeInferenceEngine:
                 pg_name = f"{self.actor_name}_pg"
                 assert resources is not None
                 pg_bundles = resources.pg_bundles
-                pg = get_named_placement_group(
+                pg = get_or_create_named_placement_group(
                     pg_name,
                     namespace=PERSISTENT_NAMESPACE,
-                    expected_bundles=pg_bundles,
+                    bundles=pg_bundles,
                 )
 
             # Create new engine actor
@@ -2647,8 +2644,8 @@ class MultiNodeInferenceEngine:
                 max_num_batched_tokens=self.max_num_batched_tokens,
             )
 
-            assert resources is not None
             if distributed_executor_backend == "ray":
+                assert resources is not None
                 scheduling_opts = {
                     "scheduling_strategy": PlacementGroupSchedulingStrategy(
                         placement_group=pg,
@@ -2661,8 +2658,8 @@ class MultiNodeInferenceEngine:
                 }
             else:
                 # mp backend: no Ray child actors; schedule this actor directly onto 1 node with all GPUs.
+                # resources is intentionally None for mp (set at line ~2423).
                 if mp_pinned_node_ip:
-                    assert resources is not None
                     scheduling_opts = {"resources": {f"node:{mp_pinned_node_ip}": 0.001}}
                 else:
                     scheduling_opts = _node_affinity_scheduling_opts_for_model(

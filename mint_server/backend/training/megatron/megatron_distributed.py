@@ -35,7 +35,7 @@ from mint_server.backend.actors.node_placement import (ModelGpuPlacement,
 from mint_server.backend.ray_cluster.model_actor_names import megatron_actor_name
 from mint_server.backend.ray_cluster.model_actor_pg_names import (
     namespace_actor_placement_group_name, namespace_pg_suffix)
-from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
+from mint_server.backend.ray_cluster.ray_placement_groups import get_or_create_named_placement_group
 # Import centralized PFS paths from config
 from mint_server.config import MINT_CODE_ROOT, PFS_PYTHONPATH, RAY_NAMESPACE
 from mint_server.config import config as server_config
@@ -653,10 +653,10 @@ def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMES
 
 
 def _get_or_create_megatron_placement_group(*, pg_name: str, bundles: list[dict[str, float | int]]):
-    return get_named_placement_group(
+    return get_or_create_named_placement_group(
         pg_name,
         namespace=PERSISTENT_NAMESPACE,
-        expected_bundles=bundles,
+        bundles=bundles,
     )
 
 
