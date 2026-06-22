@@ -41,12 +41,17 @@ async def _do_act(
         if manager is None:
             raise RuntimeError("Action session manager not initialized")
 
-        out = await manager.act(  # type: ignore[attr-defined]
-            action_session_id=request.action_session_id,
-            observation=request.observation,
-            extra_inputs=request.extra_inputs,
-            temperature=request.temperature,
-        )
+        act_kwargs = {
+            "action_session_id": request.action_session_id,
+            "observation": request.observation,
+            "extra_inputs": request.extra_inputs,
+            "temperature": request.temperature,
+        }
+        if request.return_rollout_trace is not None:
+            act_kwargs["return_rollout_trace"] = request.return_rollout_trace
+        if request.rollout_trace_config is not None:
+            act_kwargs["rollout_trace_config"] = request.rollout_trace_config
+        out = await action_session_manager.act(**act_kwargs)  # type: ignore[attr-defined]
         payload = dict(out)
         payload["type"] = "act"
         async_resolve = getattr(task_futures, "async_resolve", None)

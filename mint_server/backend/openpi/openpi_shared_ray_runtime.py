@@ -7,6 +7,7 @@ import json
 import structlog
 import os
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -15,9 +16,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from mint_server.config import RAY_NAMESPACE
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
+from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerClient
 from mint_server.backend.openpi.openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
-    OpenPIFastWorkerClient,
     OpenPIFastWorkerError,
     OpenPIFastWorkerProtocolError,
 )
@@ -53,6 +54,9 @@ class _SharedActorEntry:
 
 _SHARED_ACTORS: dict[str, _SharedActorEntry] = {}
 
+_SHARED_ACTOR_RACE_WAIT_TIMEOUT_S = 15.0
+_SHARED_ACTOR_RACE_POLL_INTERVAL_S = 0.2
+
 
 def _normalize_pool_key(
     *,
@@ -79,6 +83,49 @@ def _normalize_pool_key(
 def _shared_actor_name(pool_key: dict[str, Any]) -> str:
     payload = json.dumps(pool_key, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return f"{_SHARED_ACTOR_PREFIX}{hashlib.sha1(payload).hexdigest()[:12]}"
+
+
+def _get_named_shared_actor(actor_name: str) -> Any | None:
+    if not ray.is_initialized():
+        return None
+    try:
+        return ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
+    except (ValueError, ray.exceptions.RayError):
+        return None
+
+
+def _should_wait_for_named_actor_race(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    if "pinned node capacity check failed" in message:
+        return False
+    if "already exists" in message:
+        return True
+    if "already taken" in message:
+        return True
+    if "name is already taken" in message:
+        return True
+    if "actor with name" in message and "exists" in message:
+        return True
+    return False
+
+
+async def _wait_for_named_shared_actor(
+    actor_name: str,
+    *,
+    timeout_s: float,
+) -> Any | None:
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        actor = _get_named_shared_actor(actor_name)
+        if actor is not None:
+            return actor
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(_SHARED_ACTOR_RACE_POLL_INTERVAL_S)
+
+
+def _shared_actor_race_wait_timeout_s(spec: OpenPIFastRuntimeSpec) -> float:
+    return min(float(spec.startup_timeout_s), _SHARED_ACTOR_RACE_WAIT_TIMEOUT_S)
 
 
 def _preferred_openpi_node_ip(base_model: str, actor_name: str) -> str | None:
@@ -222,11 +269,11 @@ class OpenPISharedRuntimeCore:
         template_reusable: bool = True,
     ) -> None:
         self._spec = spec
-        self._runtime_factory = runtime_factory or OpenPIFastWorkerClient.start
+        self._runtime_factory = runtime_factory or OpenPIDirectWorkerClient.start
         self._actor_metadata = dict(actor_metadata or {})
         self._template_session_id = _template_session_id(self._actor_metadata)
         self._template_reusable = bool(template_reusable)
-        self._runtime: OpenPIFastWorkerClient | Any | None = None
+        self._runtime: OpenPIDirectWorkerClient | Any | None = None
         self._session_payloads: dict[str, dict[str, Any]] = {}
         self._initialized_sessions: set[str] = set()
         self._current_session_id: str | None = None
@@ -666,28 +713,31 @@ async def start_openpi_shared_ray_runtime(
             **_openpi_runtime_env_vars(),
             "MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT": _action_session_state_root(actor_name),
         }
-        if ray.is_initialized():
-            try:
-                actor = ray.get_actor(actor_name, namespace=RAY_NAMESPACE)
-            except ValueError:
-                actor = None
+        named_actor = _get_named_shared_actor(actor_name)
+        if named_actor is not None:
+            actor = named_actor
         if actor is None:
             owns_started_actor = True
-            actor = OpenPISharedRayRuntimeActor.options(
-                name=actor_name,
-                namespace=RAY_NAMESPACE,
-                lifetime="detached",
-                runtime_env={"env_vars": runtime_env_vars},
-                **_single_node_actor_options(
-                    base_model=str(getattr(session, "base_model", "") or ""),
+            try:
+                actor = OpenPISharedRayRuntimeActor.options(
+                    name=actor_name,
+                    namespace=RAY_NAMESPACE,
+                    lifetime="detached",
+                    runtime_env={"env_vars": runtime_env_vars},
+                    **_single_node_actor_options(
+                        base_model=str(getattr(session, "base_model", "") or ""),
+                        actor_name=actor_name,
+                    ),
+                ).remote(
                     actor_name=actor_name,
-                ),
-            ).remote(
-                actor_name=actor_name,
-                pool_key=pool_key,
-                spec=spec,
-                template_reusable=template_reusable,
-            )
+                    pool_key=pool_key,
+                    spec=spec,
+                    template_reusable=template_reusable,
+                )
+            except Exception as exc:
+                if not _should_wait_for_named_actor_race(exc):
+                    raise
+                actor = None
         if entry is None:
             entry = _SharedActorEntry(
                 actor_name=actor_name,
@@ -698,6 +748,33 @@ async def start_openpi_shared_ray_runtime(
         else:
             entry.actor = actor
             entry.pool_key = dict(pool_key)
+
+    if actor is None:
+        recovered_actor = await _wait_for_named_shared_actor(
+            actor_name,
+            timeout_s=_shared_actor_race_wait_timeout_s(spec),
+        )
+        if recovered_actor is None:
+            _drop_shared_actor_entry(actor_name)
+            raise RuntimeError(
+                "OpenPI shared runtime actor creation lost a named-actor race and no reusable "
+                f"actor became visible in time: actor_name={actor_name!r} base_model="
+                f"{getattr(session, 'base_model', '')!r}"
+            )
+        owns_started_actor = False
+        with _SHARED_POOL_LOCK:
+            current = _SHARED_ACTORS.get(actor_name)
+            if current is None:
+                entry = _SharedActorEntry(
+                    actor_name=actor_name,
+                    actor=recovered_actor,
+                    pool_key=dict(pool_key),
+                )
+                _SHARED_ACTORS[actor_name] = entry
+            else:
+                current.actor = recovered_actor
+                current.pool_key = dict(pool_key)
+                entry = current
 
     client = OpenPISharedRayRuntimeClient(
         actor=entry.actor,

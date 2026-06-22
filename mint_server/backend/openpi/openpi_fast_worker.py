@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -770,7 +771,9 @@ class OpenPIFastWorkerSession:
         }
 
     def _save_train_state_checkpoint(self, path: Path, state: Any) -> None:
-        checkpoint_path = str(Path(path).resolve())
+        checkpoint_path_obj = Path(path).resolve()
+        checkpoint_path_obj.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = str(checkpoint_path_obj)
         manager, _ = self._checkpoints.initialize_checkpoint_dir(
             checkpoint_path,
             keep_period=None,
@@ -812,7 +815,9 @@ class OpenPIFastWorkerSession:
         )
 
     def _save_sampler_checkpoint(self, path: Path, state: Any) -> None:
-        checkpoint_path = str(Path(path).resolve())
+        checkpoint_path_obj = Path(path).resolve()
+        checkpoint_path_obj.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = str(checkpoint_path_obj)
         manager, _ = self._checkpoints.initialize_checkpoint_dir(
             checkpoint_path,
             keep_period=None,
@@ -840,6 +845,38 @@ class OpenPIFastWorkerSession:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
+
+    @staticmethod
+    def _sampler_export_complete(export_dir: Path) -> bool:
+        return (export_dir / "params").is_dir() and (export_dir / "assets").is_dir()
+
+    def _save_sampler_export(self, export_path: Path, state: Any) -> Path:
+        export_dir = Path(export_path).resolve()
+        if export_dir.exists():
+            if OpenPIFastWorkerSession._sampler_export_complete(export_dir):
+                return export_dir
+            shutil.rmtree(export_dir)
+        temp_dir = export_dir.parent / f".openpi_fast_sampler_export_{export_dir.name}_{uuid.uuid4().hex}"
+        stage_dir = export_dir.parent / f".openpi_fast_sampler_export_stage_{export_dir.name}_{uuid.uuid4().hex}"
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        try:
+            self._save_sampler_checkpoint(temp_dir, state)
+            source_dir = find_openpi_policy_checkpoint_dir(temp_dir)
+            params_dir = source_dir / "params"
+            assets_dir = source_dir / "assets"
+            if not params_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI FAST sampler export missing params dir: {params_dir}")
+            if not assets_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI FAST sampler export missing assets dir: {assets_dir}")
+            stage_dir.mkdir(parents=True, exist_ok=False)
+            shutil.copytree(params_dir, stage_dir / "params")
+            shutil.copytree(assets_dir, stage_dir / "assets")
+            stage_dir.rename(export_dir)
+            return export_dir
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _load_train_state_checkpoint(self, path: Path) -> Any:
         checkpoint_path = str(Path(path).resolve())
@@ -972,6 +1009,10 @@ class OpenPIFastWorkerSession:
         return {"path": save_path, "current_step": _int_scalar(self._state.step)}
 
     def save_sampler_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
+        export_path = payload.get("export_path")
+        if export_path:
+            export_dir = self._save_sampler_export(Path(str(export_path)), self._state)
+            return {"path": str(export_dir), "current_step": _int_scalar(self._state.step)}
         save_path = str(Path(payload["save_path"]).resolve())
         self._save_sampler_checkpoint(Path(save_path), self._state)
         return {"path": save_path, "current_step": _int_scalar(self._state.step)}
@@ -1074,6 +1115,7 @@ def _dispatch_with_protocol_stdout(session: OpenPIFastWorkerSession | None, op: 
 
 
 def main() -> None:
+    _install_protocol_stdout_redirect()
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,

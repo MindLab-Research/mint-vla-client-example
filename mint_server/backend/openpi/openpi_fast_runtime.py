@@ -141,6 +141,10 @@ class OpenPIFastRuntimeSpec:
         # the OpenPI runtime torch/torchvision pair that the child must use.
         env["PYTHONPATH"] = _merge_pythonpath(self.pythonpath, None)
         env.update(self.extra_env)
+        # OpenPI protocol workers are subprocesses, not service actors. They
+        # already receive a complete env from the parent actor and must not try
+        # to hydrate from ConfigActor while importing mint_server.backend.
+        env["MINT_CONFIG_ACTOR_HYDRATE"] = "0"
         return env
 
 

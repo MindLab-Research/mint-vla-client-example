@@ -52,6 +52,7 @@ from mint_server.backend.observability.node_metrics_daemon import (
     get_or_create_node_metrics_collector_actor,
     node_metrics_actor_name,
 )
+from mint_server.backend.actors.node_placement import parse_model_gpu_placement
 from mint_server.backend.stores.supervisor_state_store import (
     SupervisorMemoryStateStore,
     SupervisorSQLiteStateStore,
@@ -537,6 +538,16 @@ def _replica_id(value: Any) -> str:
     return f"replica-{int(value or 0)}"
 
 
+def _replica_int(value: Any) -> int:
+    raw = str(value or "").strip()
+    if raw.startswith("replica-"):
+        raw = raw.removeprefix("replica-")
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 0
+
+
 def _spec_from_obj(obj: Any) -> ModelActorSpec:
     if isinstance(obj, str):
         return ModelActorSpec(domain_key=domain_key_for_vllm_base_model(obj), base_model=obj)
@@ -577,6 +588,78 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
         worker_aliases=worker_aliases,
         gpu_count=None if obj.get("gpu_count") is None else int(obj["gpu_count"]),
         enabled=bool(obj.get("enabled", True)),
+    )
+
+
+def _spec_with_env_placement(spec: ModelActorSpec) -> ModelActorSpec:
+    if not spec.base_model:
+        return spec
+
+    env_names = ["MINT_MODEL_PLACEMENT_JSON"]
+    if spec.launcher_key == "vllm":
+        env_names.insert(0, "MINT_VLLM_MODEL_PLACEMENT_JSON")
+    elif spec.launcher_key == "training":
+        env_names = [
+            "MINT_DENSE_MODEL_PLACEMENT_JSON",
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+            *env_names,
+        ]
+
+    for env_name in env_names:
+        raw_json = os.environ.get(env_name)
+        if not raw_json:
+            continue
+        placement = parse_model_gpu_placement(
+            raw_json=raw_json,
+            lookup_keys=list(
+                dict.fromkeys(
+                    key
+                    for key in (
+                        spec.base_model,
+                        spec.domain_key,
+                        spec.normalized_actor_name(),
+                    )
+                    if key
+                )
+            ),
+            env_var_name=env_name,
+            context=f"model_actor_supervisor desired spec domain={spec.domain_key!r}",
+            replica=_replica_int(spec.replica_id),
+        )
+        if placement is None:
+            continue
+        placement_slices = tuple(
+            (f"replica-{slice_.replica}", slice_.node_ip, int(slice_.gpu_count))
+            for slice_ in placement.slices
+        )
+        node_pins = tuple(dict.fromkeys(slice_.node_ip for slice_ in placement.slices))
+        return ModelActorSpec(
+            domain_key=spec.domain_key,
+            replica_id=spec.replica_id,
+            base_model=spec.base_model,
+            actor_name=spec.actor_name,
+            launcher_key=spec.launcher_key,
+            node_pin=None,
+            node_pins=node_pins,
+            placement_slices=placement_slices,
+            worker_alias=None,
+            worker_aliases=(),
+            placement_alias_slices=(),
+            gpu_count=placement.slices[0].gpu_count if placement.slices else spec.gpu_count,
+            enabled=spec.enabled,
+        )
+    return spec
+
+
+def _has_env_placement_override() -> bool:
+    return any(
+        os.environ.get(key)
+        for key in (
+            "MINT_MODEL_PLACEMENT_JSON",
+            "MINT_VLLM_MODEL_PLACEMENT_JSON",
+            "MINT_DENSE_MODEL_PLACEMENT_JSON",
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+        )
     )
 
 
@@ -740,6 +823,8 @@ def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
                     launcher_key="training",
                 )
             )
+    if _has_env_placement_override():
+        specs = [_spec_with_env_placement(spec) for spec in specs]
     return {spec.domain_key: spec for spec in specs}
 
 
@@ -849,6 +934,8 @@ def desired_specs_from_env() -> list[ModelActorSpec]:
     specs = _topology_model_specs_from_env()
     if not specs:
         return _with_internal_runtime([])
+    if _has_env_placement_override():
+        specs = [_spec_with_env_placement(spec) for spec in specs]
     return _with_internal_runtime(specs)
 
 
@@ -3228,6 +3315,17 @@ def _create_ray_actor(*, require_ready: bool = True):
         extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
     if "MINT_SUPPORTED_MODELS" in os.environ:
         extra_env["MINT_SUPPORTED_MODELS"] = os.environ["MINT_SUPPORTED_MODELS"]
+    for key in (
+        "MINT_MODEL_PLACEMENT_JSON",
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+    ):
+        if key in os.environ:
+            extra_env[key] = os.environ.get(key, "")
+    if _has_env_placement_override():
+        for key in ("MINT_TOPOLOGY_CONFIG_PATH", "MINT_TOPOLOGY_STATE_PATH"):
+            extra_env[key] = ""
     from mint_server.ray.ray_utils import strict_ray_gcs_address
 
     ray_address = strict_ray_gcs_address()

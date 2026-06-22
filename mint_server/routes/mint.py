@@ -513,6 +513,8 @@ async def act(
         observation=request.observation.model_input,
         extra_inputs={"state": request.observation.state},
         temperature=request.temperature,
+        return_rollout_trace=request.return_rollout_trace,
+        rollout_trace_config=request.rollout_trace_config,
     )
     request_json = queued_request.model_dump_json().encode("utf-8")
     request_id = f"act_{uuid.uuid4().hex}"
@@ -523,6 +525,42 @@ async def act(
         action_session_id=action_session_id,
         request=request,
     )
+    if (
+        os.environ.get("MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME", "").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ):
+        try:
+            await task_futures.async_ensure_pending(
+                request_id,
+                _build_mint_future_meta(
+                    op="mint.action.act",
+                    extra={"action_session_id": action_session_id, "execution_mode": "direct"},
+                ),
+            )
+            out = await action_session_manager.act(  # type: ignore[attr-defined]
+                action_session_id=queued_request.action_session_id,
+                observation=queued_request.observation,
+                extra_inputs=queued_request.extra_inputs,
+                temperature=queued_request.temperature,
+                return_rollout_trace=queued_request.return_rollout_trace,
+                rollout_trace_config=queued_request.rollout_trace_config,
+            )
+            payload = dict(out)
+            payload["type"] = "act"
+            await task_futures.async_resolve(
+                request_id,
+                payload,
+                billing_observations=billing_observations_from_input(
+                    gateway_auth=_gateway_auth_dict(billing_auth),
+                    request_id=request_id,
+                    billing_input=billing_input,
+                ),
+            )
+        except Exception as e:
+            await task_futures.async_fail(request_id, f"{type(e).__name__}: {e}")
+            raise HTTPException(status_code=503, detail=f"Direct action act request failed: {e}") from e
+        return UntypedAPIFuture(request_id=request_id)
+
     try:
         from mint_server.backend.actors.model_actor_supervisor import domain_key_for_internal_runtime
 

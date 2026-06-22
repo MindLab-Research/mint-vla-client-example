@@ -1262,6 +1262,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
             "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_RAY_NAMESPACE": "mint-test-ns",
             "MINT_RETRIEVE_FUTURE_HOT_TTL_S": "45",
+            "MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME": "mint-model-actor-supervisor-test",
             "MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME": "mint-model-work-scheduler-test",
             "MINT_TASK_STATE_STORE_ACTOR_NAME": "mint-task-state-store-test",
             "MINT_MAINTENANCE_CRON_ACTOR_NAME": "mint-maintenance-cron-test",
@@ -1272,6 +1273,7 @@ def test_actor_runtime_env_vars_forwards_control_plane_actor_names(tmp_path):
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert data["MINT_RAY_NAMESPACE"] == "mint-test-ns"
     assert actor_env["MINT_RETRIEVE_FUTURE_HOT_TTL_S"] == "45"
+    assert actor_env["MINT_MODEL_ACTOR_SUPERVISOR_ACTOR_NAME"] == "mint-model-actor-supervisor-test"
     assert actor_env["MINT_MODEL_WORK_SCHEDULER_ACTOR_NAME"] == "mint-model-work-scheduler-test"
     assert actor_env["MINT_TASK_STATE_STORE_ACTOR_NAME"] == "mint-task-state-store-test"
     assert actor_env["MINT_MAINTENANCE_CRON_ACTOR_NAME"] == "mint-maintenance-cron-test"
@@ -1298,6 +1300,66 @@ def test_actor_runtime_env_vars_forwards_usage_envs(tmp_path):
     assert actor_env["MINT_USAGE_BACKEND"] == "postgres"
     assert actor_env["MINT_USAGE_PG_DSN"] == "postgresql://mint:test@db/usage"
     assert actor_env["MINT_USAGE_PG_TABLE"] == "mint_platform.usage_event"
+
+
+def test_actor_runtime_env_vars_forwards_checkpoint_roots_before_hydration(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    payload = _load_actor_runtime_env_payload(
+        {
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "ray://cfg-test",
+            "MINT_CHECKPOINT_DIR": "/tmp/mint-checkpoints",
+            "MINT_PERSISTENT_CHECKPOINT_DIR": "/tmp/mint-persistent-checkpoints",
+            "MINT_RUNTIME_CHECKPOINT_DIR": "/tmp/mint-runtime-checkpoints",
+        },
+    )
+    data = payload["runtime_env"]
+    actor_env = payload["actor_env"]
+    assert data["MINT_CHECKPOINT_DIR"] == "/tmp/mint-checkpoints"
+    assert data["MINT_PERSISTENT_CHECKPOINT_DIR"] == "/tmp/mint-persistent-checkpoints"
+    assert data["MINT_RUNTIME_CHECKPOINT_DIR"] == "/tmp/mint-runtime-checkpoints"
+    assert "MINT_RUNTIME_CHECKPOINT_DIR" not in actor_env
+
+
+def test_actor_runtime_env_vars_forwards_ray_attach_hints(tmp_path):
+    env_root = tmp_path / "runtime"
+    _materialize_runtime_env(env_root)
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from mint_server.config import actor_runtime_env_vars; "
+                "print(json.dumps(actor_runtime_env_vars(pythonpath='X')))"
+            ),
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        check=True,
+        capture_output=True,
+        text=True,
+        env={
+            "PFS_RUNTIME_ENV_ROOT": str(env_root),
+            "MINT_CODE_ROOT": str(tmp_path / 'repo'),
+            "PFS_HF_MODULES_PATH": str(tmp_path / 'hf'),
+            "RAY_ADDRESS": "192.168.39.88:6379",
+            "MINT_RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "RAY_CLIENT_ADDRESS": "ray://192.168.39.87:10001",
+            "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
+            "MINT_RAY_NODE_IP_ADDRESS": "192.168.33.190",
+            "MINT_RAY_TEMP_DIR": "/tmp/mdw/t",
+        },
+    )
+    data = json.loads(out.stdout)
+    assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
+    assert "RAY_ADDRESS" not in data
+    assert "MINT_RAY_CLIENT_ADDRESS" not in data
+    assert "RAY_CLIENT_ADDRESS" not in data
+    assert "MINT_RAY_NODE_IP_ADDRESS" not in data
+    assert "MINT_RAY_TEMP_DIR" not in data
 
 
 def test_actor_runtime_env_vars_forwards_only_explicit_gcs_attach_hint(tmp_path):

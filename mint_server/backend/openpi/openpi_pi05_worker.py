@@ -12,12 +12,14 @@ import os
 import shutil
 import sys
 import traceback
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
 
@@ -72,6 +74,70 @@ def _int_scalar(value: Any) -> int:
     return int(np.asarray(value).item())
 
 
+def _compute_importance_sampling_stats(
+    *,
+    current_logprobs: np.ndarray,
+    old_logprobs: np.ndarray,
+    advantages: np.ndarray,
+) -> dict[str, float | int]:
+    current = np.asarray(current_logprobs, dtype=np.float32).reshape(-1)
+    old = np.asarray(old_logprobs, dtype=np.float32).reshape(-1)
+    adv = np.asarray(advantages, dtype=np.float32).reshape(-1)
+
+    if not (current.shape == old.shape == adv.shape):
+        raise ValueError("OpenPI pi0.5 importance_sampling inputs must share the same shape")
+    action_count = int(current.size)
+    if action_count == 0:
+        raise ValueError("OpenPI pi0.5 importance_sampling requires at least one action logprob")
+
+    log_ratio = np.clip(current - old, a_min=-20.0, a_max=20.0)
+    ratio = np.exp(log_ratio)
+    loss = -float(np.sum(ratio * adv))
+    return {
+        "loss": loss,
+        "ratio_mean": float(np.mean(ratio)),
+        "action_count": action_count,
+    }
+
+
+def _compute_ppo_stats(
+    *,
+    current_logprobs: np.ndarray,
+    old_logprobs: np.ndarray,
+    advantages: np.ndarray,
+    clip_low: float,
+    clip_high: float,
+) -> dict[str, float | int]:
+    current = np.asarray(current_logprobs, dtype=np.float32).reshape(-1)
+    old = np.asarray(old_logprobs, dtype=np.float32).reshape(-1)
+    adv = np.asarray(advantages, dtype=np.float32).reshape(-1)
+
+    if not (current.shape == old.shape == adv.shape):
+        raise ValueError("OpenPI pi0.5 ppo inputs must share the same shape")
+    action_count = int(current.size)
+    if action_count == 0:
+        raise ValueError("OpenPI pi0.5 ppo requires at least one action logprob")
+
+    log_ratio = np.clip(current - old, a_min=-20.0, a_max=20.0)
+    ratio = np.exp(log_ratio)
+    clipped_ratio = np.clip(ratio, a_min=clip_low, a_max=clip_high)
+    unclipped = -ratio * adv
+    clipped = -clipped_ratio * adv
+    return {
+        "loss": float(np.sum(np.maximum(unclipped, clipped))),
+        "ratio_mean": float(np.mean(ratio)),
+        "clipfrac_mean": float(np.mean((ratio < clip_low) | (ratio > clip_high))),
+        "action_count": action_count,
+    }
+
+
+def _normal_logprob(sample: Any, mean: Any, std: Any, jnp: Any) -> Any:
+    mask = std == 0
+    std_safe = jnp.where(mask, jnp.ones_like(std), std)
+    log_prob = -jnp.log(std_safe) - 0.5 * jnp.log(2 * jnp.pi) - 0.5 * jnp.square((sample - mean) / std_safe)
+    return jnp.where(mask, jnp.zeros_like(log_prob), log_prob)
+
+
 def _decode_image(encoded: dict[str, Any]) -> np.ndarray:
     try:
         from PIL import Image
@@ -98,9 +164,10 @@ class OpenPIPi05WorkerSession:
         import jax.numpy as jnp
         import optax
 
-        import openpi.models.model as openpi_model
-        import openpi.models.pi0_config as pi0_config
-        import openpi.shared.array_typing as array_typing
+        import openpi.models.model as openpi_model  # type: ignore[reportMissingImports]
+        import openpi.models.pi0 as pi0_model  # type: ignore[reportMissingImports]
+        import openpi.models.pi0_config as pi0_config  # type: ignore[reportMissingImports]
+        import openpi.shared.array_typing as array_typing  # type: ignore[reportMissingImports]
         import openpi.shared.nnx_utils as nnx_utils
         import openpi.training.checkpoints as checkpoints
         import openpi.training.config as config_mod
@@ -116,6 +183,7 @@ class OpenPIPi05WorkerSession:
         self._jnp = jnp
         self._optax = optax
         self._openpi_model = openpi_model
+        self._pi0_model = pi0_model
         self._pi0_config = pi0_config
         self._array_typing = array_typing
         self._nnx_utils = nnx_utils
@@ -170,12 +238,18 @@ class OpenPIPi05WorkerSession:
             ema_decay=None,
         )
         overrides = OpenPIPi05RuntimeInitOverrides.from_env()
+        self._seed_assets_dir: Path | None = None
         if overrides.weights_path is not None:
             logger.info("openpi_pi0_5_worker_using_explicit_weights_path___s")
             self._config = dataclasses.replace(
                 self._config,
                 weight_loader=weight_loaders.CheckpointWeightLoader(overrides.weights_path),
             )
+            seed_path = Path(overrides.weights_path).resolve()
+            seed_root = seed_path.parent if seed_path.name == "params" else seed_path
+            candidate_assets = seed_root / "assets"
+            if candidate_assets.is_dir():
+                self._seed_assets_dir = candidate_assets
         elif overrides.random_init:
             logger.info("OpenPI pi0.5 worker using explicit random-init mode")
             self._config = dataclasses.replace(
@@ -291,6 +365,19 @@ class OpenPIPi05WorkerSession:
         actions = jnp.asarray(item["actions"], dtype=jnp.float32)[None, ...]
         return observation, actions
 
+    def _rl_observation_from_payload(self, item: dict[str, Any]):
+        observation, _ = self._observation_from_payload({**item, "actions": [[0.0] * self._action_dim] * self._action_horizon})
+        chains = self._jnp.asarray(item["chains"], dtype=self._jnp.float32)[None, ...]
+        old_logprobs = np.asarray(item["old_logprobs"], dtype=np.float32).reshape(
+            self._action_horizon,
+            int(item["source_action_dim"]),
+        )
+        advantages = np.asarray(item["advantages"], dtype=np.float32).reshape(
+            self._action_horizon,
+            int(item["source_action_dim"]),
+        )
+        return observation, chains, old_logprobs, advantages
+
     def _grad_and_param_norm(self, model: Any, grads: Any) -> tuple[float, float]:
         nnx = self._nnx
 
@@ -324,54 +411,388 @@ class OpenPIPi05WorkerSession:
         loss_value = _float_scalar(jax.device_get(loss))
         return grads, loss_value, grad_norm, param_norm
 
+    def _compute_velocity(
+        self,
+        model_obj: Any,
+        *,
+        observation: Any,
+        x_t: Any,
+        t: Any,
+        prefix_tokens: Any,
+        prefix_mask: Any,
+        kv_cache: Any,
+    ) -> Any:
+        batch_size = observation.state.shape[0]
+        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = model_obj.embed_suffix(
+            observation,
+            x_t,
+            self._jnp.broadcast_to(t, batch_size),
+        )
+        suffix_attn_mask = self._pi0_model.make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_attn_mask = self._jnp.repeat(prefix_mask[:, None, :], suffix_tokens.shape[1], axis=1)
+        full_attn_mask = self._jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+        positions = self._jnp.sum(prefix_mask, axis=-1)[:, None] + self._jnp.cumsum(suffix_mask, axis=-1) - 1
+
+        prefix_out, suffix_out = model_obj.PaliGemma.llm(
+            [None, suffix_tokens],
+            mask=full_attn_mask,
+            positions=positions,
+            kv_cache=kv_cache,
+            adarms_cond=[None, adarms_cond],
+        )[0]
+        if prefix_out is not None:
+            raise RuntimeError("OpenPI pi0.5 suffix-only flow pass unexpectedly returned prefix output")
+        return model_obj.action_out_proj(suffix_out[:, -self._action_horizon :])
+
+    def _compute_flow_transition_logprobs(
+        self,
+        model_obj: Any,
+        rng: Any,
+        observation: Any,
+        chains: Any,
+        *,
+        denoise_inds: list[int],
+        loss_fn_config: dict[str, Any],
+        source_action_dim: int,
+    ) -> Any:
+        jnp = self._jnp
+        observation = self._openpi_model.preprocess_observation(rng, observation, train=False)
+        num_transitions = int(chains.shape[1]) - 1
+        num_steps = int(loss_fn_config.get("num_steps", num_transitions))
+        if num_steps != num_transitions:
+            raise ValueError(
+                f"OpenPI pi0.5 RL num_steps={num_steps} must match chains transitions={num_transitions}"
+            )
+
+        noise_method = str(loss_fn_config.get("noise_method", "flow_sde"))
+        if noise_method not in {"flow_sde", "flow_noise", "flow_ode"}:
+            raise ValueError("OpenPI pi0.5 RL noise_method must be flow_sde, flow_noise, or flow_ode")
+
+        joint_logprob = bool(loss_fn_config.get("joint_logprob", False))
+        noise_level = float(loss_fn_config.get("noise_level", 0.5))
+        noise_std = float(loss_fn_config.get("noise_std", loss_fn_config.get("flow_noise_std", 0.1)))
+        if noise_level < 0.0:
+            raise ValueError("OpenPI pi0.5 RL noise_level must be non-negative")
+        if noise_std < 0.0:
+            raise ValueError("OpenPI pi0.5 RL noise_std must be non-negative")
+
+        prefix_tokens, prefix_mask, prefix_ar_mask = model_obj.embed_prefix(observation)
+        prefix_attn_mask = self._pi0_model.make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = model_obj.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        timesteps = jnp.linspace(1.0, 0.0, num_steps + 1, dtype=chains.dtype)
+        if len(denoise_inds) == 1:
+            selected = [int(denoise_inds[0])]
+        else:
+            selected = [int(value) for value in denoise_inds]
+        if any(idx < 0 or idx >= num_steps for idx in selected):
+            raise ValueError("OpenPI pi0.5 RL denoise index out of range")
+
+        logprobs = []
+        if joint_logprob:
+            logprobs.append(
+                _normal_logprob(chains[:, 0], jnp.zeros_like(chains[:, 0]), jnp.ones_like(chains[:, 0]), jnp)[
+                    :, :, :source_action_dim
+                ]
+            )
+        for idx in selected:
+            x_t = chains[:, idx]
+            x_next = chains[:, idx + 1]
+            t_input = timesteps[idx]
+            delta = timesteps[idx] - timesteps[idx + 1]
+            v_t = self._compute_velocity(
+                model_obj,
+                observation=observation,
+                x_t=x_t,
+                t=t_input,
+                prefix_tokens=prefix_tokens,
+                prefix_mask=prefix_mask,
+                kv_cache=kv_cache,
+            )
+            x0_pred = x_t - v_t * t_input
+            x1_pred = x_t + v_t * (1.0 - t_input)
+
+            if noise_method == "flow_ode":
+                x0_weight = 1.0 - (t_input - delta)
+                x1_weight = t_input - delta
+                x_t_std = jnp.zeros_like(x_t)
+            elif noise_method == "flow_sde":
+                denom_timesteps = jnp.where(timesteps == 1.0, timesteps[1], timesteps)
+                sigma_ratio = timesteps / (1.0 - denom_timesteps)
+                sigmas = noise_level * jnp.sqrt(sigma_ratio)[:-1]
+                sigma_i = sigmas[idx]
+                x0_weight = 1.0 - (t_input - delta)
+                x1_weight = t_input - delta - sigma_i**2 * delta / (2.0 * t_input)
+                x_t_std = jnp.ones_like(x_t) * jnp.sqrt(delta) * sigma_i
+            else:
+                x0_weight = 1.0 - (t_input - delta)
+                x1_weight = t_input - delta
+                x_t_std = jnp.ones_like(x_t) * noise_std
+
+            x_t_mean = x0_pred * x0_weight + x1_pred * x1_weight
+            logprobs.append(_normal_logprob(x_next, x_t_mean, x_t_std, jnp)[:, :, :source_action_dim])
+
+        stacked = jnp.stack(logprobs, axis=1)
+        return jnp.mean(stacked, axis=1)
+
+    def _compute_importance_sampling_grads(
+        self,
+        observation: Any,
+        chains: Any,
+        old_logprobs: np.ndarray,
+        advantages: np.ndarray,
+        item: dict[str, Any],
+        loss_fn_config: dict[str, Any] | None,
+    ) -> tuple[Any, float, float, float, float, float, list[float]]:
+        nnx = self._nnx
+        jax = self._jax
+        cfg = dict(loss_fn_config or {})
+        source_action_dim = int(item["source_action_dim"])
+        denoise_inds = [int(value) for value in item["denoise_inds"]]
+
+        old_logprobs_t = self._jnp.asarray(old_logprobs[None, ...], dtype=self._jnp.float32)
+        advantages_t = self._jnp.asarray(advantages[None, ...], dtype=self._jnp.float32)
+
+        model = nnx.merge(self._state.model_def, self._state.params)
+        model.train()
+        self._rng, step_rng = jax.random.split(self._rng)
+
+        def loss_fn(model_obj: Any, rng: Any, obs: Any):
+            current_logprobs = self._compute_flow_transition_logprobs(
+                model_obj,
+                rng,
+                obs,
+                chains,
+                denoise_inds=denoise_inds,
+                loss_fn_config=cfg,
+                source_action_dim=source_action_dim,
+            )
+            log_ratio = self._jnp.clip(current_logprobs - old_logprobs_t, a_min=-20.0, a_max=20.0)
+            ratio = self._jnp.exp(log_ratio)
+            loss = -self._jnp.sum(ratio * advantages_t)
+            return loss, current_logprobs
+
+        diff_state = nnx.DiffState(0, self._config.trainable_filter)
+        (loss, current_logprobs), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, step_rng, observation)
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
+
+        current_logprobs_np = np.asarray(jax.device_get(current_logprobs), dtype=np.float32).reshape(old_logprobs.shape)
+        stats = _compute_importance_sampling_stats(
+            current_logprobs=current_logprobs_np,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+        )
+        _ = loss
+        return (
+            grads,
+            float(stats["loss"]),
+            grad_norm,
+            param_norm,
+            float(stats["ratio_mean"]),
+            float(stats["action_count"]),
+            current_logprobs_np.reshape(-1).tolist(),
+        )
+
+    def _compute_ppo_grads(
+        self,
+        observation: Any,
+        chains: Any,
+        old_logprobs: np.ndarray,
+        advantages: np.ndarray,
+        item: dict[str, Any],
+        loss_fn_config: dict[str, Any] | None,
+    ) -> tuple[Any, float, float, float, float, float, float, list[float]]:
+        nnx = self._nnx
+        jax = self._jax
+        cfg = dict(loss_fn_config or {})
+        source_action_dim = int(item["source_action_dim"])
+        denoise_inds = [int(value) for value in item["denoise_inds"]]
+
+        epsilon = float(cfg.get("epsilon", 0.2))
+        clip_low = float(cfg.get("clip_low", 1.0 - epsilon))
+        clip_high = float(cfg.get("clip_high", 1.0 + epsilon))
+        if clip_low > clip_high:
+            raise ValueError("ppo clip_low must be <= clip_high")
+
+        old_logprobs_t = self._jnp.asarray(old_logprobs[None, ...], dtype=self._jnp.float32)
+        advantages_t = self._jnp.asarray(advantages[None, ...], dtype=self._jnp.float32)
+
+        model = nnx.merge(self._state.model_def, self._state.params)
+        model.train()
+        self._rng, step_rng = jax.random.split(self._rng)
+
+        def loss_fn(model_obj: Any, rng: Any, obs: Any):
+            current_logprobs = self._compute_flow_transition_logprobs(
+                model_obj,
+                rng,
+                obs,
+                chains,
+                denoise_inds=denoise_inds,
+                loss_fn_config=cfg,
+                source_action_dim=source_action_dim,
+            )
+            log_ratio = self._jnp.clip(current_logprobs - old_logprobs_t, a_min=-20.0, a_max=20.0)
+            ratio = self._jnp.exp(log_ratio)
+            clipped_ratio = self._jnp.clip(ratio, a_min=clip_low, a_max=clip_high)
+            unclipped = -ratio * advantages_t
+            clipped = -clipped_ratio * advantages_t
+            loss = self._jnp.sum(self._jnp.maximum(unclipped, clipped))
+            return loss, current_logprobs
+
+        diff_state = nnx.DiffState(0, self._config.trainable_filter)
+        (loss, current_logprobs), grads = nnx.value_and_grad(
+            loss_fn,
+            argnums=diff_state,
+            has_aux=True,
+        )(model, step_rng, observation)
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
+
+        current_logprobs_np = np.asarray(jax.device_get(current_logprobs), dtype=np.float32).reshape(old_logprobs.shape)
+        stats = _compute_ppo_stats(
+            current_logprobs=current_logprobs_np,
+            old_logprobs=old_logprobs,
+            advantages=advantages,
+            clip_low=clip_low,
+            clip_high=clip_high,
+        )
+        _ = loss
+        return (
+            grads,
+            float(stats["loss"]),
+            grad_norm,
+            param_norm,
+            float(stats["ratio_mean"]),
+            float(stats["clipfrac_mean"]),
+            float(stats["action_count"]),
+            current_logprobs_np.reshape(-1).tolist(),
+        )
+
     def create_session(self) -> dict[str, Any]:
         return {"backend": "openpi_pi05", "config_name": self._config_name}
 
     def forward_backward(self, payload: dict[str, Any]) -> dict[str, Any]:
         loss_fn = str(payload.get("loss_fn") or "")
-        if loss_fn != "flow_matching":
-            raise ValueError(f"OpenPI pi0.5 only supports flow_matching, got {loss_fn!r}")
+        if loss_fn not in {"flow_matching", "importance_sampling", "ppo"}:
+            raise ValueError(
+                "OpenPI pi0.5 only supports flow_matching, importance_sampling, "
+                f"and ppo, got {loss_fn!r}"
+            )
 
         batch = list(payload.get("batch") or [])
         if not batch:
             raise ValueError("OpenPI pi0.5 forward_backward requires a non-empty batch")
 
+        loss_fn_config = dict(payload.get("loss_fn_config") or {})
         total_loss = 0.0
+        total_units = 0.0
         total_grad_norm = 0.0
         total_param_norm = 0.0
+        total_ratio = 0.0
+        total_clipfrac = 0.0
+        num_rl_items = 0
         loss_fn_outputs: list[dict[str, Any]] = []
         pending_grads = self._pending_grads
 
         for item in batch:
-            observation, actions = self._observation_from_payload(item)
-            grads, loss_value, grad_norm, param_norm = self._compute_grads(observation, actions)
-            loss_fn_outputs.append(
-                {
-                    "loss": {
-                        "data": [loss_value],
-                        "shape": [1],
-                        "dtype": "float32",
+            if loss_fn == "flow_matching":
+                observation, actions = self._observation_from_payload(item)
+                grads, loss_value, grad_norm, param_norm = self._compute_grads(observation, actions)
+                unit_count = float(self._action_horizon)
+                loss_fn_outputs.append(
+                    {
+                        "loss": {
+                            "data": [loss_value],
+                            "shape": [1],
+                            "dtype": "float32",
+                        }
                     }
-                }
-            )
+                )
+            else:
+                observation, chains, old_logprobs, advantages = self._rl_observation_from_payload(item)
+                if loss_fn == "importance_sampling":
+                    (
+                        grads,
+                        loss_value,
+                        grad_norm,
+                        param_norm,
+                        ratio_mean,
+                        unit_count,
+                        new_logprobs,
+                    ) = self._compute_importance_sampling_grads(
+                        observation,
+                        chains,
+                        old_logprobs,
+                        advantages,
+                        item,
+                        loss_fn_config,
+                    )
+                    total_ratio += ratio_mean
+                    num_rl_items += 1
+                else:
+                    (
+                        grads,
+                        loss_value,
+                        grad_norm,
+                        param_norm,
+                        ratio_mean,
+                        clipfrac_mean,
+                        unit_count,
+                        new_logprobs,
+                    ) = self._compute_ppo_grads(
+                        observation,
+                        chains,
+                        old_logprobs,
+                        advantages,
+                        item,
+                        loss_fn_config,
+                    )
+                    total_ratio += ratio_mean
+                    total_clipfrac += clipfrac_mean
+                    num_rl_items += 1
+                loss_fn_outputs.append(
+                    {
+                        "loss": {
+                            "data": [loss_value],
+                            "shape": [1],
+                            "dtype": "float32",
+                        },
+                        "logprobs": {
+                            "data": new_logprobs,
+                            "shape": [self._action_horizon, int(item["source_action_dim"])],
+                            "dtype": "float32",
+                        },
+                    }
+                )
             pending_grads = (
                 grads
                 if pending_grads is None
                 else self._jax.tree.map(lambda a, b: a + b, pending_grads, grads)
             )
             total_loss += loss_value
+            total_units += unit_count
             total_grad_norm += grad_norm
             total_param_norm += param_norm
 
         self._pending_grads = pending_grads
 
         batch_size = float(len(batch))
+        denom = max(total_units, 1.0)
         metrics = {
-            "loss:mean": total_loss / batch_size,
+            "loss:mean": total_loss / denom,
             "num_samples:sum": batch_size,
+            "num_tokens:sum": total_units,
             "grad_norm:mean": total_grad_norm / batch_size,
             "param_norm:mean": total_param_norm / batch_size,
         }
+        if num_rl_items > 0:
+            metrics["ratio:mean"] = total_ratio / num_rl_items
+        if loss_fn == "ppo" and num_rl_items > 0:
+            metrics["clipfrac:mean"] = total_clipfrac / num_rl_items
         return {
             "loss_fn_output_type": f"{loss_fn}_loss",
             "loss_fn_outputs": loss_fn_outputs,
@@ -426,7 +847,9 @@ class OpenPIPi05WorkerSession:
         }
 
     def _save_train_state_checkpoint(self, path: Path, state: Any) -> None:
-        checkpoint_path = str(Path(path).resolve())
+        checkpoint_path_obj = Path(path).resolve()
+        checkpoint_path_obj.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = str(checkpoint_path_obj)
         manager, _ = self._checkpoints.initialize_checkpoint_dir(
             checkpoint_path,
             keep_period=None,
@@ -447,8 +870,26 @@ class OpenPIPi05WorkerSession:
             if callable(close):
                 close()
 
+    def _save_checkpoint_assets(self, directory: Path) -> None:
+        data_config = self._data_loader.data_config()
+        norm_stats = data_config.norm_stats
+        if norm_stats is not None and data_config.asset_id is not None:
+            self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
+            return
+
+        seed_assets_dir = getattr(self, "_seed_assets_dir", None)
+        if seed_assets_dir is not None and Path(seed_assets_dir).is_dir():
+            shutil.copytree(Path(seed_assets_dir), directory, dirs_exist_ok=True)
+            return
+
+        raise FileNotFoundError(
+            "OpenPI pi0.5 checkpoint export missing norm_stats and seed assets directory"
+        )
+
     def _save_sampler_checkpoint(self, path: Path, state: Any) -> None:
-        checkpoint_path = str(Path(path).resolve())
+        checkpoint_path_obj = Path(path).resolve()
+        checkpoint_path_obj.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = str(checkpoint_path_obj)
         manager, _ = self._checkpoints.initialize_checkpoint_dir(
             checkpoint_path,
             keep_period=None,
@@ -460,16 +901,14 @@ class OpenPIPi05WorkerSession:
             # Sampler exports must reflect the current policy params, not a lagging EMA shadow.
             params = state.params
 
-            def save_assets(directory: Path) -> None:
-                data_config = self._data_loader.data_config()
-                norm_stats = data_config.norm_stats
-                if norm_stats is not None and data_config.asset_id is not None:
-                    self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
-
             manager.save(
                 checkpoint_step,
                 items={
-                    "assets": save_assets,
+                    "assets": (
+                        self._save_checkpoint_assets
+                        if callable(getattr(self, "_save_checkpoint_assets", None))
+                        else lambda directory: OpenPIPi05WorkerSession._save_checkpoint_assets(self, directory)
+                    ),
                     "params": {"params": params},
                 },
             )
@@ -478,6 +917,38 @@ class OpenPIPi05WorkerSession:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
+
+    @staticmethod
+    def _sampler_export_complete(export_dir: Path) -> bool:
+        return (export_dir / "params").is_dir() and (export_dir / "assets").is_dir()
+
+    def _save_sampler_export(self, export_path: Path, state: Any) -> Path:
+        export_dir = Path(export_path).resolve()
+        if export_dir.exists():
+            if OpenPIPi05WorkerSession._sampler_export_complete(export_dir):
+                return export_dir
+            shutil.rmtree(export_dir)
+        temp_dir = export_dir.parent / f".openpi_pi05_sampler_export_{export_dir.name}_{uuid.uuid4().hex}"
+        stage_dir = export_dir.parent / f".openpi_pi05_sampler_export_stage_{export_dir.name}_{uuid.uuid4().hex}"
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        shutil.rmtree(stage_dir, ignore_errors=True)
+        try:
+            self._save_sampler_checkpoint(temp_dir, state)
+            source_dir = find_openpi_policy_checkpoint_dir(temp_dir)
+            params_dir = source_dir / "params"
+            assets_dir = source_dir / "assets"
+            if not params_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing params dir: {params_dir}")
+            if not assets_dir.is_dir():
+                raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing assets dir: {assets_dir}")
+            stage_dir.mkdir(parents=True, exist_ok=False)
+            shutil.copytree(params_dir, stage_dir / "params")
+            shutil.copytree(assets_dir, stage_dir / "assets")
+            stage_dir.rename(export_dir)
+            return export_dir
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _load_train_state_checkpoint(self, path: Path) -> Any:
         checkpoint_path = str(Path(path).resolve())
@@ -599,6 +1070,10 @@ class OpenPIPi05WorkerSession:
         return {"path": save_path, "current_step": _int_scalar(self._state.step)}
 
     def save_sampler_weights(self, payload: dict[str, Any]) -> dict[str, Any]:
+        export_path = payload.get("export_path")
+        if export_path:
+            export_dir = self._save_sampler_export(Path(str(export_path)), self._state)
+            return {"path": str(export_dir), "current_step": _int_scalar(self._state.step)}
         save_path = str(Path(payload["save_path"]).resolve())
         self._save_sampler_checkpoint(Path(save_path), self._state)
         return {"path": save_path, "current_step": _int_scalar(self._state.step)}
@@ -681,7 +1156,11 @@ def _dispatch(
     raise ValueError(f"Unknown OpenPI pi0.5 worker op: {op!r}")
 
 
-def _dispatch_with_protocol_stdout(session: OpenPIPi05WorkerSession | None, op: str, payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+def _dispatch_with_protocol_stdout(
+    session: OpenPIPi05WorkerSession | None,
+    op: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
     capture = io.StringIO()
     with contextlib.redirect_stdout(capture):
         response, should_stop = _dispatch(session, op, payload)
@@ -692,6 +1171,7 @@ def _dispatch_with_protocol_stdout(session: OpenPIPi05WorkerSession | None, op: 
 
 
 def main() -> None:
+    _install_protocol_stdout_redirect()
     logging.basicConfig(
         level=logging.INFO,
         stream=sys.stderr,

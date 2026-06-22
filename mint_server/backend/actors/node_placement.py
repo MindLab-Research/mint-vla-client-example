@@ -671,10 +671,24 @@ def resolve_worker_gpu_slices_to_placement(
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
 
-    alive_nodes = _list_alive_gpu_nodes()
+    alive_ray_nodes = [n for n in ray.nodes() if n.get("Alive")]
     nodes_by_ip: dict[str, GpuNode] = {}
-    for node in alive_nodes:
-        nodes_by_ip[node.node_ip] = node
+    for n in alive_ray_nodes:
+        res = n.get("Resources") or {}
+        node_ip = str(n.get("NodeManagerAddress") or "")
+        if not node_ip or float(res.get("GPU", 0) or 0) <= 0:
+            continue
+        nodes_by_ip[node_ip] = GpuNode(
+            node_id=str(n.get("NodeID") or ""),
+            node_ip=node_ip,
+            hostname=str(n.get("NodeManagerHostname") or ""),
+            total_gpus=int(float(res.get("GPU", 0) or 0)),
+            available_gpus=int(float(res.get("GPU", 0) or 0)),
+            provider_job_id=_parse_provider_job_id_from_hostname(str(n.get("NodeManagerHostname") or "")),
+            provider_resource_queue_id=None,
+        )
+    if not nodes_by_ip:
+        nodes_by_ip = {node.node_ip: node for node in _list_alive_gpu_nodes()}
 
     # In worker context, _list_alive_gpu_nodes() returns [] because
     # ray.nodes() is guarded. The driver has already validated these IPs

@@ -93,6 +93,8 @@ class VLAActRequest(MintBaseModel):
     seq_id: int | None = None
     observation: VLAObservation
     temperature: float | None = None
+    return_rollout_trace: bool | None = None
+    rollout_trace_config: dict[str, Any] | None = None
 
 
 class MintDeleteActionSessionResponse(MintBaseModel):

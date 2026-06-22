@@ -111,10 +111,18 @@ class _AsyncResolvingTaskFutureService(_AsyncFakeTaskFutureService):
     def __init__(self) -> None:
         super().__init__()
         self.resolved: list[tuple[str, dict[str, object]]] = []
+        self.billing_observations: list[tuple[str, list[dict]]] = []
         self.failed: list[tuple[str, str]] = []
 
-    async def async_resolve(self, request_id: str, payload: dict[str, object]) -> None:
+    async def async_resolve(
+        self,
+        request_id: str,
+        payload: dict[str, object],
+        *,
+        billing_observations: list[dict] | None = None,
+    ) -> None:
         self.resolved.append((request_id, payload))
+        self.billing_observations.append((request_id, list(billing_observations or [])))
 
     async def async_fail(self, request_id: str, error: str) -> None:
         self.failed.append((request_id, error))
@@ -400,6 +408,7 @@ def test_do_act_prefers_async_task_futures_api(monkeypatch) -> None:
         )
     ]
     assert task_futures.failed == []
+    assert task_futures.billing_observations == [("req-2", [])]
 
 
 def test_do_act_logs_when_future_fail_marking_fails(monkeypatch) -> None:

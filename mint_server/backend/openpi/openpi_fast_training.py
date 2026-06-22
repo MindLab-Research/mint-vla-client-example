@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import base64
-import structlog
 import shutil
+import structlog
 import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -419,23 +419,9 @@ class OpenPIFastTrainingEngine:
         if export_dir.exists():
             raise FileExistsError(f"OpenPI FAST sampler export path already exists: {export_dir}")
 
-        temp_dir = checkpoint_root / f".openpi_fast_sampler_export_{checkpoint_name}_{uuid.uuid4().hex}"
-        try:
-            result = await self._request_runtime(runtime, "save_sampler_weights", {"save_path": str(temp_dir)})
-            source_dir = find_openpi_policy_checkpoint_dir(result["path"])
-            params_dir = source_dir / "params"
-            assets_dir = source_dir / "assets"
-            if not params_dir.is_dir():
-                raise FileNotFoundError(f"OpenPI FAST sampler export missing params dir: {params_dir}")
-            if not assets_dir.is_dir():
-                raise FileNotFoundError(f"OpenPI FAST sampler export missing assets dir: {assets_dir}")
-
-            export_dir.mkdir(parents=True, exist_ok=False)
-            shutil.copytree(params_dir, export_dir / "params")
-            shutil.copytree(assets_dir, export_dir / "assets")
-            return str(export_dir)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        result = await self._request_runtime(runtime, "save_sampler_weights", {"export_path": str(export_dir)})
+        return str(result["path"])
 
     async def save_weights(
         self,

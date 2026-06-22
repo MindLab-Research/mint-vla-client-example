@@ -32,7 +32,7 @@ class _FakeActionRuntimeClient:
         if op == "create_session":
             return {"ready": True}
         if op == "act":
-            return {
+            result = {
                 "actions": {
                     "data": [0.0] * 70,
                     "shape": [10, 7],
@@ -40,6 +40,13 @@ class _FakeActionRuntimeClient:
                 },
                 "policy_timing": {"infer_ms": 5.0},
             }
+            if payload and payload.get("return_rollout_trace"):
+                result["rollout_trace"] = {
+                    "chains": {"data": [0.0] * (2 * 10 * 32), "shape": [2, 10, 32], "dtype": "float32"},
+                    "denoise_inds": {"data": [0], "shape": [1], "dtype": "int32"},
+                    "logprobs": {"data": [0.0] * 70, "shape": [10, 7], "dtype": "float32"},
+                }
+            return result
         if op == "shutdown":
             return {"stopped": True}
         raise AssertionError(f"unexpected action op {op}")
@@ -188,6 +195,47 @@ def test_openpi_pi05_action_session_manager_act_returns_actions(monkeypatch, tmp
     assert factory.clients[0].calls[-1][0] == "act"
 
 
+def test_openpi_pi05_action_session_manager_act_can_request_rollout_trace(monkeypatch, tmp_path: Path) -> None:
+    from mint_server.backend.openpi.action_session_manager import OpenPIPi05ActionSessionManager
+
+    monkeypatch.setattr(
+        "mint_server.backend.openpi.action_session_manager.get_model_config",
+        _fake_get_model_config,
+    )
+
+    checkpoint_dir = tmp_path / "model-1" / "export-1"
+    (checkpoint_dir / "params").mkdir(parents=True, exist_ok=True)
+    (checkpoint_dir / "assets").mkdir(parents=True, exist_ok=True)
+
+    factory = _FakeActionRuntimeFactory()
+    manager = OpenPIPi05ActionSessionManager(runtime_factory=factory)
+    action_session_id = asyncio.run(
+        manager.create_session(
+            session_id="session-1",
+            action_session_seq_id=None,
+            base_model=OPENPI_PI05_MODEL,
+            model_path=f"file://{checkpoint_dir}",
+            user_id="admin",
+        )
+    )
+
+    result = asyncio.run(
+        manager.act(
+            action_session_id=action_session_id,
+            observation=_make_observation(),
+            extra_inputs={"state": TensorData(data=[0.0] * 8, shape=[8], dtype="float32")},
+            return_rollout_trace=True,
+            rollout_trace_config={"noise_method": "flow_noise", "joint_logprob": True, "num_steps": 1},
+        )
+    )
+
+    _, payload = factory.clients[0].calls[-1]
+    assert payload["return_rollout_trace"] is True  # type: ignore[union-attr]
+    assert payload["rollout_trace_config"] == {"noise_method": "flow_noise", "joint_logprob": True, "num_steps": 1}  # type: ignore[union-attr]
+    assert result["rollout_trace"]["chains"]["shape"] == [2, 10, 32]
+    assert result["rollout_trace"]["logprobs"]["shape"] == [10, 7]
+
+
 def test_openpi_pi05_action_session_manager_rejects_unsupported_model_family(monkeypatch, tmp_path: Path) -> None:
     from mint_server.backend.openpi.action_session_manager import OpenPIPi05ActionSessionManager
 
@@ -212,4 +260,3 @@ def test_openpi_pi05_action_session_manager_rejects_unsupported_model_family(mon
                 user_id="admin",
             )
         )
-

@@ -43,6 +43,20 @@ def _make_datum(*, num_images: int = 3, action_horizon: int = 10) -> Datum:
     )
 
 
+def _make_rl_datum(*, chain_action_dim: int = 7) -> Datum:
+    datum = _make_datum()
+    chains = [float(i) / 100.0 for i in range(2 * 10 * chain_action_dim)]
+    datum.loss_fn_inputs.update(
+        {
+            "chains": TensorData(data=chains, shape=[2, 10, chain_action_dim], dtype="float32"),
+            "denoise_inds": TensorData(data=[0.0], shape=[1], dtype="int64"),
+            "logprobs": TensorData(data=[-0.1] * (10 * 7), shape=[10, 7], dtype="float32"),
+            "advantages": TensorData(data=[1.0] * (10 * 7), shape=[10, 7], dtype="float32"),
+        }
+    )
+    return datum
+
+
 def test_build_openpi_pi05_sft_runtime_payload_pads_state_and_actions() -> None:
     payload = openpi_pi05_training.build_openpi_pi05_sft_runtime_payload(
         datum=_make_datum(),
@@ -104,3 +118,42 @@ def test_build_openpi_pi05_action_observation_payload_pads_state_and_keeps_promp
     assert len(payload["state"]) == 32
     assert payload["state"][:8] == [0.25] * 8
     assert payload["state"][8:] == [0.0] * 24
+
+
+def test_build_openpi_pi05_rl_runtime_payload_pads_chains_and_keeps_advantages() -> None:
+    payload = openpi_pi05_training.build_openpi_pi05_rl_runtime_payload(
+        datum=_make_rl_datum(),
+        model_config=_pi05_config(),
+    )
+
+    assert len(payload["chains"]) == 2
+    assert len(payload["chains"][0]) == 10
+    assert all(len(row) == 32 for row in payload["chains"][0])
+    assert payload["chains"][0][0][:7] == pytest.approx([i / 100.0 for i in range(7)])
+    assert payload["chains"][0][0][7:] == [0.0] * 25
+    assert payload["source_action_dim"] == 7
+    assert payload["denoise_inds"] == [0]
+    assert payload["old_logprobs"] == [-0.1] * 70
+    assert payload["advantages"] == [1.0] * 70
+
+
+def test_build_openpi_pi05_rl_runtime_payload_accepts_full_dim_chains_with_env_dim_logprobs() -> None:
+    payload = openpi_pi05_training.build_openpi_pi05_rl_runtime_payload(
+        datum=_make_rl_datum(chain_action_dim=32),
+        model_config=_pi05_config(),
+    )
+
+    assert len(payload["chains"][0][0]) == 32
+    assert payload["source_action_dim"] == 7
+    assert payload["old_logprobs"] == [-0.1] * 70
+
+
+def test_build_openpi_pi05_rl_runtime_payload_rejects_logprob_shape_mismatch() -> None:
+    datum = _make_rl_datum()
+    datum.loss_fn_inputs["logprobs"] = TensorData(data=[-0.1] * 10, shape=[10], dtype="float32")
+
+    with pytest.raises(ValueError, match="logprobs shape"):
+        openpi_pi05_training.build_openpi_pi05_rl_runtime_payload(
+            datum=datum,
+            model_config=_pi05_config(),
+        )

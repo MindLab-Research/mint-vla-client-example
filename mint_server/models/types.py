@@ -430,11 +430,15 @@ class TensorData(BaseModel):
 class ActRequest(BaseModel):
     """Request to run action inference."""
 
+    model_config = ConfigDict(extra="allow")
+
     action_session_id: str
     seq_id: int | None = None
     observation: ModelInput
     extra_inputs: dict[str, TensorData] = {}
     temperature: float | None = None
+    return_rollout_trace: bool | None = None
+    rollout_trace_config: dict[str, Any] | None = None
 
 
 class ActResponse(BaseModel):

@@ -12,9 +12,9 @@ from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_
 from mint_server.ray.ray_utils import init_ray
 from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
+from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerClient
 from mint_server.backend.openpi.openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
-    OpenPIFastWorkerClient,
     OpenPIFastWorkerError,
     OpenPIFastWorkerProtocolError,
 )
@@ -101,11 +101,11 @@ class OpenPIRayRuntimeActor:
         self._model_id = model_id
         self._training_session_id = training_session_id
         self._spec = spec
-        self._runtime: OpenPIFastWorkerClient | None = None
+        self._runtime: OpenPIDirectWorkerClient | None = None
 
-    async def _ensure_runtime(self) -> OpenPIFastWorkerClient:
+    async def _ensure_runtime(self) -> OpenPIDirectWorkerClient:
         if self._runtime is None:
-            self._runtime = await OpenPIFastWorkerClient.start(self._spec)
+            self._runtime = await OpenPIDirectWorkerClient.start(self._spec)
         return self._runtime
 
     async def ready_metadata(self) -> dict[str, Any]:

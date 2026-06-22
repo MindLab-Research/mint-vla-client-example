@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import json
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -15,7 +14,6 @@ def _spec(*, worker_module: str = "mint_server.backend.openpi.openpi_fast_worker
     from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
-        python_executable=os.sys.executable,
         worker_module=worker_module,
         startup_timeout_s=30.0,
         create_session_timeout_s=300.0,
@@ -329,6 +327,171 @@ def test_start_openpi_shared_ray_runtime_refreshes_stale_cached_actor_handle(mon
     assert openpi_shared_ray_runtime._SHARED_ACTORS[actor_name].actor == "fresh-actor"
 
 
+def test_start_openpi_shared_ray_runtime_recovers_named_actor_creation_race(
+    monkeypatch,
+) -> None:
+    from mint_server.backend.openpi import openpi_shared_ray_runtime
+
+    state: dict[str, object] = {"client_inits": []}
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            raise RuntimeError("actor with name already exists")
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, session_id, ready_timeout_s, owns_started_actor=False):
+            state["client_inits"].append(
+                {
+                    "actor": actor,
+                    "actor_name": actor_name,
+                    "session_id": session_id,
+                    "ready_timeout_s": ready_timeout_s,
+                    "worker_module": spec.worker_module,
+                    "owns_started_actor": owns_started_actor,
+                }
+            )
+
+        async def ready(self):
+            return {"actor_id": "fresh-123", "node_id": "node-456"}
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"] = actor_name
+
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "get_model_actor_supervisor", lambda: _FakePool())
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
+
+    async def _fake_wait_for_named_shared_actor(*_args, **_kwargs):
+        return "fresh-actor"
+
+    monkeypatch.setattr(openpi_shared_ray_runtime, "_wait_for_named_shared_actor", _fake_wait_for_named_shared_actor)
+
+    session = _make_session("model-a", "session-a")
+    client = asyncio.run(
+        openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+            session=session,
+            spec=_spec(),
+            config_name="pi0_fast_libero_low_mem_finetune",
+            model_config=_model_config(),
+        )
+    )
+
+    actor_name = state["register"]["actor_name"]
+    assert isinstance(client, _FakeClient)
+    assert actor_name.startswith("mint_openpi_shared_")
+    assert state["options"]["name"] == actor_name
+    assert state["options"]["runtime_env"]["env_vars"]["MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT"] == (
+        f"/repo/checkpoints/openpi_action_session_state/mint/{actor_name}"
+    )
+    assert state["client_inits"] == [
+        {
+            "actor": "fresh-actor",
+            "actor_name": actor_name,
+            "session_id": "model-a",
+            "ready_timeout_s": 300.0,
+            "worker_module": "mint_server.backend.openpi.openpi_fast_worker",
+            "owns_started_actor": False,
+        }
+    ]
+    assert state["register"]["actor_type"].value == "openpi"
+    assert state["register"]["metadata"]["worker_module"] == "mint_server.backend.openpi.openpi_fast_worker"
+    assert openpi_shared_ray_runtime._SHARED_ACTORS[actor_name].actor == "fresh-actor"
+
+
+def test_start_openpi_shared_ray_runtime_propagates_pinned_capacity_error(monkeypatch) -> None:
+    from mint_server.backend.openpi import openpi_shared_ray_runtime
+
+    state: dict[str, object] = {"wait_called": False}
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            raise RuntimeError("[OpenPISharedRuntime] pinned node capacity check failed")
+
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
+
+    async def _fake_wait_for_named_shared_actor(*_args, **_kwargs):
+        state["wait_called"] = True
+        return "unexpected-actor"
+
+    monkeypatch.setattr(openpi_shared_ray_runtime, "_wait_for_named_shared_actor", _fake_wait_for_named_shared_actor)
+
+    session = _make_session("model-a", "session-a")
+    with pytest.raises(RuntimeError, match="pinned node capacity check failed"):
+        asyncio.run(
+            openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+                session=session,
+                spec=_spec(),
+                config_name="pi0_fast_libero_low_mem_finetune",
+                model_config=_model_config(),
+            )
+        )
+
+    assert state["wait_called"] is False
+    assert openpi_shared_ray_runtime._SHARED_ACTORS == {}
+
+
+def test_start_openpi_shared_ray_runtime_clears_cache_when_named_actor_race_is_lost(monkeypatch) -> None:
+    from mint_server.backend.openpi import openpi_shared_ray_runtime
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            _ = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            _ = kwargs
+            raise RuntimeError("name is already taken")
+
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: True)
+
+    async def _fake_wait_for_named_shared_actor(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(openpi_shared_ray_runtime, "_wait_for_named_shared_actor", _fake_wait_for_named_shared_actor)
+
+    session = _make_session("model-a", "session-a")
+    with pytest.raises(RuntimeError, match="lost a named-actor race"):
+        asyncio.run(
+            openpi_shared_ray_runtime.start_openpi_shared_ray_runtime(
+                session=session,
+                spec=_spec(),
+                config_name="pi0_fast_libero_low_mem_finetune",
+                model_config=_model_config(),
+            )
+        )
+
+    assert openpi_shared_ray_runtime._SHARED_ACTORS == {}
+
+
 def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monkeypatch) -> None:
     pytest.importorskip("ray")
     from mint_server.backend.openpi import openpi_shared_ray_runtime
@@ -375,6 +538,57 @@ def test_openpi_shared_runtime_client_refreshes_named_actor_before_request(monke
     ]
 
 
+def test_openpi_shared_runtime_client_shutdown_keeps_reusable_shared_actor(monkeypatch) -> None:
+    from mint_server.backend.openpi import openpi_shared_ray_runtime
+
+    calls: list[tuple[str, object]] = []
+
+    class _SharedActor:
+        class request_for_session:
+            @staticmethod
+            def remote(session_id, op, payload, timeout_s=None):
+                calls.append(("request_for_session", session_id, op, payload, timeout_s))
+                return "shutdown-ref"
+
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
+    monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
+    monkeypatch.setattr(
+        openpi_shared_ray_runtime,
+        "_cleanup_failed_shared_actor_start",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("shared actor must not be killed by logical session shutdown")),
+    )
+
+    actor_name = "mint_openpi_shared_deadbeef"
+    actor = _SharedActor()
+    openpi_shared_ray_runtime._SHARED_ACTORS[actor_name] = openpi_shared_ray_runtime._SharedActorEntry(
+        actor_name=actor_name,
+        actor=actor,
+        pool_key={"base_model": "openpi/pi0-fast-libero-low-mem-finetune"},
+    )
+    client = openpi_shared_ray_runtime.OpenPISharedRayRuntimeClient(
+        actor=actor,
+        actor_name=actor_name,
+        spec=_spec(),
+        session_id="model-a",
+        ready_timeout_s=300.0,
+    )
+
+    async def _fake_ray_get(ref, *, timeout_s):
+        calls.append(("ray_get", ref, timeout_s))
+        return {"stopped": True, "known_session_ids": []}
+
+    monkeypatch.setattr(client, "_ray_get", _fake_ray_get)
+
+    result = asyncio.run(client.request("shutdown", {"model_id": "model-a"}))
+
+    assert result == {"stopped": True, "known_session_ids": []}
+    assert calls == [
+        ("request_for_session", "model-a", "shutdown", {"model_id": "model-a"}, None),
+        ("ray_get", "shutdown-ref", None),
+    ]
+    assert openpi_shared_ray_runtime._SHARED_ACTORS[actor_name].actor is actor
+
+
 def test_openpi_shared_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
     from mint_server.backend.openpi.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
@@ -403,8 +617,6 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
 
     state: dict[str, object] = {}
     node_id = "a" * 56
-
-    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
 
     class _FakeActorBuilder:
         def options(self, **kwargs):
@@ -435,7 +647,7 @@ def test_start_openpi_shared_ray_runtime_applies_single_node_pin(monkeypatch) ->
         def touch(self, actor_name):
             state["touch"] = actor_name
 
-    openpi_shared_ray_runtime.clear_openpi_shared_runtime_pool()
+    _reset_shared_runtime_test_state(monkeypatch, openpi_shared_ray_runtime)
     monkeypatch.setattr(openpi_shared_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
     monkeypatch.setattr(openpi_shared_ray_runtime.ray, "is_initialized", lambda: False)
     monkeypatch.setattr(openpi_shared_ray_runtime, "OpenPISharedRayRuntimeActor", _FakeActorBuilder())
@@ -696,7 +908,7 @@ def test_shared_client_close_does_not_kill_actor_after_successful_create_session
     assert state["kill_calls"] == []
 
 
-def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypatch) -> None:
+def test_shared_client_shutdown_keeps_reusable_actor_when_last_session_exits(monkeypatch) -> None:
     from mint_server.backend.openpi import openpi_shared_ray_runtime
 
     shutdown_ref = _completed_ref("shutdown-ref")
@@ -807,10 +1019,10 @@ def test_shared_client_shutdown_reclaims_actor_when_last_session_exits(monkeypat
     actor_name = state["register"]["actor_name"]
     assert result["stopped"] is True
     assert state["sessions"][-1] == (actor_name, None)
-    assert actor_name in state["unregister"]
-    assert state["shutdown_refs"] == [("shutdown-ref", 5.0)]
-    assert state["kill_calls"] == [(state["actor"], True)]
-    assert openpi_shared_ray_runtime._SHARED_ACTORS == {}
+    assert state["unregister"] == []
+    assert state["shutdown_refs"] == []
+    assert state["kill_calls"] == []
+    assert openpi_shared_ray_runtime._SHARED_ACTORS[actor_name].actor is state["actor"]
 
 
 def test_start_openpi_shared_ray_runtime_uses_model_id_as_runtime_session_key(monkeypatch) -> None:

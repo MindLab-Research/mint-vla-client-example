@@ -202,6 +202,7 @@ def test_openpi_fast_worker_checkpoint_save_normalizes_step_zero() -> None:
 
     class _FakeCheckpoints:
         def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            assert Path(checkpoint_path).is_dir()
             calls["checkpoint_path"] = checkpoint_path
             calls["init"] = {
                 "keep_period": keep_period,
@@ -257,6 +258,7 @@ def test_openpi_pi05_worker_checkpoint_save_normalizes_step_zero() -> None:
 
     class _FakeCheckpoints:
         def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            assert Path(checkpoint_path).is_dir()
             calls["checkpoint_path"] = checkpoint_path
             calls["init"] = {
                 "keep_period": keep_period,
@@ -290,7 +292,7 @@ def test_openpi_pi05_worker_checkpoint_save_normalizes_step_zero() -> None:
     assert calls["closed"] is True
 
 
-def test_openpi_fast_worker_sampler_checkpoint_omits_train_state() -> None:
+def test_openpi_fast_worker_sampler_checkpoint_omits_train_state(tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
     class _FakeManager:
@@ -305,6 +307,7 @@ def test_openpi_fast_worker_sampler_checkpoint_omits_train_state() -> None:
 
     class _FakeCheckpoints:
         def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            assert Path(checkpoint_path).is_dir()
             calls["checkpoint_path"] = checkpoint_path
             calls["init"] = {
                 "keep_period": keep_period,
@@ -335,11 +338,14 @@ def test_openpi_fast_worker_sampler_checkpoint_omits_train_state() -> None:
 
     fast_worker_module.OpenPIFastWorkerSession._save_sampler_checkpoint(
         fake_session,
-        Path("/tmp/openpi-fast-sampler"),
+        tmp_path / "missing-parent" / "openpi-fast-sampler",
         state,
     )
 
     assert calls["save"]["step"] == 1
+    assert calls["init"]["overwrite"] is True
+    assert (tmp_path / "missing-parent").is_dir()
+    assert (tmp_path / "missing-parent" / "openpi-fast-sampler").is_dir()
     assert set(calls["save"]["items"].keys()) == {"assets", "params"}
     assert calls["waited"] is True
     assert calls["closed"] is True
@@ -360,7 +366,13 @@ def test_openpi_fast_worker_sampler_checkpoint_copies_seed_assets(tmp_path) -> N
 
     class _FakeCheckpoints:
         def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            assert Path(checkpoint_path).is_dir()
             calls["checkpoint_path"] = checkpoint_path
+            calls["init"] = {
+                "keep_period": keep_period,
+                "overwrite": overwrite,
+                "resume": resume,
+            }
             return _FakeManager(), False
 
         class _normalize:
@@ -396,11 +408,12 @@ def test_openpi_fast_worker_sampler_checkpoint_copies_seed_assets(tmp_path) -> N
     assets_callback(export_assets_dir)
 
     assert (export_assets_dir / "physical-intelligence" / "libero" / "norm_stats.json").read_text(encoding="utf-8") == "{}"
+    assert calls["init"]["overwrite"] is True
     assert calls["waited"] is True
     assert calls["closed"] is True
 
 
-def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state() -> None:
+def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state(tmp_path: Path) -> None:
     calls: dict[str, object] = {}
 
     class _FakeManager:
@@ -415,6 +428,7 @@ def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state() -> None:
 
     class _FakeCheckpoints:
         def initialize_checkpoint_dir(self, checkpoint_path, *, keep_period, overwrite, resume):
+            assert Path(checkpoint_path).is_dir()
             calls["checkpoint_path"] = checkpoint_path
             calls["init"] = {
                 "keep_period": keep_period,
@@ -445,69 +459,56 @@ def test_openpi_pi05_worker_sampler_checkpoint_omits_train_state() -> None:
 
     pi05_worker_module.OpenPIPi05WorkerSession._save_sampler_checkpoint(
         fake_session,
-        Path("/tmp/openpi-pi05-sampler"),
+        tmp_path / "missing-parent" / "openpi-pi05-sampler",
         state,
     )
 
     assert calls["save"]["step"] == 1
+    assert calls["init"]["overwrite"] is True
+    assert (tmp_path / "missing-parent").is_dir()
+    assert (tmp_path / "missing-parent" / "openpi-pi05-sampler").is_dir()
     assert set(calls["save"]["items"].keys()) == {"assets", "params"}
     assert calls["waited"] is True
     assert calls["closed"] is True
 
 
-def test_openpi_fast_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
-    import io
+def test_openpi_fast_worker_sampler_export_flattens_policy_checkpoint(tmp_path: Path) -> None:
+    def _fake_save_sampler_checkpoint(path: Path, state) -> None:
+        _ = state
+        (path / "7" / "params").mkdir(parents=True)
+        (path / "7" / "assets").mkdir(parents=True)
+        (path / "7" / "params" / "_METADATA").write_text("params", encoding="utf-8")
+        (path / "7" / "assets" / "asset.json").write_text("{}", encoding="utf-8")
 
-    protocol_stream = io.StringIO()
-    monkeypatch.setattr(fast_worker_module, "_PROTOCOL_STDOUT", protocol_stream)
+    fake_session = SimpleNamespace(_save_sampler_checkpoint=_fake_save_sampler_checkpoint)
+    export_dir = fast_worker_module.OpenPIFastWorkerSession._save_sampler_export(
+        fake_session,
+        tmp_path / "policy-export",
+        SimpleNamespace(step=7),
+    )
 
-    fast_worker_module._reply({"ok": True})
-
-    assert protocol_stream.getvalue() == '{"ok": true}\n'
-
-
-def test_openpi_fast_worker_captures_non_protocol_stdout(monkeypatch) -> None:
-    warnings: list[str] = []
-
-    def _fake_dispatch(session, op, payload):
-        _ = session, op, payload
-        print("Tokens: [1, 2, 3]")
-        return {"ok": True}, False
-
-    monkeypatch.setattr(fast_worker_module, "_dispatch", _fake_dispatch)
-    monkeypatch.setattr(fast_worker_module.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
-
-    payload, should_stop = fast_worker_module._dispatch_with_protocol_stdout(None, "save_sampler_weights", {})
-
-    assert payload == {"ok": True}
-    assert should_stop is False
-    assert warnings == ["Suppressed non-protocol stdout from OpenPI worker: Tokens: [1, 2, 3]"]
+    assert export_dir == tmp_path / "policy-export"
+    assert (export_dir / "params" / "_METADATA").read_text(encoding="utf-8") == "params"
+    assert (export_dir / "assets" / "asset.json").read_text(encoding="utf-8") == "{}"
+    assert not list(tmp_path.glob(".openpi_fast_sampler_export_*"))
 
 
-def test_openpi_pi05_worker_reply_prefers_protocol_stream(monkeypatch) -> None:
-    import io
+def test_openpi_pi05_worker_sampler_export_flattens_policy_checkpoint(tmp_path: Path) -> None:
+    def _fake_save_sampler_checkpoint(path: Path, state) -> None:
+        _ = state
+        (path / "3" / "params").mkdir(parents=True)
+        (path / "3" / "assets").mkdir(parents=True)
+        (path / "3" / "params" / "_METADATA").write_text("params", encoding="utf-8")
+        (path / "3" / "assets" / "asset.json").write_text("{}", encoding="utf-8")
 
-    protocol_stream = io.StringIO()
-    monkeypatch.setattr(pi05_worker_module, "_PROTOCOL_STDOUT", protocol_stream)
+    fake_session = SimpleNamespace(_save_sampler_checkpoint=_fake_save_sampler_checkpoint)
+    export_dir = pi05_worker_module.OpenPIPi05WorkerSession._save_sampler_export(
+        fake_session,
+        tmp_path / "policy-export",
+        SimpleNamespace(step=3),
+    )
 
-    pi05_worker_module._reply({"ok": True})
-
-    assert protocol_stream.getvalue() == '{"ok": true}\n'
-
-
-def test_openpi_pi05_worker_captures_non_protocol_stdout(monkeypatch) -> None:
-    warnings: list[str] = []
-
-    def _fake_dispatch(session, op, payload):
-        _ = session, op, payload
-        print("Tokens: [1, 2, 3]")
-        return {"ok": True}, False
-
-    monkeypatch.setattr(pi05_worker_module, "_dispatch", _fake_dispatch)
-    monkeypatch.setattr(pi05_worker_module.logger, "warning", lambda msg, *args: warnings.append(msg % args if args else msg))
-
-    payload, should_stop = pi05_worker_module._dispatch_with_protocol_stdout(None, "save_sampler_weights", {})
-
-    assert payload == {"ok": True}
-    assert should_stop is False
-    assert warnings == ["Suppressed non-protocol stdout from OpenPI worker: Tokens: [1, 2, 3]"]
+    assert export_dir == tmp_path / "policy-export"
+    assert (export_dir / "params" / "_METADATA").read_text(encoding="utf-8") == "params"
+    assert (export_dir / "assets" / "asset.json").read_text(encoding="utf-8") == "{}"
+    assert not list(tmp_path.glob(".openpi_pi05_sampler_export_*"))

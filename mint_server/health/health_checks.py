@@ -4,6 +4,7 @@ import asyncio
 import os
 import time
 from dataclasses import dataclass
+from typing import Any
 
 import structlog
 from fastapi.responses import JSONResponse
@@ -61,16 +62,18 @@ async def _ping_public_dependencies(*, timeout_s: float) -> None:
     scheduler_ping = getattr(model_work_scheduler, "async_ping", None)
     if scheduler_ping is None:
         scheduler_ping = getattr(model_work_scheduler, "ping")
-    task_ping = getattr(task_state_store, "async_ping", None)
-    if task_ping is None:
-        task_ping = getattr(task_state_store, "ping")
-
     component_timeout_s = min(timeout_s, PUBLIC_HEALTHZ_COMPONENT_TIMEOUT_S)
 
+    task_ping = getattr(task_state_store, "async_ensure_ready", None)
+    task_ping_kwargs = {"timeout_s": component_timeout_s, "create_if_missing": True}
+    if task_ping is None:
+        task_ping = getattr(task_state_store, "async_ping", None)
+        task_ping_kwargs = {"timeout_s": component_timeout_s}
+
     _ping_t0 = time.perf_counter()
-    async def _call_ping(fn) -> object:
+    async def _call_ping(fn, **kwargs: Any) -> object:
         try:
-            out = fn(timeout_s=component_timeout_s)
+            out = fn(**kwargs)
             if asyncio.iscoroutine(out):
                 out = await out
             if isinstance(out, dict) and not bool(out.get("ok", True)):
@@ -82,8 +85,8 @@ async def _ping_public_dependencies(*, timeout_s: float) -> None:
             raise _PublicDependencyUnhealthy(f"{type(e).__name__}: {e}") from e
 
     await asyncio.gather(
-        _call_ping(scheduler_ping),
-        _call_ping(task_ping),
+        _call_ping(scheduler_ping, timeout_s=component_timeout_s),
+        _call_ping(task_ping, **task_ping_kwargs),
     )
 
 

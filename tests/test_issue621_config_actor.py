@@ -55,6 +55,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert classify_env_key("MINT_DEPLOYMENT_ENV") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_CLUSTER_ID") == CONFIG_CLASS_OBSERVABILITY
     assert classify_env_key("MINT_TASK_STATE_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
+    assert classify_env_key("MINT_TASK_HOT_KV_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
+    assert classify_env_key("MINT_FUTURE_STATE_STORE_DB_PATH") == CONFIG_CLASS_TASK_STATE
     assert classify_env_key("MINT_TASK_STATE_STORE_OWNER_TTL_S") == CONFIG_CLASS_TASK_STATE
     assert classify_env_key("VOLCENGINE_ACCESS_KEY") == CONFIG_CLASS_SNAPSHOT_CONFIG
     assert classify_env_key("VOLCENGINE_SECRET_KEY") == CONFIG_CLASS_SNAPSHOT_CONFIG
@@ -75,6 +77,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
             "MINT_DEPLOYMENT_ENV": "prod",
             "MINT_CLUSTER_ID": "volcano",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
+            "MINT_TASK_HOT_KV_STORE_DB_PATH": "/tmp/task-hot-kv.sqlite3",
+            "MINT_FUTURE_STATE_STORE_DB_PATH": "/tmp/future.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_RENEW_S": "10",
             "VOLCENGINE_ACCESS_KEY": "volc-ak",
             "VOLCENGINE_SECRET_KEY": "volc-sk",
@@ -105,6 +109,8 @@ def test_runtime_config_classifies_bootstrap_actor_creation_snapshot_and_observa
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_DEPLOYMENT_ENV"] == "prod"
     assert grouped[CONFIG_CLASS_OBSERVABILITY]["MINT_CLUSTER_ID"] == "volcano"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
+    assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_HOT_KV_STORE_DB_PATH"] == "/tmp/task-hot-kv.sqlite3"
+    assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_FUTURE_STATE_STORE_DB_PATH"] == "/tmp/future.sqlite3"
     assert grouped[CONFIG_CLASS_TASK_STATE]["MINT_TASK_STATE_STORE_OWNER_RENEW_S"] == "10"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["VOLCENGINE_ACCESS_KEY"] == "volc-ak"
     assert grouped[CONFIG_CLASS_SNAPSHOT_CONFIG]["VOLCENGINE_SECRET_KEY"] == REDACTED_VALUE
@@ -167,6 +173,8 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
             "MINT_CLUSTER_ID": "volcano",
             "OTEL_EXPORTER_OTLP_HEADERS": "Authorization=secret",
             "MINT_TASK_STATE_STORE_DB_PATH": "/tmp/task.sqlite3",
+            "MINT_TASK_HOT_KV_STORE_DB_PATH": "/tmp/task-hot-kv.sqlite3",
+            "MINT_FUTURE_STATE_STORE_DB_PATH": "/tmp/future.sqlite3",
             "MINT_TASK_STATE_STORE_OWNER_TTL_S": "30",
             "VOLCENGINE_ACCESS_KEY": "volc-ak",
             "VOLCENGINE_SECRET_KEY": "volc-sk",
@@ -194,6 +202,8 @@ def test_actor_env_from_environ_keeps_real_values_for_actor_hydration() -> None:
     assert actor_env["MINT_CLUSTER_ID"] == "volcano"
     assert actor_env["OTEL_EXPORTER_OTLP_HEADERS"] == "Authorization=secret"
     assert actor_env["MINT_TASK_STATE_STORE_DB_PATH"] == "/tmp/task.sqlite3"
+    assert actor_env["MINT_TASK_HOT_KV_STORE_DB_PATH"] == "/tmp/task-hot-kv.sqlite3"
+    assert actor_env["MINT_FUTURE_STATE_STORE_DB_PATH"] == "/tmp/future.sqlite3"
     assert actor_env["MINT_TASK_STATE_STORE_OWNER_TTL_S"] == "30"
     assert actor_env["VOLCENGINE_ACCESS_KEY"] == "volc-ak"
     assert actor_env["VOLCENGINE_SECRET_KEY"] == "volc-sk"

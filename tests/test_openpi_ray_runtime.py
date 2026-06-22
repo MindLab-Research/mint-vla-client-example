@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import importlib
-import os
 import time
 from types import SimpleNamespace
 
@@ -47,7 +46,6 @@ def _spec():
     from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
 
     return OpenPIFastRuntimeSpec(
-        python_executable=os.sys.executable,
         startup_timeout_s=30.0,
         create_session_timeout_s=300.0,
         request_timeout_s=300.0,

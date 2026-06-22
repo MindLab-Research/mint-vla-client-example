@@ -5,6 +5,7 @@ import hashlib
 import json
 import structlog
 import os
+import time
 from typing import Any
 
 import ray
@@ -12,9 +13,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from mint_server.config import RAY_NAMESPACE
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
+from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerClient
 from mint_server.backend.openpi.openpi_fast_runtime import (
     OpenPIFastRuntimeSpec,
-    OpenPIFastWorkerClient,
     OpenPIFastWorkerError,
     OpenPIFastWorkerProtocolError,
 )
@@ -33,6 +34,24 @@ from mint_server.backend.actors.node_placement import (
 
 
 logger = structlog.get_logger(__name__)
+
+
+def _capacity_retry_timeout_s() -> float:
+    raw = os.environ.get("MINT_OPENPI_ACTION_CAPACITY_RETRY_TIMEOUT_S", "30")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid MINT_OPENPI_ACTION_CAPACITY_RETRY_TIMEOUT_S=%r; using 30s", raw)
+        return 30.0
+
+
+def _capacity_retry_interval_s() -> float:
+    raw = os.environ.get("MINT_OPENPI_ACTION_CAPACITY_RETRY_INTERVAL_S", "1")
+    try:
+        return max(0.1, float(raw))
+    except (TypeError, ValueError):
+        logger.warning("Invalid MINT_OPENPI_ACTION_CAPACITY_RETRY_INTERVAL_S=%r; using 1s", raw)
+        return 1.0
 
 
 def _action_actor_name(
@@ -80,10 +99,31 @@ def _preferred_openpi_action_node_ip(base_model: str, actor_name: str) -> str | 
             f"[OpenPIActionRuntime] node pinning model={base_model!r} actor={actor_name!r}: "
             f"expected exactly 1 GPU, got {placement.total_gpus}"
         )
-    assert_node_ip_capacity(
-        required_gpus_by_node_ip={placement.slices[0].node_ip: 1},
-        context=f"[OpenPIActionRuntime] node pinning model={base_model!r} actor={actor_name!r}",
-    )
+    required_gpus = {placement.slices[0].node_ip: 1}
+    deadline = time.monotonic() + _capacity_retry_timeout_s()
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            assert_node_ip_capacity(
+                required_gpus_by_node_ip=required_gpus,
+                context=f"[OpenPIActionRuntime] node pinning model={base_model!r} actor={actor_name!r}",
+            )
+            break
+        except RuntimeError as exc:
+            if "pinned node capacity check failed" not in str(exc) or time.monotonic() >= deadline:
+                raise
+            delay_s = min(_capacity_retry_interval_s(), max(0.0, deadline - time.monotonic()))
+            logger.warning(
+                "[OpenPIActionRuntime] pinned node capacity unavailable; retrying "
+                "attempt=%s delay_s=%.3f model=%s actor=%s error=%s",
+                attempt,
+                delay_s,
+                base_model,
+                actor_name,
+                exc,
+            )
+            time.sleep(delay_s)
     return placement.slices[0].node_ip
 
 
@@ -136,11 +176,11 @@ class OpenPIActionRayRuntimeActor:
         self._action_session_id = action_session_id
         self._base_model = base_model
         self._spec = spec
-        self._runtime: OpenPIFastWorkerClient | None = None
+        self._runtime: OpenPIDirectWorkerClient | None = None
 
-    async def _ensure_runtime(self) -> OpenPIFastWorkerClient:
+    async def _ensure_runtime(self) -> OpenPIDirectWorkerClient:
         if self._runtime is None:
-            self._runtime = await OpenPIFastWorkerClient.start(self._spec)
+            self._runtime = await OpenPIDirectWorkerClient.start(self._spec)
         return self._runtime
 
     async def ready_metadata(self) -> dict[str, Any]:

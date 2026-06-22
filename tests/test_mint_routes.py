@@ -225,9 +225,70 @@ def test_mint_action_route_enqueues_billing_observation(monkeypatch) -> None:
     assert queued["extra"]["gateway_auth"]["apikey_id"] == _APIKEY_ID
 
 
-def test_mint_create_action_session_maps_capacity_runtime_error_to_503(
-    monkeypatch,
-) -> None:
+def test_mint_action_route_forwards_rollout_trace_options(monkeypatch) -> None:
+    from mint_server.routes import mint as mint_routes
+
+    task_futures = _StubTaskFutureService()
+    scheduler = _StubModelWorkScheduler()
+
+    class _StubActionSessionManager:
+        def get_billing_metadata(self, action_session_id: str) -> dict:
+            assert action_session_id == "action-session-1"
+            return {
+                "base_model": "openpi/pi05-libero-low-mem-finetune",
+                "policy_family": "flow_matching",
+                "action_dim": 7,
+                "action_horizon": 10,
+            }
+
+    monkeypatch.setattr(mint_routes, "task_futures", task_futures, raising=False)
+    monkeypatch.setattr(mint_routes, "action_session_manager", _StubActionSessionManager(), raising=False)
+    _install_billing_user(monkeypatch, mint_routes)
+
+    import mint_server.backend.scheduling.model_work_scheduler as mws
+
+    monkeypatch.setattr(mws, "model_work_scheduler", scheduler)
+
+    app = FastAPI()
+    app.include_router(mint_routes.router, prefix="/api/v1/mint")
+    client = TestClient(app)
+
+    trace_config = {
+        "num_steps": 3,
+        "noise_method": "flow_sde",
+        "noise_level": 0.5,
+        "noise_std": 0.12,
+        "joint_logprob": False,
+    }
+    resp = client.post(
+        "/api/v1/mint/action_sessions/action-session-1/act",
+        json={
+            "observation": {
+                "state": {"data": [0.0] * 8, "shape": [8], "dtype": "float32"},
+                "model_input": {
+                    "chunks": [
+                        {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                        {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                        {"type": "image", "data": "aW1n", "format": "png", "expected_tokens": 256},
+                        {"type": "encoded_text", "tokens": [1, 2, 3]},
+                    ]
+                },
+            },
+            "return_rollout_trace": True,
+            "rollout_trace_config": trace_config,
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    queued = scheduler.calls[0]
+    request_json = json.loads(queued["request_json"].decode("utf-8"))
+    assert request_json["return_rollout_trace"] is True
+    assert request_json["rollout_trace_config"] == trace_config
+    assert request_json["extra_inputs"]["state"]["shape"] == [8]
+    assert queued["extra"]["billing_observation_input"]["metadata"]["base_model"] == "openpi/pi05-libero-low-mem-finetune"
+
+
+def test_mint_create_action_session_maps_capacity_runtime_error_to_503(monkeypatch) -> None:
     from mint_server.routes import mint as mint_routes
     import mint_server.auth.supported_models_gate as supported_models_gate
 

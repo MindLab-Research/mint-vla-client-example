@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 import structlog
 import uuid
 from typing import Any, Awaitable, Callable
@@ -13,6 +14,7 @@ from mint_server.backend.core.model_registry import get_model_config
 from mint_server.backend.openpi.openpi_action_ray_runtime import (
     OpenPIActionRayRuntimeClient,
     _actor_ready_timeout_s,
+    start_openpi_action_ray_runtime,
 )
 from mint_server.backend.openpi.openpi_fast_action_runtime import (
     OPENPI_FAST_ACTION_WORKER_MODULE,
@@ -69,7 +71,24 @@ async def _default_pi05_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path, action_session_id, base_model, model_config, config_name
+    del checkpoint_path, config_name
+    direct_enabled = os.environ.get("MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if direct_enabled:
+        spec = dataclasses.replace(
+            OpenPIFastActionRuntimeSpec.from_env(),
+            worker_module="mint_server.backend.openpi_pi05_action_worker",
+        )
+        return await start_openpi_action_ray_runtime(
+            action_session_id=action_session_id,
+            base_model=base_model,
+            spec=spec,
+        )
+    del action_session_id, base_model, model_config
     raise RuntimeError(
         "OpenPI pi0.5 action runtime must be reconciled by ModelActorSupervisor before request handling"
     )
@@ -380,6 +399,8 @@ class OpenPIFastActionSessionManager:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
         temperature: float | None = None,
+        return_rollout_trace: bool | None = None,
+        rollout_trace_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         runtime = self._runtime_clients.get(action_session_id)
         if runtime is None:
@@ -397,8 +418,10 @@ class OpenPIFastActionSessionManager:
             observation=observation,
             extra_inputs=extra_inputs,
             temperature=temperature,
+            return_rollout_trace=return_rollout_trace,
+            rollout_trace_config=rollout_trace_config,
         )
-        return await runtime.request("act", request.model_dump(mode="json"))
+        return await runtime.request("act", request.model_dump(mode="json", exclude_none=True))
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
@@ -499,6 +522,8 @@ class OpenPIPi05ActionSessionManager:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
         temperature: float | None = None,
+        return_rollout_trace: bool | None = None,
+        rollout_trace_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         runtime = self._runtime_clients.get(action_session_id)
         if runtime is None:
@@ -516,8 +541,10 @@ class OpenPIPi05ActionSessionManager:
             observation=observation,
             extra_inputs=extra_inputs,
             temperature=temperature,
+            return_rollout_trace=return_rollout_trace,
+            rollout_trace_config=rollout_trace_config,
         )
-        return await runtime.request("act", request.model_dump(mode="json"))
+        return await runtime.request("act", request.model_dump(mode="json", exclude_none=True))
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
@@ -646,6 +673,8 @@ class ActionSessionRouter:
         observation: ModelInput,
         extra_inputs: dict[str, TensorData],
         temperature: float | None = None,
+        return_rollout_trace: bool | None = None,
+        rollout_trace_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         manager = self._manager_for_session.get(action_session_id)
         if manager is None:
@@ -657,6 +686,8 @@ class ActionSessionRouter:
             observation=observation,
             extra_inputs=extra_inputs,
             temperature=temperature,
+            return_rollout_trace=return_rollout_trace,
+            rollout_trace_config=rollout_trace_config,
         )
 
     async def shutdown_session(self, action_session_id: str) -> None:

@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import base64
-import structlog
 import shutil
+import structlog
 import uuid
 from pathlib import Path
 from typing import Any
@@ -180,6 +180,104 @@ def build_openpi_pi05_sft_runtime_payload(
     return {**payload, "actions": actions}
 
 
+def _reshape_flat(data: list[Any], shape: list[int], *, key: str) -> Any:
+    if not shape:
+        return data[0] if data else None
+    expected = 1
+    for dim in shape:
+        expected *= int(dim)
+    if expected != len(data):
+        raise ValueError(f"OpenPI pi0.5 {key} data length does not match shape")
+
+    def _reshape(values: list[Any], dims: list[int]) -> Any:
+        if len(dims) == 1:
+            return values[: dims[0]]
+        stride = 1
+        for dim in dims[1:]:
+            stride *= int(dim)
+        return [_reshape(values[i * stride : (i + 1) * stride], dims[1:]) for i in range(dims[0])]
+
+    return _reshape(data, [int(dim) for dim in shape])
+
+
+def _pad_action_rows(rows: list[list[Any]], target_dim: int, *, key: str) -> list[list[float]]:
+    padded: list[list[float]] = []
+    for row in rows:
+        padded.append(_pad([float(value) for value in row], target_dim, key=key))
+    return padded
+
+
+def build_openpi_pi05_rl_runtime_payload(
+    *,
+    datum: Any,
+    model_config: ModelConfig,
+) -> dict[str, Any]:
+    payload = _common_input_payload(
+        model_input=datum.model_input,
+        state_input=datum.loss_fn_inputs.get("state"),
+        model_config=model_config,
+    )
+
+    action_dim = int(model_config.action_dim or 0)
+    action_horizon = int(model_config.action_horizon or 0)
+    if action_horizon <= 0:
+        raise ValueError("OpenPI pi0.5 model config must define positive action_dim and action_horizon")
+
+    chains_data, chains_shape = _tensor_payload(datum.loss_fn_inputs.get("chains"), "chains")
+    if len(chains_shape) != 3:
+        raise ValueError("OpenPI pi0.5 RL chains must be rank-3 [steps+1, action_horizon, action_dim]")
+    num_chain_states = int(chains_shape[0])
+    if num_chain_states < 2:
+        raise ValueError("OpenPI pi0.5 RL chains must contain at least two states")
+    if int(chains_shape[1]) != action_horizon:
+        raise ValueError(
+            f"OpenPI pi0.5 RL chains action_horizon mismatch: expected {action_horizon}, got {chains_shape[1]}"
+        )
+    chain_action_dim = int(chains_shape[2])
+    if chain_action_dim <= 0:
+        raise ValueError("OpenPI pi0.5 RL chains must have a positive trailing action dimension")
+
+    raw_chains = _reshape_flat(chains_data, chains_shape, key="chains")
+    chains = [
+        _pad_action_rows(list(chain_state), action_dim, key="chains")
+        for chain_state in raw_chains
+    ]
+
+    denoise_data, denoise_shape = _tensor_payload(datum.loss_fn_inputs.get("denoise_inds"), "denoise_inds")
+    if len(denoise_shape) != 1:
+        raise ValueError("OpenPI pi0.5 RL denoise_inds must be rank-1")
+    denoise_inds = [int(value) for value in denoise_data]
+    num_transitions = num_chain_states - 1
+    if len(denoise_inds) not in {1, num_transitions}:
+        raise ValueError(
+            "OpenPI pi0.5 RL denoise_inds must contain either one selected step or one value per transition"
+        )
+
+    old_logprobs_data, old_logprobs_shape = _tensor_payload(datum.loss_fn_inputs.get("logprobs"), "logprobs")
+    advantages_data, advantages_shape = _tensor_payload(datum.loss_fn_inputs.get("advantages"), "advantages")
+    if len(old_logprobs_shape) != 2 or int(old_logprobs_shape[0]) != action_horizon:
+        raise ValueError("OpenPI pi0.5 RL logprobs shape must be [action_horizon, action_dim]")
+    source_action_dim = int(old_logprobs_shape[1])
+    if source_action_dim <= 0:
+        raise ValueError("OpenPI pi0.5 RL logprobs must have a positive trailing action dimension")
+    if source_action_dim > action_dim:
+        raise ValueError("OpenPI pi0.5 RL logprobs trailing dimension exceeds model action_dim")
+    expected_logprob_shape = [action_horizon, source_action_dim]
+    if advantages_shape != expected_logprob_shape:
+        raise ValueError(
+            f"OpenPI pi0.5 RL advantages shape must be {expected_logprob_shape}, got {advantages_shape}"
+        )
+
+    return {
+        **payload,
+        "chains": chains,
+        "denoise_inds": denoise_inds,
+        "old_logprobs": [float(value) for value in old_logprobs_data],
+        "advantages": [float(value) for value in advantages_data],
+        "source_action_dim": source_action_dim,
+    }
+
+
 def build_openpi_pi05_action_observation_payload(
     *,
     observation: Any,
@@ -299,8 +397,15 @@ class OpenPIPi05TrainingEngine:
 
     async def forward_backward(self, session: Any, request: Any) -> dict[str, Any]:
         loss_fn = str(request.forward_backward_input.loss_fn)
-        if loss_fn != "flow_matching":
-            raise ValueError("OpenPI pi0.5 only supports flow_matching forward_backward requests")
+        if loss_fn == "flow_matching":
+            payload_builder = build_openpi_pi05_sft_runtime_payload
+        elif loss_fn in {"importance_sampling", "ppo"}:
+            payload_builder = build_openpi_pi05_rl_runtime_payload
+        else:
+            raise ValueError(
+                "OpenPI pi0.5 only supports flow_matching, importance_sampling, "
+                "and ppo forward_backward requests"
+            )
 
         model_config = self._model_config(session.base_model)
         runtime = self._runtime_for_session(session)
@@ -311,7 +416,7 @@ class OpenPIPi05TrainingEngine:
                 "loss_fn": loss_fn,
                 "loss_fn_config": dict(request.forward_backward_input.loss_fn_config or {}),
                 "batch": [
-                    build_openpi_pi05_sft_runtime_payload(datum=datum, model_config=model_config)
+                    payload_builder(datum=datum, model_config=model_config)
                     for datum in request.forward_backward_input.data
                 ],
             },
@@ -380,23 +485,9 @@ class OpenPIPi05TrainingEngine:
         if export_dir.exists():
             raise FileExistsError(f"OpenPI pi0.5 sampler export path already exists: {export_dir}")
 
-        temp_dir = checkpoint_root / f".openpi_pi05_sampler_export_{checkpoint_name}_{uuid.uuid4().hex}"
-        try:
-            result = await self._request_runtime(runtime, "save_sampler_weights", {"save_path": str(temp_dir)})
-            source_dir = find_openpi_policy_checkpoint_dir(result["path"])
-            params_dir = source_dir / "params"
-            assets_dir = source_dir / "assets"
-            if not params_dir.is_dir():
-                raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing params dir: {params_dir}")
-            if not assets_dir.is_dir():
-                raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing assets dir: {assets_dir}")
-
-            export_dir.mkdir(parents=True, exist_ok=False)
-            shutil.copytree(params_dir, export_dir / "params")
-            shutil.copytree(assets_dir, export_dir / "assets")
-            return str(export_dir)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+        checkpoint_root.mkdir(parents=True, exist_ok=True)
+        result = await self._request_runtime(runtime, "save_sampler_weights", {"export_path": str(export_dir)})
+        return str(result["path"])
 
     async def save_weights(self, session: Any, save_path: str) -> str:
         runtime = self._runtime_for_session(session)

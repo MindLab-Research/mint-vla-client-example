@@ -341,6 +341,55 @@ def test_issue_593_model_runtime_max_claim_uses_training_override_for_megatron(
     assert _model_runtime_max_claim_for_spec(spec) == 23
 
 
+def test_issue_593_supervisor_env_placement_clears_inherited_topology(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import mint_server.backend.actors.model_actor_supervisor as supervisor_module
+
+    actor = _FakeActorHandle()
+    created = {"actor": actor, "remote_args": None, "remote_kwargs": None, "remote_decorator": None}
+
+    fake_ray = types.SimpleNamespace(
+        is_initialized=lambda: True,
+        cluster_resources=lambda: {"node:10.1.2.3": 1.0, "node:__internal_head__": 1.0},
+    )
+
+    def _remote(**kwargs):
+        created["remote_decorator"] = kwargs
+        return lambda _cls: _FakeRemoteActorClass(created)
+
+    placement = '{"openpi/pi0-fast-libero-low-mem-finetune":{"replica":0,"node_ip":"192.168.40.8","gpu_count":1}}'
+    fake_ray.remote = _remote
+    monkeypatch.setitem(sys.modules, "ray.util", types.SimpleNamespace(get_node_ip_address=lambda: "10.1.2.3"))
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+    monkeypatch.setattr(supervisor_module, "PFS_PYTHONPATH", "PFS_PATH", raising=False)
+    monkeypatch.setenv("MINT_MODEL_PLACEMENT_JSON", placement)
+    monkeypatch.setenv("MINT_TOPOLOGY_CONFIG_PATH", "/tmp/stale-topology.json")
+    monkeypatch.setenv("MINT_TOPOLOGY_STATE_PATH", "/tmp/stale-topology-state.json")
+    monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "10.1.2.3:6379")
+    monkeypatch.setattr(
+        supervisor_module,
+        "actor_runtime_env",
+        lambda **kwargs: {
+            "env_vars": {
+                "PYTHONPATH": kwargs.get("pythonpath", ""),
+                **dict(kwargs.get("extra") or {}),
+            }
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(supervisor_module, "otel_env_vars", lambda: {}, raising=False)
+    monkeypatch.setattr(supervisor_module, "sync_get_ray_ref", lambda ref, **_kwargs: ref.value, raising=False)
+    monkeypatch.setattr(supervisor_module, "desired_specs_from_env", lambda: [], raising=False)
+
+    supervisor_module._create_ray_actor(require_ready=True)
+
+    env_vars = created["options"]["runtime_env"]["env_vars"]
+    assert env_vars["MINT_MODEL_PLACEMENT_JSON"] == placement
+    assert env_vars["MINT_TOPOLOGY_CONFIG_PATH"] == ""
+    assert env_vars["MINT_TOPOLOGY_STATE_PATH"] == ""
+
+
 def test_issue_638_supervisor_registers_actor_observability(monkeypatch: pytest.MonkeyPatch) -> None:
     import mint_server.backend.actors.model_actor_supervisor as supervisor_module
     import mint_server.observability.logging_context as logging_context
@@ -2376,6 +2425,51 @@ def test_issue_593_topology_specs_inherit_runtime_placement(
             gpu_count=1,
         ),
     ]
+
+
+def test_issue_593_env_placement_overrides_topology_desired_specs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    import mint_server.backend.actors.node_placement as node_placement_module
+
+    monkeypatch.setenv(
+        "MINT_TOPOLOGY_CONFIG_PATH",
+        _write_supervisor_topology(
+            tmp_path,
+            {
+                "openpi/pi0-fast-libero-low-mem-finetune": {
+                    "vllm": {"placement": [{"replica": 0, "node_ip": "10.9.9.9", "gpu_count": 1}]},
+                }
+            },
+        ),
+    )
+    monkeypatch.setenv(
+        "MINT_MODEL_PLACEMENT_JSON",
+        '{"openpi/pi0-fast-libero-low-mem-finetune":{"replica":0,"node_ip":"192.168.40.8","gpu_count":1}}',
+    )
+    monkeypatch.setattr(node_placement_module.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        node_placement_module.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-override",
+                "NodeManagerAddress": "192.168.40.8",
+                "NodeManagerHostname": "override-worker",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+
+    specs = desired_specs_from_env()
+    vllm_spec = next(spec for spec in specs if spec.domain_key == "vllm:openpi/pi0-fast-libero-low-mem-finetune")
+
+    assert vllm_spec.node_pin is None
+    assert vllm_spec.node_pins == ("192.168.40.8",)
+    assert vllm_spec.placement_slices == (("replica-0", "192.168.40.8", 1),)
+    assert vllm_spec.normalized_node_pins() == ["192.168.40.8"]
 
 
 def test_issue_593_topology_specs_accept_bumblebee_training_alias(

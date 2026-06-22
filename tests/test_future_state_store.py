@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from mint_server.backend.scheduling.model_work_admission import enqueue_model_work
-from mint_server.backend.stores.task_state_store import FutureStatus, TaskFutureService, TaskStateStore
+from mint_server.backend.stores.task_state_store import FutureStatus, TaskFutureService, TaskStateNotFoundError, TaskStateStore
 
 FutureStateStore = TaskStateStore
 
@@ -11,6 +11,8 @@ FutureStateStore = TaskStateStore
 class _LocalFutureStateClient:
     def __init__(self, store: FutureStateStore) -> None:
         self.store = store
+        self.payload_results: dict[str, object] = {}
+        self.payload_reads: list[str] = []
 
     async def async_ensure_task(self, **kwargs):
         return self.store.ensure_task(**kwargs)
@@ -35,6 +37,12 @@ class _LocalFutureStateClient:
 
     async def async_get_task(self, request_id: str):
         return self.store.get_task(request_id)
+
+    async def async_get_result_payload(self, request_id: str):
+        self.payload_reads.append(str(request_id))
+        if str(request_id) in self.payload_results:
+            return self.payload_results[str(request_id)]
+        raise AttributeError("payload result not configured")
 
     async def async_list_tasks_by_metadata(self, **kwargs):
         return self.store.list_tasks_by_metadata(**kwargs)
@@ -88,6 +96,17 @@ class _LocalTaskStateClient:
 
     async def async_stats(self):
         return {"ok": True}
+
+
+class _WrappedNotFound(Exception):
+    def __init__(self, request_id: str) -> None:
+        super().__init__(f"RayTaskError(TaskStateNotFoundError): {request_id}")
+        self.cause = TaskStateNotFoundError(request_id)
+
+
+class _WrappedMissingFutureClient(_LocalFutureStateClient):
+    async def async_get_task(self, request_id: str):
+        raise _WrappedNotFound(request_id)
 
 
 def test_future_state_store_scheduler_lease_and_finalize() -> None:
@@ -215,6 +234,24 @@ def test_future_state_store_list_active_tasks_limit_bounds_index_scans(monkeypat
     assert calls == [1]
 
 
+def test_future_state_store_sqlite_path_persists_tasks(tmp_path) -> None:
+    db_path = tmp_path / "future_state.sqlite3"
+    store = FutureStateStore(db_path)
+    store.create_task(
+        request_id="req-sqlite",
+        op="training.create_model",
+        domain_key="training_session:model",
+        request_json=b'{"ok":true}',
+        metadata={"op": "training.create_model"},
+        now=10.0,
+    )
+    store.close()
+
+    reopened = FutureStateStore(db_path)
+    assert reopened.get_task("req-sqlite")["request_json"] == b'{"ok":true}'
+    reopened.close()
+
+
 def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
@@ -242,7 +279,142 @@ def test_task_future_service_writes_new_futures_to_future_state_store(tmp_path) 
     assert future_store.get_task("req-2")["status"] == "retrieved"
 
 
+def test_task_future_service_reads_future_payload_via_future_state_client(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    future_client = _LocalFutureStateClient(future_store)
+    service = TaskFutureService(
+        future_state_client=future_client,
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+
+    future_store.ensure_task(request_id="req-remote", status="pending")
+    future_store.complete_task_success(
+        request_id="req-remote",
+        result_path=str(tmp_path / "not-visible-here.json"),
+        result_checksum="sha256:unused",
+        result_size_bytes=10,
+    )
+    future_client.payload_results["req-remote"] = {"ok": "remote"}
+
+    assert asyncio.run(service.async_get_result("req-remote")) == {"ok": "remote"}
+    assert future_client.payload_reads == ["req-remote"]
+    assert future_store.get_task("req-remote")["status"] == "retrieved"
+
+
+def test_task_future_service_falls_back_to_local_payload_when_actor_payload_missing(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    future_client = _LocalFutureStateClient(future_store)
+    payload_store = __import__(
+        "mint_server.backend.stores.task_payload_store",
+        fromlist=["TaskPayloadStore"],
+    ).TaskPayloadStore(root_dir=tmp_path)
+    payload = payload_store.write_json_payload(
+        request_id="req-local-visible",
+        attempt_id="future__local",
+        payload={"ok": "local"},
+    )
+    service = TaskFutureService(
+        future_state_client=future_client,
+        task_state_client=_LocalTaskStateClient(task_store),
+        payload_store=payload_store,
+    )
+
+    future_store.ensure_task(request_id="req-local-visible", status="pending")
+    future_store.complete_task_success(
+        request_id="req-local-visible",
+        result_path=str(payload["path"]),
+        result_checksum=str(payload["checksum"]),
+        result_size_bytes=int(payload["size_bytes"]),
+    )
+    future_client.async_get_result_payload = (  # type: ignore[method-assign]
+        lambda request_id: (_ for _ in ()).throw(FileNotFoundError(request_id))
+    )
+
+    assert asyncio.run(service.async_get_result("req-local-visible")) == {"ok": "local"}
+    assert future_store.get_task("req-local-visible")["status"] == "retrieved"
+
+
+def test_task_future_service_resolves_payload_via_future_state_client(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    future_client = _LocalFutureStateClient(future_store)
+    calls: list[dict] = []
+
+    async def _resolve_with_payload(**kwargs):
+        calls.append(dict(kwargs))
+        future_store.complete_task_success(
+            request_id=kwargs["request_id"],
+            result_path=str(tmp_path / "actor-visible.json"),
+            result_checksum="sha256:actor",
+            result_size_bytes=10,
+        )
+        future_client.payload_results[kwargs["request_id"]] = kwargs["payload"]
+        return future_store.get_task(kwargs["request_id"])
+
+    future_client.async_resolve_with_payload = _resolve_with_payload  # type: ignore[attr-defined]
+    service = TaskFutureService(
+        future_state_client=future_client,
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+
+    asyncio.run(service.async_ensure_pending("req-actor-payload", {"op": "mint.action.act"}))
+    asyncio.run(service.async_resolve("req-actor-payload", {"ok": "actor"}))
+
+    assert calls[0]["request_id"] == "req-actor-payload"
+    assert calls[0]["payload"] == {"ok": "actor"}
+    assert calls[0]["attempt_id"].startswith("future__")
+    assert asyncio.run(service.async_get_result("req-actor-payload")) == {"ok": "actor"}
+    assert future_client.payload_reads == ["req-actor-payload"]
+
+
 def test_model_work_admission_delegates_durable_create_to_scheduler_gateway(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    service = TaskFutureService(
+        future_state_client=_LocalFutureStateClient(future_store),
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+    service._payload_store = __import__(
+        "mint_server.backend.stores.task_payload_store",
+        fromlist=["TaskPayloadStore"],
+    ).TaskPayloadStore(root_dir=tmp_path)
+
+    class _Scheduler:
+        def __init__(self) -> None:
+            self.seen_status: FutureStatus | None = None
+            self.seen_metadata: dict | None = None
+
+        async def append_work(self, **kwargs):
+            try:
+                self.seen_status = await service.async_get_status(kwargs["request_id"])
+            except KeyError:
+                self.seen_status = None
+            self.seen_metadata = dict(kwargs.get("extra") or {})
+            return {"ok": True, "request_id": kwargs["request_id"]}
+
+    scheduler = _Scheduler()
+
+    asyncio.run(
+        enqueue_model_work(
+            request_id="req-admission",
+            op="training.create_model",
+            request_json=b'{"base_model":"Qwen/Test"}',
+            domain_key="megatron:Qwen/Test",
+            queued_meta={"op": "training.create_model"},
+            scheduler_client=scheduler,
+            future_service_client=service,
+        )
+    )
+
+    assert scheduler.seen_status == FutureStatus.PENDING
+    assert scheduler.seen_metadata is not None
+    assert scheduler.seen_metadata["op"] == "training.create_model"
+    assert asyncio.run(service.async_get_status("req-admission")) == FutureStatus.PENDING
+
+
+def test_model_work_admission_registers_future_before_scheduler_append(tmp_path) -> None:
     future_store = FutureStateStore.in_memory()
     task_store = TaskStateStore.in_memory()
     service = TaskFutureService(
@@ -353,3 +525,46 @@ def test_task_future_service_reads_legacy_sqlite_terminal_rows(tmp_path) -> None
 
     assert asyncio.run(service.async_get_status("legacy-1")) == FutureStatus.DONE
     assert asyncio.run(service.async_get_result("legacy-1")) == {"legacy": True}
+
+
+def test_task_future_service_unwraps_ray_task_not_found_for_legacy_fallback(tmp_path) -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    payload_store = __import__(
+        "mint_server.backend.stores.task_payload_store",
+        fromlist=["TaskPayloadStore"],
+    ).TaskPayloadStore(root_dir=tmp_path)
+    payload = payload_store.write_json_payload(request_id="legacy-wrapped", attempt_id="a", payload={"ok": True})
+    task_store.ensure_task(request_id="legacy-wrapped", metadata={"op": "sampling.asample"})
+    task_store.stage_payload(request_id="legacy-wrapped", staged_payload_path=str(payload["path"]))
+    task_store.complete_task_success(
+        request_id="legacy-wrapped",
+        result_path=str(payload["path"]),
+        result_checksum=str(payload["checksum"]),
+        result_size_bytes=int(payload["size_bytes"]),
+        metadata={"done_at": 1.0},
+    )
+    service = TaskFutureService(
+        future_state_client=_WrappedMissingFutureClient(future_store),
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+    service._payload_store = payload_store
+
+    assert asyncio.run(service.async_get_status("legacy-wrapped")) == FutureStatus.DONE
+    assert asyncio.run(service.async_get_result("legacy-wrapped")) == {"ok": True}
+
+
+def test_task_future_service_unwraps_ray_task_not_found_to_unknown() -> None:
+    future_store = FutureStateStore.in_memory()
+    task_store = TaskStateStore.in_memory()
+    service = TaskFutureService(
+        future_state_client=_WrappedMissingFutureClient(future_store),
+        task_state_client=_LocalTaskStateClient(task_store),
+    )
+
+    try:
+        asyncio.run(service.async_get_status("missing-wrapped"))
+    except KeyError as exc:
+        assert "Unknown request_id: missing-wrapped" in str(exc)
+    else:
+        raise AssertionError("expected KeyError")

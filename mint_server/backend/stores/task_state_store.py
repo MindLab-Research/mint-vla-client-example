@@ -11,7 +11,7 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator, Mapping
 
 from mint_server.config import actor_runtime_env, apply_detached_actor_resources, config as server_config, otel_env_vars, TIER_CPU
 from mint_server.ray.runtime_env import env_nonempty
@@ -140,6 +140,10 @@ def _task_state_cause_from_ray_error(exc: BaseException) -> TaskStateStoreError 
     return None
 
 
+class TaskStateStoreIdentityMismatchError(TaskStateStoreUnavailableError):
+    pass
+
+
 class FutureStatus(Enum):
     PENDING = "pending"
     DONE = "done"
@@ -163,6 +167,28 @@ def _billing_event_id(*, account_id: str, apikey_id: str, request_id: str, charg
         ]
     )
     return uuid.uuid5(_BILLING_EVENT_NAMESPACE, key).hex
+
+
+def _is_task_state_not_found_error(exc: Exception) -> bool:
+    if isinstance(exc, (KeyError, TaskStateNotFoundError)):
+        return True
+    candidate: BaseException | None = exc
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            candidate = as_instanceof_cause()
+        except Exception:
+            candidate = exc
+    if isinstance(candidate, (KeyError, TaskStateNotFoundError)):
+        return True
+    cause = getattr(exc, "cause", None)
+    if isinstance(cause, (KeyError, TaskStateNotFoundError)):
+        return True
+    if type(candidate).__name__ == "TaskStateNotFoundError":
+        return True
+    if type(exc).__name__ == "RayTaskError" and "TaskStateNotFoundError" in str(exc):
+        return True
+    return False
 
 
 def _billing_label(*, model: str | None, route: str, dimension: str, unit: str) -> str:
@@ -807,6 +833,8 @@ class TaskStateStore:
 
     def __init__(self, db_path: str | os.PathLike[str]) -> None:
         self._db_path = str(db_path)
+        if self._db_path != ":memory:":
+            Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         if self._db_path == ":memory:":
             hot_kv_path = ":memory:"
@@ -2661,6 +2689,65 @@ def _future_state_store_db_path(task_state_db_path: str | None = None) -> str:
     return str(base.parent.parent / "future-state" / "futures.rocksdb")
 
 
+def _canonical_store_identity_path(value: object) -> str:
+    path = str(value or "")
+    if not path or path == ":memory:":
+        return path
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _expected_task_state_actor_identity() -> dict[str, str]:
+    from mint_server.backend.stores.task_payload_store import _task_payload_root_dir
+
+    return {
+        "actor_name": _ray_task_state_store_actor_name(),
+        "namespace": _ray_namespace(),
+        "db_path": _canonical_store_identity_path(_task_state_store_db_path()),
+        "hot_kv_db_path": _canonical_store_identity_path(_task_hot_kv_store_db_path()),
+        "future_db_path": _canonical_store_identity_path(_future_state_store_db_path()),
+        "payload_root_dir": _canonical_store_identity_path(_task_payload_root_dir()),
+    }
+
+
+def _task_state_actor_identity_mismatches(ping: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    expected = _expected_task_state_actor_identity()
+    mismatches: dict[str, dict[str, str]] = {}
+    for key, expected_value in expected.items():
+        actual = ping.get(key)
+        if key.endswith("_path") or key.endswith("_dir"):
+            actual_value = _canonical_store_identity_path(actual)
+        else:
+            actual_value = "" if actual is None else str(actual)
+        if actual_value != expected_value:
+            mismatches[key] = {"expected": expected_value, "actual": actual_value}
+    return mismatches
+
+
+def _validate_task_state_actor_ping(ping: Mapping[str, Any]) -> None:
+    if not bool(ping.get("ok")):
+        raise TaskStateStoreUnavailableError(f"TaskStateStore ping failed: {dict(ping)!r}")
+    mismatches = _task_state_actor_identity_mismatches(ping)
+    if mismatches:
+        raise TaskStateStoreIdentityMismatchError(f"TaskStateStore actor config mismatch: {mismatches!r}")
+
+
+def _kill_ray_actor(actor: Any) -> None:
+    try:
+        import ray
+
+        ray.kill(actor, no_restart=True)
+    except Exception:
+        pass
+
+
+def _sync_ping_validate_task_state_actor(actor: Any, *, timeout_s: float) -> dict[str, Any]:
+    out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
+    if not isinstance(out, dict):
+        raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+    _validate_task_state_actor_ping(out)
+    return out
+
+
 class _TaskStateStoreActor:
     def __init__(self, db_path: str | None = None) -> None:
         try:
@@ -3084,6 +3171,98 @@ class _TaskStateStoreActor:
             out=out,
         )
 
+    def future_commit_finalize_success_with_payload(self, **kwargs: Any) -> dict[str, Any]:
+        payload = kwargs.pop("payload")
+        billing_observations = kwargs.pop("billing_observations", None)
+        request_id = str(kwargs["request_id"])
+        attempt_id = str(kwargs["attempt_id"])
+        lease_id = str(kwargs["lease_id"])
+
+        from .task_payload_store import TaskPayloadStore
+
+        payload_store = TaskPayloadStore()
+        payload_meta = payload_store.write_json_payload(
+            request_id=request_id,
+            attempt_id=f"{attempt_id}__{lease_id}",
+            payload=payload,
+        )
+        out = self._future_call_and_notify(
+            "commit_finalize_success",
+            **kwargs,
+            result_path=str(payload_meta["path"]),
+            result_checksum=str(payload_meta["checksum"]),
+            result_size_bytes=int(payload_meta["size_bytes"]),
+        )
+        return self._future_append_billing_after_terminal_success(
+            request_id=request_id,
+            billing_observations=billing_observations,
+            source="model_work_terminal",
+            now=kwargs.get("now"),
+            out=out,
+        )
+
+    def future_get_result_payload(self, **kwargs: Any) -> Any:
+        request_id = str(kwargs["request_id"])
+        record = self._future_store_or_create().get_task(request_id)
+        status = str(record.get("status"))
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        if status == "retrieved" and str(metadata.get("terminal_status") or "done") != "done":
+            raise KeyError(f"Future already retrieved without result: {request_id}")
+        if status not in {"done", "retrieved"}:
+            raise KeyError(f"Future is not done: {request_id}")
+        result_path = record.get("result_path")
+        if not isinstance(result_path, str) or not result_path:
+            raise KeyError(f"Future result payload missing: {request_id}")
+
+        from .task_payload_store import TaskPayloadStore
+
+        return TaskPayloadStore().read_json_payload(
+            path=result_path,
+            expected_checksum=record.get("result_checksum"),
+        )
+
+    def future_resolve_with_payload(self, **kwargs: Any) -> dict[str, Any]:
+        request_id = str(kwargs["request_id"])
+        payload = kwargs.pop("payload")
+        billing_observations = kwargs.pop("billing_observations", None)
+        attempt_id = str(kwargs.pop("attempt_id", "") or f"future__{uuid.uuid4().hex}")
+
+        from .task_payload_store import TaskPayloadStore
+
+        payload_store = TaskPayloadStore()
+        payload_path = str(
+            payload_store.payload_path(
+                request_id=request_id,
+                attempt_id=attempt_id,
+            )
+        )
+        self._future_call_and_notify(
+            "stage_payload",
+            request_id=request_id,
+            staged_payload_path=payload_path,
+            metadata={"staged_payload_path": payload_path},
+        )
+        payload_meta = payload_store.write_json_payload(
+            request_id=request_id,
+            attempt_id=attempt_id,
+            payload=payload,
+        )
+        out = self._future_call_and_notify(
+            "complete_task_success",
+            request_id=request_id,
+            result_path=str(payload_meta["path"]),
+            result_checksum=str(payload_meta["checksum"]),
+            result_size_bytes=int(payload_meta["size_bytes"]),
+            metadata={
+                "done_at": time.time(),
+                "final_status": FutureStatus.DONE.value,
+                "payload_state": "committed",
+                "staged_payload_path": None,
+            },
+            billing_observations=billing_observations,
+        )
+        return out if isinstance(out, dict) else {}
+
     def future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return self._future_call_and_notify("commit_finalize_failure", **kwargs)
 
@@ -3382,10 +3561,16 @@ class _TaskStateStoreActor:
             self._otel_error = f"{type(e).__name__}: {e}"
 
     def ping(self) -> dict[str, Any]:
+        from mint_server.backend.stores.task_payload_store import _task_payload_root_dir
+
         return {
             "ok": True,
             "actor_name": _ray_task_state_store_actor_name(),
             "namespace": _ray_namespace(),
+            "db_path": _canonical_store_identity_path(self._store.db_path),
+            "hot_kv_db_path": _canonical_store_identity_path(_task_hot_kv_store_db_path(self._store.db_path)),
+            "future_db_path": _canonical_store_identity_path(_future_state_store_db_path()),
+            "payload_root_dir": _canonical_store_identity_path(_task_payload_root_dir()),
             "started_at": self._started_at,
         }
 
@@ -3752,16 +3937,28 @@ def _create_ray_actor_handle():
         ),
     }
     apply_detached_actor_resources(options, ray)
-    actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
-    return actor
+    last_error: Exception | None = None
+    for attempt in range(6):
+        actor = _RayTaskStateStoreActor.options(**options).remote(db_path)
+        try:
+            _sync_ping_validate_task_state_actor(actor, timeout_s=5.0)
+            return actor
+        except TaskStateStoreIdentityMismatchError as e:
+            last_error = e
+            _kill_ray_actor(actor)
+        except Exception as e:
+            last_error = e
+        if attempt < 5:
+            time.sleep(min(2.0, 0.25 * (attempt + 1)))
+    raise TaskStateStoreUnavailableError(
+        f"Failed to create ready detached Ray TaskStateStore actor actor_name={actor_name!r}"
+    ) from last_error
 
 
 def _create_ray_actor(*, require_ready: bool = True):
     actor = _create_ray_actor_handle()
     if require_ready:
-        out = sync_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
-        if not isinstance(out, dict):
-            raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+        _sync_ping_validate_task_state_actor(actor, timeout_s=5.0)
     return actor
 
 
@@ -3771,6 +3968,7 @@ async def _create_ray_actor_async(*, require_ready: bool = True):
         out = await async_get_ray_ref(actor.ping.remote(), timeout_s=5.0)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+        _validate_task_state_actor_ping(out)
     return actor
 
 
@@ -3796,17 +3994,40 @@ class TaskStateStoreClient:
                 out = sync_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+                _validate_task_state_actor_ping(out)
                 return actor
+            except TaskStateStoreIdentityMismatchError:
+                _kill_ray_actor(actor)
+                self._reset_ray_actor()
             except Exception:
                 self._reset_ray_actor()
         actor_name = _ray_task_state_store_actor_name()
+        actor = None
         try:
             actor = ray.get_actor(actor_name, namespace=_ray_namespace())
-        except Exception:
+            if require_ready:
+                out = sync_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+                _validate_task_state_actor_ping(out)
+        except TaskStateStoreIdentityMismatchError:
+            if actor is not None:
+                _kill_ray_actor(actor)
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            try:
+                actor = _create_ray_actor(require_ready=require_ready)
+            except Exception as e:
+                raise TaskStateStoreUnavailableError(
+                    "Failed to get/create detached Ray TaskStateStore actor"
+                ) from e
+        except Exception as e:
+            self._reset_ray_actor()
             if not create_if_missing:
                 raise TaskStateStoreUnavailableError(
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
-                )
+                ) from e
             try:
                 actor = _create_ray_actor(require_ready=require_ready)
             except Exception as e:
@@ -3831,23 +4052,46 @@ class TaskStateStoreClient:
                 out = await async_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
                 if not isinstance(out, dict):
                     raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+                _validate_task_state_actor_ping(out)
                 return actor
+            except TaskStateStoreIdentityMismatchError:
+                _kill_ray_actor(actor)
+                self._reset_ray_actor()
             except Exception:
                 self._reset_ray_actor()
         import ray
 
         actor_name = _ray_task_state_store_actor_name()
+        actor = None
         try:
             actor = await asyncio.to_thread(
                 ray.get_actor,
                 actor_name,
                 namespace=_ray_namespace(),
             )
-        except Exception:
+            if require_ready:
+                out = await async_get_ray_ref(actor.ping.remote(), timeout_s=1.0)
+                if not isinstance(out, dict):
+                    raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+                _validate_task_state_actor_ping(out)
+        except TaskStateStoreIdentityMismatchError:
+            if actor is not None:
+                _kill_ray_actor(actor)
+            self._reset_ray_actor()
+            if not create_if_missing:
+                raise
+            try:
+                actor = _create_ray_actor(require_ready=require_ready)
+            except Exception as e:
+                raise TaskStateStoreUnavailableError(
+                    "Failed to get/create detached Ray TaskStateStore actor"
+                ) from e
+        except Exception as e:
+            self._reset_ray_actor()
             if not create_if_missing:
                 raise TaskStateStoreUnavailableError(
                     f"Detached Ray TaskStateStore actor unavailable actor_name={actor_name!r}"
-                )
+                ) from e
             try:
                 actor = await _create_ray_actor_async(require_ready=require_ready)
             except Exception as e:
@@ -3922,6 +4166,7 @@ class TaskStateStoreClient:
             out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+        _validate_task_state_actor_ping(out)
         return out
 
     def ensure_started(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
@@ -3929,6 +4174,7 @@ class TaskStateStoreClient:
         out = sync_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+        _validate_task_state_actor_ping(out)
         return out
 
     def ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -3940,12 +4186,11 @@ class TaskStateStoreClient:
             raise
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
-        if not bool(out.get("ok")):
-            raise TaskStateStoreUnavailableError(f"TaskStateStore ping failed: {out!r}")
+        _validate_task_state_actor_ping(out)
         return out
 
     async def async_ensure_started(self) -> None:
-        await self._get_ray_actor_async(require_ready=False, create_if_missing=True)
+        await self.async_ensure_ready(create_if_missing=True)
 
     async def async_ensure_ready(
         self,
@@ -3964,6 +4209,7 @@ class TaskStateStoreClient:
             out = await async_get_ray_ref(actor.ping.remote(), timeout_s=timeout_s)
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
+        _validate_task_state_actor_ping(out)
         return out
 
     async def async_ping(self, *, timeout_s: float = 5.0) -> dict[str, Any]:
@@ -3975,8 +4221,7 @@ class TaskStateStoreClient:
             raise
         if not isinstance(out, dict):
             raise TypeError(f"TaskStateStore.ping returned non-dict: {type(out)}")
-        if not bool(out.get("ok")):
-            raise TaskStateStoreUnavailableError(f"TaskStateStore ping failed: {out!r}")
+        _validate_task_state_actor_ping(out)
         return out
 
     async def async_stats(self) -> dict[str, Any]:
@@ -4215,6 +4460,15 @@ class TaskStateStoreClient:
 
     async def async_future_commit_finalize_success(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_commit_finalize_success", **kwargs)
+
+    async def async_future_commit_finalize_success_with_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_commit_finalize_success_with_payload", **kwargs)
+
+    async def async_future_get_result_payload(self, **kwargs: Any) -> Any:
+        return await self._call("future_get_result_payload", **kwargs)
+
+    async def async_future_resolve_with_payload(self, **kwargs: Any) -> dict[str, Any]:
+        return await self._dict_call("future_resolve_with_payload", **kwargs)
 
     async def async_future_commit_finalize_failure(self, **kwargs: Any) -> dict[str, Any]:
         return await self._dict_call("future_commit_finalize_failure", **kwargs)
@@ -4843,6 +5097,18 @@ class TaskFutureService:
             return
         meta = await self.async_get_meta(request_id)
         result = _sync_training_session_step(meta, result)
+        resolve_with_payload = getattr(self._future_state, "async_resolve_with_payload", None)
+        if callable(resolve_with_payload):
+            try:
+                await resolve_with_payload(
+                    request_id=str(request_id),
+                    attempt_id=f"future__{uuid.uuid4().hex}",
+                    payload=result,
+                    billing_observations=billing_observations,
+                )
+                return
+            except AttributeError:
+                pass
         attempt_id = f"future__{uuid.uuid4().hex}"
         staged_payload_path = str(
             self._payloads.payload_path(
@@ -4907,7 +5173,9 @@ class TaskFutureService:
     ) -> dict[str, Any]:
         try:
             record = await self._future_state.async_get_task(str(request_id))
-        except (KeyError, TaskStateNotFoundError):
+        except Exception as e:
+            if not _is_task_state_not_found_error(e):
+                raise
             return {"failed": False, "reason": "unknown"}
         if _status_from_task_record(record) != FutureStatus.PENDING:
             return {"failed": False, "reason": "not_pending"}
@@ -4921,10 +5189,14 @@ class TaskFutureService:
     async def async_get_status(self, request_id: str) -> FutureStatus:
         try:
             record = await self._future_state.async_get_task(str(request_id))
-        except (KeyError, TaskStateNotFoundError):
+        except Exception as e:
+            if not _is_task_state_not_found_error(e):
+                raise
             try:
                 record = await self._task_state.async_get_task(str(request_id))
-            except (KeyError, TaskStateNotFoundError):
+            except Exception as e:
+                if not _is_task_state_not_found_error(e):
+                    raise
                 raise KeyError(f"Unknown request_id: {request_id}") from None
         return _status_from_task_record(record)
 
@@ -4965,7 +5237,9 @@ class TaskFutureService:
         try:
             record = await self._future_state.async_get_task(str(request_id))
             state_client = self._future_state
-        except (KeyError, TaskStateNotFoundError):
+        except Exception as e:
+            if not _is_task_state_not_found_error(e):
+                raise
             record = await self._task_state.async_get_task(str(request_id))
             state_client = self._task_state
         status = str(record.get("status"))
@@ -4978,11 +5252,28 @@ class TaskFutureService:
         result_path = record.get("result_path")
         if not isinstance(result_path, str) or not result_path:
             raise KeyError(f"Future result payload missing: {request_id}")
-        payload = await asyncio.to_thread(
-            self._payloads.read_json_payload,
-            path=result_path,
-            expected_checksum=record.get("result_checksum"),
-        )
+        get_payload = getattr(state_client, "async_get_result_payload", None)
+        if callable(get_payload):
+            try:
+                payload = await get_payload(request_id=str(request_id))
+            except AttributeError:
+                payload = await asyncio.to_thread(
+                    self._payloads.read_json_payload,
+                    path=result_path,
+                    expected_checksum=record.get("result_checksum"),
+                )
+            except FileNotFoundError:
+                payload = await asyncio.to_thread(
+                    self._payloads.read_json_payload,
+                    path=result_path,
+                    expected_checksum=record.get("result_checksum"),
+                )
+        else:
+            payload = await asyncio.to_thread(
+                self._payloads.read_json_payload,
+                path=result_path,
+                expected_checksum=record.get("result_checksum"),
+            )
         if status != "retrieved":
             await state_client.async_mark_task_retrieved(request_id=str(request_id))
         return payload
@@ -4990,14 +5281,18 @@ class TaskFutureService:
     async def async_get_error(self, request_id: str) -> str | None:
         try:
             record = await self._future_state.async_get_task(str(request_id))
-        except (KeyError, TaskStateNotFoundError):
+        except Exception as e:
+            if not _is_task_state_not_found_error(e):
+                raise
             record = await self._task_state.async_get_task(str(request_id))
         return None if record.get("error") is None else str(record.get("error"))
 
     async def async_get_meta(self, request_id: str) -> dict[str, Any] | None:
         try:
             record = await self._future_state.async_get_task(str(request_id))
-        except (KeyError, TaskStateNotFoundError):
+        except Exception as e:
+            if not _is_task_state_not_found_error(e):
+                raise
             record = await self._task_state.async_get_task(str(request_id))
         metadata = record.get("metadata")
         return dict(metadata) if isinstance(metadata, dict) else None

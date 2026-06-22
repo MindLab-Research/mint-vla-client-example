@@ -446,14 +446,19 @@ class _FakeTrainingRuntimeClient:
         if op == "create_session":
             return {"session": "created"}
         if op in {"save_weights", "save_sampler_weights"}:
-            assert payload is not None
-            save_path = Path(payload["save_path"])
-            (save_path / "1" / "params").mkdir(parents=True, exist_ok=True)
-            (save_path / "1" / "assets").mkdir(parents=True, exist_ok=True)
-            (save_path / "1" / "train_state").mkdir(parents=True, exist_ok=True)
-            (save_path / "1" / "params" / "_METADATA").write_text("params", encoding="utf-8")
-            (save_path / "1" / "assets" / "asset.json").write_text("{}", encoding="utf-8")
-            (save_path / "1" / "train_state" / "_METADATA").write_text("train", encoding="utf-8")
+            save_path = Path(payload.get("export_path") or payload["save_path"])  # type: ignore[union-attr]
+            if op == "save_sampler_weights":
+                (save_path / "params").mkdir(parents=True, exist_ok=True)
+                (save_path / "assets").mkdir(parents=True, exist_ok=True)
+                (save_path / "params" / "_METADATA").write_text("params", encoding="utf-8")
+                (save_path / "assets" / "asset.json").write_text("{}", encoding="utf-8")
+            else:
+                (save_path / "1" / "params").mkdir(parents=True, exist_ok=True)
+                (save_path / "1" / "assets").mkdir(parents=True, exist_ok=True)
+                (save_path / "1" / "train_state").mkdir(parents=True, exist_ok=True)
+                (save_path / "1" / "params" / "_METADATA").write_text("params", encoding="utf-8")
+                (save_path / "1" / "assets" / "asset.json").write_text("{}", encoding="utf-8")
+                (save_path / "1" / "train_state" / "_METADATA").write_text("train", encoding="utf-8")
             return {"path": str(save_path)}
         if op == "shutdown":
             return {"stopped": True}
@@ -521,44 +526,23 @@ class _FakeActionRuntimeFactory:
         return client
 
 
-def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
+def test_openpi_fast_default_runtime_factory_requires_supervisor_reconciliation(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
     from mint_server.backend.openpi.action_session_manager import _default_runtime_factory
 
-    runtime_env = configure_runtime_env()
-    calls: list[dict[str, object]] = []
-
-    async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config, template_reusable):
-        calls.append(
-            {
-                "session_id": session.model_id,
-                "base_model": session.base_model,
-                "worker_module": spec.worker_module,
-                "python_executable": spec.python_executable,
-                "pythonpath": spec.pythonpath,
-                "config_name": config_name,
-                "action_dim": model_config.action_dim,
-                "action_horizon": model_config.action_horizon,
-                "action_token_budget": model_config.action_token_budget,
-                "max_model_len": model_config.max_model_len,
-                "template_reusable": template_reusable,
-            }
-        )
-        return "openpi-shared-runtime-client"
+    configure_runtime_env()
+    calls: list[str] = []
 
     async def _unexpected_local_fast_start(spec=None):
+        calls.append("local-fast")
         raise AssertionError(f"local fast action worker path must not run: {spec}")
 
     async def _unexpected_local_worker_start(spec):
+        calls.append("local-worker")
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
-    monkeypatch.setattr(
-        "mint_server.backend.openpi.action_session_manager.start_openpi_shared_ray_runtime",
-        _fake_start_openpi_shared_ray_runtime,
-        raising=False,
-    )
     monkeypatch.setattr(
         "mint_server.backend.openpi.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
         _unexpected_local_fast_start,
@@ -568,71 +552,37 @@ def test_openpi_fast_default_runtime_factory_uses_shared_runtime(
         _unexpected_local_worker_start,
     )
 
-    runtime = asyncio.run(
-        _default_runtime_factory(
-            action_session_id="session-1:action:3",
-            base_model=OPENPI_FAST_MODEL,
-            checkpoint_path="/tmp/export-1",
-            model_config=SimpleNamespace(action_dim=7, action_horizon=10, action_token_budget=21, max_model_len=180),
-            config_name="pi0_fast_libero_low_mem_finetune",
+    with pytest.raises(RuntimeError, match="ModelActorSupervisor"):
+        asyncio.run(
+            _default_runtime_factory(
+                action_session_id="session-1:action:3",
+                base_model=OPENPI_FAST_MODEL,
+                checkpoint_path="/tmp/export-1",
+                model_config=SimpleNamespace(action_dim=7, action_horizon=10, action_token_budget=21, max_model_len=180),
+                config_name="pi0_fast_libero_low_mem_finetune",
+            )
         )
-    )
 
-    assert runtime == "openpi-shared-runtime-client"
-    assert calls == [
-        {
-            "session_id": "session-1:action:3",
-            "base_model": OPENPI_FAST_MODEL,
-            "worker_module": "mint_server.backend.openpi.openpi_fast_action_worker",
-            "python_executable": str(runtime_env["layout"].host_python),
-            "pythonpath": runtime_env["pythonpath"],
-            "config_name": "pi0_fast_libero_low_mem_finetune",
-            "action_dim": 7,
-            "action_horizon": 10,
-            "action_token_budget": 21,
-            "max_model_len": 180,
-            "template_reusable": False,
-        }
-    ]
+    assert calls == []
 
 
-def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
+def test_openpi_pi05_default_runtime_factory_requires_supervisor_reconciliation(
     monkeypatch,
     configure_runtime_env,
 ) -> None:
     from mint_server.backend.openpi.action_session_manager import _default_pi05_runtime_factory
 
-    runtime_env = configure_runtime_env()
-    calls: list[dict[str, object]] = []
-
-    async def _fake_start_openpi_shared_ray_runtime(*, session, spec, config_name, model_config, template_reusable):
-        calls.append(
-            {
-                "session_id": session.model_id,
-                "base_model": session.base_model,
-                "worker_module": spec.worker_module,
-                "python_executable": spec.python_executable,
-                "pythonpath": spec.pythonpath,
-                "config_name": config_name,
-                "action_dim": model_config.action_dim,
-                "action_horizon": model_config.action_horizon,
-                "max_model_len": model_config.max_model_len,
-                "template_reusable": template_reusable,
-            }
-        )
-        return "openpi-shared-runtime-client"
+    configure_runtime_env()
+    calls: list[str] = []
 
     async def _unexpected_local_fast_start(spec=None):
+        calls.append("local-fast")
         raise AssertionError(f"local pi0.5 action worker path must not run: {spec}")
 
     async def _unexpected_local_worker_start(spec):
+        calls.append("local-worker")
         raise AssertionError(f"local worker path must not run: {spec.worker_module}")
 
-    monkeypatch.setattr(
-        "mint_server.backend.openpi.action_session_manager.start_openpi_shared_ray_runtime",
-        _fake_start_openpi_shared_ray_runtime,
-        raising=False,
-    )
     monkeypatch.setattr(
         "mint_server.backend.openpi.openpi_fast_action_runtime.OpenPIFastActionWorkerClient.start",
         _unexpected_local_fast_start,
@@ -642,31 +592,18 @@ def test_openpi_pi05_default_runtime_factory_uses_shared_runtime(
         _unexpected_local_worker_start,
     )
 
-    runtime = asyncio.run(
-        _default_pi05_runtime_factory(
-            action_session_id="session-1:action:9",
-            base_model="openpi/pi05-libero-low-mem-finetune",
-            checkpoint_path="/tmp/export-9",
-            model_config=SimpleNamespace(action_dim=7, action_horizon=10, max_model_len=180),
-            config_name="pi05_libero",
+    with pytest.raises(RuntimeError, match="ModelActorSupervisor"):
+        asyncio.run(
+            _default_pi05_runtime_factory(
+                action_session_id="session-1:action:9",
+                base_model="openpi/pi05-libero-low-mem-finetune",
+                checkpoint_path="/tmp/export-9",
+                model_config=SimpleNamespace(action_dim=7, action_horizon=10, max_model_len=180),
+                config_name="pi05_libero",
+            )
         )
-    )
 
-    assert runtime == "openpi-shared-runtime-client"
-    assert calls == [
-        {
-            "session_id": "session-1:action:9",
-            "base_model": "openpi/pi05-libero-low-mem-finetune",
-            "worker_module": "mint_server.backend.openpi.openpi_pi05_action_worker",
-            "python_executable": str(runtime_env["layout"].host_python),
-            "pythonpath": runtime_env["pythonpath"],
-            "config_name": "pi05_libero",
-            "action_dim": 7,
-            "action_horizon": 10,
-            "max_model_len": 180,
-            "template_reusable": False,
-        }
-    ]
+    assert calls == []
 
 
 def test_recover_detached_action_runtime_client_uses_shared_client_for_shared_actor(monkeypatch) -> None:
@@ -970,6 +907,85 @@ def test_start_openpi_action_ray_runtime_applies_single_node_pin(monkeypatch) ->
     ]
 
 
+def test_start_openpi_action_ray_runtime_retries_transient_capacity_block(monkeypatch) -> None:
+    from mint_server.backend.openpi import openpi_action_ray_runtime
+    from mint_server.backend.openpi.openpi_fast_action_runtime import OpenPIFastActionRuntimeSpec
+
+    state: dict[str, object] = {}
+    node_id = "c" * 56
+
+    class _FakeActorBuilder:
+        def options(self, **kwargs):
+            state["options"] = kwargs
+            return self
+
+        def remote(self, **kwargs):
+            state["remote"] = kwargs
+            return "actor-1"
+
+    class _FakeClient:
+        def __init__(self, *, actor, actor_name, spec, action_session_id, ready_timeout_s):
+            _ = actor, actor_name, spec, action_session_id, ready_timeout_s
+
+        async def ready(self):
+            return {"actor_id": "actor-123", "node_id": node_id, "node_ip": "192.168.38.176"}
+
+        async def close(self):
+            return None
+
+    class _FakePool:
+        def register(self, **kwargs):
+            state["register"] = kwargs
+
+        def mark_ready(self, actor_name):
+            state["mark_ready"] = actor_name
+
+        def touch(self, actor_name):
+            state["touch"] = actor_name
+
+    monkeypatch.setattr(openpi_action_ray_runtime, "ensure_openpi_ray_initialized", lambda: None)
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeActor", _FakeActorBuilder())
+    monkeypatch.setattr(openpi_action_ray_runtime, "OpenPIActionRayRuntimeClient", _FakeClient)
+    monkeypatch.setattr(openpi_action_ray_runtime, "get_model_actor_supervisor", lambda: _FakePool())
+    monkeypatch.setattr(openpi_action_ray_runtime, "_openpi_runtime_env_vars", _fake_openpi_actor_env)
+    monkeypatch.setenv("MINT_CODE_ROOT", "/repo")
+    monkeypatch.setenv("MINT_OPENPI_ACTION_CAPACITY_RETRY_TIMEOUT_S", "5")
+    monkeypatch.setenv("MINT_OPENPI_ACTION_CAPACITY_RETRY_INTERVAL_S", "0.1")
+    monkeypatch.setattr(openpi_action_ray_runtime.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        openpi_action_ray_runtime,
+        "parse_model_gpu_placement",
+        lambda **_kwargs: SimpleNamespace(
+            total_gpus=1,
+            slices=(SimpleNamespace(replica=0, worker_index=1, gpu_count=1, node_ip="192.168.38.176"),)
+        ),
+    )
+    capacity_calls: list[dict[str, object]] = []
+
+    def _capacity_check(**kwargs):
+        capacity_calls.append(kwargs)
+        if len(capacity_calls) == 1:
+            raise RuntimeError("pinned node capacity check failed: available_gpus=0")
+
+    monkeypatch.setattr(openpi_action_ray_runtime, "assert_node_ip_capacity", _capacity_check)
+    monkeypatch.setattr(
+        openpi_action_ray_runtime.ray,
+        "nodes",
+        lambda: [{"Alive": True, "NodeManagerAddress": "192.168.38.176", "NodeID": node_id}],
+    )
+
+    asyncio.run(
+        openpi_action_ray_runtime.start_openpi_action_ray_runtime(
+            action_session_id="session-1:action:4",
+            base_model=OPENPI_FAST_MODEL,
+            spec=OpenPIFastActionRuntimeSpec(),
+        )
+    )
+
+    assert len(capacity_calls) == 2
+    assert state["options"]["resources"] == {"node:192.168.38.176": 0.001}
+
+
 def test_openpi_action_ray_runtime_client_ray_get_awaits_future_without_ray_get(monkeypatch) -> None:
     pytest.importorskip("ray")
     from mint_server.backend.openpi.openpi_action_ray_runtime import OpenPIActionRayRuntimeClient
@@ -1015,6 +1031,10 @@ def test_openpi_fast_save_weights_for_sampler_exports_policy_loadable_checkpoint
     assert (export_dir / "params" / "_METADATA").exists()
     assert (export_dir / "assets" / "asset.json").exists()
     assert not (export_dir / "train_state").exists()
+    assert factory.clients[0].calls[-1] == (
+        "save_sampler_weights",
+        {"export_path": str(tmp_path / "model-1" / "export-1")},
+    )
 
 
 def test_action_session_manager_create_session_starts_runtime_from_checkpoint(tmp_path: Path) -> None:

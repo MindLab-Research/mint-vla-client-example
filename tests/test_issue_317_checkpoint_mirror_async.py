@@ -929,3 +929,157 @@ async def test_issue_317_named_save_weights_for_sampler_admin_owner_is_anonymous
     metadata = read_checkpoint_metadata(str(ckpt_dir))
     assert metadata["owner_id"] is None
     assert inflight_calls == [("run-317", -1)]
+
+
+@pytest.mark.anyio
+async def test_openpi_named_save_weights_for_sampler_returns_runtime_node_path_when_invisible(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
+
+    async def _identity_materialize(session):
+        return session
+
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.setenv("MINT_OPENPI_ALLOW_RUNTIME_NODE_SAMPLER_PATH", "1")
+
+    invisible_path = tmp_path / "runtime" / "persistent_cache" / "owner-a" / "run-openpi" / "sampler-a" / "sampler"
+    resolved: dict[str, object] = {}
+
+    async def _fake_save_weights_for_sampler(**kwargs):
+        export_dir = Path(kwargs["checkpoint_base_dir"]) / "run-openpi" / "sampler-a" / "sampler"
+        assert export_dir == invisible_path
+        return str(export_dir)
+
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        resolved["request_id"] = request_id
+        resolved["response"] = response
+
+    async def _async_fail(request_id: str, error: str) -> None:
+        raise AssertionError(f"unexpected async_fail({request_id}): {error}")
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-openpi",
+                base_model="openpi/pi0.5-bridge",
+                current_step=11,
+                backend="openpi_pi05",
+                lora_config=SimpleNamespace(rank=8, train_mlp=False),
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
+    )
+    monkeypatch.setattr(
+        tr,
+        "task_futures",
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
+    )
+    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(invisible_path))
+    monkeypatch.setattr(
+        tr,
+        "_claim_sampler_checkpoint_or_raise",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("openpi runtime-node paths are not published")),
+    )
+    monkeypatch.setattr(
+        tr,
+        "validate_sampler_checkpoint_for_sampling",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invisible path must not be validated locally")),
+    )
+    monkeypatch.setattr(
+        tr,
+        "begin_async_checkpoint_mirror",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invisible path must not be mirrored locally")),
+    )
+    monkeypatch.setattr(
+        tr,
+        "write_checkpoint_metadata",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("invisible path must not get local metadata")),
+    )
+
+    request = SaveWeightsForSamplerRequest(model_id="run-openpi", seq_id=0, path="sampler-a")
+    await tr._do_save_weights_for_sampler(
+        request_id="req-openpi-runtime-node-sampler",
+        request=request,
+        user_id="owner-a",
+        prefer_tinker=False,
+    )
+
+    assert resolved["request_id"] == "req-openpi-runtime-node-sampler"
+    response = resolved["response"]
+    assert response["path"] == str(invisible_path)
+    assert response["filesystem_path"] == str(invisible_path)
+    assert response["storage_tier"] == "runtime_node_filesystem"
+    assert response["mirror_status"] is None
+
+
+@pytest.mark.anyio
+async def test_openpi_named_save_weights_for_sampler_rejects_invisible_runtime_path_by_default(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from mint_server.models.types import SaveWeightsForSamplerRequest
+    from mint_server.routes import training as tr
+
+    async def _identity_materialize(session):
+        return session
+
+    monkeypatch.setattr(tr, "_materialize_training_session_for_stateful_use", _identity_materialize)
+    monkeypatch.delenv("MINT_OPENPI_ALLOW_RUNTIME_NODE_SAMPLER_PATH", raising=False)
+
+    invisible_path = tmp_path / "runtime" / "persistent_cache" / "owner-a" / "run-openpi" / "sampler-a" / "sampler"
+    failed: dict[str, str] = {}
+
+    async def _fake_save_weights_for_sampler(**kwargs):
+        return str(invisible_path)
+
+    async def _async_resolve(request_id: str, response: dict) -> None:
+        raise AssertionError(f"unexpected async_resolve({request_id}): {response}")
+
+    async def _async_fail(request_id: str, error: str) -> None:
+        failed["request_id"] = request_id
+        failed["error"] = error
+
+    monkeypatch.setattr(
+        tr,
+        "training_manager",
+        SimpleNamespace(
+            get_session=lambda _model_id: SimpleNamespace(
+                model_id="run-openpi",
+                base_model="openpi/pi0.5-bridge",
+                current_step=11,
+                backend="openpi_pi05",
+                lora_config=SimpleNamespace(rank=8, train_mlp=False),
+            ),
+            mark_inflight=lambda *_args, **_kwargs: None,
+        ),
+    )
+    monkeypatch.setattr(
+        tr,
+        "training_engine",
+        SimpleNamespace(save_weights_for_sampler=_fake_save_weights_for_sampler),
+    )
+    monkeypatch.setattr(
+        tr,
+        "task_futures",
+        SimpleNamespace(async_resolve=_async_resolve, async_fail=_async_fail),
+    )
+    monkeypatch.setattr(tr, "build_persistent_cache_dir", lambda **_kwargs: str(invisible_path))
+
+    request = SaveWeightsForSamplerRequest(model_id="run-openpi", seq_id=0, path="sampler-a")
+    await tr._do_save_weights_for_sampler(
+        request_id="req-openpi-runtime-node-sampler-reject",
+        request=request,
+        user_id="owner-a",
+        prefer_tinker=False,
+    )
+
+    assert failed["request_id"] == "req-openpi-runtime-node-sampler-reject"
+    assert "not visible from the API process" in failed["error"]

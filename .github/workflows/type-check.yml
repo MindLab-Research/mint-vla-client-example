@@ -27,6 +27,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          rm -rf .venv
           uv venv --python 3.12
           uv pip install --python .venv/bin/python --index-strategy unsafe-best-match \
             --index-url "$UV_INDEX_URL" \

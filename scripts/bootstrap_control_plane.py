@@ -69,7 +69,7 @@ def _prepare_runtime(config_path: str | None) -> None:
 async def _bootstrap_async(args: argparse.Namespace) -> dict:
     from mint_server.backend.core import config_actor
     from mint_server.backend.actors import model_actor_supervisor
-    from mint_server.backend.stores.task_state_store import task_state_store
+    from mint_server.backend.stores.task_state_store import task_futures, task_state_store
     from mint_server.backend.scheduling.model_work_scheduler import model_work_scheduler
     from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
     from mint_server.config import RAY_NAMESPACE
@@ -84,7 +84,10 @@ async def _bootstrap_async(args: argparse.Namespace) -> dict:
     task_state_snapshot = task_state_store.ensure_ready(
         timeout_s=float(args.timeout_s), create_if_missing=True
     )
-    scheduler_stats = await model_work_scheduler.stats(
+    task_future_snapshot = await task_futures.async_ensure_ready(
+        timeout_s=float(args.timeout_s), create_if_missing=True
+    )
+    scheduler_snapshot = await model_work_scheduler.stats(
         timeout_s=float(args.timeout_s), create_if_missing=True
     )
     cron_snapshot = await maintenance_cron_actor.async_ensure_started(
@@ -97,26 +100,30 @@ async def _bootstrap_async(args: argparse.Namespace) -> dict:
     else:
         supervisor_snapshot = model_actor_supervisor.ensure_started(timeout_s=float(args.timeout_s))
 
-    return {
+    summary = {
         "ok": True,
         "config_actor": {
             "actor_name": config_snapshot.get("actor_name"),
             "ray_namespace": config_snapshot.get("ray_namespace"),
             "fingerprint": config_snapshot.get("fingerprint"),
         },
-        "model_actor_supervisor": {
-            "desired_total": supervisor_snapshot.get("desired_total"),
-            "managed_total": supervisor_snapshot.get("managed_total"),
-            "reconcile_loop_running": supervisor_snapshot.get("reconcile_loop_running"),
-            "last_reconcile_at": supervisor_snapshot.get("last_reconcile_at"),
-        },
         "task_state_store": {
             "actor_name": task_state_snapshot.get("actor_name"),
             "namespace": task_state_snapshot.get("namespace"),
+            "db_path": task_state_snapshot.get("db_path"),
+        },
+        "task_futures": {
+            "actor_name": task_future_snapshot.get("actor_name"),
+            "namespace": task_future_snapshot.get("namespace"),
+            "future_db_path": task_future_snapshot.get("future_db_path"),
+            "payload_root_dir": task_future_snapshot.get("payload_root_dir"),
         },
         "model_work_scheduler": {
-            "actor_name": scheduler_stats.get("actor_name"),
-            "domain_count": len(scheduler_stats.get("domains", {})),
+            "actor_name": scheduler_snapshot.get("actor_name"),
+            "namespace": scheduler_snapshot.get("namespace"),
+            "task_state_store_enabled": scheduler_snapshot.get("task_state_store_enabled"),
+            "queue_depth": scheduler_snapshot.get("queue_depth"),
+            "domain_count": len(scheduler_snapshot.get("domains", {})),
         },
         "maintenance_cron_actor": {
             "actor_name": cron_snapshot.get("actor_name"),

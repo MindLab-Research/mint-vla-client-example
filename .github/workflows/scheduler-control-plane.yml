@@ -73,6 +73,7 @@ jobs:
 
       - name: Install scheduler CI dependencies
         run: |
+          rm -rf .venv
           uv venv --python 3.12
           uv pip install --python .venv/bin/python --index-url "$UV_INDEX_URL" \
             coverage==7.14.1 \

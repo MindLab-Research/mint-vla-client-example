@@ -127,6 +127,42 @@ def test_parse_model_gpu_placement_accepts_node_ip_slice(
     assert placement.required_gpus_by_node_ip() == {"10.0.0.17": 4}
 
 
+def test_resolve_worker_gpu_slices_to_placement_uses_ray_nodes_for_pinned_node_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    vp = _import_node_placement(monkeypatch)
+
+    monkeypatch.setattr(
+        vp.ray,
+        "nodes",
+        lambda: [
+            {
+                "Alive": True,
+                "NodeID": "node-1",
+                "NodeManagerAddress": "10.0.0.17",
+                "NodeManagerHostname": "t-abc-worker-1",
+                "Resources": {"GPU": 8},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        vp,
+        "_list_alive_gpu_nodes",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected GPU availability scan")),
+    )
+
+    placement = vp.resolve_worker_gpu_slices_to_placement(
+        worker_gpu_slices=[(0, None, 4, "10.0.0.17")],
+        context="test direct node_ip placement",
+    )
+
+    assert placement.node_ips == ["10.0.0.17"]
+    assert placement.total_gpus == 4
+    assert placement.slices[0].worker_index == 1
+    assert placement.slices[0].hostname == "t-abc-worker-1"
+    assert placement.required_gpus_by_node_ip() == {"10.0.0.17": 4}
+
+
 def test_parse_model_gpu_placement_node_ip_slice_ignores_duplicate_hostname_worker_indexes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

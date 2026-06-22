@@ -204,6 +204,43 @@ async def _retrieve_model_work_via_gateway(
     return None
 
 
+def _is_ray_actor_unavailable(exc: Exception) -> bool:
+    """Best-effort detection without importing ray on non-Ray test paths."""
+    candidate: BaseException | None = exc
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            candidate = as_instanceof_cause()
+        except Exception:
+            candidate = exc
+    name = type(candidate).__name__
+    if name in {"ActorDiedError", "ActorUnavailableError"}:
+        return True
+    message = str(candidate)
+    return (
+        "The actor is temporarily unavailable" in message
+        or "ActorUnavailableError" in message
+        or "recvmsg:Connection reset by peer" in message
+    )
+
+
+def _is_task_state_not_found_error(exc: Exception) -> bool:
+    """Detect TaskStateNotFoundError even when Ray wraps it as RayTaskError."""
+    candidate: BaseException | None = exc
+    as_instanceof_cause = getattr(exc, "as_instanceof_cause", None)
+    if callable(as_instanceof_cause):
+        try:
+            candidate = as_instanceof_cause()
+        except Exception:
+            candidate = exc
+    if type(candidate).__name__ == "TaskStateNotFoundError":
+        return True
+    cause = getattr(exc, "cause", None)
+    if type(cause).__name__ == "TaskStateNotFoundError":
+        return True
+    return type(exc).__name__ == "RayTaskError" and "TaskStateNotFoundError" in str(exc)
+
+
 async def _lookup_legacy_task_state_terminal(request_id: str, http_request: Request) -> Any | None:
     try:
         from mint_server.backend.scheduling.model_work_task_gateway import model_work_task_gateway
@@ -310,6 +347,53 @@ def _failed_payload(error: str | None, request: Request) -> dict[str, str]:
     if _is_privileged(request):
         return {"error": error, "category": "system"}
     return {"error": _public_error(error), "category": "system"}
+
+
+
+
+def _terminal_evicted_payload(record: dict[str, Any]) -> dict[str, Any]:
+    raw_meta = record.get("metadata")
+    meta: dict[str, Any] = raw_meta if isinstance(raw_meta, dict) else {}
+    done_at = meta.get("done_at") or meta.get("failed_at") or record.get("updated_at")
+    retrieved_at = record.get("updated_at") if str(record.get("status") or "") == "retrieved" else None
+    try:
+        done_at_s = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(done_at)))
+    except Exception:
+        done_at_s = None
+    try:
+        retrieved_at_s = None if retrieved_at is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(retrieved_at)))
+    except Exception:
+        retrieved_at_s = None
+    return {
+        "error": "Known terminal future evicted",
+        "category": "system",
+        "request_id": str(record.get("request_id") or ""),
+        "op": str(meta.get("op") or record.get("op") or ""),
+        "done_at": done_at_s,
+        "retrieved_at": retrieved_at_s,
+    }
+
+
+def _terminal_payload_missing_payload(request_id: str, exc: BaseException) -> dict[str, str]:
+    return {
+        "error": f"Future result payload missing: {type(exc).__name__}: {exc}",
+        "category": "system",
+        "request_id": str(request_id),
+    }
+
+
+def _is_terminal_payload_missing_error(exc: BaseException) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    message = str(exc).lower()
+    if type(exc).__name__ == "TaskPayloadStoreError" and "payload" in message:
+        return True
+    if type(exc).__name__ == "RayTaskError" and (
+        "filenotfounderror" in message
+        or "no such file or directory" in message
+    ):
+        return True
+    return False
 
 
 @router.post("/retrieve_future")
@@ -487,6 +571,11 @@ async def retrieve_future(
             }
         _record_retrieve_wait(path="local", outcome="unknown", waited=False)
         raise HTTPException(status_code=404, detail=detail)
+    except Exception as e:
+        if not _is_ray_actor_unavailable(e):
+            raise
+        _record_retrieve_wait(path="local", outcome="unknown", waited=False)
+        raise HTTPException(status_code=503, detail="TaskStateStore unavailable")
 
     waited_for_status_change = False
     if status == FutureStatus.PENDING:
@@ -516,6 +605,20 @@ async def retrieve_future(
                 }
             _record_retrieve_wait(path="local", outcome="unknown", waited=waited_for_status_change)
             raise HTTPException(status_code=404, detail=detail)
+        except TaskStateStoreUnavailableError:
+            logger.warning(
+                "[retrieve_future] request_id=%s wait_status_change unavailable; returning pending",
+                body.request_id,
+                exc_info=True,
+            )
+        except Exception as e:
+            if not _is_ray_actor_unavailable(e):
+                raise
+            logger.warning(
+                "[retrieve_future] request_id=%s wait_status_change actor unavailable; returning pending",
+                body.request_id,
+                exc_info=True,
+            )
 
     meta = None
     try:
@@ -843,7 +946,13 @@ async def retrieve_future(
             return _apply_local_cached_response(cached, http_request, response)
         try:
             result = await task_futures.async_get_result(body.request_id)
-        except Exception:
+        except Exception as e:
+            if _is_terminal_payload_missing_error(e):
+                payload = _terminal_payload_missing_payload(body.request_id, e)
+                _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
+                logger.warning("[retrieve_future] request_id=%s status=retrieved payload_missing=%s", body.request_id, e)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                return payload
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 _pending_hint_clear(body.request_id)
@@ -882,7 +991,13 @@ async def retrieve_future(
         _pending_hint_clear(body.request_id)
         try:
             result = await task_futures.async_get_result(body.request_id)
-        except Exception:
+        except Exception as e:
+            if _is_terminal_payload_missing_error(e):
+                payload = _terminal_payload_missing_payload(body.request_id, e)
+                _recent_put(body.request_id, payload, ttl_s=_local_hot_ttl_s())
+                logger.warning("[retrieve_future] request_id=%s status=done payload_missing=%s", body.request_id, e)
+                _record_retrieve_wait(path="local", outcome="ready", waited=waited_for_status_change)
+                return payload
             task_state_payload = await _lookup_legacy_task_state_terminal(body.request_id, http_request)
             if task_state_payload is not None:
                 logger.info("done_legacy_task_state_store", status="done", served="legacy_task_state_store")

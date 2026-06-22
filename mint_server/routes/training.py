@@ -4017,6 +4017,8 @@ async def _do_save_weights_for_sampler(
         if session is None:
             raise RuntimeError(f"Model '{request.model_id}' not found")
         session = await _materialize_training_session_for_stateful_use(session)
+        session_backend = str(getattr(session, "backend", "") or "")
+        openpi_sampler_backend = session_backend in {"openpi_fast", "openpi_pi05"}
         # Determine checkpoint name
         if request.path is not None:
             # Named save - use provided path
@@ -4029,14 +4031,15 @@ async def _do_save_weights_for_sampler(
             ):
                 raise ValueError(f"Invalid checkpoint name: {request.path!r}")
             created_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-            claimed_ckpt_id = await _claim_sampler_checkpoint_or_raise(
-                owner_id=None if is_admin else user_id,
-                model_id=session.model_id,
-                raw_checkpoint_id=checkpoint_name,
-                model_name=session.base_model,
-                checkpoint_created_at=created_at,
-                retry=bool(request.retry),
-            )
+            if not openpi_sampler_backend:
+                claimed_ckpt_id = await _claim_sampler_checkpoint_or_raise(
+                    owner_id=None if is_admin else user_id,
+                    model_id=session.model_id,
+                    raw_checkpoint_id=checkpoint_name,
+                    model_name=session.base_model,
+                    checkpoint_created_at=created_at,
+                    retry=bool(request.retry),
+                )
             save_path = build_persistent_cache_dir(
                 user_id=None if is_admin else user_id,
                 model_id=session.model_id,
@@ -4097,79 +4100,101 @@ async def _do_save_weights_for_sampler(
                 ),
             },
         )
+        runtime_node_filesystem_checkpoint = bool(
+            request.path is not None
+            and openpi_sampler_backend
+            and not os.path.isdir(str(save_path))
+        )
+        if runtime_node_filesystem_checkpoint:
+            allow_runtime_node_path = (
+                os.environ.get("MINT_OPENPI_ALLOW_RUNTIME_NODE_SAMPLER_PATH", "").strip().lower()
+                in {"1", "true", "yes", "on"}
+            )
+            if not allow_runtime_node_path:
+                raise RuntimeError(
+                    "OpenPI sampler checkpoint was exported to a path that is not visible from the API process: "
+                    f"{save_path}. Configure MINT_RUNTIME_CHECKPOINT_DIR/TINKER_RUNTIME_CHECKPOINT_DIR to a shared "
+                    "filesystem visible to the API process, training runtime, and action runtime, or set "
+                    "MINT_OPENPI_ALLOW_RUNTIME_NODE_SAMPLER_PATH=1 only when downstream consumers run on the same "
+                    "runtime-node filesystem."
+                )
+        if request.path is not None and openpi_sampler_backend and not runtime_node_filesystem_checkpoint:
+            claimed_ckpt_id = await _claim_sampler_checkpoint_or_raise(
+                owner_id=None if is_admin else user_id,
+                model_id=session.model_id,
+                raw_checkpoint_id=checkpoint_name,
+                model_name=session.base_model,
+                checkpoint_created_at=created_at,
+                retry=bool(request.retry),
+            )
 
         validate_checkpoint_t0 = time.perf_counter()
-        with start_as_current_span(
-            "training.save_weights_for_sampler.validate_checkpoint",
-            component="routes.training",
-            op="training.save_weights_for_sampler.validate_checkpoint",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(request.model_id),
-                "save_path": str(save_path),
-                "save_mode": "named" if request.path is not None else "ephemeral",
-            },
-        ):
-            if checkpoint_has_optimizer_state(save_path):
-                raise RuntimeError(
-                    f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
-                )
-            try:
-                validate_sampler_checkpoint_for_sampling(save_path)
-            except ValueError as e:
-                raise RuntimeError(
-                    f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
-                ) from e
+        if not runtime_node_filesystem_checkpoint:
+            with start_as_current_span(
+                "training.save_weights_for_sampler.validate_checkpoint",
+                component="routes.training",
+                op="training.save_weights_for_sampler.validate_checkpoint",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "save_path": str(save_path),
+                    "save_mode": "named" if request.path is not None else "ephemeral",
+                },
+            ):
+                if checkpoint_has_optimizer_state(save_path):
+                    raise RuntimeError(
+                        f"save_weights_for_sampler must not produce optimizer artifacts, but found some under: {save_path}"
+                    )
+                try:
+                    validate_sampler_checkpoint_for_sampling(save_path)
+                except ValueError as e:
+                    raise RuntimeError(
+                        f"save_weights_for_sampler produced an invalid sampler checkpoint at {save_path}: {e}"
+                    ) from e
 
         await _safe_update_training_meta(
             request_id,
             {
                 "stage": "write_checkpoint_metadata",
-                "validate_checkpoint_s": max(
-                    0.0, time.perf_counter() - validate_checkpoint_t0
-                ),
+                "validate_checkpoint_s": max(0.0, time.perf_counter() - validate_checkpoint_t0),
+                "runtime_node_filesystem_checkpoint": runtime_node_filesystem_checkpoint,
             },
         )
         ttl_seconds = request.ttl_seconds
         if request.path is None and ttl_seconds is None:
             ttl_seconds = None
         write_metadata_t0 = time.perf_counter()
-        with start_as_current_span(
-            "training.save_weights_for_sampler.write_checkpoint_metadata",
-            component="routes.training",
-            op="training.save_weights_for_sampler.write_checkpoint_metadata",
-            request_id=str(request_id),
-            attributes={
-                "model_id": str(request.model_id),
-                "checkpoint_name": str(checkpoint_name),
-                "storage_tier": "ephemeral_pfs"
-                if request.path is None
-                else "persistent_cache",
-                "ttl_seconds": None
-                if request.ttl_seconds is None
-                else int(request.ttl_seconds),
-            },
-        ):
-            write_checkpoint_metadata(
-                save_path,
-                {
-                    "checkpoint_id": checkpoint_name,
-                    "owner_id": None if is_admin else user_id,
-                    "model_id": session.model_id,
-                    "model_name": session.base_model,
-                    "created_at": created_at,
-                    "step": session.current_step,
-                    "checkpoint_type": "sampler",
-                    "optimizer_present": False,
-                    "backend": session.backend,
-                    "type": "sampler",
-                    "storage_tier": "ephemeral_pfs"
-                    if request.path is None
-                    else "persistent_cache",
-                    "ttl_seconds": request.ttl_seconds,
-                    "ckpt_id": claimed_ckpt_id,
+        if not runtime_node_filesystem_checkpoint:
+            with start_as_current_span(
+                "training.save_weights_for_sampler.write_checkpoint_metadata",
+                component="routes.training",
+                op="training.save_weights_for_sampler.write_checkpoint_metadata",
+                request_id=str(request_id),
+                attributes={
+                    "model_id": str(request.model_id),
+                    "checkpoint_name": str(checkpoint_name),
+                    "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
+                    "ttl_seconds": None if request.ttl_seconds is None else int(request.ttl_seconds),
                 },
-            )
+            ):
+                write_checkpoint_metadata(
+                    save_path,
+                    {
+                        "checkpoint_id": checkpoint_name,
+                        "owner_id": None if is_admin else user_id,
+                        "model_id": session.model_id,
+                        "model_name": session.base_model,
+                        "created_at": created_at,
+                        "step": session.current_step,
+                        "checkpoint_type": "sampler",
+                        "optimizer_present": False,
+                        "backend": session.backend,
+                        "type": "sampler",
+                        "storage_tier": "ephemeral_pfs" if request.path is None else "persistent_cache",
+                        "ttl_seconds": request.ttl_seconds,
+                        "ckpt_id": claimed_ckpt_id,
+                    },
+                )
         await _safe_update_training_meta(
             request_id,
             {
@@ -4181,7 +4206,7 @@ async def _do_save_weights_for_sampler(
         )
 
         persistent_path = None
-        if request.path is not None:
+        if request.path is not None and not runtime_node_filesystem_checkpoint:
             mirror_t0 = time.perf_counter()
             await _safe_update_training_meta(
                 request_id,
@@ -4236,7 +4261,28 @@ async def _do_save_weights_for_sampler(
         path_uri = tinker_uri if prefer_tinker else mint_uri
         checkpoint_owner_id = (None if is_admin else user_id) or "anonymous"
 
-        if request.path is not None:
+        if request.path is not None and runtime_node_filesystem_checkpoint:
+            response = SaveWeightsForSamplerResponse(
+                path=save_path,
+                sampling_session_id=None,
+            ).model_dump()
+            response.update(
+                checkpoint_record_id=claimed_ckpt_id,
+                filesystem_path=save_path,
+                persistent_filesystem_path=None,
+                mirror_status=None,
+                storage_tier="runtime_node_filesystem",
+                mirror_error=None,
+            )
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "ready",
+                    "storage_tier": "runtime_node_filesystem",
+                    "filesystem_path": save_path,
+                },
+            )
+        elif request.path is not None:
             # Named flow: Return path, caller creates session separately
             response = SaveWeightsForSamplerResponse(
                 path=path_uri,
@@ -4250,6 +4296,30 @@ async def _do_save_weights_for_sampler(
                 mirror_status=MIRROR_STATUS_PENDING,
                 storage_tier="persistent_cache",
                 mirror_error=None,
+            )
+        elif str(getattr(session, "backend", "")) == "openpi_pi05":
+            # OpenPI pi0.5 action sampling consumes the exported checkpoint
+            # directory directly via /mint/action_sessions. Registering a text
+            # Multi-LoRA sampling session would route the OpenPI model id through
+            # vLLM/HuggingFace loading, which is not valid for this backend.
+            response = SaveWeightsForSamplerResponse(
+                path=None,
+                sampling_session_id=None,
+            ).model_dump()
+            response.update(
+                filesystem_path=save_path,
+                persistent_filesystem_path=None,
+                mirror_status=None,
+                mirror_error=None,
+                storage_tier="ephemeral_pfs",
+            )
+            await _safe_update_training_meta(
+                request_id,
+                {
+                    "stage": "ready",
+                    "storage_tier": "ephemeral_pfs",
+                    "filesystem_path": save_path,
+                },
             )
         else:
             # Ephemeral flow: Use multi-LoRA engine for frozen per-session weights
@@ -4452,6 +4522,13 @@ async def _do_save_weights_for_sampler(
                 sampling_session_id=sampling_session_id,
                 owner_id=checkpoint_owner_id,
             ).model_dump()
+            response.update(
+                filesystem_path=save_path,
+                persistent_filesystem_path=None,
+                mirror_status=None,
+                mirror_error=None,
+                storage_tier="ephemeral_pfs",
+            )
 
         await task_futures.async_resolve(request_id, response)
 

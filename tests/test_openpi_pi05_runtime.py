@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -14,7 +15,6 @@ from mint_server.models.types import (
     ForwardBackwardRequest,
     ImageChunk,
     ModelInput,
-    OptimStepRequest,
     TensorData,
     TrainStepRequest,
 )
@@ -53,6 +53,23 @@ def _make_datum() -> Datum:
     )
 
 
+def _make_rl_datum() -> Datum:
+    datum = _make_datum()
+    datum.loss_fn_inputs.update(
+        {
+            "chains": TensorData(
+                data=[float(i) / 100.0 for i in range(2 * 10 * 7)],
+                shape=[2, 10, 7],
+                dtype="float32",
+            ),
+            "denoise_inds": TensorData(data=[0.0], shape=[1], dtype="int64"),
+            "logprobs": TensorData(data=[-0.1] * (10 * 7), shape=[10, 7], dtype="float32"),
+            "advantages": TensorData(data=[1.0] * (10 * 7), shape=[10, 7], dtype="float32"),
+        }
+    )
+    return datum
+
+
 class _FakeRuntimeClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict | None]] = []
@@ -67,19 +84,30 @@ class _FakeRuntimeClient:
             assert payload is not None
             batch = payload["batch"]
             return {
-                "loss_fn_output_type": "flow_matching_loss",
+                "loss_fn_output_type": f"{payload['loss_fn']}_loss",
                 "loss_fn_outputs": [
                     {"loss": {"data": [float(i + 1)], "shape": [1], "dtype": "float32"}}
                     for i, _ in enumerate(batch)
                 ],
-                "metrics": {"loss:mean": 1.25, "num_samples:sum": float(len(batch))},
+                "metrics": {
+                    "loss:mean": 1.25,
+                    "num_samples:sum": float(len(batch)),
+                    **({"clipfrac:mean": 0.5} if payload["loss_fn"] == "ppo" else {}),
+                },
             }
         if op == "optim_step":
             assert payload is not None
             return {"metrics": {"learning_rate": payload["learning_rate"]}}
         if op == "save_weights":
             assert payload is not None
-            return {"path": payload["save_path"]}
+            return {"path": payload["save_path"]}  # type: ignore[union-attr]
+        if op == "save_sampler_weights":
+            save_path = Path(payload.get("export_path") or payload["save_path"])  # type: ignore[union-attr]
+            (save_path / "params").mkdir(parents=True, exist_ok=False)
+            (save_path / "assets").mkdir(parents=True, exist_ok=False)
+            (save_path / "params" / "_METADATA").write_text("{}", encoding="utf-8")
+            (save_path / "assets" / "asset.json").write_text("{}", encoding="utf-8")
+            return {"path": str(save_path)}
         if op == "load_weights":
             return {"current_step": 5, "learning_rate": 0.001}
         if op == "shutdown":
@@ -240,11 +268,11 @@ def test_openpi_pi05_engine_forward_backward_builds_payload_and_updates_grad_sta
     op, payload = factory.clients[0].calls[-1]
     assert op == "forward_backward"
     assert payload is not None
-    assert payload["loss_fn"] == "flow_matching"
+    assert payload["loss_fn"] == "flow_matching"  # type: ignore[union-attr]
     assert payload is not None
     assert len(payload["batch"]) == 1
     assert payload is not None
-    assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13]
+    assert payload["batch"][0]["tokenized_prompt"] == [11, 12, 13]  # type: ignore[union-attr]
     assert payload is not None
     assert len(payload["batch"][0]["state"]) == 32
     assert payload is not None
@@ -270,8 +298,44 @@ def test_openpi_pi05_engine_rejects_unknown_loss_functions(monkeypatch) -> None:
         forward_backward_input=ForwardBackwardInput(data=[_make_datum()], loss_fn="cross_entropy"),
     )
 
-    with pytest.raises(ValueError, match="flow_matching"):
+    with pytest.raises(ValueError, match="flow_matching|importance_sampling|ppo"):
         asyncio.run(engine.forward_backward(session, request))
+
+
+def test_openpi_pi05_engine_ppo_builds_rl_payload_and_updates_grad_state(monkeypatch) -> None:
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
+
+    monkeypatch.setattr(
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
+        lambda base_model: _pi05_model_config(),
+    )
+
+    factory = _FakeRuntimeFactory()
+    engine = OpenPIPi05TrainingEngine(runtime_factory=factory)
+    session = _make_session()
+    asyncio.run(engine.create_training_session(session))
+    request = ForwardBackwardRequest(
+        model_id=session.model_id,
+        forward_backward_input=ForwardBackwardInput(
+            data=[_make_rl_datum()],
+            loss_fn="ppo",
+            loss_fn_config={"epsilon": 0.15, "noise_method": "flow_sde"},
+        ),
+    )
+
+    result = asyncio.run(engine.forward_backward(session, request))
+
+    assert session.accumulated_gradients == 1
+    assert result["loss_fn_output_type"] == "ppo_loss"
+    assert result["metrics"]["clipfrac:mean"] == pytest.approx(0.5)
+    op, payload = factory.clients[0].calls[-1]
+    assert op == "forward_backward"
+    assert payload["loss_fn"] == "ppo"  # type: ignore[union-attr]
+    assert payload["loss_fn_config"] == {"epsilon": 0.15, "noise_method": "flow_sde"}  # type: ignore[union-attr]
+    assert payload["batch"][0]["source_action_dim"] == 7  # type: ignore[union-attr]
+    assert payload["batch"][0]["denoise_inds"] == [0]  # type: ignore[union-attr]
+    assert len(payload["batch"][0]["chains"]) == 2  # type: ignore[union-attr]
+    assert all(len(row) == 32 for row in payload["batch"][0]["chains"][0])  # type: ignore[union-attr]
 
 
 def test_openpi_pi05_engine_train_step_composes_forward_backward_and_optim_step(monkeypatch) -> None:
@@ -328,3 +392,34 @@ def test_openpi_pi05_engine_save_load_and_shutdown_delegate_to_runtime(monkeypat
         "load_weights",
         "shutdown",
     ]
+
+
+def test_openpi_pi05_save_weights_for_sampler_creates_checkpoint_root(tmp_path: Path, monkeypatch) -> None:
+    from mint_server.backend.openpi.openpi_pi05_training import OpenPIPi05TrainingEngine
+
+    monkeypatch.setattr(
+        "mint_server.backend.openpi.openpi_pi05_training.get_model_config",
+        lambda base_model: _pi05_model_config(),
+    )
+
+    factory = _FakeRuntimeFactory()
+    engine = OpenPIPi05TrainingEngine(runtime_factory=factory)
+    session = _make_session()
+    asyncio.run(engine.create_training_session(session))
+
+    export_path = asyncio.run(
+        engine.save_weights_for_sampler(
+            session=session,
+            checkpoint_name="export-1",
+            checkpoint_base_dir=str(tmp_path),
+        )
+    )
+
+    export_dir = Path(export_path)
+    assert export_dir == tmp_path / "model-1" / "export-1"
+    assert (export_dir / "params" / "_METADATA").exists()
+    assert (export_dir / "assets" / "asset.json").exists()
+    assert factory.clients[0].calls[-1] == (
+        "save_sampler_weights",
+        {"export_path": str(tmp_path / "model-1" / "export-1")},
+    )

@@ -17,7 +17,6 @@ from mint_server.models.types import (
     ForwardBackwardRequest,
     ImageChunk,
     ModelInput,
-    OptimStepRequest,
     TrainStepRequest,
 )
 
@@ -483,6 +482,21 @@ def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
     env = spec.build_env()
 
     assert env["PYTHONPATH"] == os.pathsep.join(runtime_env["pythonpath"])
+
+
+def test_openpi_fast_runtime_build_env_disables_config_actor_hydration(
+    monkeypatch,
+    configure_runtime_env,
+) -> None:
+    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
+
+    configure_runtime_env()
+    monkeypatch.setenv("MINT_CONFIG_ACTOR_HYDRATE", "1")
+
+    spec = OpenPIFastRuntimeSpec.from_env()
+    env = spec.build_env()
+
+    assert env["MINT_CONFIG_ACTOR_HYDRATE"] == "0"
 
 
 def test_openpi_fast_runtime_spec_rejects_incomplete_runtime_env_layout(
