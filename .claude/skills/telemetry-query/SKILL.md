@@ -36,7 +36,7 @@ description: |
 - 认证: Header `x-api-key: <MCP_API_KEY>`
 
 密钥：`MCP_API_KEY` 来自 K8s Secret `monitoring/victorialogs-mcp-api-keys`
-（client id `ai-client-1`）。获取/轮换找 @曾一航 或 @NolanHo。
+（client id `ai-client-1`）。密钥值见 `/vePFS-Mindverse/share/mint/SECRET.md`。
 
 ## 协议要点（脚本已封装，调试时备查）
 
@@ -54,8 +54,8 @@ description: |
 参考同目录 `.env.example` 配置 `.env`（已被 gitignore，勿提交密钥）。
 
 ```bash
-# .env 内容
-MCP_API_KEY=<从 K8s Secret 获取>
+# .env 内容（密钥值见 /vePFS-Mindverse/share/mint/SECRET.md）
+MCP_API_KEY=<从 SECRET.md 获取>
 MCP_LOGS_URL=https://otelmcp.macaron.xin/logs/mcp
 MCP_METRICS_URL=https://otelmcp.macaron.xin/metrics/mcp
 MCP_TRACES_URL=https://otelmcp.macaron.xin/traces/mcp
