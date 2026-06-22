@@ -21,7 +21,7 @@ from ray.exceptions import GetTimeoutError, RayActorError
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
-from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group
+from mint_server.backend.ray_cluster.ray_placement_groups import get_named_placement_group, get_or_create_named_placement_group
 from mint_server.backend.actors.model_actor_publication import BackendModelActorLaunch, publish_backend_model_actor
 from mint_server.backend.actors.model_actor_supervisor import ActorType, get_model_actor_supervisor
 from mint_server.backend.actors.node_placement import parse_model_gpu_placement
@@ -177,17 +177,17 @@ def _preferred_worker_node_ip_for_model(model_key: str | None, base_model: str) 
 
 
 def _get_or_create_pg(actor_name: str, *, model_key: str | None, base_model: str) -> Any:
-    """Attach the controller-created detached 1-GPU placement group for this actor."""
+    """Get or create the detached 1-GPU placement group for this actor."""
     pg_name = _pg_name(actor_name)
     bundle: dict[str, float] = {"GPU": 1.0, "CPU": 1.0}
     preferred_ip = _preferred_worker_node_ip_for_model(model_key, base_model)
     if preferred_ip:
         bundle[f"node:{preferred_ip}"] = 0.001
         logger.info("dense_trainer_pin", model=model_key or base_model, node_ip=preferred_ip)
-    return get_named_placement_group(
+    return get_or_create_named_placement_group(
         pg_name,
         namespace=PERSISTENT_DENSE_NAMESPACE,
-        expected_bundles=[bundle],
+        bundles=[bundle],
     )
 
 

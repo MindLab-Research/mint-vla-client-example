@@ -34,6 +34,7 @@ Entrypoint: |
   export HF_HUB_OFFLINE=1
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1
+  export RAY_ENABLE_AUTO_CONNECT=0
 
   node_id="$(hostname | tr -c 'A-Za-z0-9_.-' '-')"
   export MINT_NODE_ID="${node_id}"

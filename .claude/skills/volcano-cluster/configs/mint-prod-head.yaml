@@ -27,6 +27,7 @@ Entrypoint: |
   export HF_HUB_OFFLINE=1
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1
+  export RAY_ENABLE_AUTO_CONNECT=0
   export MINT_RAY_INCLUDE_DASHBOARD=0
   export MINT_RAY_CLIENT_SERVER_PORT=0
 

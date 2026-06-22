@@ -11248,6 +11248,13 @@ async def async_get_or_create_megatron_worker_group(
     Wraps blocking Ray operations in asyncio.to_thread() to avoid blocking
     the uvicorn event loop during FastAPI request handling.
 
+    Safety note: This function is called from VerlTrainingEngine which runs
+    in the API server driver process. In the driver process, ray.is_initialized()
+    is a process-level check that always returns True, so @wrap_auto_init is a
+    no-op and ray.get/ray.get_actor work correctly in to_thread workers.
+    DO NOT call this from inside a Ray actor — to_thread workers in actor
+    processes do not inherit Ray thread-local connection state.
+
     Args:
         base_model: HuggingFace model path.
         lora_rank: LoRA rank.

@@ -29,8 +29,21 @@ def _verify_named_actor_absent(
     timeout_s: float,
     poll_interval_s: float,
 ) -> None:
+    """Verify a named actor has been removed from Ray.
+
+    This function may be called from asyncio.to_thread context. In that case
+    it runs on a thread pool worker without Ray thread-local state. To handle
+    this safely, it uses ray.is_initialized() check before each ray.get_actor
+    call. With RAY_ENABLE_AUTO_CONNECT=0, a missing connection will raise
+    instead of spawning a zombie GCS.
+    """
     deadline = time.monotonic() + timeout_s
     while True:
+        if not ray.is_initialized():
+            raise RuntimeError(
+                f"Ray not initialized when verifying actor disappearance for "
+                f"actor_name={actor_name!r} namespace={namespace!r}"
+            )
         try:
             ray.get_actor(actor_name, namespace=namespace)
         except ValueError:

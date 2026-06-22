@@ -1,7 +1,7 @@
 ---
 name: mint-dev
 description: |
-  Development environment operations for the Mint server on the Volcano dev host.
+  Development environment operations for the Mint server on the dev driver node.
 
   Use for: starting/restarting the dev API server, reading dev logs, updating the
   dev server checkout, and validating local changes against the dev deployment.
@@ -17,327 +17,285 @@ description: |
 
 # Mint Dev
 
-Read this whole file before touching the dev environment. If a step is missing,
-update the skill instead of reviving old deployment paths.
+Read this whole file before touching the dev environment.
 
-## Environment
+## Architecture
+
+```
+Local Machine          mint-dev (driver)              mint-dev-head (Volcano pod)
+─────────────          ────────────────               ──────────────────────────
+tinker-cookbook ──HTTP──> mint-server API ──Ray──>   GCS + raylet + dashboard
+                    (port from namespace)  direct attach   GPU Workers (Volcano pods)
+                       ↑
+                  SSH tunnel
+```
 
 | Item | Value |
 |------|-------|
-| Ray head task | `mint-dev-head` |
-| Ray head IP | Read from `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` |
-| Shell access | No SSH access to the dev head; attach only through Ray Client |
-| API port | `8000` (code default) |
-| Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` (launcher default) |
-| Ray namespace | `mint_${USER}` with a non-root user name |
-| Auth mode | `no-auth` by default; exceptional auth env must come from the explicit launch environment |
-| Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint_server_auth.log` |
+| Driver node | `mint-dev` (SSH alias) |
+| Ray head | Volcano pod (`mint-dev-head`), managed by volcano-cluster skill |
+| Head IP | `cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` |
+| Connection mode | Direct attach (`ray.init(address="auto")`) |
+| API port | Derived from namespace hash (`[30000, 40000)`); override with `MINT_PORT` |
+| Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
+| Ray namespace | `mint_<user>_dev` (per-user) |
+| Auth mode | `no-auth` by default |
+| Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log` |
 
-The dev Ray head is reachable only as a Ray Client endpoint. Do not use
-historical `ssh mint-dev` commands.
+## Quick Start
 
-### Launch contract: minimal inputs
-
-`scripts/start_dev_server.sh` is the dev launcher. It takes the smallest
-possible input set and lets everything else fall back to code defaults
-(host/port, `LD_LIBRARY_PATH`, vLLM child python, HF modules, supported-model
-list). It does NOT source ambient shared env files: code checkout and Ray
-namespace are per-launch identity inputs.
-
-| Variable | Role | Source |
-|----------|------|--------|
-| `MINT_CODE_ROOT` | mint-server checkout to run | **required, no default** |
-| `MINT_RAY_NAMESPACE` | actor namespace | derived `mint_<user>`, refuses root/empty |
-| `PFS_RUNTIME_ENV_ROOT` | prebuilt host-venv (interpreter + torch/vllm), not business code | defaults to dev runtime |
-| `MINT_RAY_HEAD_ADDRESS_PATH` | head-address file; server reads live head IP | defaults to canonical dev path |
-| `MINT_TMP_ROOT` | scratch root | defaults to dev tmp |
-| `MINT_DEV_DEPLOYMENT_ENV` | optional deployment policy (models, placement, prewarm, OTEL) | optional; must not set code root or namespace |
-| `MINT_RAY_JOB_WORKING_DIR` | (not recommended) Ray working_dir override | leave unset |
-
-Do **not** set `MINT_RAY_JOB_WORKING_DIR`. Setting it causes Ray to package and
-upload the entire directory (~100-240 MB) over the Ray Client connection on
-every job. Workers access code via `PYTHONPATH` which already points at the PFS
-path in `MINT_CODE_ROOT`.
-
-`MINT_CODE_ROOT` has no default on purpose. It **must** be a path under
-`/vePFS-Mindverse/share/` that is visible to all Ray nodes (head + workers).
-Each user should maintain their own personal checkout — the exact path is up to
-you, as long as it is under `/vePFS-Mindverse/share/` and not the shared dev
-checkout. Do **not** use:
-
-- `/root/code/mint` or any other local path — Ray head nodes cannot see it
-- `/vePFS-Mindverse/user/<you>/...` — the `/user` subtree is not mounted on Ray nodes
-- `/vePFS-Mindverse/share/mint/dev/mint-server` — shared checkout, changes here affect everyone
-
-Sync your local checkout to your chosen share path before starting:
+### 1. Sync code to PFS
 
 ```bash
-rsync -a --delete <your-local-checkout>/ /vePFS-Mindverse/share/<your-path>/
-MINT_CODE_ROOT=/vePFS-Mindverse/share/<your-path> MINT_DEV_USER=<you> \
-  MINT_DEV_DEPLOYMENT_ENV=/path/to/explicit/deployment.env \
-  nohup scripts/start_dev_server.sh >> /tmp/mint_dev.log 2>&1 &
+rsync -a --exclude '.git' --exclude '__pycache__' \
+  <your-checkout>/ /vePFS-Mindverse/share/code/<you>/<branch>/
 ```
 
-If it is unset, the launcher refuses. **Ask the user which checkout to run**
-before launching; do not guess.
+**Do not use `--delete`** — it can remove files that other users or the
+runtime depend on. Only sync your code, not the entire directory tree.
 
-`MINT_RAY_NAMESPACE` is user-scoped. The launcher derives `mint_<user>` from the
-effective non-root user and refuses `mint`, `root`, `mint_root`, or empty. **If
-the namespace cannot be derived (for example you run as root), ask the user**
-for `MINT_RAY_NAMESPACE` or `MINT_DEV_USER` instead of inventing one. Do not
-hard-code shared namespaces such as `tinker_leixiang`.
+`MINT_CODE_ROOT` must be under `/vePFS-Mindverse/share/` and visible to all
+Ray nodes. Do not use local paths or `/vePFS-Mindverse/user/...`.
 
-Dev runs should not use a default `secrets.env`. Keep per-run values in the
-explicit launch environment or `MINT_DEV_DEPLOYMENT_ENV`, and never print,
-commit, or paste private values into logs.
+### 2. Generate placement config
 
-## Code Versioning
-
-The dev server code is whatever checkout you pass as `MINT_CODE_ROOT`. Manage it
-as a git checkout; do not use file sync tools. Record the branch and commit SHA
-before testing.
+Worker IPs change when the cluster is recreated. Generate a run env file:
 
 ```bash
-cd "${MINT_CODE_ROOT}"
-git fetch origin
-git status --short --branch
-git rev-parse HEAD
+HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
+python scripts/tools/gen_dev_placement.py --head-ip $HEAD_IP \
+  --model Qwen/Qwen3-0.6B --gpu-count 1 \
+  --output /tmp/mint_dev_run.env
+scp /tmp/mint_dev_run.env mint-dev:/tmp/mint_dev_run.env
 ```
 
-For issue branches, check out the requested branch in your `MINT_CODE_ROOT` and
-record the commit SHA before testing. There is no canonical shared checkout the
-launcher defaults to; the checkout is always an explicit input.
-
-## Start Or Restart
-
-The launcher re-execs into the runtime interpreter under
-`PFS_RUNTIME_ENV_ROOT/host-venv`; do not use system Python for server startup or
-Ray inspection.
-
-The current dev head cannot be entered with SSH, so the old `pkill`/`nohup`
-restart path is invalid. Do not restart the shared dev API process until the
-API process owner/launcher for the Ray-Client-only topology is identified.
-
-For a local or issue-scoped dev server on a machine with the PFS mounted, the
-one-shot minimal launch is:
+### 3. Start dev server
 
 ```bash
-MINT_CODE_ROOT=/path/to/your/mint-server-checkout \
-MINT_DEV_USER=<you> \
-scripts/start_dev_server.sh
+ssh mint-dev 'MINT_CODE_ROOT=/vePFS-Mindverse/share/code/<you>/<branch> \
+  MINT_DEV_USER=<you> \
+  MINT_RAY_NAMESPACE=mint_<you>_dev \
+  MINT_LOG_FILE=/vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log \
+  MINT_DISABLE_MINT_ROUTE=1 \
+  MINT_UVICORN_WORKERS=1 \
+  MINT_SUPERVISOR_STATE_BACKEND=memory \
+  MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env \
+  nohup /vePFS-Mindverse/share/code/<you>/<branch>/scripts/start_dev_server.sh \
+  >> /tmp/mint_dev_launch.log 2>&1 &'
 ```
 
-That is the whole required input: the checkout to run, plus a non-root user for
-the namespace. Runtime root, head address, port, model list, and library paths
-all use defaults. The launcher prints the resolved contract to stderr before
-starting; review it. Override a default only when needed, for example:
+The launcher auto-loads deployment defaults (model lists, vLLM flags, OTel
+endpoint, logging) and `secrets.env` (OTLP API keys). Port is derived from
+the namespace; override with `MINT_PORT=8000` if needed.
+
+The reconcile loop is **enabled by default** — the supervisor will
+automatically create runtime/training/vLLM replicas. To disable for
+debugging, set `MINT_SUPERVISOR_RECONCILE_LOOP=0`.
+
+### 4. Wait for healthz
 
 ```bash
-MINT_CODE_ROOT=/path/to/checkout MINT_DEV_USER=<you> \
-PFS_RUNTIME_ENV_ROOT=/path/to/other/runtime \
-MINT_DEV_DEPLOYMENT_ENV=/path/to/deployment.env \
-scripts/start_dev_server.sh
+ssh mint-dev 'curl -s http://localhost:8000/api/v1/healthz'
+# Expected: {"status":"ready"}
 ```
 
-If `MINT_CODE_ROOT` is missing the launcher refuses; ask the user which checkout
-to run. If the namespace resolves to root the launcher refuses; ask the user for
-`MINT_RAY_NAMESPACE` or `MINT_DEV_USER`.
-
-After any code change, restart the server before validating behavior. Python
-servers do not hot-reload. In the Ray-Client-only dev topology, treat shared
-server restart as blocked unless the current API launcher is known.
-
-### Issue-scoped servers
-
-There is no separate issue launcher. Isolation between concurrent dev servers
-comes entirely from the Ray namespace: every control-plane actor is looked up
-with `namespace=`, so a per-launch `mint_<user>` (or issue-scoped) namespace
-already gives the server its own scheduler, task-store, and cron actors. Run an
-isolated issue server with `start_dev_server.sh` plus a scoped namespace, port,
-and log, and any issue-specific tuning as plain env vars:
+### 5. SSH tunnel for local access
 
 ```bash
-MINT_CODE_ROOT=/path/to/issue/checkout \
-MINT_RAY_NAMESPACE=mint_<you>_issue_<n> \
-MINT_PORT=10416 \
-MINT_LOG_FILE=/tmp/mint_server_issue_<n>.log \
-MINT_DISABLE_MINT_ROUTE=1 MINT_UVICORN_WORKERS=1 \
-scripts/start_dev_server.sh
+ssh -f -N -L 8000:localhost:8000 mint-dev
 ```
 
-## Issue-Scoped Cleanup
+## Configuration Reference
 
-Cleanup is a required closeout step, not an optional courtesy. After finishing
-or abandoning dev/API validation, remove zombie Ray actors and namespaces that
-you created before handing the environment back. Only clean namespaces that are
-clearly yours, for example a prefix containing the issue/PR and your user name.
-Never clean shared namespaces such as `tinker_leixiang` or another user's
-namespace.
+### Required inputs
 
-Also stop local issue-scoped API servers or TermDeck-backed tasks that you
-started once the validation is finished or blocked. Before stopping a process,
-verify all of the following:
+| Variable | Purpose |
+|----------|---------|
+| `MINT_CODE_ROOT` | mint-server checkout (PFS path visible to all Ray nodes) |
+| `MINT_DEV_USER` | Username for namespace derivation (must be non-root) |
 
-- the process cwd, listening port, log path, or TermDeck session name matches
-  your issue-scoped run
-- `/api/v1/server_info` or the startup log identifies the expected local
-  process, port, branch/SHA, and namespace
-- no paired validation command is still running against that port
+### Recommended dev settings
 
-Use `SIGTERM` or TermDeck control input first, then confirm the port is no
-longer listening. Do not kill shared dev API processes or another user's
-server just because they are old.
+| Variable | Value | Why |
+|----------|-------|-----|
+| `MINT_SUPERVISOR_STATE_BACKEND` | `memory` | Avoids RocksDB lock conflicts from stale actors |
+| `MINT_DEV_RUN_ENV` | `/tmp/mint_dev_run.env` | Per-run placement config (IPs change when cluster recreated) |
+| `MINT_UVICORN_WORKERS` | `1` | Single worker for dev |
 
-Before killing anything, list exact targets and verify the namespace prefix:
+### Auto-loaded config
+
+The launcher (`start_dev_server.sh`) automatically loads:
+- **Deployment defaults**: model lists, vLLM flags, OTel endpoint, logging, resource queues
+- **secrets.env**: `/vePFS-Mindverse/share/mint/dev/config/secrets.env` (OTLP API keys)
+- **`RAY_ENABLE_AUTO_CONNECT=0`**: Prevents zombie GCS processes in worker actors
+
+### Placement config
+
+See `scripts/tools/gen_dev_placement.py` — generates a run env file with
+placement JSON from the current cluster's Ray dashboard. Run it whenever
+the cluster is recreated.
+
+### `MINT_DISABLE_MINT_ROUTE`
+
+When set to `1`, skips loading the `/api/v1/mint/*` route module (`routes/mint.py`).
+These routes provide Mint-only API extensions: VLA action sessions, VLA train_step,
+checkpoint interpolation, and reverse KL forward/backward. Setting this flag avoids
+loading their dependencies (action session manager, interpolation utils) during
+startup, which is useful for standard RL training/inference that doesn't use these
+features. Leave unset if you need VLA or checkpoint interpolation endpoints.
+
+## Restart After Code Changes
+
+Python servers do not hot-reload. After any code change:
 
 ```bash
-HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-export CLEANUP_NAMESPACE_PREFIX="mint_pr668_"
-MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
-/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python - <<'PY'
-import os
+# 1. Kill old server
+ssh mint-dev 'kill $(pgrep -f "scripts/run_server.py" | head -1) 2>/dev/null; sleep 2'
+
+# 2. Clean stale control-plane actors (if fingerprint mismatch)
+ssh mint-dev 'PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
+$PY -c "
 import ray
-
-prefix = os.environ["CLEANUP_NAMESPACE_PREFIX"]
-ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace="mint_cleanup", ignore_reinit_error=True, log_to_driver=False)
-targets = []
-for actor in ray.util.list_named_actors(all_namespaces=True):
-    namespace = str(actor.get("namespace") or actor.get("ray_namespace") or "")
-    name = str(actor.get("name") or actor.get("actor_name") or "")
-    if namespace.startswith(prefix) and name:
-        targets.append((namespace, name))
-print(targets)
+ray.init(address=\"$HEAD_IP:6379\", namespace=\"mint_<you>_dev\", ignore_reinit_error=True, log_to_driver=False)
+for name in [\"mint_config\", \"mint_task_state_store\", \"mint_model_work_scheduler\", \"mint_maintenance_cron\", \"mint_model_actor_supervisor\"]:
+    try:
+        a = ray.get_actor(name, namespace=\"mint_<you>_dev\")
+        ray.kill(a, no_restart=True)
+        print(f\"killed {name}\")
+    except Exception:
+        pass
 ray.shutdown()
-PY
+"'
+
+# 3. Sync updated code (no --delete!)
+rsync -a --exclude '.git' --exclude '__pycache__' \
+  <your-checkout>/ /vePFS-Mindverse/share/code/<you>/<branch>/
+
+# 4. Restart (same command as Quick Start step 3)
 ```
-
-If every target is from the issue-scoped namespace you created and the task is
-finished, kill those actors with `ray.kill(..., no_restart=True)` and re-list to
-confirm `remaining=[]`. Remove only placement groups that are named for the same
-issue-scoped actors/namespace. Do not use local `ray` CLI commands.
-
-If cleanup cannot complete because Ray Client, dashboard, or the cluster is
-unavailable, record the namespace, actor names, error, and follow-up owner in the
-task evidence before stopping. Do not leave a dev task marked complete while
-known owned zombie actors or placement groups remain unreported.
 
 ## Health And Logs
 
 ```bash
-curl http://localhost:8000/api/v1/healthz
+# API health
+ssh mint-dev 'curl -s http://localhost:8000/api/v1/healthz'
+
+# Server info
+ssh mint-dev 'curl -s http://localhost:8000/api/v1/server_info'
+
+# Admission stats (scheduler + supervisor + ray cluster)
+ssh mint-dev 'curl -s http://localhost:8000/internal/admission_stats'
+
+# Server logs
+ssh mint-dev 'tail -50 /vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log'
+
+# Ray cluster status
+ssh mint-dev 'curl -s http://<HEAD_IP>:8265/api/cluster_status'
 ```
 
-If validating Ray connectivity directly, use Ray Client:
+## RL Sanity Check
+
+After starting the dev server, run the RL check:
 
 ```bash
-PY=/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python
-export HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-$PY - <<'PY'
+ssh -f -N -L 8000:localhost:8000 mint-dev
+
+MINT_BASE_URL=http://localhost:8000 \
+TINKER_API_KEY=dummy \
+MINT_API_KEY=dummy \
+python scripts/tools/rl_check.py \
+  --model Qwen/Qwen3-0.6B \
+  --steps 10 \
+  --group-size 4 \
+  --timeout-s 600
+```
+
+Pass criteria: all 10 steps complete, `num_datums > 0` per step, status `pass`.
+
+## Issue-Scoped Servers
+
+Isolation comes from the Ray namespace. Use a scoped namespace, port, and log:
+
+```bash
+MINT_CODE_ROOT=/path/to/checkout \
+MINT_RAY_NAMESPACE=mint_<you>_issue_<n> \
+MINT_PORT=10416 \
+MINT_LOG_FILE=/tmp/mint_server_issue_<n>.log \
+MINT_UVICORN_WORKERS=1 \
+MINT_SUPERVISOR_STATE_BACKEND=memory \
+MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env \
+scripts/start_dev_server.sh
+```
+
+## Cleanup
+
+After finishing dev validation, clean up **all** actors in your namespace.
+This is a required closeout step, not optional.
+
+```bash
+ssh mint-dev 'PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
+NS=mint_<you>_dev
+$PY -c "
 import ray
-import os
-ray.init(address=f"ray://{os.environ['HEAD_IP']}:10001")
-print(ray.cluster_resources())
+ray.init(address=\"$HEAD_IP:6379\", namespace=\"$NS\", ignore_reinit_error=True, log_to_driver=False)
+# Kill all named actors in your namespace
+for actor in ray.util.list_named_actors(all_namespaces=True):
+    ns = str(actor.get(\"namespace\") or \"\")
+    name = str(actor.get(\"name\") or \"\")
+    if ns == \"$NS\" and name:
+        try:
+            a = ray.get_actor(name, namespace=ns)
+            ray.kill(a, no_restart=True)
+            print(f\"killed {name}\")
+        except Exception as e:
+            print(f\"skip {name}: {e}\")
+# Also clean issue-scoped namespaces
+for actor in ray.util.list_named_actors(all_namespaces=True):
+    ns = str(actor.get(\"namespace\") or \"\")
+    name = str(actor.get(\"name\") or \"\")
+    if ns.startswith(\"mint_<you>_issue_\") and name:
+        try:
+            a = ray.get_actor(name, namespace=ns)
+            ray.kill(a, no_restart=True)
+            print(f\"killed {name} in {ns}\")
+        except Exception as e:
+            print(f\"skip {name} in {ns}: {e}\")
 ray.shutdown()
-PY
+"'
 ```
 
-For local or issue-scoped dev servers with `MINT_INTERNAL_API_TOKEN` configured
-through an explicit launch environment, `/internal/*` also requires
-platform-forwarded identity headers. A plain `X-API-Key` request can return
-`401 {"error":"Missing platform auth headers"}`. When auth is enabled, pass the
-internal token through the process environment without printing values and send
-the token plus a synthetic operator identity:
-
-```bash
-/usr/bin/curl -s \
-  -H "X-Internal-Token: ${MINT_INTERNAL_API_TOKEN:-}" \
-  -H "X-MinT-User-Id: 000000000000000000000001" \
-  -H "X-MinT-User-Role: admin" \
-  -H "X-MinT-Account-Id: 000000000000000000000001" \
-  -H "X-MinT-Apikey-Id: 000000000000000000000002" \
-  -H "X-MinT-Request-Id: dev-operator-check" \
-  http://localhost:8000/internal/model_actor_supervisor
-```
-
-If the dev server is intentionally running without `MINT_INTERNAL_API_TOKEN`,
-internal routes use local/dev pass-through and do not need these headers. Check
-which mode the target server uses before concluding an endpoint is broken.
+Also stop your API server process and verify the port is no longer listening.
+Do not leave dev tasks marked complete while known actors remain in your namespace.
 
 ## Internal Ops
 
-For `/internal/*` actor inventory, actor kill, scheduler diagnostics, deep
-health, and Ray diagnostics, read and use the `mint-ops` skill after this one.
-Public `/api/v1/healthz` is only a cheap API-worker health check.
-
-## Control-Plane Actor Refresh
-
-Dev and prod share the same detached control-plane actor pattern. After a code
-or config update, startup can fail because a stale namespace-local control-plane
-actor has an old config fingerprint or code identity. Common messages include
-`ConfigActorSnapshotMismatchError` for `mint_config` and
-`model_actor_supervisor_code_mismatch` for `mint_model_actor_supervisor`.
-
-Do not restart Ray or worker nodes for these failures. In dev, first confirm the
-namespace is yours (`MINT_RAY_NAMESPACE="mint_${USER}"` or an issue-scoped
-namespace). Then kill only the stale control-plane actor in that namespace with
-the project runtime Python and Ray Client:
-
-```bash
-PY=/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python
-HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-export MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001"
-export MINT_RAY_NAMESPACE="mint_${USER}"
-$PY - <<'PY'
-import os
-import ray
-
-namespace = os.environ["MINT_RAY_NAMESPACE"]
-ray.init(address=os.environ["MINT_RAY_CLIENT_ADDRESS"], namespace=namespace, ignore_reinit_error=True, log_to_driver=False)
-actor = ray.get_actor("mint_config", namespace=namespace)
-ray.kill(actor, no_restart=True)
-print(f"killed mint_config namespace={namespace}")
-ray.shutdown()
-PY
-```
-
-Restart the issue-scoped API server after the control-plane actor is removed.
-If the namespace is shared or belongs to another user, stop and ask before
-killing anything. `/internal/model_actor_supervisor` is the source of truth for
-topology/runtime health after a supervisor control-plane rebuild; `/internal/actors`
-is a backend publication inventory and may be empty until backend actors publish
-again.
+For `/internal/*` actor inventory, actor kill, scheduler diagnostics, and Ray
+diagnostics, use the `mint-ops` skill. Internal routes on the dev server use
+pass-through mode (no auth headers needed).
 
 ## Worker Node Lifecycle
 
-Dev GPU worker lifecycle is topology/Supervisor owned. Do not use historical
-Volcano CLI commands to list, submit, cancel, or inspect worker jobs.
-
-Use the `volcano-cluster` skill. The dev head is `mint-dev-head`, and Python
-attaches through Ray Client using the current head-address file:
-
-```bash
-HEAD_IP="$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)"
-MINT_RAY_CLIENT_ADDRESS="ray://${HEAD_IP}:10001" \
-/vePFS-Mindverse/share/mint/dev/runtime/host-venv/bin/python scripts/tools/volcano_sdk_jobs.py --region cn-beijing list --name-contains mint-dev-worker- --limit 200
-```
-
-Credential checks may report only source existence. Never print secret values,
-credential files, signed requests, or process environments.
+Dev GPU workers are Volcano pods managed by the `volcano-cluster` skill.
+Do not run local `ray` or `volc` CLI commands. Use the volcano-cluster skill
+for cluster lifecycle (create/teardown workers, list jobs, inspect instances).
 
 ## Hard Rules
 
 - Do not perform production operations from this skill.
 - Do not run local `ray` or `volc` CLI commands. Use project Python with Ray
-  Client for inspection, and use the `volcano-cluster` skill for lifecycle work.
-- Do not use `ssh mint-dev`; the dev head is Ray-Client-only.
+  for inspection, and use the `volcano-cluster` skill for lifecycle work.
 - Do not source or print private config unless the task requires it.
-- Do not switch ports to hide a failed restart; fix the listener or process that
-  owns port `8000`.
+- Do not switch ports to hide a failed restart; fix the listener or process.
 - Do not default `MINT_CODE_ROOT` to the shared dev checkout. It is a required,
   explicit input; ask the user which checkout to run.
-- Do not invent a Ray namespace. Derive `mint_<user>`; if that resolves to root
-  or is otherwise unavailable, ask the user.
-- Do not install packages until the runtime root (`PFS_RUNTIME_ENV_ROOT`) and the
-  resolved `PYTHONPATH` have been verified.
+- Do not invent a Ray namespace. Derive `mint_<user>_dev`; if that resolves to
+  root, ask the user for `MINT_DEV_USER` or `MINT_RAY_NAMESPACE`.
+- Do not install packages until the runtime root (`PFS_RUNTIME_ENV_ROOT`) and
+  the resolved `PYTHONPATH` have been verified.
 - Do not finish dev validation without cleaning owned zombie namespaces, actors,
   and placement groups, or recording why cleanup was blocked.
+- **NEVER use `rsync --delete`** to sync code or runtime assets. It can remove
+  files that other users or the runtime depend on. Use `rsync -a` without
+  `--delete`, or copy individual files explicitly.

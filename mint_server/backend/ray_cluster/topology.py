@@ -1,5 +1,4 @@
 from __future__ import annotations
-from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 
 import ipaddress
 import importlib
@@ -295,9 +294,6 @@ def default_ray_node_lister() -> Iterable[RayNodeState]:
         import ray
 
         if not ray.is_initialized():
-            return []
-
-        if _is_ray_worker_process():
             return []
 
         rows = ray.nodes()

@@ -9,7 +9,6 @@ import asyncio
 import json
 import structlog
 import os
-import threading
 import time
 from typing import TYPE_CHECKING, Any, cast
 
@@ -335,16 +334,7 @@ class TrainingWorker:
         self._last_activity = time.time()
         self._idle_timeout = idle_timeout
         self._shutdown_requested = False
-
-        # Start watchdog thread if timeout enabled
-        if idle_timeout > 0:
-            self._watchdog_thread = threading.Thread(
-                target=self._idle_watchdog,
-                daemon=True,
-                name="TrainingWorker-IdleWatchdog",
-            )
-            self._watchdog_thread.start()
-            logger.info("idle_watchdog_started___s", timeout=idle_timeout)
+        self._idle_watchdog_task: asyncio.Task | None = None
 
         logger.info("loading__s_with_lora", rank=base_model)
 
@@ -541,15 +531,15 @@ class TrainingWorker:
         )
         logger.debug("saved_session__s_state", step=session_id)
 
-    def _idle_watchdog(self) -> None:
-        """Background thread that monitors for idle timeout.
+    async def _idle_watchdog_async(self) -> None:
+        """Async task that monitors for idle timeout.
 
-        Checks every 30 seconds if the worker has been idle too long.
-        If so, terminates the actor to release GPU resources.
+        Runs on the actor's main asyncio event loop so Ray API calls
+        (ray.actor.exit_actor) have proper thread-local connection state.
         """
         check_interval = 30  # seconds between checks
         while not self._shutdown_requested:
-            time.sleep(check_interval)
+            await asyncio.sleep(check_interval)
             if self._shutdown_requested:
                 break
 
@@ -568,13 +558,20 @@ class TrainingWorker:
                 ray.actor.exit_actor()
                 return
 
-    def heartbeat(self) -> dict:
+    async def heartbeat(self) -> dict:
         """Keep worker alive and return status. Call periodically to prevent idle timeout.
+
+        Also lazily starts the idle watchdog task on the actor's main event loop
+        on first call. This avoids creating a daemon thread in __init__ (which
+        runs in Ray's thread pool without a running event loop).
 
         Returns:
             Dict with idle_time and timeout info.
         """
         self._touch()
+        if self._idle_watchdog_task is None and self._idle_timeout > 0:
+            self._idle_watchdog_task = asyncio.create_task(self._idle_watchdog_async())
+            logger.info("idle_watchdog_started___s", timeout=self._idle_timeout)
         return {
             "idle_timeout": self._idle_timeout,
             "time_until_timeout": max(0, self._idle_timeout - (time.time() - self._last_activity)),

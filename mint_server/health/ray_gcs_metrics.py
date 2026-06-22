@@ -196,8 +196,27 @@ def _collect_ray_gcs_metrics() -> dict[str, Any]:
     import ray
 
     from mint_server.config import RAY_NAMESPACE
+    from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process
 
     timeout_s = _float_env("MINT_RAY_GCS_METRICS_TIMEOUT_S", 2.0)
+    if is_ray_worker_process():
+        return {
+            "status": "unavailable",
+            "up": False,
+            "namespace": RAY_NAMESPACE,
+            "collected_at": _utc_now_iso(),
+            "timeout_s": timeout_s,
+            "candidate_addresses": [],
+            "sources_with_metrics": [],
+            "scrape_error_count": 0,
+            "scrape_errors": [],
+            "sample_count": 0,
+            "samples": [],
+            "aggregates": {},
+            "derived": {},
+            "error": "ray gcs metrics collection skipped in worker context (use /internal/ray_gcs_metrics from driver)",
+        }
+
     if not ray.is_initialized():
         raise RuntimeError("Ray is not initialized")
 

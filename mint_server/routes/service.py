@@ -743,7 +743,10 @@ def _resolve_model_path(
     if not can_system and not model_path.startswith(("mint://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    owner_scope = owner_id if can_system else user_id
+    # When can_system is True but owner_id is not provided (e.g. dev no-auth
+    # mode or SDK clients that don't pass owner_id), fall back to user_id
+    # so checkpoint resolution does not fail with "owner_id is required".
+    owner_scope = owner_id or user_id if can_system else user_id
     try:
         resolved = resolve_checkpoint_uri(model_path, "", user_id=owner_scope, is_admin=can_system)
     except ValueError as e:

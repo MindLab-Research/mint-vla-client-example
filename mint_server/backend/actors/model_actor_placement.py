@@ -1,5 +1,4 @@
 from __future__ import annotations
-from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 
 import structlog
 import time
@@ -288,10 +287,6 @@ def _default_gpu_actor_lister() -> Iterable[dict[str, Any]]:
         if not ray.is_initialized():
             return []
 
-        if _is_ray_worker_process():
-            logger.warning('[model_actor_placement] cluster_state_unavailable_in_worker: skipping GPU actor listing (degraded mode)')
-            return []
-
         namespace = _ray_namespace()
 
         # Use ray.util.list_named_actors instead of ray.nodes()+ray_state.list_actors().
@@ -349,15 +344,10 @@ def _default_placement_group_lister() -> Iterable[dict[str, Any]]:
 
         if not ray.is_initialized():
             return []
-        if _is_ray_worker_process():
-            logger.warning('[model_actor_placement] cluster_state_unavailable_in_worker: skipping placement group listing (degraded mode)')
-            return []
         try:
             table = ray.util.placement_group_table()
         except Exception:
             return []
-        # Do not call ray.nodes() — it triggers auto_init in Ray Client mode.
-        # Node IP is not needed for placement group listing in detached actors.
         node_id_to_ip = {}
     except Exception:
         return []

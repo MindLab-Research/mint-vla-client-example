@@ -173,16 +173,85 @@ unset MINT_RAY_HEAD_ADDRESS_PATH || true
 unset RAY_ADDRESS || true
 export MINT_TMP_ROOT="${MINT_TMP_ROOT:-/vePFS-Mindverse/share/mint/dev/tmp}"
 
-# Dev defaults for optional services. Set to "postgres" only when a billing
-# database is available; "disabled" avoids the startup health-check dependency.
+# ---------------------------------------------------------------------------
+# Dev deployment defaults
+#
+# These values were previously in /vePFS-Mindverse/share/mint/dev/config/common.env.
+# They are now baked into the launcher so that a bare `start_dev_server.sh`
+# (without MINT_DEV_DEPLOYMENT_ENV) still gets sensible dev defaults.
+#
+# Secrets (OTLP API keys, etc.) should be placed in a secrets.env file and
+# loaded via MINT_DEV_DEPLOYMENT_ENV=/path/to/secrets.env.
+# ---------------------------------------------------------------------------
+
+# Auth mode.
+export MINT_AUTH_MODE="${MINT_AUTH_MODE:-no-auth}"
+
+# Vendored deps used by some backends.
+export MINT_BUMBLEBEE_REPO_PATH="${MINT_BUMBLEBEE_REPO_PATH:-/vePFS-Mindverse/share/mint/dev/vendor/bumblebee}"
+export MINT_ACTOR_EXTRA_PYTHONPATH="${MINT_ACTOR_EXTRA_PYTHONPATH:-/vePFS-Mindverse/share/mint/dev/vendor/flash-attn-current}"
+
+# MoE LoRA export policy.
+export MINT_MOE_LORA_SHARED_EXPERT_EXPORT="${MINT_MOE_LORA_SHARED_EXPERT_EXPORT:-0}"
+export MINT_MOE_LORA_SPARSE_EXPERT_EXPORT="${MINT_MOE_LORA_SPARSE_EXPERT_EXPORT:-1}"
+
+# Model advertisement + persistence/prewarm policy.
+export MINT_SUPPORTED_MODELS="${MINT_SUPPORTED_MODELS:-Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507}"
+export MINT_PERSISTENT_MODELS="${MINT_PERSISTENT_MODELS:-Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-4B-Thinking-2507,Qwen/Qwen3-30B-A3B-Instruct-2507}"
+export MINT_PERSISTENT_PREWARM_INFERENCE="${MINT_PERSISTENT_PREWARM_INFERENCE:-1}"
+export MINT_PERSISTENT_PREWARM_TRAINING="${MINT_PERSISTENT_PREWARM_TRAINING:-1}"
+export MINT_PERSISTENT_TRAIN_LORA_RANK="${MINT_PERSISTENT_TRAIN_LORA_RANK:-64}"
+export MINT_PERSISTENT_TRAIN_LR="${MINT_PERSISTENT_TRAIN_LR:-5e-5}"
+export MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S="${MINT_PERSISTENT_MEGATRON_READY_TIMEOUT_S:-3600}"
+export MINT_SAVE_LORA_TIMEOUT_S="${MINT_SAVE_LORA_TIMEOUT_S:-1800}"
+export MINT_SCHEDULER_ENABLE="${MINT_SCHEDULER_ENABLE:-1}"
+
+# vLLM serving flags.
+export MINT_ROUTER_REPLAY_MODE="${MINT_ROUTER_REPLAY_MODE:-disabled}"
+export MINT_VLLM_ENABLE_CHUNKED_PREFILL="${MINT_VLLM_ENABLE_CHUNKED_PREFILL:-1}"
+export MINT_VLLM_ENABLE_PREFIX_CACHING="${MINT_VLLM_ENABLE_PREFIX_CACHING:-1}"
+export MINT_VLLM_FULLY_SHARDED_LORAS="${MINT_VLLM_FULLY_SHARDED_LORAS:-1}"
+export MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE="${MINT_VLLM_WORKER_LORA_LOAD_TO_DEVICE:-0}"
+export MINT_VLLM_ADMISSION_CONTROL="${MINT_VLLM_ADMISSION_CONTROL:-1}"
+
+# Logging + observability.
+export MINT_LOG_MAX_BYTES="${MINT_LOG_MAX_BYTES:-10485760}"
+export MINT_LOG_BACKUP_COUNT="${MINT_LOG_BACKUP_COUNT:-5}"
+export OTEL_SERVICE_NAME="${OTEL_SERVICE_NAME:-mint}"
+export OTEL_EXPORTER_OTLP_ENDPOINT="${OTEL_EXPORTER_OTLP_ENDPOINT:-otel.macaron.xin:4317}"
+export OTEL_EXPORTER_OTLP_INSECURE="${OTEL_EXPORTER_OTLP_INSECURE:-false}"
+export OTEL_METRIC_EXPORT_INTERVAL_MS="${OTEL_METRIC_EXPORT_INTERVAL_MS:-10000}"
+export OTEL_LOG_LEVEL="${OTEL_LOG_LEVEL:-DEBUG}"
+export MINT_HEALTHZ_RAY_TIMEOUT_S="${MINT_HEALTHZ_RAY_TIMEOUT_S:-30.0}"
+export MINT_VLLM_REQUEST_TIMING="${MINT_VLLM_REQUEST_TIMING:-1}"
+export MINT_TIMING_DIAG="${MINT_TIMING_DIAG:-1}"
+export MINT_VERL_DIAGNOSTICS="${MINT_VERL_DIAGNOSTICS:-1}"
+export MINT_LOG_KILL_STACK="${MINT_LOG_KILL_STACK:-1}"
+
+# Resource queues for GPU worker submission.
+export MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID="${MINT_MEGATRON_VOLC_RESOURCE_QUEUE_ID:-q-20251126180002-26lwz}"
+export MINT_VLLM_VOLC_RESOURCE_QUEUE_ID="${MINT_VLLM_VOLC_RESOURCE_QUEUE_ID:-q-20251126180002-26lwz}"
+
+# Data + scratch.
+export MINT_CHECKPOINT_DIR="${MINT_CHECKPOINT_DIR:-/tos-mindverse/tinker_checkpoints}"
+export MINT_RUNTIME_CHECKPOINT_DIR="${MINT_RUNTIME_CHECKPOINT_DIR:-/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints}"
+export MINT_TASK_PAYLOAD_ROOT_DIR="${MINT_TASK_PAYLOAD_ROOT_DIR:-/vePFS-Mindverse/share/mint/dev/data/task-state/payloads}"
+
+export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY="${MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY:-1024}"
+
+# Dev defaults for optional services.
 export MINT_USAGE_BACKEND="${MINT_USAGE_BACKEND:-disabled}"
 
-# Models the supervisor should pre-create workers for (comma-separated).
-# Empty by default; set via deployment env or explicit override for the
-# models you want to test.
-export MINT_SUPPORTED_MODELS="${MINT_SUPPORTED_MODELS:-}"
-
+# Load optional secrets env (OTLP API keys, etc.) and per-run overrides.
+# Default: /vePFS-Mindverse/share/mint/dev/config/secrets.env if it exists.
+# Override with MINT_DEV_DEPLOYMENT_ENV=/path/to/secrets.env.
 deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
+if [ -z "${deployment_env}" ]; then
+  _default_secrets="/vePFS-Mindverse/share/mint/dev/config/secrets.env"
+  if [ -r "${_default_secrets}" ]; then
+    deployment_env="${_default_secrets}"
+  fi
+fi
 source_env_file "MINT_DEV_DEPLOYMENT_ENV" "${deployment_env}"
 
 run_env="${MINT_DEV_RUN_ENV:-}"

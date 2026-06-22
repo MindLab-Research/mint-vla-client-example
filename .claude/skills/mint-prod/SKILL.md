@@ -229,3 +229,8 @@ credential files, signed requests, or process environments.
 - Do not run local `ray` or `volc` commands. Use the environment host or the
   appropriate cluster skill.
 - Do not restart Ray or worker nodes to fix an API process problem.
+- **NEVER use `rsync --delete` to sync runtime assets to `/vePFS-Mindverse/share/mint/runtime/`.**
+  The PFS runtime directory contains pre-built binaries (runsvdir, sshd) and
+  config files that are NOT in the git repo. `rsync --delete` silently removes
+  them, breaking node bootstrap. Use `rsync` without `--delete`, or copy
+  individual files explicitly.

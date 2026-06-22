@@ -220,9 +220,6 @@ def _available_resources_per_node_with_pg_fallback(
     *,
     context: str,
 ) -> tuple[dict[str, dict[str, float]], bool]:
-    if _is_ray_worker_process():
-        logger.warning("[node_placement] cluster_state_unavailable_in_worker: skipping available resources (degraded mode)")
-        return {}, False
     try:
         from ray._private import state as ray_state
 
@@ -341,10 +338,6 @@ def _available_gpus_for_node(
 def _list_alive_gpu_nodes() -> list[GpuNode]:
     if not ray.is_initialized():
         raise RuntimeError("ray is not initialized (expected to be connected already)")
-
-    if _is_ray_worker_process():
-        logger.warning("[node_placement] cluster_state_unavailable_in_worker: skipping GPU node listing (degraded mode)")
-        return []
 
     avail, fail_closed_on_missing = _available_resources_per_node_with_pg_fallback(
         context="_list_alive_gpu_nodes",
@@ -683,11 +676,33 @@ def resolve_worker_gpu_slices_to_placement(
     for node in alive_nodes:
         nodes_by_ip[node.node_ip] = node
 
+    # In worker context, _list_alive_gpu_nodes() returns [] because
+    # ray.nodes() is guarded. The driver has already validated these IPs
+    # during reconcile. Trust the configured placement and skip alive check.
+    worker_context = _is_ray_worker_process()
+
     slices: list[ModelGpuSlice] = []
     for replica, worker_idx, gpu_count, node_ip in normalized_slices:
         assert node_ip is not None
         node = nodes_by_ip.get(node_ip)
         if node is None:
+            if worker_context:
+                # Trust the configured node_ip without Ray cluster-state validation.
+                logger.info(
+                    "[node_placement] worker_context_trusting_configured_ip=%s context=%s",
+                    node_ip,
+                    context,
+                )
+                slices.append(
+                    ModelGpuSlice(
+                        replica=replica,
+                        worker_index=-1,
+                        gpu_count=int(gpu_count),
+                        node_ip=node_ip,
+                        hostname="",
+                    )
+                )
+                continue
             raise RuntimeError(
                 f"{context}: pinned node_ip={node_ip} is not an alive Ray GPU node; "
                 f"alive_node_ips={sorted(nodes_by_ip)}"

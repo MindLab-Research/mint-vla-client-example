@@ -185,10 +185,31 @@ def _collect_ray_cluster_health() -> dict[str, Any]:
     import ray
 
     from mint_server.config import RAY_NAMESPACE
+    from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process
 
     max_pending_pg_names = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_PENDING_PG_NAMES", 20)
     max_dead_node_sample = _int_env("MINT_RAY_CLUSTER_HEALTH_MAX_DEAD_NODE_SAMPLE", 10)
     slow_probe_ms = _float_env("MINT_RAY_CLUSTER_HEALTH_SLOW_PROBE_MS", 2000.0)
+
+    if is_ray_worker_process():
+        return {
+            "status": "unavailable",
+            "up": False,
+            "namespace": RAY_NAMESPACE,
+            "collected_at": _utc_now_iso(),
+            "probes": {},
+            "warnings": ["worker_context_skipped"],
+            "warning_count": 1,
+            "probe_error_count": 0,
+            "slow_probe_count": 0,
+            "slow_probe_threshold_ms": slow_probe_ms,
+            "nodes": {},
+            "resources": {},
+            "placement_groups": {},
+            "named_actors": {},
+            "error": "ray cluster health collection skipped in worker context (use /internal/ray_cluster_health from driver)",
+            "total_probe_latency_ms": 0.0,
+        }
 
     if not ray.is_initialized():
         raise RuntimeError("Ray is not initialized")

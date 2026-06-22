@@ -642,13 +642,16 @@ def _deterministic_checkpoint_candidates(
     path_part: str,
 ) -> list[str]:
     candidates: list[str] = []
+    # Always include "anonymous" as a fallback owner_dir, because dense
+    # trainer actors save checkpoints without a user_id (owner_dir="anonymous"),
+    # while API requests resolve with the HTTP user_id. This ensures the
+    # resolver can find checkpoints saved by actors regardless of the
+    # request's user context.
+    owner_dirs = [owner_dir, "anonymous"] if owner_dir != "anonymous" else ["anonymous"]
     for root in roots:
-        candidates.extend(
-            [
-                os.path.join(root, owner_dir, path_part),
-                os.path.join(root, path_part),
-            ]
-        )
+        for od in owner_dirs:
+            candidates.append(os.path.join(root, od, path_part))
+        candidates.append(os.path.join(root, path_part))
     out: list[str] = []
     seen: set[str] = set()
     for candidate in candidates:
@@ -681,17 +684,19 @@ def resolve_checkpoint_id(
 
 def _checkpoint_type_from_uri_path(path_part: str) -> CheckpointType | None:
     parts = path_part.split("/")
-    if len(parts) >= 3 and parts[1] == "weights":
-        return "training"
-    if len(parts) >= 3 and parts[1] == "sampler_weights":
-        return "sampler"
+    for i, part in enumerate(parts):
+        if part == "weights" and 0 < i < len(parts) - 1:
+            return "training"
+        if part == "sampler_weights" and 0 < i < len(parts) - 1:
+            return "sampler"
     return None
 
 
 def _strip_checkpoint_kind(path_part: str) -> str:
     parts = path_part.split("/")
-    if len(parts) >= 3 and parts[1] in ("weights", "sampler_weights"):
-        return "/".join([parts[0], *parts[2:]])
+    for i, part in enumerate(parts):
+        if part in ("weights", "sampler_weights") and 0 < i < len(parts) - 1:
+            return "/".join(parts[:i] + parts[i + 1 :])
     return path_part
 
 

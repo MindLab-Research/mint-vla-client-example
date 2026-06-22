@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import structlog
-from mint_server.backend.ray_cluster.ray_worker_check import is_ray_worker_process as _is_ray_worker_process
 import time
 
 import os
@@ -136,19 +135,20 @@ def _adopt_surviving_gpu_actors_enabled() -> bool:
 def _reconcile_loop_enabled() -> bool:
     """Whether the periodic reconcile loop should run.
 
-    Defaults to **disabled** to avoid the head-node memory explosion
-    documented in issue #753.  The supervisor actor is still created and
-    provides actor registration, inventory management, and snapshot — only
-    the periodic reconcile loop (which calls Ray cluster-state APIs and
-    creates NodeMetricsCollectorActor on every node) is skipped.
+    Defaults to **enabled**. The zombie GCS root cause that originally
+    required disabling the loop (issue #753) has been fixed: cluster
+    metrics collection was moved from NodeMetricsCollectorActor to the
+    driver process, and all Ray API calls now run on the actor's main
+    asyncio event loop instead of daemon threads.
 
-    Set ``MINT_SUPERVISOR_RECONCILE_LOOP=1`` to re-enable the loop.
+    Set ``MINT_SUPERVISOR_RECONCILE_LOOP=0`` to disable the loop
+    (e.g. for debugging or when running on a very large shared cluster).
     """
     raw = str(os.environ.get("MINT_SUPERVISOR_RECONCILE_LOOP") or "").strip().lower()
-    # Default: disabled. Only enable when explicitly requested.
+    # Default: enabled. Only disable when explicitly requested.
     if not raw:
-        return False
-    return raw in {"1", "true", "yes", "on"}
+        return True
+    return raw not in {"0", "false", "no", "off"}
 
 
 def _otel_metric_attrs() -> dict[str, str]:
@@ -938,9 +938,6 @@ def _is_ray_get_timeout_error(exc: BaseException) -> bool:
 
 def _observed_free_gpus_by_node() -> dict[str, int]:
     try:
-        if _is_ray_worker_process():
-            logger.warning("[supervisor] cluster_state_unavailable_in_worker: skipping placement group table (degraded mode)")
-            return {}
         from mint_server.backend.actors.node_placement import _list_alive_gpu_nodes
 
         return {
@@ -957,9 +954,6 @@ def _placement_group_table() -> dict[str, Any]:
     try:
         import ray
 
-        if _is_ray_worker_process():
-            logger.warning("[supervisor] cluster_state_unavailable_in_worker: skipping placement group table (degraded mode)")
-            return {}
         table = ray.util.placement_group_table()
         return table if isinstance(table, dict) else {}
     except Exception:
@@ -2746,7 +2740,7 @@ class ModelActorSupervisorCore:
             # surviving actors are registered in the inventory even without
             # the periodic loop.
             if _adopt_surviving_gpu_actors_enabled():
-                await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+                await self._adopt_surviving_gpu_actors_async()
             return self.snapshot()
 
         if self._reconcile_task is not None and not self._reconcile_task.done():
@@ -2765,13 +2759,20 @@ class ModelActorSupervisorCore:
             # startup adoption opt-in and leave the explicit method available
             # for controlled restart flows.
             if _adopt_surviving_gpu_actors_enabled():
-                await asyncio.to_thread(self._adopt_surviving_gpu_actors)
+                await self._adopt_surviving_gpu_actors_async()
             self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         finally:
             self._reconcile_loop_starting = False
         return self.snapshot()
 
-    def _adopt_surviving_gpu_actors(self) -> None:
+    async def _adopt_surviving_gpu_actors_async(self) -> None:
+        """Async wrapper for _adopt_surviving_gpu_actors.
+
+        Runs on the actor's main asyncio event loop so that Ray API calls
+        inside _default_gpu_actor_lister() (ray.util.list_named_actors)
+        have proper thread-local connection state.
+        """
+        self._adopt_surviving_gpu_actors()
         """Re-register still-alive mint GPU actors into inventory after a restart.
 
         On supervisor control-plane restart the in-memory inventory is empty.

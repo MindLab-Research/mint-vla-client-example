@@ -1101,7 +1101,10 @@ async def test_issue_593_supervisor_reconciles_control_plane_dependencies() -> N
 
 
 @pytest.mark.anyio
-async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
+async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reconcile loop is enabled by default (PR #756 fixed the zombie GCS root cause).
+    When enabled, ensure_reconcile_loop_started should start a background task."""
+    monkeypatch.delenv("MINT_SUPERVISOR_RECONCILE_LOOP", raising=False)
     calls: list[str] = []
 
     async def _ensure_dependency() -> dict:
@@ -1120,14 +1123,12 @@ async def test_issue_593_supervisor_bootstrap_starts_reconcile_loop() -> None:
         reconcile_interval_s=3600.0,
     )
 
-    # Reconcile loop is disabled by default (issue #753).
-    # When disabled, ensure_reconcile_loop_started should return snapshot
-    # with reconcile_loop_running=False and NOT start a background task.
+    # Reconcile loop is enabled by default (PR #756).
+    # When enabled, ensure_reconcile_loop_started should start a background task.
     out = await supervisor.ensure_reconcile_loop_started()
     try:
-        assert calls == []
-        assert out["reconcile_loop_running"] is False
-        assert supervisor._reconcile_task is None
+        assert out["reconcile_loop_running"] is True
+        assert supervisor._reconcile_task is not None
     finally:
         task = supervisor._reconcile_task
         if task is not None:

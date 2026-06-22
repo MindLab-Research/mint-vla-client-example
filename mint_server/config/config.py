@@ -302,6 +302,16 @@ def actor_runtime_env_vars(
         "PFS_RUNTIME_ENV_ROOT": PFS_RUNTIME_ENV_ROOT,
         "MINT_CODE_ROOT": MINT_CODE_ROOT,
         "PFS_HF_MODULES_PATH": PFS_HF_MODULES_PATH,
+        # Prevent Ray's @wrap_auto_init from spawning zombie GCS processes in
+        # worker/actor contexts. See ray._private.auto_init_hook: when
+        # ray.is_initialized() returns False (e.g. in daemon-thread sampling
+        # loops), auto_init calls ray.init() locally, creating a new GCS server
+        # + Dashboard on every iteration. Setting RAY_ENABLE_AUTO_CONNECT=0
+        # makes cluster-state APIs (ray.nodes(), ray.cluster_resources(), etc.)
+        # raise instead of auto-initializing — fail fast, no zombie processes.
+        # Layer 1: node bootstrap templates (volcano-cluster configs/*.yaml).
+        # Layer 2: here, so all actor runtime_env inherits it.
+        "RAY_ENABLE_AUTO_CONNECT": "0",
     }
     if direct_ray_address is not None:
         out["MINT_RAY_GCS_ADDRESS"] = direct_ray_address
@@ -319,6 +329,7 @@ def actor_runtime_env_vars(
         "MINT_RAY_HEAD_ADDRESS_PATH",
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_CONTROL_PLANE_NODE_IP",
+        "MINT_PORT",
         "MINT_RAY_TEMP_DIR",
         "MINT_RAY_JOB_WORKING_DIR",
         "MINT_RAY_WORKING_DIR",
@@ -328,6 +339,13 @@ def actor_runtime_env_vars(
         "MINT_SUPPORTED_MODELS",
         "MINT_TASK_STATE_STORE_DB_PATH",
         "MINT_FUTURE_STATE_STORE_DB_PATH",
+        "MINT_MODEL_PLACEMENT_JSON",
+        "MINT_VLLM_MODEL_PLACEMENT_JSON",
+        "MINT_DENSE_MODEL_PLACEMENT_JSON",
+        "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
+        "MINT_MODEL_CONFIG_OVERRIDES_JSON",
+        "MINT_CHECKPOINT_DIR",
+        "MINT_RUNTIME_CHECKPOINT_DIR",
     ):
         if not include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
             continue

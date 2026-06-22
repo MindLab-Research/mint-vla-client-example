@@ -2665,6 +2665,12 @@ async def async_get_or_create_bumblebee_worker_group(
     traceparent: str | None = None,
     request_id: str | None = None,
 ) -> ray.actor.ActorHandle:
+    """Async version of get_or_create_bumblebee_worker_group.
+
+    Safety note: Called from VerlTrainingEngine in the API driver process.
+    DO NOT call from inside a Ray actor — to_thread workers in actor processes
+    do not inherit Ray thread-local connection state.
+    """
     return await asyncio.to_thread(
         get_or_create_bumblebee_worker_group,
         base_model,
