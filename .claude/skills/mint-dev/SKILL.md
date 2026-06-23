@@ -35,10 +35,10 @@ tinker-cookbook ──HTTP──> mint-server API ──Ray──>   GCS + rayle
 | Driver node | `mint-dev` (SSH alias) |
 | Ray head | Volcano pod (`mint-dev-head`), managed by volcano-cluster skill |
 | Head IP | `cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` |
-| Connection mode | Direct attach (`ray.init(address="auto")`) |
+| Connection mode | Direct attach via `MINT_RAY_GCS_ADDRESS=<head>:6379` |
 | API port | Derived from namespace hash (`[30000, 40000)`); override with `MINT_PORT` |
 | Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
-| Ray namespace | `mint_<user>_dev` (per-user) |
+| Ray namespace | `mint_<user>` by default; override with a per-user scoped namespace |
 | Auth mode | `no-auth` by default |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log` |
 
@@ -57,16 +57,20 @@ runtime depend on. Only sync your code, not the entire directory tree.
 `MINT_CODE_ROOT` must be under `/vePFS-Mindverse/share/` and visible to all
 Ray nodes. Do not use local paths or `/vePFS-Mindverse/user/...`.
 
-### 2. Generate placement config
+### 2. Placement config
 
-Worker IPs change when the cluster is recreated. Generate a run env file:
+Worker IPs change when the cluster is recreated. Do not hand-edit placement
+for normal dev startup: `scripts/start_dev_server.sh` auto-generates a
+run-local placement env from the current Ray dashboard when no placement env
+vars are already set.
+
+Manual placement remains an override for special debugging:
 
 ```bash
 HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
 python scripts/tools/gen_dev_placement.py --head-ip $HEAD_IP \
   --model Qwen/Qwen3-0.6B --gpu-count 1 \
-  --output /tmp/mint_dev_run.env
-scp /tmp/mint_dev_run.env mint-dev:/tmp/mint_dev_run.env
+  --output /vePFS-Mindverse/share/mint/dev/tmp/mint_dev_run.env
 ```
 
 ### 3. Start dev server
@@ -74,19 +78,18 @@ scp /tmp/mint_dev_run.env mint-dev:/tmp/mint_dev_run.env
 ```bash
 ssh mint-dev 'MINT_CODE_ROOT=/vePFS-Mindverse/share/code/<you>/<branch> \
   MINT_DEV_USER=<you> \
-  MINT_RAY_NAMESPACE=mint_<you>_dev \
   MINT_LOG_FILE=/vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log \
   MINT_DISABLE_MINT_ROUTE=1 \
   MINT_UVICORN_WORKERS=1 \
   MINT_SUPERVISOR_STATE_BACKEND=memory \
-  MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env \
   nohup /vePFS-Mindverse/share/code/<you>/<branch>/scripts/start_dev_server.sh \
   >> /tmp/mint_dev_launch.log 2>&1 &'
 ```
 
 The launcher auto-loads deployment defaults (model lists, vLLM flags, OTel
-endpoint, logging) and `secrets.env` (OTLP API keys). Port is derived from
-the namespace; override with `MINT_PORT=8000` if needed.
+endpoint, logging), derives the port from the namespace, and auto-generates
+placement if needed. Override with `MINT_PORT=8000` or
+`MINT_DEV_RUN_ENV=<path>` if needed.
 
 The reconcile loop is **enabled by default** — the supervisor will
 automatically create runtime/training/vLLM replicas. To disable for
@@ -119,21 +122,24 @@ ssh -f -N -L 8000:localhost:8000 mint-dev
 | Variable | Value | Why |
 |----------|-------|-----|
 | `MINT_SUPERVISOR_STATE_BACKEND` | `memory` | Avoids RocksDB lock conflicts from stale actors |
-| `MINT_DEV_RUN_ENV` | `/tmp/mint_dev_run.env` | Per-run placement config (IPs change when cluster recreated) |
+| `MINT_DEV_RUN_ENV` | optional | Per-run overrides; if it sets placement vars, auto placement is skipped |
 | `MINT_UVICORN_WORKERS` | `1` | Single worker for dev |
 
 ### Auto-loaded config
 
 The launcher (`start_dev_server.sh`) automatically loads:
 - **Deployment defaults**: model lists, vLLM flags, OTel endpoint, logging, resource queues
-- **secrets.env**: `/vePFS-Mindverse/share/mint/dev/config/secrets.env` (OTLP API keys)
-- **`RAY_ENABLE_AUTO_CONNECT=0`**: Prevents zombie GCS processes in worker actors
+- **Optional deployment env**: only when `MINT_DEV_DEPLOYMENT_ENV=<path>` is set explicitly
+- **Auto placement env**: generated under `MINT_TMP_ROOT/auto-placement/` unless placement vars already exist
 
 ### Placement config
 
-See `scripts/tools/gen_dev_placement.py` — generates a run env file with
-placement JSON from the current cluster's Ray dashboard. Run it whenever
-the cluster is recreated.
+See `scripts/tools/gen_dev_placement.py` — it generates placement JSON from
+the current cluster's Ray dashboard. The launcher runs it automatically when
+no placement env var is set. To force manual placement, set one of
+`MINT_MODEL_PLACEMENT_JSON`, `MINT_DENSE_MODEL_PLACEMENT_JSON`,
+`MINT_VLLM_MODEL_PLACEMENT_JSON`, or `MINT_MEGATRON_MODEL_PLACEMENT_JSON`
+directly or through `MINT_DEV_RUN_ENV`.
 
 ### `MINT_DISABLE_MINT_ROUTE`
 
@@ -157,10 +163,10 @@ ssh mint-dev 'PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/
 HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
 $PY -c "
 import ray
-ray.init(address=\"$HEAD_IP:6379\", namespace=\"mint_<you>_dev\", ignore_reinit_error=True, log_to_driver=False)
+ray.init(address=\"$HEAD_IP:6379\", namespace=\"mint_<you>\", ignore_reinit_error=True, log_to_driver=False)
 for name in [\"mint_config\", \"mint_task_state_store\", \"mint_model_work_scheduler\", \"mint_maintenance_cron\", \"mint_model_actor_supervisor\"]:
     try:
-        a = ray.get_actor(name, namespace=\"mint_<you>_dev\")
+        a = ray.get_actor(name, namespace=\"mint_<you>\")
         ray.kill(a, no_restart=True)
         print(f\"killed {name}\")
     except Exception:
@@ -224,7 +230,6 @@ MINT_PORT=10416 \
 MINT_LOG_FILE=/tmp/mint_server_issue_<n>.log \
 MINT_UVICORN_WORKERS=1 \
 MINT_SUPERVISOR_STATE_BACKEND=memory \
-MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env \
 scripts/start_dev_server.sh
 ```
 
@@ -236,7 +241,7 @@ This is a required closeout step, not optional.
 ```bash
 ssh mint-dev 'PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
 HEAD_IP=$(cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt)
-NS=mint_<you>_dev
+NS=mint_<you>
 $PY -c "
 import ray
 ray.init(address=\"$HEAD_IP:6379\", namespace=\"$NS\", ignore_reinit_error=True, log_to_driver=False)
@@ -290,7 +295,7 @@ for cluster lifecycle (create/teardown workers, list jobs, inspect instances).
 - Do not switch ports to hide a failed restart; fix the listener or process.
 - Do not default `MINT_CODE_ROOT` to the shared dev checkout. It is a required,
   explicit input; ask the user which checkout to run.
-- Do not invent a Ray namespace. Derive `mint_<user>_dev`; if that resolves to
+- Do not invent a Ray namespace. Derive `mint_<user>`; if that resolves to
   root, ask the user for `MINT_DEV_USER` or `MINT_RAY_NAMESPACE`.
 - Do not install packages until the runtime root (`PFS_RUNTIME_ENV_ROOT`) and
   the resolved `PYTHONPATH` have been verified.

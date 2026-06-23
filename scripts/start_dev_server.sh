@@ -37,7 +37,17 @@ set -eu
 #   MINT_DEV_RUN_ENV          per-run overrides (port, run-local task DB,
 #                             placement, debug knobs). Same identity keys are
 #                             rejected; set them in the launching shell or
-#                             packet-owned launch env.
+#                             packet-owned launch env. If this does not set
+#                             placement env vars, the launcher auto-generates
+#                             placement from the current Ray dashboard.
+#   MINT_DEV_AUTO_PLACEMENT   set to 0 to disable auto placement generation.
+#   MINT_DEV_AUTO_PLACEMENT_ENV
+#                             generated placement env path; defaults under
+#                             MINT_TMP_ROOT/auto-placement/.
+#   MINT_DEV_AUTO_PLACEMENT_GPU_COUNT
+#                             fallback GPUs per model for auto placement.
+#   MINT_DEV_AUTO_PLACEMENT_GPU_COUNTS_JSON
+#                             optional JSON mapping model names to GPU counts.
 #   MINT_DEV_GC_OLD_ACTORS    set to 1 to run scripts/tools/dev_ray_cleanup.py
 #                             gc-stale-actors before bootstrap.
 #   MINT_DEV_STOP_EXISTING_PORT_SERVER
@@ -51,9 +61,9 @@ set -eu
 #   MINT_DEV_BOOTSTRAP_TIMEOUT_S
 #                             per-step timeout for bootstrap_control_plane.py.
 #                             Defaults to 180s because first detached actor
-#                             startup can be slow on a busy shared Ray Client.
+#                             startup can be slow on a busy shared Ray cluster.
 #   MINT_DEV_RESET_SKIP_RAY_WHEN_NO_ALIVE
-#                             when set, force reset may skip Ray Client cleanup
+#                             when set, force reset may skip Ray cleanup
 #                             after the dashboard shows no ALIVE actors or
 #                             active reset placement groups in this namespace.
 #   MINT_DEV_TOPOLOGY_SOURCE_DIR
@@ -86,6 +96,13 @@ source_env_file() {
   . "${env_file}"
   set +a
   export MINT_CODE_ROOT MINT_RAY_NAMESPACE PFS_RUNTIME_ENV_ROOT
+}
+
+has_explicit_placement_env() {
+  [ -n "${MINT_MODEL_PLACEMENT_JSON:-}" ] \
+    || [ -n "${MINT_DENSE_MODEL_PLACEMENT_JSON:-}" ] \
+    || [ -n "${MINT_VLLM_MODEL_PLACEMENT_JSON:-}" ] \
+    || [ -n "${MINT_MEGATRON_MODEL_PLACEMENT_JSON:-}" ]
 }
 
 if [ -z "${MINT_CODE_ROOT:-}" ]; then
@@ -160,14 +177,13 @@ export MINT_PORT
 export PFS_RUNTIME_ENV_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/share/mint/dev/runtime}"
 export PFS_HF_MODULES_PATH="${PFS_HF_MODULES_PATH:-/vePFS-Mindverse/share/huggingface/modules}"
 # Do NOT set MINT_RAY_JOB_WORKING_DIR. Even PFS paths cause Ray to package and
-# upload the directory (~100-240 MB) over the Ray Client connection.
+# upload the directory (~100-240 MB) through the Ray job/runtime-env path.
 # Workers find mint_server via PFS_PYTHONPATH (built from MINT_CODE_ROOT) which
 # is passed as env_vars to every actor's runtime_env.
-# Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH or RAY_ADDRESS. The driver
-# must attach as a Ray client (ray://...:10001), and Ray worker bootstrap treats
-# inherited RAY_ADDRESS as an instruction to nested direct-attach before user
-# runtime_env can blank it. Mint code that needs the direct GCS address reads the
-# explicit MINT_RAY_GCS_ADDRESS value instead.
+# Local only: do NOT export MINT_RAY_HEAD_ADDRESS_PATH or RAY_ADDRESS. The
+# driver gets the direct GCS address through MINT_RAY_GCS_ADDRESS, and Ray
+# worker bootstrap treats inherited RAY_ADDRESS as an instruction to nested
+# direct-attach before user runtime_env can blank it.
 ray_head_ip_path="${MINT_RAY_HEAD_ADDRESS_PATH:-/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt}"
 unset MINT_RAY_HEAD_ADDRESS_PATH || true
 unset RAY_ADDRESS || true
@@ -242,16 +258,9 @@ export MINT_API_WORK_QUEUE_ACTOR_MAX_CONCURRENCY="${MINT_API_WORK_QUEUE_ACTOR_MA
 # Dev defaults for optional services.
 export MINT_USAGE_BACKEND="${MINT_USAGE_BACKEND:-disabled}"
 
-# Load optional secrets env (OTLP API keys, etc.) and per-run overrides.
-# Default: /vePFS-Mindverse/share/mint/dev/config/secrets.env if it exists.
-# Override with MINT_DEV_DEPLOYMENT_ENV=/path/to/secrets.env.
+# Load optional deployment env (OTLP API keys, etc.) and per-run overrides.
+# Set MINT_DEV_DEPLOYMENT_ENV=/path/to/env explicitly when needed.
 deployment_env="${MINT_DEV_DEPLOYMENT_ENV:-}"
-if [ -z "${deployment_env}" ]; then
-  _default_secrets="/vePFS-Mindverse/share/mint/dev/config/secrets.env"
-  if [ -r "${_default_secrets}" ]; then
-    deployment_env="${_default_secrets}"
-  fi
-fi
 source_env_file "MINT_DEV_DEPLOYMENT_ENV" "${deployment_env}"
 
 run_env="${MINT_DEV_RUN_ENV:-}"
@@ -302,23 +311,15 @@ ray_head_ip=""
 if [ -r "${ray_head_ip_path}" ]; then
   ray_head_ip=$(tr -d '[:space:]' < "${ray_head_ip_path}")
 fi
-# Connection mode: Ray Client (ray://) or direct attach (GCS address).
-# Default: direct attach via MINT_RAY_GCS_ADDRESS — no Ray Client proxy.
-# Set MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 to force Ray Client mode.
+# Connection mode: direct attach only (GCS address).
 if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ] && [ -n "${ray_head_ip}" ]; then
   export MINT_RAY_GCS_ADDRESS="${ray_head_ip}:6379"
 fi
-if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -z "${RAY_CLIENT_ADDRESS:-}" ]; then
-  # Direct attach mode: do NOT set RAY_CLIENT_ADDRESS.
-  # ray.init(address=MINT_RAY_GCS_ADDRESS) connects directly to GCS.
-  unset RAY_CLIENT_ADDRESS 2>/dev/null || true
-elif [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -n "${RAY_CLIENT_ADDRESS:-}" ]; then
-  export MINT_RAY_CLIENT_ADDRESS="${RAY_CLIENT_ADDRESS}"
-fi
-if [ -z "${MINT_RAY_CLIENT_ADDRESS:-}" ] && [ -z "${MINT_RAY_GCS_ADDRESS:-}" ]; then
+unset RAY_CLIENT_ADDRESS 2>/dev/null || true
+unset MINT_RAY_CLIENT_ADDRESS 2>/dev/null || true
+if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ]; then
   echo "error: no Ray head address. Expected an IP in ${ray_head_ip_path}" >&2
-  echo "       or set MINT_RAY_GCS_ADDRESS=<head>:6379 for direct attach," >&2
-  echo "       or MINT_RAY_CLIENT_ADDRESS=ray://<head>:10001 for Ray Client." >&2
+  echo "       or set MINT_RAY_GCS_ADDRESS=<head>:6379 for direct attach." >&2
   exit 1
 fi
 
@@ -336,6 +337,31 @@ fi
 # another checkout bypasses this repo's Ray bootstrap sanitization.
 export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"
 
+auto_placement_env="${MINT_DEV_AUTO_PLACEMENT_ENV:-}"
+if [ "${MINT_DEV_AUTO_PLACEMENT:-1}" != "0" ] && ! has_explicit_placement_env; then
+  if [ -z "${ray_head_ip}" ]; then
+    echo "error: cannot auto-generate placement; no Ray head IP in ${ray_head_ip_path}" >&2
+    echo "       Set explicit placement env vars or MINT_DEV_AUTO_PLACEMENT=0 to bypass." >&2
+    exit 1
+  fi
+  if [ -z "${auto_placement_env}" ]; then
+    auto_placement_safe_ns=$(printf '%s' "${MINT_RAY_NAMESPACE}" | sed 's#[^A-Za-z0-9_.-]#_#g')
+    auto_placement_env="${MINT_TMP_ROOT}/auto-placement/${auto_placement_safe_ns}.env"
+  fi
+  echo "auto-generating Mint dev placement from Ray head ${ray_head_ip}" >&2
+  "${py}" scripts/tools/gen_dev_placement.py \
+    --head-ip "${ray_head_ip}" \
+    --models-from-env \
+    --gpu-count "${MINT_DEV_AUTO_PLACEMENT_GPU_COUNT:-1}" \
+    --output "${auto_placement_env}" \
+    --force
+  source_env_file "MINT_DEV_AUTO_PLACEMENT_ENV" "${auto_placement_env}"
+elif has_explicit_placement_env; then
+  echo "using explicit Mint placement env; auto placement skipped" >&2
+else
+  echo "Mint dev auto placement disabled; continuing without generated placement" >&2
+fi
+
 echo "=== mint-dev launch contract ===" >&2
 echo "MINT_CODE_ROOT            ${MINT_CODE_ROOT}" >&2
 echo "MINT_DEV_SOURCE_CHECKOUT  ${MINT_DEV_SOURCE_CHECKOUT:-<none>}" >&2
@@ -344,7 +370,6 @@ echo "MINT_RAY_NAMESPACE        ${MINT_RAY_NAMESPACE}" >&2
 echo "MINT_PORT                 ${MINT_PORT}" >&2
 echo "PFS_RUNTIME_ENV_ROOT      ${PFS_RUNTIME_ENV_ROOT}" >&2
 echo "MINT_VLLM_CHILD_PYTHON    ${MINT_VLLM_CHILD_PYTHON_EXECUTABLE}" >&2
-echo "MINT_RAY_CLIENT_ADDRESS   ${MINT_RAY_CLIENT_ADDRESS:-<unset, direct attach>}" >&2
 echo "MINT_RAY_GCS_ADDRESS      ${MINT_RAY_GCS_ADDRESS:-<unset>}" >&2
 echo "MINT_CONTROL_PLANE_NODE   ${MINT_CONTROL_PLANE_NODE_IP:-<auto>}" >&2
 echo "RAY_ADDRESS               ${RAY_ADDRESS:-<unset>}" >&2
@@ -352,6 +377,8 @@ echo "ray head ip source        ${ray_head_ip_path}" >&2
 echo "MINT_TMP_ROOT             ${MINT_TMP_ROOT}" >&2
 echo "MINT_DEV_DEPLOYMENT_ENV   ${deployment_env:-<none, code defaults>}" >&2
 echo "MINT_DEV_RUN_ENV          ${run_env:-<none>}" >&2
+echo "MINT_DEV_AUTO_PLACEMENT   ${MINT_DEV_AUTO_PLACEMENT:-1}" >&2
+echo "MINT_DEV_AUTO_PLACEMENT_ENV ${auto_placement_env:-<none>}" >&2
 echo "================================" >&2
 
 if [ -n "${MINT_DEV_TOPOLOGY_SOURCE_DIR:-}" ]; then

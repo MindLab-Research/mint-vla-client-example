@@ -19,12 +19,15 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     # Namespace is user-scoped and never defaults to a shared/root name.
     assert 'export MINT_RAY_NAMESPACE="${MINT_RAY_NAMESPACE:-mint_${mint_user}}"' in text
     assert '""|mint|root|mint_root)' in text
-    # Driver attaches as a Ray client; the file-path env is not exported to it.
+    # Driver direct-attaches to GCS; the file-path env is not exported to it.
     assert "unset MINT_RAY_HEAD_ADDRESS_PATH" in text
     assert "unset RAY_ADDRESS" in text
-    assert 'export MINT_RAY_CLIENT_ADDRESS="ray://${ray_head_ip}:10001"' in text
+    assert "unset RAY_CLIENT_ADDRESS" in text
+    assert "unset MINT_RAY_CLIENT_ADDRESS" in text
     assert 'export MINT_RAY_GCS_ADDRESS="${ray_head_ip}:6379"' in text
     assert 'export RAY_ADDRESS="${ray_head_ip}:6379"' not in text
+    assert "ray://" not in text
+    assert "Ray Client" not in text
     # vLLM worker bootstrap must always use the wrapper from this checkout.
     assert 'vllm_worker_python="${MINT_CODE_ROOT}/scripts/vllm_worker_python.py"' in text
     assert 'export MINT_VLLM_CHILD_PYTHON_EXECUTABLE="${vllm_worker_python}"' in text
@@ -39,6 +42,18 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
     assert "MINT_DEV_TOPOLOGY_SOURCE_DIR" in text
     assert "syncing topology env" in text
     assert 'rsync -a --delete --include \'*/\' --include \'*.yaml\' --exclude \'*\'' in text
+    assert "MINT_DEV_AUTO_PLACEMENT" in text
+    assert "has_explicit_placement_env()" in text
+    assert 'if [ "${MINT_DEV_AUTO_PLACEMENT:-1}" != "0" ] && ! has_explicit_placement_env; then' in text
+    assert "scripts/tools/gen_dev_placement.py" in text
+    assert "--models-from-env" in text
+    assert '--gpu-count "${MINT_DEV_AUTO_PLACEMENT_GPU_COUNT:-1}"' in text
+    assert "MINT_DEV_AUTO_PLACEMENT_ENV" in text
+    assert 'source_env_file "MINT_DEV_AUTO_PLACEMENT_ENV" "${auto_placement_env}"' in text
+    assert "MINT_MODEL_PLACEMENT_JSON" in text
+    assert "MINT_DENSE_MODEL_PLACEMENT_JSON" in text
+    assert "MINT_VLLM_MODEL_PLACEMENT_JSON" in text
+    assert "MINT_MEGATRON_MODEL_PLACEMENT_JSON" in text
     assert "scripts/tools/dev_ray_cleanup.py gc-stale-actors" in text
     assert "scripts/tools/dev_ray_cleanup.py reset-control-plane" in text
     assert "MINT_DEV_RESET_SKIP_RAY_WHEN_NO_ALIVE" in text
@@ -58,7 +73,7 @@ def test_start_dev_server_script_uses_minimal_launch_contract() -> None:
 
 
 def test_runtime_config_has_no_dev_secrets_env_shim() -> None:
-    text = (REPO_ROOT / "mint_server" / "runtime_config.py").read_text()
+    text = (REPO_ROOT / "mint_server" / "config" / "runtime_config.py").read_text()
 
     assert LEGACY_DEV_SECRETS_ENV not in text
     assert "MINT_DEV_CONFIG_ENV" not in text
