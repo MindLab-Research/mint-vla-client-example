@@ -29,7 +29,9 @@ Use this skill for MinT internal control-plane operations and for the standalone
 Use `/internal/*` for operator-only control-plane state.
 
 Environment-specific skills provide host, port, auth, and restart rules:
-- For development, read `mint-dev` first; default local base URL is `http://localhost:8000` and auth is usually disabled.
+- For development, read `mint-dev` first; set `MINT_BASE_URL` from the
+  namespace-derived `MINT_PORT` printed by the dev launcher. Auth is usually
+  disabled.
 - For production, read `mint-prod` first; default local base URL is `http://localhost:18000` and every internal call requires `X-API-Key` except public health checks.
 
 ### Hard Rules
@@ -46,7 +48,12 @@ Environment-specific skills provide host, port, auth, and restart rules:
 Development:
 
 ```bash
-BASE=http://localhost:8000
+if [ -n "${MINT_BASE_URL:-}" ]; then
+  BASE="$MINT_BASE_URL"
+else
+  : "${MINT_PORT:?set MINT_PORT from the mint-dev launcher}"
+  BASE="http://localhost:${MINT_PORT}"
+fi
 curl -s "$BASE/internal/actors?type=vllm" | jq
 ```
 

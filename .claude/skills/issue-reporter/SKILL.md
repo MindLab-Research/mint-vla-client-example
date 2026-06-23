@@ -31,7 +31,13 @@ Screenshots, partial errors, vague descriptions. Extract: what action failed, wh
 ```python
 # scripts/reproduce_user_report.py
 import os
-BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+
+BASE_URL = os.environ.get("MINT_BASE_URL")
+if not BASE_URL:
+    port = os.environ.get("MINT_PORT")
+    if not port:
+        raise SystemExit("Set MINT_BASE_URL or MINT_PORT for the target server")
+    BASE_URL = f"http://localhost:{port}"
 API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 ```
 

@@ -12,7 +12,12 @@ import requests
 # Configuration
 # =============================================================================
 
-BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+BASE_URL = os.environ.get("MINT_BASE_URL")
+if not BASE_URL:
+    _mint_port = os.environ.get("MINT_PORT")
+    if not _mint_port:
+        raise RuntimeError("Set MINT_BASE_URL or MINT_PORT for the target dev server")
+    BASE_URL = f"http://localhost:{_mint_port}"
 API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 DEFAULT_POLL_TIMEOUT_S = int(os.environ.get("MINT_MERGE_GATE_POLL_TIMEOUT_S", "900"))

@@ -38,7 +38,12 @@ Write a script that can run against either production or development:
 # scripts/tools/reproduce_issue_<NUMBER>.py
 import os
 
-BASE_URL = os.environ.get("MINT_BASE_URL", "http://localhost:8000")
+BASE_URL = os.environ.get("MINT_BASE_URL")
+if not BASE_URL:
+    port = os.environ.get("MINT_PORT")
+    if not port:
+        raise SystemExit("Set MINT_BASE_URL or MINT_PORT for the target server")
+    BASE_URL = f"http://localhost:{port}"
 API_KEY = os.environ.get("MINT_API_KEY", "dummy")
 
 # ... reproduction logic using BASE_URL and API_KEY
@@ -82,7 +87,7 @@ Before proceeding, clearly document:
 
 ```bash
 # Check dev server is running
-curl http://localhost:8000/api/v1/healthz
+curl http://localhost:${MINT_PORT}/api/v1/healthz
 ```
 
 If dev server is not running, use the `mint-dev` skill to start it. Dev code is
@@ -95,7 +100,8 @@ If reproduction requires `model_path` or `state_path` pointing at an absolute ch
 
 - Use an admin API key on the dev server. Absolute paths are rejected for non-admin requests.
 - If you need a private dev server, follow the `mint-dev` skill's isolated debug server rules:
-  - Python attach uses `ray://<head_ip>:10001`, not raw `:6379`
+  - Python attach runs on the dev driver and uses direct GCS attach
+    (`<head_ip>:6379`), not Ray Client mode.
   - fresh `MINT_RAY_NAMESPACE`
   - fresh `MINT_STARTUP_LEASE_ACTOR_NAME`
   - `MINT_UVICORN_WORKERS=1`
@@ -113,7 +119,7 @@ python scripts/tools/reproduce_issue_<NUMBER>.py
 
 Or explicitly:
 ```bash
-MINT_BASE_URL=http://localhost:8000 \
+MINT_BASE_URL=http://localhost:${MINT_PORT} \
 MINT_API_KEY=dummy \
 python scripts/tools/reproduce_issue_<NUMBER>.py
 ```
@@ -183,10 +189,10 @@ Examples that usually require doc updates:
 |------|---------|
 | Reproduce on prod (China) | `MINT_BASE_URL=https://mint.macaron.xin MINT_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
 | Reproduce on prod (international) | `MINT_BASE_URL=https://mint.macaron.im MINT_API_KEY=<admin_key> python scripts/tools/reproduce_issue_X.py` |
-| Reproduce on dev | `python scripts/tools/reproduce_issue_X.py` |
+| Reproduce on dev | `MINT_PORT=<port> python scripts/tools/reproduce_issue_X.py` |
 | Prod logs (READ-ONLY) | `ssh mint-prod-volcano "tail -100 /tmp/mint_server_auth.log"` |
-| Dev logs | `ssh mint-dev "tail -100 /tmp/mint_server.log"` |
-| Health check | `curl http://localhost:8000/api/v1/healthz` |
+| Dev logs | `ssh mint-dev "tail -100 /vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log"` |
+| Health check | `curl http://localhost:${MINT_PORT}/api/v1/healthz` |
 
 ---
 

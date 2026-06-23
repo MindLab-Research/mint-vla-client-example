@@ -363,8 +363,8 @@ def init_ray(**kwargs: Any) -> Any:
     """Initialize Ray with optional log forwarding to driver.
 
     Adds log_to_driver=True when MINT_RAY_LOG_TO_DRIVER is enabled, unless explicitly
-    set by the caller. When the caller leaves address unset or uses "auto", prefer
-    the configured head-address file, then Ray Client endpoints, then direct attach.
+    set by the caller. Mint dev policy is direct GCS attach; Ray Client
+    endpoints remain accepted only as compatibility inputs.
 
     When attaching through Ray Client, local repo paths must be supplied at the job
     level rather than per-actor runtime_env. `MINT_RAY_JOB_WORKING_DIR` provides

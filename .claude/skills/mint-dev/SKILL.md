@@ -22,7 +22,7 @@ Read this whole file before touching the dev environment.
 ## Architecture
 
 ```
-Local Machine          mint-dev (driver)              mint-dev-head (Volcano pod)
+Local Machine          mint-dev-driver (driver)       mint-dev-head (Volcano pod)
 ─────────────          ────────────────               ──────────────────────────
 tinker-cookbook ──HTTP──> mint-server API ──Ray──>   GCS + raylet + dashboard
                     (port from namespace)  direct attach   GPU Workers (Volcano pods)
@@ -32,15 +32,28 @@ tinker-cookbook ──HTTP──> mint-server API ──Ray──>   GCS + rayle
 
 | Item | Value |
 |------|-------|
-| Driver node | `mint-dev` (SSH alias) |
+| Driver node | `mint-dev-driver`, `192.168.42.106` (SSH alias: `mint-dev`) |
 | Ray head | Volcano pod (`mint-dev-head`), managed by volcano-cluster skill |
 | Head IP | `cat /vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt` |
-| Connection mode | Direct attach via `MINT_RAY_GCS_ADDRESS=<head>:6379` |
+| Connection mode | Direct GCS attach (`MINT_RAY_GCS_ADDRESS=<head_ip>:6379`) |
 | API port | Derived from namespace hash (`[30000, 40000)`); override with `MINT_PORT` |
 | Runtime root | `/vePFS-Mindverse/share/mint/dev/runtime` |
-| Ray namespace | `mint_<user>` by default; override with a per-user scoped namespace |
+| Ray namespace | Defaults to `mint_<user>`; override with `MINT_RAY_NAMESPACE` |
 | Auth mode | `no-auth` by default |
 | Log file | `/vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log` |
+
+## Access
+
+All dev API-server and driver-side debugging runs on `mint-dev` /
+`mint-dev-driver`. Do not start Mint dev servers on the Ray head pod.
+
+To SSH into Mint dev machines, append only your public key to:
+
+```bash
+/vePFS-Mindverse/share/mint/runtime/ssh/authorized_keys
+```
+
+Never write private keys there, and do not remove or rewrite other users' keys.
 
 ## Quick Start
 
@@ -82,14 +95,24 @@ ssh mint-dev 'MINT_CODE_ROOT=/vePFS-Mindverse/share/code/<you>/<branch> \
   MINT_DISABLE_MINT_ROUTE=1 \
   MINT_UVICORN_WORKERS=1 \
   MINT_SUPERVISOR_STATE_BACKEND=memory \
+  MINT_TASK_STATE_STORE_DB_PATH=:memory: \
   nohup /vePFS-Mindverse/share/code/<you>/<branch>/scripts/start_dev_server.sh \
   >> /tmp/mint_dev_launch.log 2>&1 &'
 ```
 
 The launcher auto-loads deployment defaults (model lists, vLLM flags, OTel
-endpoint, logging), derives the port from the namespace, and auto-generates
-placement if needed. Override with `MINT_PORT=8000` or
+endpoint, logging) and `secrets.env` (OTLP API keys), derives the port from
+the namespace, and auto-generates placement if needed. The launcher prints
+the resolved `MINT_PORT` during startup; use that value for health checks,
+tunnels, and local clients. Override with `MINT_PORT=<port>` or
 `MINT_DEV_RUN_ENV=<path>` if needed.
+
+After launch, set the printed port in your local shell before running the
+following commands:
+
+```bash
+export MINT_PORT=<printed-port>
+```
 
 The reconcile loop is **enabled by default** — the supervisor will
 automatically create runtime/training/vLLM replicas. To disable for
@@ -98,14 +121,14 @@ debugging, set `MINT_SUPERVISOR_RECONCILE_LOOP=0`.
 ### 4. Wait for healthz
 
 ```bash
-ssh mint-dev 'curl -s http://localhost:8000/api/v1/healthz'
+ssh mint-dev "curl -s http://localhost:${MINT_PORT}/api/v1/healthz"
 # Expected: {"status":"ready"}
 ```
 
 ### 5. SSH tunnel for local access
 
 ```bash
-ssh -f -N -L 8000:localhost:8000 mint-dev
+ssh -f -N -L ${MINT_PORT}:localhost:${MINT_PORT} mint-dev
 ```
 
 ## Configuration Reference
@@ -116,12 +139,15 @@ ssh -f -N -L 8000:localhost:8000 mint-dev
 |----------|---------|
 | `MINT_CODE_ROOT` | mint-server checkout (PFS path visible to all Ray nodes) |
 | `MINT_DEV_USER` | Username for namespace derivation (must be non-root) |
+| `MINT_RAY_NAMESPACE` | Optional explicit namespace; defaults to `mint_<user>` |
+| `MINT_PORT` | Optional explicit API port; defaults to a stable namespace hash |
 
 ### Recommended dev settings
 
 | Variable | Value | Why |
 |----------|-------|-----|
 | `MINT_SUPERVISOR_STATE_BACKEND` | `memory` | Avoids RocksDB lock conflicts from stale actors |
+| `MINT_TASK_STATE_STORE_DB_PATH` | `:memory:` | Keeps TaskStateStore non-persistent for disposable dev servers |
 | `MINT_DEV_RUN_ENV` | optional | Per-run overrides; if it sets placement vars, auto placement is skipped |
 | `MINT_UVICORN_WORKERS` | `1` | Single worker for dev |
 
@@ -140,6 +166,17 @@ no placement env var is set. To force manual placement, set one of
 `MINT_MODEL_PLACEMENT_JSON`, `MINT_DENSE_MODEL_PLACEMENT_JSON`,
 `MINT_VLLM_MODEL_PLACEMENT_JSON`, or `MINT_MEGATRON_MODEL_PLACEMENT_JSON`
 directly or through `MINT_DEV_RUN_ENV`.
+
+If you already have placement JSON, provide it through the canonical runtime
+variables read by the supervisor and backends:
+
+- `MINT_MODEL_PLACEMENT_JSON`
+- `MINT_DENSE_MODEL_PLACEMENT_JSON`
+- `MINT_VLLM_MODEL_PLACEMENT_JSON`
+- `MINT_MEGATRON_MODEL_PLACEMENT_JSON`
+
+`scripts/tools/gen_dev_placement.py` writes those variables into the run env
+file consumed by `MINT_DEV_RUN_ENV`.
 
 ### `MINT_DISABLE_MINT_ROUTE`
 
@@ -185,13 +222,13 @@ rsync -a --exclude '.git' --exclude '__pycache__' \
 
 ```bash
 # API health
-ssh mint-dev 'curl -s http://localhost:8000/api/v1/healthz'
+ssh mint-dev "curl -s http://localhost:${MINT_PORT}/api/v1/healthz"
 
 # Server info
-ssh mint-dev 'curl -s http://localhost:8000/api/v1/server_info'
+ssh mint-dev "curl -s http://localhost:${MINT_PORT}/api/v1/server_info"
 
 # Admission stats (scheduler + supervisor + ray cluster)
-ssh mint-dev 'curl -s http://localhost:8000/internal/admission_stats'
+ssh mint-dev "curl -s http://localhost:${MINT_PORT}/internal/admission_stats"
 
 # Server logs
 ssh mint-dev 'tail -50 /vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log'
@@ -205,9 +242,9 @@ ssh mint-dev 'curl -s http://<HEAD_IP>:8265/api/cluster_status'
 After starting the dev server, run the RL check:
 
 ```bash
-ssh -f -N -L 8000:localhost:8000 mint-dev
+ssh -f -N -L ${MINT_PORT}:localhost:${MINT_PORT} mint-dev
 
-MINT_BASE_URL=http://localhost:8000 \
+MINT_BASE_URL=http://localhost:${MINT_PORT} \
 TINKER_API_KEY=dummy \
 MINT_API_KEY=dummy \
 python scripts/tools/rl_check.py \
@@ -227,11 +264,21 @@ Isolation comes from the Ray namespace. Use a scoped namespace, port, and log:
 MINT_CODE_ROOT=/path/to/checkout \
 MINT_RAY_NAMESPACE=mint_<you>_issue_<n> \
 MINT_PORT=10416 \
-MINT_LOG_FILE=/tmp/mint_server_issue_<n>.log \
+MINT_LOG_FILE=/vePFS-Mindverse/share/mint/dev/logs/mint-server-issue-<n>.log \
 MINT_UVICORN_WORKERS=1 \
 MINT_SUPERVISOR_STATE_BACKEND=memory \
+MINT_TASK_STATE_STORE_DB_PATH=:memory: \
 scripts/start_dev_server.sh
 ```
+
+## CI And Bug Workflow
+
+Current CI gates cover type checking and the Scheduler component. Run the
+relevant local checks for the files you touch, and treat CI failures as blockers
+unless you can identify and record an unrelated pre-existing failure.
+
+When you find a bug, open a GitHub issue and put it into MinT task management.
+Do not rely on chat context or a local todo as the only tracking mechanism.
 
 ## Cleanup
 
@@ -289,6 +336,10 @@ for cluster lifecycle (create/teardown workers, list jobs, inspect instances).
 ## Hard Rules
 
 - Do not perform production operations from this skill.
+- Do not use Ray Client mode (`ray://...:10001`) for dev. Mint dev API servers
+  and driver-side scripts must direct-attach through `MINT_RAY_GCS_ADDRESS`.
+- Do not start dev API servers on the Ray head pod; use the dev driver
+  (`mint-dev` / `mint-dev-driver`) only.
 - Do not run local `ray` or `volc` CLI commands. Use project Python with Ray
   for inspection, and use the `volcano-cluster` skill for lifecycle work.
 - Do not source or print private config unless the task requires it.

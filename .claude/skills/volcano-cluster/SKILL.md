@@ -153,7 +153,8 @@ Workers read the head IP from that PFS file. Do not patch head IPs into worker t
 
 - Do not run `ray start` on `mint-dev`.
 - Do not start a schedulable Ray node on API/bastion hosts.
-- On dev API hosts, attach Python through Ray client: `ray://<RAY_HEAD_IP>:10001`.
+- On dev API hosts, attach Python directly to GCS from the dev driver:
+  `<RAY_HEAD_IP>:6379`. Do not use Ray Client mode for Mint dev.
 - For CLI-style status checks, use the canonical Ray wrapper and connect to the head address.
 
 Example:
@@ -162,7 +163,7 @@ Example:
 PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
 $PY - <<'PY'
 import ray
-ray.init(address="ray://<RAY_HEAD_IP>:10001")
+ray.init(address="<RAY_HEAD_IP>:6379")
 print(ray.cluster_resources())
 ray.shutdown()
 PY
@@ -174,8 +175,8 @@ Use API surfaces first. Do not restart Ray as a first response to actor placemen
 
 ```bash
 # Dev
-curl -s "http://localhost:8000/internal/actors?type=megatron" | jq
-curl -s -X POST -H "Content-Type: application/json" -d '{"actor_type":"megatron"}' http://localhost:8000/internal/actors/kill
+curl -s "http://localhost:${MINT_PORT}/internal/actors?type=megatron" | jq
+curl -s -X POST -H "Content-Type: application/json" -d '{"actor_type":"megatron"}' http://localhost:${MINT_PORT}/internal/actors/kill
 
 # Prod
 curl -s -H "X-API-Key: $MINT_API_KEY" "http://localhost:18000/internal/actors?type=megatron" | jq

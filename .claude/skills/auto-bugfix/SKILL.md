@@ -12,7 +12,7 @@ description: |
 
   Refers to:
   - `bugfix` skill for reproduction discipline
-  - `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; default port 8000)
+  - `mint-dev` skill for dev environment constraints (SSH host `mint-dev`; namespace-derived or explicit `MINT_PORT`)
   - `architecture-design` skill for architecture docs alignment
 
   Procedure contract: read this SKILL.md end-to-end before acting. Do not slice it on demand or use it as a lookup table mid-run.
@@ -203,10 +203,14 @@ export MINT_PORT="$((10000 + ISSUE % 5000))"
 Namespace cleanup (run before starting the issue-scoped server, and after finishing the issue):
 ```bash
 # Pass `MINT_RAY_NAMESPACE` explicitly (ssh does not forward local env by default).
-ssh mint-dev "MINT_RAY_NAMESPACE='${MINT_RAY_NAMESPACE:?unset}' python3 -c \"
+ssh mint-dev "PY=/vePFS-Mindverse/share/code/mint-runtime-py31213/host-venv/bin/python
+MINT_RAY_NAMESPACE='${MINT_RAY_NAMESPACE:?unset}' \$PY -c \"
 import os
 import ray
-ray.init(address=\"auto\", ignore_reinit_error=True)
+head_path = \"/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt\"
+with open(head_path, \"r\", encoding=\"utf-8\") as f:
+    head_ip = f.read().strip()
+ray.init(address=f\"{head_ip}:6379\", ignore_reinit_error=True)
 ns = os.environ[\"MINT_RAY_NAMESPACE\"]
 actors = ray.util.list_named_actors(all_namespaces=True)
 killed = 0
@@ -237,21 +241,27 @@ Issue-specific server root on mint-dev:
 ssh mint-dev "mkdir -p /root/mint_project && ln -sfn $MINT_CODE_ROOT /root/mint_project/mint-server-issue-$ISSUE"
 ```
 
-Start an issue-scoped dev server (does not touch the default dev server on port 8000):
+Start an issue-scoped dev server (does not touch the shared dev server):
 ```bash
-ssh mint-dev "cat > /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
+ssh mint-dev "mkdir -p /vePFS-Mindverse/share/mint/dev/tmp /vePFS-Mindverse/share/mint/dev/logs /vePFS-Mindverse/share/mint/dev/runtime
+cat > /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 cd '$MINT_CODE_ROOT'
 export MINT_CODE_ROOT='$MINT_CODE_ROOT'
 export MINT_RAY_NAMESPACE='$MINT_RAY_NAMESPACE'
 export MINT_PORT='$MINT_PORT'
-export MINT_USAGE_LOG_DIR='/tmp/mint_usage_issue_$ISSUE'
+export MINT_LOG_FILE='/vePFS-Mindverse/share/mint/dev/logs/mint-server-issue-$ISSUE.log'
+export MINT_USAGE_LOG_DIR='/vePFS-Mindverse/share/mint/dev/logs/usage-issue-$ISSUE'
 export MINT_AUTH_MODE=no-auth
+export MINT_UVICORN_WORKERS=1
+export MINT_SUPERVISOR_STATE_BACKEND=memory
+export MINT_TASK_STATE_STORE_DB_PATH=:memory:
+export MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env
 exec scripts/start_dev_server.sh
 SH
 chmod +x /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh
-nohup /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh >> /tmp/mint_server_issue_$ISSUE.log 2>&1 & echo \$! > /tmp/mint_server_issue_$ISSUE.pid"
+nohup /vePFS-Mindverse/share/mint/dev/tmp/start_issue_$ISSUE.sh >> /vePFS-Mindverse/share/mint/dev/logs/mint-server-issue-$ISSUE.launch.log 2>&1 & echo \$! > /vePFS-Mindverse/share/mint/dev/runtime/mint-server-issue-$ISSUE.pid"
 ```
 
 Issue-scoped health check (via local SSH tunnel):
@@ -262,12 +272,12 @@ curl http://localhost:$MINT_PORT/api/v1/healthz
 
 Issue-scoped logs:
 ```bash
-ssh mint-dev "tail -50 /tmp/mint_server_issue_$ISSUE.log"
+ssh mint-dev "tail -50 /vePFS-Mindverse/share/mint/dev/logs/mint-server-issue-$ISSUE.log"
 ```
 
 Issue-scoped stop:
 ```bash
-ssh mint-dev "test -f /tmp/mint_server_issue_$ISSUE.pid && xargs -r kill < /tmp/mint_server_issue_$ISSUE.pid || true"
+ssh mint-dev "test -f /vePFS-Mindverse/share/mint/dev/runtime/mint-server-issue-$ISSUE.pid && xargs -r kill < /vePFS-Mindverse/share/mint/dev/runtime/mint-server-issue-$ISSUE.pid || true"
 ```
 
 ### 3c) Delegate the fix to a bugfixer subagent
