@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1.6
+#
+# Mint full image for A800 / SM80 — CUDA 12.9 legacy version. NOT RECOMMENDED.
+#
+# All dependencies baked in: torch 2.9.1+cu129, vLLM 0.16.x, DeepEP, ray, …
+# Uses a private Volcano registry base image.
+#
+# For new deployments, prefer docker/Dockerfile.sm80.full (CUDA 13.0.3).
+#
+# Build:
+#   docker build -t mint:full-sm80-cuda129 \
+#     --build-arg DEEPEP_VARIANT=sm80 \
+#     -f docker/Dockerfile.sm80.cuda129.full .
+#
+# DeepEP variants:
+#   sm80 — rebuild with DISABLE_SM90_FEATURES=1, force-disable NVSHMEM (A800)
+#   base — use DeepEP from the base image as-is (SM90 only, will crash on A800)
+
+# ─── Base image (private Volcano registry) ──────────────────────────
+# Includes: torch 2.9.1+cu129, DeepEP, vLLM 0.16.x
+ARG BASE_IMAGE=image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/verl@sha256:a4599b0ebbf8fed7fb469886d90ecf0b6be9b36e55ef31e4df329c7b2c1922c6
+FROM ${BASE_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── System deps ────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  aria2 \
+  ca-certificates \
+  curl \
+  git \
+  git-lfs \
+  openssh-client \
+  openssh-server \
+  rsync \
+  build-essential \
+  ninja-build \
+  python3.12-venv \
+  ibverbs-providers \
+  ibverbs-utils \
+  libibverbs-dev \
+  libnccl-dev \
+  numactl \
+  iotop \
+  sysstat \
+  vim \
+  less \
+  strace \
+  gdb \
+  htop \
+  && rm -rf /var/lib/apt/lists/*
+
+# ─── SSH ────────────────────────────────────────────────────────────
+RUN mkdir -p /run/sshd && \
+    ssh-keygen -A && \
+    sed -i \
+      -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+      -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+      /etc/ssh/sshd_config
+
+# ─── Virtualenv + tooling ──────────────────────────────────────────
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv --system-site-packages "${VIRTUAL_ENV}"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+ARG PIP_VERSION=24.2
+ARG SETUPTOOLS_VERSION=79.0.0
+RUN python -m pip install --no-cache-dir --upgrade \
+  "pip==${PIP_VERSION}" \
+  "setuptools==${SETUPTOOLS_VERSION}" \
+  wheel
+
+# ─── CUDA paths ────────────────────────────────────────────────────
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda"
+ENV NCCL_IB_DISABLE=0
+ENV NCCL_NET_GDR_LEVEL=2
+ENV NCCL_DEBUG=WARN
+
+# ─── Verify base image packages ────────────────────────────────────
+RUN python -c "import torch; import deep_ep; import deep_ep_cpp; import vllm; print('torch:', torch.__version__); print('cuda:', torch.version.cuda); print('vllm:', getattr(vllm, '__version__', 'unknown')); assert torch.__version__.startswith('2.9.'); assert (torch.version.cuda or '').startswith('12.9')"
+
+# ─── DeepEP SM80 rebuild ──────────────────────────────────────────
+ARG DEEPEP_VARIANT=sm80
+ARG DEEPEP_SOURCE_DIR=/home/dpsk_a2a/DeepEP
+RUN set -euo pipefail; \
+  if [ "${DEEPEP_VARIANT}" = "base" ]; then \
+    echo "DeepEP variant: base (SM90, not patched)"; \
+  elif [ "${DEEPEP_VARIANT}" = "sm80" ]; then \
+    echo "DeepEP variant: sm80"; \
+    test -d "${DEEPEP_SOURCE_DIR}"; \
+    rm -rf /tmp/DeepEP; \
+    cp -a "${DEEPEP_SOURCE_DIR}" /tmp/DeepEP; \
+    python -c $'from __future__ import annotations\n\nimport os\nfrom pathlib import Path\n\nsetup_py = Path("/tmp/DeepEP/setup.py")\nif not setup_py.exists():\n    raise SystemExit(f"DeepEP setup.py not found at {setup_py}")\nsetup_txt = setup_py.read_text(encoding="utf-8")\n\nif "Patched: force-disable NVSHMEM" not in setup_txt:\n    lines = setup_py.splitlines(True)\n    insert_at = None\n    for i, line in enumerate(lines):\n        if line.strip() == "# NVSHMEM flags":\n            insert_at = i\n            break\n    if insert_at is None:\n        raise SystemExit("DeepEP setup.py anchor not found: # NVSHMEM flags")\n\n    nl = chr(10)\n    env_key = "DISABLE_SM90_FEATURES"\n    inject_lines = [\n        "    # Patched: force-disable NVSHMEM when DISABLE_SM90_FEATURES=1 (SM80 build)" + nl,\n        f"    if int(os.getenv({env_key!r}, 0)):" + nl,\n        "        disable_nvshmem = True" + nl,\n        nl,\n    ]\n    lines[insert_at:insert_at] = inject_lines\n    setup_py.write_text("".join(lines), encoding="utf-8")\n\ncfg = Path("/tmp/DeepEP/csrc/config.hpp")\nif not cfg.exists():\n    raise SystemExit(f"DeepEP config.hpp not found at {cfg}")\ncfg_txt = cfg.read_text(encoding="utf-8")\n\ncfg_lines = cfg_txt.splitlines(True)\nmatch_idxs = [i for i, line in enumerate(cfg_lines) if "NVSHMEM is disable during compilation" in line]\nif len(match_idxs) != 1:\n    raise SystemExit("DeepEP config.hpp needle not found for NVSHMEM-disabled RDMA hint")\nidx = match_idxs[0]\nindent = cfg_lines[idx][: (len(cfg_lines[idx]) - len(cfg_lines[idx].lstrip()))]\ncfg_lines[idx] = indent + "return 0;" + chr(10)\ncfg.write_text("".join(cfg_lines), encoding="utf-8")\n'; \
+    DISABLE_SM90_FEATURES=1 TORCH_CUDA_ARCH_LIST=8.0 python -m pip install --no-cache-dir --no-deps --no-build-isolation --force-reinstall /tmp/DeepEP; \
+    python -c "import deep_ep_cpp; assert deep_ep_cpp.is_sm90_compiled() is False; print('deep_ep_cpp SM80 OK')"; \
+    rm -rf /tmp/DeepEP; \
+  else \
+    echo "ERROR: unknown DEEPEP_VARIANT='${DEEPEP_VARIANT}'" >&2; exit 1; \
+  fi
+
+# ─── Core runtime deps ─────────────────────────────────────────────
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+    "ray[default,cpp]==2.51.1" \
+    "fastapi[standard]==0.121.2" \
+    "uvicorn[standard]==0.38.0" \
+    "pydantic==2.12.4" \
+    "httpx==0.27.2" \
+    "structlog>=25.5.0" \
+    "opentelemetry-api>=1.39.1" \
+    "opentelemetry-sdk>=1.39.1" \
+    "opentelemetry-exporter-otlp>=1.39.1" \
+    "transformers==4.57.0" \
+    "accelerate==1.11.0" \
+    "einops" \
+    "onnxscript" \
+    "codetiming==1.4.0" \
+    "torchdata==0.11.0" \
+    "datasets==4.4.2" \
+    "tensordict" \
+    "peft==0.18.0"
+
+# ─── NVIDIA ModelOpt ───────────────────────────────────────────────
+ARG NVIDIA_PYPI_INDEX=https://pypi.nvidia.com
+ARG NVIDIA_MODELOPT_VERSION=0.41.0
+RUN python -m pip install --no-cache-dir \
+  --index-url "${NVIDIA_PYPI_INDEX}" \
+  --extra-index-url https://pypi.org/simple \
+  --retries 10 --timeout 60 \
+  --only-binary=:all: \
+  "nvidia-modelopt==${NVIDIA_MODELOPT_VERSION}"
+
+# ─── Misc build deps ──────────────────────────────────────────────
+RUN python -m pip install --no-cache-dir --only-binary=:all: --retries 10 --timeout 60 "pybind11"
+
+# OmegaConf requires antlr4-python3-runtime==4.9.*
+RUN python -m pip install --no-cache-dir --only-binary=:all: --no-deps "omegaconf==2.3.0"
+RUN python -m pip install --no-cache-dir --no-build-isolation "antlr4-python3-runtime==4.9.3"
+RUN python -c "import antlr4; print('antlr4 OK'); import omegaconf; print('omegaconf:', omegaconf.__version__)"
+
+# ─── PFS overlay env (for consistency) ─────────────────────────────
+ENV PFS_OVERLAY_ROOT=/vePFS-Mindverse
+ENV PFS_RUNTIME_ENV_ROOT=${PFS_OVERLAY_ROOT}/runtime-env
+ENV PFS_HF_MODULES_PATH=${PFS_OVERLAY_ROOT}/hf-modules
+
+# ─── Verification ──────────────────────────────────────────────────
+RUN python -c "import onnxscript, modelopt; print('onnxscript OK'); print('modelopt:', getattr(modelopt, '__version__', 'unknown'))"
+RUN python -c "import torch, deep_ep_cpp, vllm; import ray; print('torch:', torch.__version__); print('ray:', ray.__version__); print('vllm:', getattr(vllm, '__version__', 'unknown'))"
+
+CMD ["bash", "-lc", "python -c 'import torch, deep_ep_cpp, vllm; print(torch.__version__, torch.version.cuda); print(getattr(vllm, \"__version__\", \"unknown\"))' && sleep infinity"]

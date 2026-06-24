@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1.6
+#
+# Mint overlay image for A800 / SM80 — CUDA 12.9 legacy version.
+#
+# CUDA 12.9 + system tools + Python 3.12 + Ray in the image.
+# torch/vLLM/DeepEP/Megatron/verl come from the PFS overlay disk at runtime.
+#
+# For new deployments, prefer docker/Dockerfile.sm80.overlay (CUDA 13.0.3).
+#
+# Build:
+#   docker build -t mint:overlay-sm80-cuda129 -f docker/Dockerfile.sm80.cuda129.overlay .
+
+ARG CUDA_IMAGE=nvidia/cuda:12.9.2-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── System + Python (single apt-get to save a layer) ──────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  aria2 \
+  ca-certificates \
+  curl \
+  wget \
+  git \
+  git-lfs \
+  openssh-client \
+  openssh-server \
+  rsync \
+  build-essential \
+  ninja-build \
+  python3.12 \
+  python3.12-venv \
+  python3.12-dev \
+  ibverbs-providers \
+  ibverbs-utils \
+  libibverbs-dev \
+  libnccl-dev \
+  numactl \
+  iotop \
+  sysstat \
+  vim \
+  less \
+  strace \
+  gdb \
+  htop \
+  && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+  && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
+  && rm -rf /var/lib/apt/lists/*
+
+# ─── SSH (for Ray inter-node communication & debugging) ─────────────
+RUN mkdir -p /run/sshd && \
+    ssh-keygen -A && \
+    sed -i \
+      -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+      -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+      /etc/ssh/sshd_config
+
+# ─── Virtualenv ─────────────────────────────────────────────────────
+ENV VIRTUAL_ENV=/opt/venv
+RUN python -m venv --system-site-packages "${VIRTUAL_ENV}"
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+ARG PIP_VERSION=24.2
+ARG SETUPTOOLS_VERSION=79.0.0
+RUN python -m pip install --no-cache-dir --upgrade \
+  "pip==${PIP_VERSION}" \
+  "setuptools==${SETUPTOOLS_VERSION}" \
+  wheel
+
+# ─── Ray — infrastructure layer, pinned to match the server ────────
+ARG RAY_VERSION=2.51.1
+RUN python -m pip install --no-cache-dir --only-binary=:all: \
+  "ray[default,cpp]==${RAY_VERSION}"
+
+# ─── Environment ───────────────────────────────────────────────────
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda"
+ENV NCCL_IB_DISABLE=0
+ENV NCCL_NET_GDR_LEVEL=2
+ENV NCCL_DEBUG=WARN
+ENV PFS_OVERLAY_ROOT=/vePFS-Mindverse
+ENV PFS_RUNTIME_ENV_ROOT=${PFS_OVERLAY_ROOT}/runtime-env
+ENV PFS_HF_MODULES_PATH=${PFS_OVERLAY_ROOT}/hf-modules
+
+# ─── Verify ────────────────────────────────────────────────────────
+RUN python -c "import ray; print('ray:', ray.__version__); print('python:', __import__('sys').version)"
+
+CMD ["bash", "-lc", "sleep infinity"]

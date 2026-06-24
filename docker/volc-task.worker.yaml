@@ -1,0 +1,57 @@
+# self define e.g text_classfication
+TaskName: "mint-dev-worker-1"
+# description for this task
+Description: "mint-dev-worker 8-gpu worker"
+# entry point command
+Entrypoint: "set -euo pipefail\n\nexport MINT_ENV=dev\nexport MINT_NODE_ROLE=worker\nexport MINT_TMP_ROOT=/mnt/tmp\nexport MINT_RUNTIME_ROOT=/vePFS-Mindverse/share/mint/runtime\nexport MINT_NODE_SERVICE_DIR=\"${MINT_RUNTIME_ROOT}/services/${MINT_ENV}-${MINT_NODE_ROLE}\"\nexport MINT_NODE_LOCAL_SERVICE_DIR=\"/tmp/mint-runit/${MINT_ENV}-${MINT_NODE_ROLE}\"\nexport PATH=\"${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin:${PATH}\"\nexport MINT_NODE_LOG_ROOT=/vePFS-Mindverse/share/mint/logs/nodes\nexport MINT_NODE_STATE_ROOT=/vePFS-Mindverse/share/mint/dev/runtime/node-state\nexport MINT_RAY_HEAD_IP_PATH=/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt\nexport HF_HUB_OFFLINE=1\nexport HF_HOME=/vePFS-Mindverse/share/huggingface\nexport PYTHONDONTWRITEBYTECODE=1\nexport RAY_ENABLE_AUTO_CONNECT=0\n\nnode_id=\"$(hostname | tr -c 'A-Za-z0-9_.-' '-')\"\nexport MINT_NODE_ID=\"${node_id}\"\n\nmkdir -p \"${MINT_TMP_ROOT}/w/${MINT_NODE_ID}\" \"${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}\" \"${MINT_NODE_STATE_ROOT}\"\nrm -rf \"${MINT_NODE_LOCAL_SERVICE_DIR}\"\nmkdir -p \"$(dirname \"${MINT_NODE_LOCAL_SERVICE_DIR}\")\"\ncp -a \"${MINT_NODE_SERVICE_DIR}\" \"${MINT_NODE_LOCAL_SERVICE_DIR}\"\nfind \"${MINT_NODE_LOCAL_SERVICE_DIR}\" -name supervise -type d -prune -exec rm -rf {} +\n{\n  date -Is\n  echo \"entrypoint role=${MINT_NODE_ROLE} node_id=${MINT_NODE_ID} service_dir=${MINT_NODE_SERVICE_DIR} local_service_dir=${MINT_NODE_LOCAL_SERVICE_DIR}\"\n} >> \"${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}/entrypoint.log\" 2>&1\n\n# Start services directly (bypass runsvdir — PFS runtime binaries may not\n# match the pod image after rsync --delete corrupted the runtime dir).\nmkdir -p /run/sshd\n/usr/sbin/sshd -D -e \\\n  -o \"Port=22\" \\\n  -o \"ListenAddress=0.0.0.0\" \\\n  -o \"HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_rsa_key\" \\\n  -o \"HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ecdsa_key\" \\\n  -o \"HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ed25519_key\" \\\n  -o \"PermitRootLogin=yes\" \\\n  -o \"PasswordAuthentication=no\" \\\n  -o \"PubkeyAuthentication=yes\" \\\n  -o \"AuthorizedKeysFile=/vePFS-Mindverse/share/mint/runtime/ssh/authorized_keys\" \\\n  -o \"StrictModes=no\" \\\n  -o \"UsePAM=no\" \\\n  -o \"PidFile=/tmp/mint-sshd.pid\" \\\n  >> \"${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}/sshd.log\" 2>&1 &\n\n/vePFS-Mindverse/share/mint/runtime/supervisor/current/bin/mint-ray-node \\\n  >> \"${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}/ray.log\" 2>&1 &\n\nwait"
+Tags: []
+# the code path you want to upload locally
+UserCodePath: ""
+# remote path mount in training container
+RemoteMountCodePath: ""
+# user define env var
+Envs: []
+# queue created under Resource Group, empty as default queue
+ResourceQueueID: "q-20251126180002-26lwz"
+# distributed framework, support: TensorFlow PS,PyTorch DDP,Horovod,BytePS
+Framework: "Custom"
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.hpcpni2l.28xlarge"
+ActiveDeadlineSeconds: 0
+# enable tensor board or not
+EnableTensorBoard: false
+# storages
+Storages:
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse"
+      VepfsId: "vepfs-cnbjecc87dad63ea"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      MountPath: "/vePFS-Mindverse/share"
+      VepfsId: "vepfs-cnbjecc87dad63ea"
+      SubPath: "share"
+    - Type: "Vepfs"
+      MountPath: "/mnt/tmp"
+      VepfsId: "vepfs-cnbjecc87dad63ea"
+      SubPath: "share/mint/dev/tmp/r"
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse-dev"
+      Prefix: "/"
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse-prod"
+      Bucket: "tos-mindverse"
+      Prefix: "/"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/mint/mint-ray-node:latest-sm80"
+CacheType: "Cloudfs"
+# user define retry options
+RetryOptions:
+    EnableRetry: false
+    MaxRetryTimes: 5
+    IntervalSeconds: 120
+    PolicySets: []
+    EnableReserveResourceOnRetry: false
+Priority: 4

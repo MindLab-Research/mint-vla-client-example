@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.6
+#
+# Mint base image for H100/H800 / SM90 — CUDA toolkit + system tools only.
+# No Python, no Ray. Use this as a starting point for custom overlays.
+#
+# Build:
+#   docker build -t mint:base-sm90 -f docker/Dockerfile.sm90.base .
+
+ARG CUDA_IMAGE=nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04
+FROM ${CUDA_IMAGE}
+
+SHELL ["/bin/bash", "-lc"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ─── System dependencies ─────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  aria2 \
+  ca-certificates \
+  curl \
+  wget \
+  git \
+  git-lfs \
+  openssh-client \
+  openssh-server \
+  rsync \
+  build-essential \
+  ninja-build \
+  ibverbs-providers \
+  ibverbs-utils \
+  libibverbs-dev \
+  numactl \
+  iotop \
+  sysstat \
+  vim \
+  less \
+  strace \
+  gdb \
+  htop \
+  && rm -rf /var/lib/apt/lists/*
+
+# ─── SSH (for Ray inter-node communication & debugging) ─────────────
+RUN mkdir -p /run/sshd && \
+    ssh-keygen -A && \
+    sed -i \
+      -e 's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+      -e 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+      /etc/ssh/sshd_config
+
+# ─── CUDA paths ────────────────────────────────────────────────────
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:${LD_LIBRARY_PATH}"
+ENV CUDA_HOME="/usr/local/cuda"
+
+# ─── NCCL / RDMA ───────────────────────────────────────────────────
+ENV NCCL_IB_DISABLE=0
+ENV NCCL_NET_GDR_LEVEL=2
+ENV NCCL_DEBUG=WARN
+
+# ─── PFS overlay mount point ───────────────────────────────────────
+ENV PFS_OVERLAY_ROOT=/vePFS-Mindverse
+ENV PFS_RUNTIME_ENV_ROOT=${PFS_OVERLAY_ROOT}/runtime-env
+ENV PFS_HF_MODULES_PATH=${PFS_OVERLAY_ROOT}/hf-modules
+
+CMD ["bash", "-lc", "sleep infinity"]
