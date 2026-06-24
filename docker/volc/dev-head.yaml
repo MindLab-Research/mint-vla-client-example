@@ -1,5 +1,4 @@
-# MINT Production Ray Head Node - DO NOT MODIFY FOR DEV
-# This cluster is for production deployment only.
+# Ray Head Node - CPU only, persistent
 # Head bootstrap is environment-owned. Worker lifecycle is SDK/topology-owned.
 #
 # The node process tree is supervised by the shared runit bundle under the
@@ -8,28 +7,27 @@
 # Ray tmp uses /mnt/tmp, a short Vepfs mount, to avoid Unix socket path length
 # failures without relying on symlinks.
 
-TaskName: "mint-prod-head"
-Description: "MINT PRODUCTION - Ray head node - DO NOT USE FOR DEV"
+TaskName: "mint-dev-head"
+Description: "mint-dev-head cpu task"
 
 Entrypoint: |
   set -euo pipefail
 
-  export MINT_ENV=prod
+  export MINT_ENV=dev
   export MINT_NODE_ROLE=head
   export MINT_TMP_ROOT=/mnt/tmp
+  export MINT_RAY_HEAD_NUM_CPUS=16
   export MINT_RUNTIME_ROOT=/vePFS-Mindverse/share/mint/runtime
   export MINT_NODE_SERVICE_DIR="${MINT_RUNTIME_ROOT}/services/${MINT_ENV}-${MINT_NODE_ROLE}"
   export MINT_NODE_LOCAL_SERVICE_DIR="/tmp/mint-runit/${MINT_ENV}-${MINT_NODE_ROLE}"
   export PATH="${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin:${PATH}"
   export MINT_NODE_LOG_ROOT=/vePFS-Mindverse/share/mint/logs/nodes
-  export MINT_NODE_STATE_ROOT=/vePFS-Mindverse/share/mint/prod/runtime/node-state
-  export MINT_RAY_HEAD_IP_PATH=/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
+  export MINT_NODE_STATE_ROOT=/vePFS-Mindverse/share/mint/dev/runtime/node-state
+  export MINT_RAY_HEAD_IP_PATH=/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt
   export HF_HUB_OFFLINE=1
   export HF_HOME=/vePFS-Mindverse/share/huggingface
   export PYTHONDONTWRITEBYTECODE=1
   export RAY_ENABLE_AUTO_CONNECT=0
-  export MINT_RAY_INCLUDE_DASHBOARD=0
-  export MINT_RAY_CLIENT_SERVER_PORT=0
 
   mkdir -p "${MINT_TMP_ROOT}/h" "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}" "${MINT_NODE_STATE_ROOT}"
   rm -rf "${MINT_NODE_LOCAL_SERVICE_DIR}"
@@ -39,13 +37,33 @@ Entrypoint: |
   {
     date -Is
     echo "entrypoint role=${MINT_NODE_ROLE} service_dir=${MINT_NODE_SERVICE_DIR} local_service_dir=${MINT_NODE_LOCAL_SERVICE_DIR}"
-    ls -la "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_SERVICE_DIR}" "${MINT_NODE_LOCAL_SERVICE_DIR}" || true
   } >> "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/entrypoint.log" 2>&1
 
-  exec "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_LOCAL_SERVICE_DIR}"
+  # Start services directly (bypass runsvdir — PFS runtime binaries may not
+  # match the pod image after rsync --delete corrupted the runtime dir).
+  mkdir -p /run/sshd
+  /usr/sbin/sshd -D -e \
+    -o "Port=22" \
+    -o "ListenAddress=0.0.0.0" \
+    -o "HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_rsa_key" \
+    -o "HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ecdsa_key" \
+    -o "HostKey=/vePFS-Mindverse/share/mint/runtime/ssh/ssh_host_ed25519_key" \
+    -o "PermitRootLogin=yes" \
+    -o "PasswordAuthentication=no" \
+    -o "PubkeyAuthentication=yes" \
+    -o "AuthorizedKeysFile=/vePFS-Mindverse/share/mint/runtime/ssh/authorized_keys" \
+    -o "StrictModes=no" \
+    -o "UsePAM=no" \
+    -o "PidFile=/tmp/mint-sshd.pid" \
+    >> "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/sshd/current" 2>&1 &
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
-ResourceQueueID: "q-20251225183621-m2297"  # CPU queue for head node
+  /vePFS-Mindverse/share/mint/runtime/supervisor/current/bin/mint-ray-node \
+    >> "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/ray/current" 2>&1 &
+
+  wait
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/mint/mint-ray-node:latest-sm80"
+ResourceQueueID: "q-20260519151516-zh4nt"  # CPU queue (dedicated)
 Framework: "Custom"
 
 TaskRoleSpecs:
@@ -53,7 +71,7 @@ TaskRoleSpecs:
       RoleReplicas: 1
       Flavor: "ml.r3i.4xlarge"  # CPU instance
 
-# No time limit - runs indefinitely
+# No timeout (0 = unlimited)
 ActiveDeadlineSeconds: 0
 DelayExitTimeSeconds: 0
 AccessType: "Private"
@@ -67,9 +85,13 @@ Storages:
     - Type: "Vepfs"
       Id: "vepfs-cnbjecc87dad63ea"
       MountPath: "/mnt/tmp"
-      SubPath: "share/mint/prod/tmp/r"
+      SubPath: "share/mint/dev/tmp/r"
       ReadOnly: false
     - Type: "TosFuse"
       MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse-dev"
+      Prefix: "/"
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse-prod"
       Bucket: "tos-mindverse"
       Prefix: "/"

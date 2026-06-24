@@ -121,7 +121,7 @@ providers:
       mode: default_chain
     templates:
       a800-8gpu-c1:
-        template_path: /vePFS-Mindverse/share/<owner>/mint-server/.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml
+        template_path: /vePFS-Mindverse/share/<owner>/mint-server/docker/volc/dev-worker.yaml
         resource_queue_id: q-20251126180002-26lwz
         gpu_count: 8
 nodes:
@@ -140,8 +140,8 @@ The supervisor submits workers in ascending alias order. If `mint-worker-0` is m
 Head-node lifecycle is still environment-owned bootstrap. Worker lifecycle is topology/SDK-owned.
 
 Head templates:
-- `.claude/skills/volcano-cluster/configs/mint-dev-head.yaml`
-- `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`
+- `docker/volc/dev-head.yaml`
+- `docker/volc/prod-head.yaml`
 
 Head nodes publish their IP to:
 - Dev: `/vePFS-Mindverse/share/mint/dev/ray/head-address/ray_head_ip.txt`
@@ -236,7 +236,7 @@ cat /vePFS-Mindverse/share/mint/<env>/runtime/topology_state.yaml
 | Dev | `mint-dev-head.yaml` | `mint-dev-worker.yaml` |
 | Prod | `mint-prod-head.yaml` | `mint-prod-worker.yaml` |
 
-All configs live in `.claude/skills/volcano-cluster/configs/`.
+All configs live in `docker/volc/`.
 
 ## Shared Node Runtime Assets
 

@@ -243,27 +243,34 @@ docker build --build-arg RAY_VERSION=2.52.0 \
     -t mint:overlay-sm80 -f docker/Dockerfile.sm80.overlay .
 ```
 
-## Volcano task templates
+## Cluster deployment templates
 
-Volcano task YAML templates for launching the mint dev cluster:
+Volcano and (future) Aliyun task YAML templates live under `docker/volc/`
+and `docker/aliyun/` respectively. These are the canonical deployment
+configs — the `.claude/skills/volcano-cluster/configs/` copies are kept
+in sync.
 
 ```
 docker/
-├── volc-task.head.yaml    ← CPU head node (ml.r3i.4xlarge)
-└── volc-task.worker.yaml   ← GPU worker node (ml.hpcpni2l.28xlarge)
+├── volc/
+│   ├── dev-head.yaml      ← dev CPU head (ml.r3i.4xlarge)
+│   ├── dev-worker.yaml     ← dev GPU worker (ml.hpcpni2l.28xlarge)
+│   ├── prod-head.yaml     ← prod CPU head
+│   └── prod-worker.yaml   ← prod GPU worker
+└── aliyun/                  ← (future)
 ```
 
 Submit:
 ```bash
 # Start head first
-volc ml_task submit -c docker/volc-task.head.yaml
+volc ml_task submit -c docker/volc/dev-head.yaml
 
-# Wait for Ray head IP to be written to PFS, then start workers
-volc ml_task submit -c docker/volc-task.worker.yaml
+# Wait for Ray head IP, then start workers
+volc ml_task submit -c docker/volc/dev-worker.yaml
 ```
 
-The worker template uses `TaskName: mint-dev-worker-1`. To launch
-multiple workers, change the `TaskName` field for each submission.
+The worker template uses `TaskName: mint-dev-worker`. To launch multiple
+workers, change the `TaskName` field for each submission.
 
 ## Environment variables
 

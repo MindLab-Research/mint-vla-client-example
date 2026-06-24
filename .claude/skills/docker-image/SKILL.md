@@ -69,10 +69,10 @@ docker push image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16
 ## 4) Update dev/prod Ray task YAMLs to the new mint:N
 
 Update the image tag in:
-- `.claude/skills/volcano-cluster/configs/mint-dev-head.yaml`
-- `.claude/skills/volcano-cluster/configs/mint-dev-worker.yaml`
-- `.claude/skills/volcano-cluster/configs/mint-prod-head.yaml`
-- `.claude/skills/volcano-cluster/configs/mint-prod-worker.yaml`
+- `docker/volc/dev-head.yaml`
+- `docker/volc/dev-worker.yaml`
+- `docker/volc/prod-head.yaml`
+- `docker/volc/prod-worker.yaml`
 
 Guideline:
 - Volcano should use `mint:16-sm80`

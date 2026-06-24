@@ -1,0 +1,88 @@
+# MINT Production Ray GPU Worker - DO NOT MODIFY FOR DEV
+# This cluster is for production deployment only.
+#
+# Before submitting:
+#   - Ensure mint-prod-head is running and has written ray_head_ip.txt
+#   - Configure this file as a template in MINT_TOPOLOGY_CONFIG_PATH
+#   - Let mint_model_actor_supervisor submit one 1-node task per mint-worker-{idx}
+#
+# Node lifecycle is submitted through VolcanoTopologyProvider /
+# scripts/tools/volcano_sdk_jobs.py, not the Volcano CLI.
+#
+# The node process tree is supervised by the shared runit bundle under the
+# shared Mint runtime. The template intentionally does not inject application
+# code paths; service configs decide what workloads run on the Ray cluster.
+# Ray tmp uses /mnt/tmp, a short Vepfs mount, to avoid Unix socket path length
+# failures without relying on symlinks.
+
+TaskName: "mint-prod-worker"
+Description: "MINT PRODUCTION - Ray GPU worker - DO NOT USE FOR DEV"
+
+Entrypoint: |
+  set -euo pipefail
+
+  export MINT_ENV=prod
+  export MINT_NODE_ROLE=worker
+  export MINT_TMP_ROOT=/mnt/tmp
+  export MINT_RUNTIME_ROOT=/vePFS-Mindverse/share/mint/runtime
+  export MINT_NODE_SERVICE_DIR="${MINT_RUNTIME_ROOT}/services/${MINT_ENV}-${MINT_NODE_ROLE}"
+  export MINT_NODE_LOCAL_SERVICE_DIR="/tmp/mint-runit/${MINT_ENV}-${MINT_NODE_ROLE}"
+  export PATH="${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin:${PATH}"
+  export MINT_NODE_LOG_ROOT=/vePFS-Mindverse/share/mint/logs/nodes
+  export MINT_NODE_STATE_ROOT=/vePFS-Mindverse/share/mint/prod/runtime/node-state
+  export MINT_RAY_HEAD_IP_PATH=/vePFS-Mindverse/share/mint/prod/ray/head-address/ray_head_ip.txt
+  export HF_HUB_OFFLINE=1
+  export HF_HOME=/vePFS-Mindverse/share/huggingface
+  export PYTHONDONTWRITEBYTECODE=1
+  export RAY_ENABLE_AUTO_CONNECT=0
+
+  node_id="$(hostname | tr -c 'A-Za-z0-9_.-' '-')"
+  export MINT_NODE_ID="${node_id}"
+
+  mkdir -p "${MINT_TMP_ROOT}/w/${MINT_NODE_ID}" "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}" "${MINT_NODE_STATE_ROOT}"
+  rm -rf "${MINT_NODE_LOCAL_SERVICE_DIR}"
+  mkdir -p "$(dirname "${MINT_NODE_LOCAL_SERVICE_DIR}")"
+  cp -a "${MINT_NODE_SERVICE_DIR}" "${MINT_NODE_LOCAL_SERVICE_DIR}"
+  find "${MINT_NODE_LOCAL_SERVICE_DIR}" -name supervise -type d -prune -exec rm -rf {} +
+  {
+    date -Is
+    echo "entrypoint role=${MINT_NODE_ROLE} node_id=${MINT_NODE_ID} service_dir=${MINT_NODE_SERVICE_DIR} local_service_dir=${MINT_NODE_LOCAL_SERVICE_DIR}"
+    ls -la "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_SERVICE_DIR}" "${MINT_NODE_LOCAL_SERVICE_DIR}" || true
+  } >> "${MINT_NODE_LOG_ROOT}/${MINT_ENV}/${MINT_NODE_ROLE}/${MINT_NODE_ID}/entrypoint.log" 2>&1
+
+  exec "${MINT_RUNTIME_ROOT}/supervisor/current/usr/bin/runsvdir" "${MINT_NODE_LOCAL_SERVICE_DIR}"
+
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/mint/mint-ray-node:latest-sm80"
+ResourceQueueID: "<GPU_QUEUE_ID>"  # Prod prefers a800-mindverse-C1 (q-20251126180002-26lwz) or C2 (q-20260203101340-www2h). Set explicitly before submit.
+Framework: "Custom"
+
+TaskRoleSpecs:
+    - RoleName: "worker"
+      RoleReplicas: 1
+      Flavor: "ml.hpcpni2l.28xlarge"  # 8x A800 80GB (RDMA)
+
+# No time limit - runs indefinitely
+ActiveDeadlineSeconds: 0
+DelayExitTimeSeconds: 0
+AccessType: "Private"
+
+Storages:
+    - Type: "Vepfs"
+      Id: "vepfs-cnbjecc87dad63ea"
+      MountPath: "/vePFS-Mindverse"
+      SubPath: ""
+      ReadOnly: true
+    - Type: "Vepfs"
+      Id: "vepfs-cnbjecc87dad63ea"
+      MountPath: "/vePFS-Mindverse/share"
+      SubPath: "share"
+      ReadOnly: false
+    - Type: "Vepfs"
+      Id: "vepfs-cnbjecc87dad63ea"
+      MountPath: "/mnt/tmp"
+      SubPath: "share/mint/prod/tmp/r"
+      ReadOnly: false
+    - Type: "TosFuse"
+      MountPath: "/tos-mindverse"
+      Bucket: "tos-mindverse"
+      Prefix: "/"

@@ -71,7 +71,7 @@ Entrypoint: |
 
   wait
 
-ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/namespace-mindverse/mint:16-sm80"
+ImageUrl: "image-mindverse-cn-beijing.cr.volces.com/mint/mint-ray-node:latest-sm80"
 ResourceQueueID: "<GPU_QUEUE_ID>"  # Set explicitly before submit. If only prod GPU queues are available, get user approval.
 Framework: "Custom"
 
