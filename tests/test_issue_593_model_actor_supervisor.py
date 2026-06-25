@@ -1372,6 +1372,47 @@ async def test_issue_648_launch_model_engine_host_passes_training_token_budget(
 
 
 @pytest.mark.anyio
+async def test_launch_bumblebee_model_engine_host_uses_spec_placement_over_global_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _fake_get_or_create_model_engine_host(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(ok=True)
+
+    runtime_module = types.ModuleType("mint_server.backend.actors.model_engine_host")
+    runtime_module.get_or_create_model_engine_host = _fake_get_or_create_model_engine_host
+    monkeypatch.setitem(sys.modules, "mint_server.backend.actors.model_engine_host", runtime_module)
+    monkeypatch.setenv(
+        "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON",
+        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"node_ip":"10.0.0.99","gpu_count":4}}',
+    )
+    monkeypatch.setenv(
+        "MINT_MODEL_PLACEMENT_JSON",
+        '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"node_ip":"10.0.0.98","gpu_count":4}}',
+    )
+
+    actor = await launch_model_engine_host(
+        ModelActorSpec(
+            domain_key="bumblebee:mint_megatron_qwen3_30b_a3b_instruct_2507",
+            replica_id="replica-0",
+            base_model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+            node_pin="10.0.0.7",
+            gpu_count=4,
+        ),
+        generation=12,
+    )
+
+    assert actor.ok is True
+    runtime_env_extra = captured["runtime_env_extra"]
+    expected = '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"gpu_count":4,"node_ip":"10.0.0.7","replica":0}}'
+    assert runtime_env_extra["MINT_MODEL_PLACEMENT_JSON"] == expected
+    assert runtime_env_extra["MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON"] == expected
+    assert "MINT_VLLM_MODEL_PLACEMENT_JSON" not in runtime_env_extra
+
+
+@pytest.mark.anyio
 async def test_issue_593_supervisor_creates_replica_and_syncs_scheduler() -> None:
     created: list[_FakeRuntimeActor] = []
     events: list[str] = []

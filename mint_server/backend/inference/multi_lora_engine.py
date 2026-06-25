@@ -1359,7 +1359,6 @@ class MultiLoRAInferenceEngine:
 _model_to_actor_name = vllm_actor_name
 
 
-
 def _resolve_model_path(model_name: str) -> str:
     """Resolve model name to a concrete local snapshot path on PFS."""
     # Map of model names to local paths

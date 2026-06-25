@@ -87,16 +87,49 @@ def _local_sampling_config(session_id: str) -> tuple[str | None, str | None, int
     )
 
 
-def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
+def _parse_typed_checkpoint_path(model_path: str) -> tuple[str, str, str] | None:
     if model_path.startswith("mint://"):
         path_part = model_path[len("mint://") :]
+    elif model_path.startswith("tinker://"):
+        path_part = model_path[len("tinker://") :]
     else:
         return None
 
     parts = [p for p in path_part.split("/") if p]
     if len(parts) == 3 and parts[1] in ("weights", "sampler_weights"):
-        return parts[0], parts[2]
+        return parts[0], parts[1], parts[2]
     return None
+
+
+def _parse_checkpoint_path(model_path: str) -> tuple[str, str] | None:
+    parsed = _parse_typed_checkpoint_path(model_path)
+    if parsed is None:
+        return None
+    model_id, _kind, checkpoint_name = parsed
+    return model_id, checkpoint_name
+
+
+def _checkpoint_model_id_matches_session(model_id: str, session_id: str | None) -> bool:
+    if not session_id:
+        return False
+    session = str(session_id)
+    model = str(model_id)
+    if model == session:
+        return True
+    prefix = f"{session}_"
+    return model.startswith(prefix) and model[len(prefix) :].isdigit()
+
+
+def _same_session_anonymous_sampler_owner(model_path: str, *, session_id: str | None) -> str | None:
+    parsed = _parse_typed_checkpoint_path(model_path)
+    if parsed is None:
+        return None
+    model_id, kind, _checkpoint_name = parsed
+    if kind != "sampler_weights":
+        return None
+    if not _checkpoint_model_id_matches_session(model_id, session_id):
+        return None
+    return "anonymous"
 
 
 def _infer_base_model_from_checkpoint(
@@ -304,14 +337,11 @@ async def _create_sampling_session_impl(
     request: CreateSamplingSessionRequest,
     http_request: Request,
 ) -> CreateSamplingSessionResponse:
-    """Create a sampling session using the shared multi-LoRA engine.
+    """Create and persist a Mint sampling session.
 
-    Uses the shared multi-LoRA engine for efficient session management:
-    - Without model_path: Uses base model (no LoRA)
-    - With model_path: Loads LoRA adapter into shared engine
-
-    First call lazily initializes the multi-LoRA engine (~60s).
-    Subsequent calls register sessions instantly (<1s).
+    Backend engine startup is deferred until sampling work executes. Without a
+    model_path this records a base-model session; with a model_path this records
+    the PEFT adapter path for backend-specific lazy loading.
     """
     user_id = _get_user_id(http_request)
     created_at = datetime.now().isoformat()
@@ -322,6 +352,7 @@ async def _create_sampling_session_impl(
         user_id=user_id,
         owner_id=request.owner_id,
         http_request=http_request,
+        session_id=request.session_id,
     )
 
     if not base_model:
@@ -386,6 +417,7 @@ async def _create_sampling_session_impl(
                 user_id=user_id,
                 owner_id=request.owner_id,
                 http_request=http_request,
+                session_id=request.session_id,
             )
 
         from mint_server.backend.training.bumblebee.bumblebee_lora import prepare_lora_adapter_for_vllm
@@ -724,6 +756,7 @@ def _resolve_model_path(
     user_id: str | None,
     owner_id: str | None = None,
     http_request: Request,
+    session_id: str | None = None,
 ) -> str:
     """Resolve model_path URI to filesystem path.
 
@@ -740,21 +773,27 @@ def _resolve_model_path(
     )
 
     can_system = can_manage_system(http_request)
-    if not can_system and not model_path.startswith(("mint://", "ckpt_")):
+    if not can_system and not model_path.startswith(("mint://", "tinker://", "ckpt_")):
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # When can_system is True but owner_id is not provided (e.g. dev no-auth
-    # mode or SDK clients that don't pass owner_id), fall back to user_id
-    # so checkpoint resolution does not fail with "owner_id is required".
-    owner_scope = owner_id or user_id if can_system else user_id
+    # In dev/no-auth mode or SDK flows that do not pass owner_id, use user_id
+    # for ordinary checkpoint resolution instead of requiring explicit admin
+    # checkpoint ownership.
+    owner_scope = (owner_id or user_id) if can_system else user_id
+    resolve_as_admin = can_system
+    if can_system and not str(owner_id or "").strip():
+        anonymous_sampler_owner = _same_session_anonymous_sampler_owner(model_path, session_id=session_id)
+        if anonymous_sampler_owner is not None:
+            owner_scope = anonymous_sampler_owner
+            resolve_as_admin = False
     try:
-        resolved = resolve_checkpoint_uri(model_path, "", user_id=owner_scope, is_admin=can_system)
+        resolved = resolve_checkpoint_uri(model_path, "", user_id=owner_scope, is_admin=resolve_as_admin)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     if model_path.startswith("ckpt_") and resolved == model_path:
         raise HTTPException(status_code=404, detail="Checkpoint not found")
     try:
-        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=can_system)
+        ensure_checkpoint_path_allowed(resolved, user_id=owner_scope, is_admin=resolve_as_admin)
     except PermissionError as e:
         raise HTTPException(status_code=403, detail=str(e)) from e
     return materialize_persistent_checkpoint(resolved)
@@ -767,6 +806,7 @@ def _resolve_base_model_for_sampling_request(
     user_id: str | None,
     owner_id: str | None,
     http_request: Request,
+    session_id: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Return the effective base_model and resolved adapter path for a sampling request."""
     adapter_path: str | None = None
@@ -776,6 +816,7 @@ def _resolve_base_model_for_sampling_request(
             user_id=user_id,
             owner_id=owner_id,
             http_request=http_request,
+            session_id=session_id,
         )
         base_model = _infer_base_model_from_adapter(adapter_path)
     return base_model, adapter_path

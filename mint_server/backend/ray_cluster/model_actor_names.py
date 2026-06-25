@@ -28,6 +28,7 @@ import re
 
 __all__ = [
     "vllm_actor_name",
+    "sglang_actor_name",
     "megatron_actor_name",
     "bumblebee_actor_name",
     "dense_actor_name",
@@ -61,6 +62,11 @@ def _sanitize(value: str) -> str:
 def vllm_actor_name(base_model: str) -> str:
     """``"Qwen/Qwen3-30B-A3B-Instruct-2507"`` → ``"mint_vllm_qwen3_30b_a3b_instruct_2507"``"""
     return f"mint_vllm_{_sanitize(_model_part(base_model))}"
+
+
+def sglang_actor_name(base_model: str) -> str:
+    """``"Qwen/Qwen3-30B-A3B-Instruct-2507"`` → ``"mint_sglang_qwen3_30b_a3b_instruct_2507"``"""
+    return f"mint_sglang_{_sanitize(_model_part(base_model))}"
 
 
 def megatron_actor_name(base_model: str) -> str:

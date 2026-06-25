@@ -30,10 +30,15 @@ from mint_server.backend.training.bumblebee.bumblebee_distributed import (
     _bumblebee_model_name_for_base_model,
     _bumblebee_runtime_env_defaults,
     _bumblebee_runtime_pythonpath,
+    _bumblebee_target_modules_for_flags,
     _bumblebee_runtime_etp,
     _coerce_int,
+    _filter_bumblebee_adapter_model_for_target_modules,
+    _assert_bumblebee_node_ip_capacity_with_sglang_reclaim,
     _make_bumblebee_pg_name,
     _normalize_bumblebee_peft_adapter_config,
+    _reclaim_same_model_sglang_resources_for_bumblebee,
+    _use_bumblebee_dense_dp0_attention_export,
     get_or_create_bumblebee_worker_group,
 )
 
@@ -156,6 +161,145 @@ def test_bumblebee_runtime_env_passthrough_includes_backend_knobs():
     assert "MINT_BUMBLEBEE_FLASH_ATTN_OVERLAY_PATH" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "NVTE_FLASH_ATTN" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
     assert "BUMBLEBEE_TE_SDPA_FALLBACK" in BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS
+
+
+def test_bumblebee_capacity_check_reclaims_same_model_sglang_resources_once(monkeypatch):
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
+
+    capacity_calls = []
+    reclaim_calls = []
+
+    def fake_assert_node_ip_capacity(**kwargs):
+        capacity_calls.append(kwargs)
+        if len(capacity_calls) == 1:
+            raise RuntimeError("pinned node capacity check failed: blocked by live SGLang actor")
+
+    def fake_reclaim(**kwargs):
+        reclaim_calls.append(kwargs)
+        return {"killed_actor_names": ["mint_sglang_qwen3_30b_a3b_instruct_2507"]}
+
+    monkeypatch.setattr(bb, "assert_node_ip_capacity", fake_assert_node_ip_capacity)
+    monkeypatch.setattr(bb, "_reclaim_same_model_sglang_resources_for_bumblebee", fake_reclaim)
+
+    _assert_bumblebee_node_ip_capacity_with_sglang_reclaim(
+        model_name="Qwen/Qwen3-30B-A3B-Instruct-2507",
+        required_gpus_by_node_ip={"192.0.2.10": 4},
+        context="bumblebee training",
+        ignore_placement_group_names={"owned-pg"},
+        ignore_placement_group_namespace="mint_test",
+    )
+
+    assert capacity_calls == [
+        {
+            "required_gpus_by_node_ip": {"192.0.2.10": 4},
+            "context": "bumblebee training",
+            "ignore_placement_group_names": {"owned-pg"},
+            "ignore_placement_group_namespace": "mint_test",
+        },
+        {
+            "required_gpus_by_node_ip": {"192.0.2.10": 4},
+            "context": "bumblebee training",
+            "ignore_placement_group_names": {"owned-pg"},
+            "ignore_placement_group_namespace": "mint_test",
+        },
+    ]
+    assert reclaim_calls == [
+        {
+            "model_name": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+            "context": "bumblebee training",
+            "namespace": bb.PERSISTENT_NAMESPACE,
+        }
+    ]
+
+
+def test_bumblebee_sglang_reclaim_only_kills_same_model_same_namespace(monkeypatch):
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
+
+    namespace = "mint_test"
+    model_key = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    model_name = (
+        "/vePFS-Mindverse/share/huggingface/hub/"
+        "models--Qwen--Qwen3-30B-A3B-Instruct-2507/"
+        "snapshots/0d7cf23991f47feeb3a57ecb4c9cee8ea4a17bfe"
+    )
+    sglang_actor = "mint_sglang_qwen3_30b_a3b_instruct_2507"
+    runtime_actor = "mint_model_runtime_sglang_qwen_qwen3_30b_a3b_instruct_2507_replica_0"
+    actors = {
+        sglang_actor: object(),
+        f"{sglang_actor}_rank1": object(),
+        runtime_actor: object(),
+        "mint_sglang_qwen3_4b_instruct_2507": object(),
+    }
+    killed = []
+    invalidated = []
+
+    def fake_list_named_actors(*, all_namespaces):
+        assert all_namespaces is True
+        return [
+            {"namespace": namespace, "name": sglang_actor},
+            {"namespace": namespace, "name": f"{sglang_actor}_rank1"},
+            {"namespace": namespace, "name": "mint_sglang_qwen3_4b_instruct_2507"},
+            {"namespace": "other", "name": f"{sglang_actor}_rank2"},
+        ]
+
+    def fake_get_actor(actor_name, *, namespace):
+        assert namespace == "mint_test"
+        if actor_name not in actors:
+            raise ValueError(actor_name)
+        return actors[actor_name]
+
+    def fake_kill(actor, **kwargs):
+        del actor
+        killed.append(kwargs)
+
+    fake_sglang_engine = types.ModuleType("mint_server.backend.sglang_engine")
+    fake_sglang_engine._invalidate_model_session_loras = lambda model: invalidated.append(model)
+
+    monkeypatch.setattr(bb.ray.util, "list_named_actors", fake_list_named_actors, raising=False)
+    monkeypatch.setattr(bb.ray, "get_actor", fake_get_actor)
+    monkeypatch.setattr(bb.ray_kill, "kill", fake_kill)
+    monkeypatch.setitem(sys.modules, "mint_server.backend.sglang_engine", fake_sglang_engine)
+
+    result = _reclaim_same_model_sglang_resources_for_bumblebee(
+        model_name=model_name,
+        context="bumblebee training",
+        namespace=namespace,
+    )
+
+    assert result == {"killed_actor_names": [runtime_actor, sglang_actor, f"{sglang_actor}_rank1"]}
+    assert [entry["actor_name"] for entry in killed] == [runtime_actor, sglang_actor, f"{sglang_actor}_rank1"]
+    assert {entry["namespace"] for entry in killed} == {namespace}
+    assert {entry["reason"] for entry in killed} == {"bumblebee_launch_same_model_sglang_preempt"}
+    assert invalidated == [model_key]
+
+
+def test_bumblebee_dense_dp0_export_only_for_attention_only_multi_dp():
+    ps = SimpleNamespace(dp_size=8)
+
+    assert _use_bumblebee_dense_dp0_attention_export(
+        ps,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+    assert not _use_bumblebee_dense_dp0_attention_export(
+        ps,
+        train_attn=True,
+        train_mlp=True,
+        train_unembed=False,
+    )
+    assert not _use_bumblebee_dense_dp0_attention_export(
+        ps,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=True,
+    )
+    assert not _use_bumblebee_dense_dp0_attention_export(
+        SimpleNamespace(dp_size=1),
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
 
 
 def test_bumblebee_model_name_defaults_to_qwen3_moe(monkeypatch):
@@ -335,6 +479,440 @@ def test_bumblebee_group_normalizes_adapter_config_after_all_rank_writes(tmp_pat
     assert result["adapter_config"]["peft_type"] == "LORA"
 
 
+def test_bumblebee_group_save_lora_weights_forwards_train_flags(tmp_path):
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    calls = []
+
+    class RecordingRemote:
+        def remote(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return object()
+
+    remote = RecordingRemote()
+    group.workers = [SimpleNamespace(save_lora_weights=remote)]
+    group._current_session = "session-a"
+    group._ensure_initialized = MethodType(lambda self: None, group)
+    group._ray_get_group_results = MethodType(lambda self, refs, *, op: [], group)
+
+    group.save_lora_weights(
+        str(tmp_path),
+        session_id="session-a",
+        actual_rank=16,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    assert calls
+    _, kwargs = calls[0]
+    assert kwargs["session_id"] == "session-a"
+    assert kwargs["actual_rank"] == 16
+    assert kwargs["train_attn"] is True
+    assert kwargs["train_mlp"] is False
+    assert kwargs["train_unembed"] is False
+
+
+def test_bumblebee_adapter_filter_removes_unrequested_expert_mlp_tensors(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    adapter_config = {
+        "r": 16,
+        "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+        "peft_type": "LORA",
+    }
+    (tmp_path / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
+    save_file(
+        {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1, 1),
+            "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight": torch.ones(1, 1),
+            "base_model.model.model.layers.0.mlp.experts.0.gate_proj.lora_A.weight": torch.ones(1, 1),
+            "base_model.model.model.layers.0.mlp.experts.0.down_proj.lora_B.weight": torch.ones(1, 1),
+        },
+        str(tmp_path / "adapter_model.safetensors"),
+    )
+    (tmp_path / "bumblebee_adapter_meta.json").write_text(
+        json.dumps({"num_tensors": 4, "num_parameters": 4}),
+        encoding="utf-8",
+    )
+
+    update = _filter_bumblebee_adapter_model_for_target_modules(tmp_path, adapter_config)
+
+    assert update is not None
+    assert update["num_tensors"] == 2
+    assert update["filtered_removed_tensors"] == 2
+    tensors = load_file(tmp_path / "adapter_model.safetensors")
+    assert sorted(tensors) == [
+        "base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+    ]
+    metadata = json.loads((tmp_path / "bumblebee_adapter_meta.json").read_text(encoding="utf-8"))
+    assert metadata["num_tensors"] == 2
+    assert metadata["filtered_removed_tensors"] == 2
+
+
+def test_bumblebee_group_filters_attention_only_sampler_export_after_rank_writes(tmp_path):
+    from safetensors.torch import load_file, save_file
+
+    group_cls = BumblebeeWorkerGroup.__ray_actor_class__
+    group = object.__new__(group_cls)
+    remote = SimpleNamespace(remote=lambda *_args, **_kwargs: object())
+    group.workers = [SimpleNamespace(save_lora_weights=remote)]
+    group._current_session = "session-a"
+    group._ensure_initialized = MethodType(lambda self: None, group)
+
+    def fake_ray_get_group_results(self, refs, *, op):
+        del self, refs, op
+        adapter_config = {
+            "r": 16,
+            "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            "peft_type": "LORA",
+        }
+        (tmp_path / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
+        save_file(
+            {
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(1, 1),
+                "base_model.model.model.layers.0.mlp.experts.0.up_proj.lora_A.weight": torch.ones(1, 1),
+            },
+            str(tmp_path / "adapter_model.safetensors"),
+        )
+        (tmp_path / "bumblebee_adapter_meta.json").write_text(
+            json.dumps({"num_tensors": 2, "num_parameters": 2}),
+            encoding="utf-8",
+        )
+        return [{"adapter_config": adapter_config, "backend": "bumblebee"}]
+
+    group._ray_get_group_results = MethodType(fake_ray_get_group_results, group)
+
+    result = group.save_lora_weights(
+        str(tmp_path),
+        session_id="session-a",
+        actual_rank=16,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    tensors = load_file(tmp_path / "adapter_model.safetensors")
+    assert sorted(tensors) == [
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+    ]
+    assert result["filtered_removed_tensors"] == 1
+    assert result["num_tensors"] == 1
+
+
+def test_bumblebee_rank_save_lora_weights_respects_attention_only_targets(
+    tmp_path,
+    monkeypatch,
+):
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.world_size = 1
+    worker.base_model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+    worker.lora_rank = 64
+    worker.learning_rate = 1e-4
+    worker._current_session = "session-a"
+    worker._session_meta = {
+        "session-a": BumblebeeSessionMeta(step_count=3, learning_rate=2e-5, actual_rank=16)
+    }
+    worker._ensure_session_loaded = MethodType(
+        lambda self, session_id, actual_rank, **kwargs: self._update_session_train_flags(session_id, **kwargs),
+        worker,
+    )
+    handle = SimpleNamespace(
+        _model="model",
+        _extras={"model_chunks": ["chunk"], "model_cfg": "model-cfg"},
+        _parallel_state="parallel-state",
+    )
+    worker._require_runtime = MethodType(lambda self: (object(), handle), worker)
+
+    fake_lora_adapter = types.ModuleType("bumblebee.model.qwen3_moe.lite.lora_adapter")
+    save_calls = []
+
+    def fake_save_lora_adapter(
+        chunks,
+        model_cfg,
+        parallel_state,
+        save_path,
+        *,
+        base_model_name_or_path,
+        lora_config,
+        metadata,
+    ):
+        save_calls.append(
+            {
+                "chunks": chunks,
+                "model_cfg": model_cfg,
+                "parallel_state": parallel_state,
+                "base_model_name_or_path": base_model_name_or_path,
+                "lora_config": dict(lora_config),
+                "metadata": dict(metadata),
+            }
+        )
+        adapter_config = {
+            "r": int(lora_config["rank"]),
+            "target_modules": list(lora_config["target_modules"]),
+            "peft_type": "LORA",
+        }
+        (tmp_path / "adapter_config.json").write_text(json.dumps(adapter_config), encoding="utf-8")
+        return {"adapter_config": adapter_config}
+
+    fake_lora_adapter.save_lora_adapter = fake_save_lora_adapter
+    monkeypatch.setitem(sys.modules, "bumblebee.model.qwen3_moe.lite.lora_adapter", fake_lora_adapter)
+
+    meta = worker.save_lora_weights(
+        str(tmp_path),
+        session_id="session-a",
+        actual_rank=16,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    assert save_calls
+    assert save_calls[0]["lora_config"]["target_modules"] == ["linear_qkv", "linear_proj"]
+    assert save_calls[0]["metadata"]["train_mlp"] is False
+    assert meta["train_attn"] is True
+    assert meta["train_mlp"] is False
+    assert meta["train_unembed"] is False
+
+
+def test_bumblebee_rank_save_lora_weights_uses_dense_dp0_export_for_attention_only(
+    tmp_path,
+    monkeypatch,
+):
+    from safetensors.torch import load_file
+
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.world_size = 32
+    worker.base_model = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    worker.lora_rank = 64
+    worker.learning_rate = 1e-4
+    worker._current_session = "session-a"
+    worker._session_meta = {
+        "session-a": BumblebeeSessionMeta(step_count=1, learning_rate=3e-5, actual_rank=64)
+    }
+    worker._ensure_session_loaded = MethodType(
+        lambda self, session_id, actual_rank, **kwargs: self._update_session_train_flags(session_id, **kwargs),
+        worker,
+    )
+    model_cfg = SimpleNamespace(
+        num_hidden_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_experts=0,
+        moe_intermediate_size=0,
+    )
+    parallel_state = SimpleNamespace(
+        dp_size=8,
+        dp_rank=0,
+        tp_size=4,
+        tp_rank=0,
+        ep_size=8,
+        etp_size=1,
+        pp_size=1,
+    )
+    handle = SimpleNamespace(
+        _model="model",
+        _extras={"model_chunks": ["chunk"], "model_cfg": model_cfg},
+        _parallel_state=parallel_state,
+    )
+    worker._require_runtime = MethodType(lambda self: (object(), handle), worker)
+
+    fake_lora_adapter = types.ModuleType("bumblebee.model.qwen3_moe.lite.lora_adapter")
+
+    def fake_export_lora_adapter_state(chunks, cfg, ps, *, cpu=True):
+        assert chunks == ["chunk"]
+        assert cfg is model_cfg
+        assert ps is parallel_state
+        assert cpu is True
+        return {
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight": torch.ones(2, 3),
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight": torch.ones(4, 2),
+        }
+
+    def unexpected_save_lora_adapter(*_args, **_kwargs):
+        raise AssertionError("attention-only multi-DP export should not call vendor save_lora_adapter")
+
+    fake_lora_adapter.export_lora_adapter_state = fake_export_lora_adapter_state
+    fake_lora_adapter.save_lora_adapter = unexpected_save_lora_adapter
+    monkeypatch.setitem(sys.modules, "bumblebee.model.qwen3_moe.lite.lora_adapter", fake_lora_adapter)
+
+    meta = worker.save_lora_weights(
+        str(tmp_path),
+        session_id="session-a",
+        actual_rank=64,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    tensors = load_file(tmp_path / "adapter_model.safetensors")
+    assert sorted(tensors) == [
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+    ]
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert adapter_config["r"] == 64
+    assert adapter_config["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
+    saved_meta = json.loads((tmp_path / "bumblebee_adapter_meta.json").read_text(encoding="utf-8"))
+    assert saved_meta["metadata"]["dense_dp0_attention_export"] is True
+    assert saved_meta["metadata"]["train_mlp"] is False
+    assert meta["num_tensors"] == 2
+    assert meta["num_parameters"] == 14
+    assert meta["actual_rank"] == 64
+    assert meta["train_mlp"] is False
+
+
+def test_bumblebee_save_lora_adapter_artifacts_uses_dense_dp0_export_for_attention_only(
+    tmp_path,
+    monkeypatch,
+):
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+    worker.rank = 0
+    worker.world_size = 32
+    worker.base_model = "Qwen/Qwen3-235B-A22B-Instruct-2507"
+    worker.lora_rank = 64
+    worker.learning_rate = 1e-4
+    model_cfg = SimpleNamespace(
+        num_hidden_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_experts=0,
+        moe_intermediate_size=0,
+    )
+    parallel_state = SimpleNamespace(
+        dp_size=8,
+        dp_rank=0,
+        tp_size=4,
+        tp_rank=0,
+        ep_size=8,
+        etp_size=1,
+        pp_size=1,
+    )
+    handle = SimpleNamespace(
+        _model="model",
+        _extras={"model_chunks": ["chunk"], "model_cfg": model_cfg},
+        _parallel_state=parallel_state,
+    )
+    worker._require_runtime = MethodType(lambda self: (object(), handle), worker)
+
+    fake_lora_adapter = types.ModuleType("bumblebee.model.qwen3_moe.lite.lora_adapter")
+
+    def fake_export_lora_adapter_state(_chunks, _cfg, _ps, *, cpu=True):
+        assert cpu is True
+        return {
+            "base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight": torch.ones(2, 3),
+        }
+
+    def unexpected_save_lora_adapter(*_args, **_kwargs):
+        raise AssertionError("attention-only multi-DP save_state export should not call vendor save_lora_adapter")
+
+    fake_lora_adapter.export_lora_adapter_state = fake_export_lora_adapter_state
+    fake_lora_adapter.save_lora_adapter = unexpected_save_lora_adapter
+    monkeypatch.setitem(sys.modules, "bumblebee.model.qwen3_moe.lite.lora_adapter", fake_lora_adapter)
+
+    meta = worker._save_lora_adapter_artifacts(
+        str(tmp_path),
+        session_id="session-a",
+        actual_rank=64,
+        checkpoint_type="training_state",
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
+
+    assert (tmp_path / "adapter_model.safetensors").is_file()
+    adapter_config = json.loads((tmp_path / "adapter_config.json").read_text(encoding="utf-8"))
+    assert adapter_config["target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
+    saved_meta = json.loads((tmp_path / "bumblebee_adapter_meta.json").read_text(encoding="utf-8"))
+    assert saved_meta["metadata"]["checkpoint_type"] == "training_state"
+    assert saved_meta["metadata"]["dense_dp0_attention_export"] is True
+    assert meta["num_tensors"] == 1
+
+
+def test_bumblebee_rank_initialize_uses_actor_target_modules(monkeypatch):
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
+
+    captured: dict[str, object] = {}
+
+    class FakeRuntimeConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeConfig:
+        def __init__(self, **kwargs):
+            self.__dict__.update(kwargs)
+
+    class FakeRuntime:
+        def build_model(self):
+            return object()
+
+    def fake_create_runtime(runtime_config):
+        captured["runtime_config"] = runtime_config
+        captured["bb_cfg"] = runtime_config.backend_cfg
+        return FakeRuntime()
+
+    fake_runtime_module = types.ModuleType("bumblebee.runtime")
+    fake_runtime_module.RuntimeConfig = FakeRuntimeConfig
+    fake_runtime_module.create_runtime = fake_create_runtime
+    fake_bb_config_module = types.ModuleType("bumblebee.runtime.backends.bb.config")
+    fake_bb_config_module.BBConfig = FakeConfig
+    fake_contracts_config_module = types.ModuleType("bumblebee.runtime.contracts.config")
+    fake_contracts_config_module.OptimizerConfig = FakeConfig
+    fake_contracts_config_module.ParallelConfig = FakeConfig
+
+    monkeypatch.setitem(sys.modules, "bumblebee.runtime", fake_runtime_module)
+    monkeypatch.setitem(sys.modules, "bumblebee.runtime.backends.bb.config", fake_bb_config_module)
+    monkeypatch.setitem(sys.modules, "bumblebee.runtime.contracts.config", fake_contracts_config_module)
+    monkeypatch.setattr(bb, "_ensure_bumblebee_repo_importable", lambda: "/fake/bumblebee")
+
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = worker_cls(
+        rank=0,
+        world_size=1,
+        master_addr="127.0.0.1",
+        master_port=12345,
+        base_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
+        lora_rank=64,
+        learning_rate=1e-4,
+        distributed_config=bb.DistributedConfig(),
+        target_modules=("linear_qkv", "linear_proj"),
+    )
+
+    meta = worker.initialize()
+
+    bb_cfg = captured["bb_cfg"]
+    assert bb_cfg.impl_cfg["lora"]["target_modules"] == ["linear_qkv", "linear_proj"]
+    assert meta["target_modules"] == ["linear_qkv", "linear_proj"]
+
+
+def test_bumblebee_rank_rejects_session_target_mismatch():
+    worker_cls = BumblebeeRankWorker.__ray_actor_class__
+    worker = object.__new__(worker_cls)
+    worker.target_modules = ("linear_qkv", "linear_proj")
+    worker.learning_rate = 1e-4
+    worker._session_meta = {}
+
+    meta = worker._update_session_train_flags(
+        "session-a",
+        train_attn=True,
+        train_mlp=True,
+        train_unembed=False,
+    )
+
+    with pytest.raises(RuntimeError, match="target_modules mismatch"):
+        worker._assert_session_targets_supported(meta)
+
+
 def _make_rank_worker_for_checkpoint_test():
     worker_cls = BumblebeeRankWorker.__ray_actor_class__
     worker = object.__new__(worker_cls)
@@ -371,12 +949,22 @@ def _make_rank_worker_for_checkpoint_test():
 
     runtime = FakeRuntime()
     handle = SimpleNamespace(_extras={})
-    worker._ensure_session_loaded = MethodType(lambda self, session_id, actual_rank: {}, worker)
+    worker._ensure_session_loaded = MethodType(lambda self, session_id, actual_rank, **_kwargs: {}, worker)
     worker._require_runtime = MethodType(lambda self: (runtime, handle), worker)
     worker._reset_optimizer_state = MethodType(lambda self: None, worker)
 
-    def fake_save_lora_adapter_artifacts(self, save_path, *, session_id, actual_rank, checkpoint_type):
-        del session_id, actual_rank, checkpoint_type
+    def fake_save_lora_adapter_artifacts(
+        self,
+        save_path,
+        *,
+        session_id,
+        actual_rank,
+        checkpoint_type,
+        train_attn=True,
+        train_mlp=True,
+        train_unembed=True,
+    ):
+        del session_id, actual_rank, checkpoint_type, train_attn, train_mlp, train_unembed
         from safetensors.torch import save_file
 
         save_file({"layer.lora_a": torch.tensor([1.0])}, f"{save_path}/adapter_model.safetensors")
@@ -416,7 +1004,7 @@ def _make_rank_worker_for_sft_loss_test():
 
     runtime = FakeRuntime()
     worker._ensure_session_loaded = MethodType(
-        lambda self, session_id, actual_rank: {"session_state": "loaded"},
+        lambda self, session_id, actual_rank, **_kwargs: {"session_state": "loaded"},
         worker,
     )
     worker._require_runtime = MethodType(lambda self: (runtime, object()), worker)
@@ -687,7 +1275,9 @@ def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics
     import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
 
     stale_actor = SimpleNamespace()
-    created_actor = object()
+    created_actor = SimpleNamespace(
+        initialize=SimpleNamespace(remote=lambda: "initialize-ref")
+    )
     kill_calls: list[dict] = []
 
     class _FakeRemoteOptions:
@@ -706,9 +1296,11 @@ def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics
     monkeypatch.setattr(bb.ray, "get_actor", lambda *_args, **_kwargs: stale_actor)
 
     def fake_ray_get(ref, timeout=None):
-        assert ref == "broken-diagnostics-ref"
-        assert timeout == 10
-        raise bb.ray.exceptions.ActorDiedError()
+        if ref == "broken-diagnostics-ref":
+            assert timeout == 10
+            raise bb.ray.exceptions.ActorDiedError()
+        assert ref == "initialize-ref"
+        return {"status": "ok"}
 
     monkeypatch.setattr(bb.ray, "get", fake_ray_get)
     stale_actor.get_diagnostics = _BrokenDiagnostics()
@@ -739,6 +1331,81 @@ def test_issue_670_bumblebee_get_or_create_recreates_actor_when_rank_diagnostics
             "verify_absent": True,
         }
     ]
+
+
+def test_bumblebee_get_or_create_recreates_actor_when_target_modules_mismatch(monkeypatch):
+    import mint_server.backend.training.bumblebee.bumblebee_distributed as bb
+
+    stale_actor = SimpleNamespace()
+    created_actor = SimpleNamespace(
+        initialize=SimpleNamespace(remote=lambda: "initialize-ref")
+    )
+    kill_calls: list[dict] = []
+    remote_calls: list[dict] = []
+
+    class _FakeRemoteOptions:
+        def remote(self, **kwargs):
+            remote_calls.append(kwargs)
+            return created_actor
+
+    class _FakeRemoteClass:
+        def options(self, **_kwargs):
+            return _FakeRemoteOptions()
+
+    class _Diagnostics:
+        def remote(self):
+            return "diagnostics-ref"
+
+    monkeypatch.setattr(bb.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(bb.ray, "get_actor", lambda *_args, **_kwargs: stale_actor)
+
+    def fake_ray_get(ref, timeout=None):
+        if ref == "diagnostics-ref":
+            assert timeout == 10
+            return {
+                "lora_rank": 64,
+                "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+            }
+        assert ref == "initialize-ref"
+        return {"status": "ok"}
+
+    monkeypatch.setattr(bb.ray, "get", fake_ray_get)
+    stale_actor.get_diagnostics = _Diagnostics()
+    monkeypatch.setattr(bb.ray_kill, "kill", lambda *args, **kwargs: kill_calls.append(kwargs))
+    monkeypatch.setattr(bb, "BumblebeeWorkerGroup", _FakeRemoteClass())
+    monkeypatch.setattr(bb, "actor_runtime_env_vars", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        "mint_server.backend.actors.model_actor_publication.publish_backend_model_actor",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(bb, "is_topology_desired_model", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(bb, "_model_gpu_placement_for_model", lambda *_args, **_kwargs: None)
+
+    actor = get_or_create_bumblebee_worker_group(
+        base_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
+        lora_rank=64,
+        learning_rate=1e-4,
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+        observability_base_model="Qwen/Qwen3-235B-A22B-Instruct-2507",
+    )
+
+    assert actor is created_actor
+    assert kill_calls == [
+        {
+            "reason": "bumblebee_actor_lora_target_modules_mismatch",
+            "actor_name": "mint_bumblebee_qwen3_235b_a22b_instruct_2507",
+            "namespace": bb.PERSISTENT_NAMESPACE,
+            "no_restart": True,
+            "verify_absent": True,
+        }
+    ]
+    assert remote_calls[0]["target_modules"] == _bumblebee_target_modules_for_flags(
+        train_attn=True,
+        train_mlp=False,
+        train_unembed=False,
+    )
 
 
 def test_issue_670_bumblebee_get_or_create_keeps_actor_when_diagnostics_timeout(monkeypatch):

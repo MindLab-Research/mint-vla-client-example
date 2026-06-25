@@ -14,6 +14,7 @@ Solution: Pad value tensor from 128→192 before attention, enabling FlashAttent
 Then unpad output from 192→128 after attention.
 """
 
+import os
 import structlog
 from functools import wraps
 
@@ -754,8 +755,12 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
     from megatron.core.packed_seq_params import PackedSeqParams
 
     def patched_preprocess_thd_no_padding(
-        input_ids: torch.Tensor, pre_process: bool = True, need_roll: bool = False
-    ) -> tuple[torch.Tensor, PackedSeqParams]:
+        input_ids: torch.Tensor,
+        pre_process: bool = True,
+        need_roll: bool = False,
+        use_fp8_padding: bool = False,
+    ) -> tuple[torch.Tensor, PackedSeqParams] | tuple[torch.Tensor, PackedSeqParams, torch.Tensor | None]:
+        _local_attn = _local_attention_patches_enabled()
         batch_size = input_ids.shape[0]
 
         tp_size = mpu.get_tensor_model_parallel_world_size()
@@ -764,11 +769,20 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
         align_size = tp_size * cp_size * 2 if cp_size > 1 else tp_size
         seqlens_in_batch = input_ids.offsets().diff()
 
+        if use_fp8_padding:
+            per_seq_align, total_align = verl_mcore_util._compute_fp8_thd_align_size(align_size)
+            align_size = per_seq_align
+
         pad_size = (align_size - seqlens_in_batch % align_size) % align_size
         seqlens_in_batch_padded = seqlens_in_batch + pad_size
 
         cu_seqlens_padded = torch.zeros(batch_size + 1, dtype=torch.int32, device=input_ids.device)
         cu_seqlens_padded[1:] = torch.cumsum(seqlens_in_batch_padded, dim=0)
+
+        if use_fp8_padding:
+            pad_size_last = (total_align - cu_seqlens_padded[-1] % total_align) % total_align
+            cu_seqlens_padded[-1] += pad_size_last
+            seqlens_in_batch_padded[-1] += pad_size_last
 
         seqlens_in_batch_cpu: list[int] = seqlens_in_batch.tolist()
         seqlens_in_batch_padded_cpu: list[int] = seqlens_in_batch_padded.tolist()
@@ -780,14 +794,19 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
         shape[0] = sum(seqlens_in_batch_padded_cpu) // cp_size
         if pre_process:
             input_ids_rmpad = torch.zeros(shape, dtype=input_ids.dtype, device=input_ids.device)
+            position_ids_rmpad = torch.zeros(shape[0], dtype=torch.long, device=input_ids.device)
             if need_roll:
                 saved_roll_dict: dict[int, torch.Tensor] = {}
+                saved_position_roll_dict: dict[int, torch.Tensor] = {}
 
             for i in range(batch_size):
                 if cp_size <= 1:
                     seqlen = seqlens_in_batch_cpu[i]
                     start_idx = cu_seqlens_padded_cpu[i]
                     input_ids_rmpad[start_idx : start_idx + seqlen] = input_ids[i]
+                    position_ids_rmpad[start_idx : start_idx + seqlen] = torch.arange(
+                        seqlen, dtype=torch.long, device=input_ids.device
+                    )
                     continue
 
                 seqlen_padded_i = seqlens_in_batch_padded_cpu[i]
@@ -803,6 +822,9 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
                 chunk_len = max(0, chunk_end - chunk_start)
                 if chunk_len > 0:
                     input_ids_rmpad[start_idx : start_idx + chunk_len] = d[chunk_start : chunk_start + chunk_len]
+                    position_ids_rmpad[start_idx : start_idx + chunk_len] = torch.arange(
+                        chunk_start, chunk_start + chunk_len, dtype=torch.long, device=input_ids.device
+                    )
 
                 remain_start = seqlen_padded_i - half_seqlen * (cp_rank + 1)
                 remain_end = seqlen_padded_i - half_seqlen * cp_rank
@@ -812,22 +834,32 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
                     input_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = d[
                         remain_start:remain_end
                     ]
+                    position_ids_rmpad[start_idx + half_seqlen : start_idx + half_seqlen + remain_len] = torch.arange(
+                        remain_start, remain_end, dtype=torch.long, device=input_ids.device
+                    )
 
                 if need_roll:
                     idx = (cp_rank + 1) * half_seqlen
-                    if idx < d.shape[0]:
-                        saved_roll_dict[start_idx + half_seqlen - 1] = d[idx]
+                    if half_seqlen > 0 and idx < d.shape[0]:
+                        k = start_idx + half_seqlen - 1
+                        saved_roll_dict[k] = d[idx]
+                        saved_position_roll_dict[k] = position_ids_rmpad[k]
                     if remain_len > 0:
                         k = start_idx + half_seqlen + remain_len - 1
                         if remain_end == d.shape[0]:
                             saved_roll_dict[k] = d[0]
+                            saved_position_roll_dict[k] = torch.zeros((), dtype=torch.long, device=input_ids.device)
                         elif remain_end < d.shape[0]:
                             saved_roll_dict[k] = d[remain_end]
+                            saved_position_roll_dict[k] = position_ids_rmpad[k]
 
             if need_roll:
                 input_ids_rmpad = torch.roll(input_ids_rmpad, shifts=-1, dims=0)
+                position_ids_rmpad = torch.roll(position_ids_rmpad, shifts=-1, dims=0)
                 for k, v in saved_roll_dict.items():
                     input_ids_rmpad[k] = v
+                for k, v in saved_position_roll_dict.items():
+                    position_ids_rmpad[k] = v
 
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
@@ -839,7 +871,11 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
             cu_seqlens_kv_padded=cu_seqlens_padded,
         )
         if pre_process:
+            if _local_attn:
+                return input_ids_rmpad.unsqueeze(0), packed_seq_params, position_ids_rmpad.unsqueeze(0)
             return input_ids_rmpad.unsqueeze(0), packed_seq_params
+        if _local_attn:
+            return input_ids, packed_seq_params, None
         return input_ids, packed_seq_params
 
     # Patch the canonical definition.
@@ -854,6 +890,97 @@ def _apply_preprocess_thd_no_padding_cp_short_seq_patch() -> None:
         verl_mcore_model_forward.preprocess_thd_no_padding = patched_preprocess_thd_no_padding  # type: ignore[assignment]
     verl_mcore_util._mint_preprocess_thd_no_padding_cp_short_seq_patched = True  # type: ignore[attr-defined]
     print("[VERL_PATCH] Patched verl preprocess_thd_no_padding (CP short-seq clamp)")
+
+
+_MINT_VERL_LOCAL_ATTENTION_PATCHES = os.environ.get(
+    "MINT_VERL_LOCAL_ATTENTION_PATCHES", ""
+).strip().lower()
+
+
+def _local_attention_patches_enabled() -> bool:
+    """Whether verl patches that change attention-mask shapes and return-value
+    arity are active.
+
+    These patches are needed when training with Megatron local DotProductAttention
+    (``MINT_MEGATRON_TRANSFORMER_LAYER_SPEC=local``), which is the configuration
+    used when the model's serving backend is SGLang.  They change the return
+    type of ``preprocess_thd_no_padding`` from a 2-tuple to a 3-tuple and
+    transform the BSHD valid-mask from 2-D to 4-D, so they must be off for
+    models that do not opt in.
+
+    Default: off.  Set ``MINT_VERL_LOCAL_ATTENTION_PATCHES=1`` to enable.
+    """
+    return _MINT_VERL_LOCAL_ATTENTION_PATCHES in {"1", "true", "yes", "on"}
+
+
+def _apply_bshd_attention_mask_shape_patch() -> None:
+    """Patch verl's BSHD no-padding mask for Megatron local DotProductAttention.
+
+    verl returns a [batch, seq] valid-token mask from preprocess_bshd_no_padding.
+    Megatron local attention applies mask_func directly to attention scores with
+    shape [batch, heads, sq, sk], so the mask must be broadcastable to 4D and
+    must use True for masked positions.
+
+    Guarded by ``MINT_VERL_LOCAL_ATTENTION_PATCHES``: skipped unless the env var
+    is set to a truthy value (default off).  The patch changes mask shapes and
+    is only needed when local attention is in use (e.g. SGLang serving backend).
+    """
+    if not _local_attention_patches_enabled():
+        return
+    try:
+        from verl.models.mcore import model_forward as verl_mcore_model_forward
+    except Exception as e:
+        logger.warning(
+            "Could not import verl.models.mcore.model_forward; skipping BSHD mask patch: %s: %s",
+            type(e).__name__,
+            e,
+        )
+        return
+
+    if getattr(verl_mcore_model_forward, "_mint_bshd_attention_mask_shape_patched", False):
+        return
+
+    original_preprocess = verl_mcore_model_forward.preprocess_bshd_no_padding
+    original_postprocess = verl_mcore_model_forward.postprocess_bshd_no_padding
+
+    def patched_preprocess_bshd_no_padding(
+        input_ids: torch.Tensor,
+        pre_process: bool = True,
+        need_roll: bool = False,
+        use_fp8_padding: bool = False,
+    ):
+        input_ids_bshd, valid_mask, position_ids = original_preprocess(
+            input_ids,
+            pre_process=pre_process,
+            need_roll=need_roll,
+            use_fp8_padding=use_fp8_padding,
+        )
+        if valid_mask.dim() != 2:
+            return input_ids_bshd, valid_mask, position_ids
+
+        seq_len = int(valid_mask.shape[1])
+        key_padding_mask = ~valid_mask.bool()
+        causal_mask = torch.triu(
+            torch.ones((seq_len, seq_len), dtype=torch.bool, device=valid_mask.device),
+            diagonal=1,
+        )
+        attention_mask = causal_mask.unsqueeze(0).unsqueeze(0) | key_padding_mask[:, None, None, :]
+        return input_ids_bshd, attention_mask, position_ids
+
+    def patched_postprocess_bshd_no_padding(
+        output: torch.Tensor,
+        attention_mask: torch.Tensor,
+        post_process: bool = True,
+    ) -> torch.Tensor:
+        if attention_mask.dim() == 4:
+            valid_mask = ~torch.diagonal(attention_mask[:, 0, :, :], dim1=-2, dim2=-1)
+            return original_postprocess(output, valid_mask, post_process=post_process)
+        return original_postprocess(output, attention_mask, post_process=post_process)
+
+    verl_mcore_model_forward.preprocess_bshd_no_padding = patched_preprocess_bshd_no_padding  # type: ignore[assignment]
+    verl_mcore_model_forward.postprocess_bshd_no_padding = patched_postprocess_bshd_no_padding  # type: ignore[assignment]
+    verl_mcore_model_forward._mint_bshd_attention_mask_shape_patched = True  # type: ignore[attr-defined]
+    print("[VERL_PATCH] Patched verl BSHD attention mask shape for local attention")
 
 
 def _apply_te_triton_get_int_dtype_patch() -> None:
@@ -1368,6 +1495,7 @@ def apply_verl_patches():
     _apply_rope_thd_cp_len_clamp_patch()
     _apply_yarn_rope_cp_seq_len_align_patch()
     _apply_preprocess_thd_no_padding_cp_short_seq_patch()
+    _apply_bshd_attention_mask_shape_patch()
 
     def patched_build_tf_config(self):
         """Patched _build_tf_config that uses fused attention for MLA models."""
@@ -1429,6 +1557,17 @@ def apply_verl_patches():
             provider.variable_seq_lengths = True
             provider.moe_token_dispatcher_type = "alltoall"
             provider.moe_router_load_balancing_type = "none"
+
+            layer_spec_override = os.environ.get("MINT_MEGATRON_TRANSFORMER_LAYER_SPEC", "").strip().lower()
+            if layer_spec_override in {"local", "megatron-core", "megatron_core"}:
+                from megatron.bridge.models.gpt_provider import local_layer_spec
+
+                provider.transformer_layer_spec = local_layer_spec
+                print("[VERL_PATCH] Using Megatron local transformer layer spec")
+            elif layer_spec_override not in {"", "default", "te", "transformer_engine"}:
+                raise ValueError(
+                    f"Invalid MINT_MEGATRON_TRANSFORMER_LAYER_SPEC={layer_spec_override!r}"
+                )
 
             # Apply transformer config overrides
             for key, value in override_transformer_config.items():

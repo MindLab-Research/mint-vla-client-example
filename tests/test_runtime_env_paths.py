@@ -12,6 +12,8 @@ import sys
 
 import mint_server.config as server_config
 from mint_server.ray.runtime_env import (
+    TIER_GPU_RL,
+    TIER_GPU_VLA,
     bootstrap_runtime_pythonpath,
     build_runtime_pythonpath,
     checkout_runtime_env_layout,
@@ -21,19 +23,32 @@ from mint_server.ray.runtime_env import (
 )
 
 
-def _materialize_runtime_env(root: Path) -> None:
-    layout = checkout_runtime_env_layout(str(root))
+def _runtime_manifest(*, tier: str = TIER_GPU_RL) -> dict:
+    runtime = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mint"]["runtime_env"]
+    from mint_server.ray.runtime_env import _tiers_for
+
     manifest = {
         "runtime_env": {
-            "site_packages_dir": "site-packages",
-            "source_dir": "src",
-            "base_python_dir": "base-python",
-            "host_venv_dir": "host-venv",
+            "site_packages_dir": runtime.get("site_packages_dir", "site-packages"),
+            "source_dir": runtime.get("source_dir", "src"),
+            "base_python_dir": runtime.get("base_python_dir", "base-python"),
+            "host_venv_dir": runtime.get("host_venv_dir", "host-venv"),
         },
-        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mint"]["runtime_env"]["sources"],
+        "sources": [
+            source
+            for source in runtime["sources"]
+            if source.get("tier", TIER_GPU_RL) in _tiers_for(tier)
+        ],
+        "tier": tier,
     }
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    return manifest
+
+
+def _materialize_runtime_env(root: Path, *, tier: str = TIER_GPU_RL) -> None:
+    layout = checkout_runtime_env_layout(str(root), tier=tier)
+    tier_root = root / tier
+    tier_root.mkdir(parents=True, exist_ok=True)
+    (tier_root / "manifest.json").write_text(json.dumps(_runtime_manifest(tier=tier)), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     Path(layout.base_python_root).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
@@ -45,9 +60,9 @@ def _materialize_runtime_env(root: Path) -> None:
     Path(layout.host_python).chmod(0o755)
 
 
-def _materialize_runtime_env_with_real_host_python(root: Path) -> None:
-    _materialize_runtime_env(root)
-    layout = checkout_runtime_env_layout(str(root))
+def _materialize_runtime_env_with_real_host_python(root: Path, *, tier: str = TIER_GPU_RL) -> None:
+    _materialize_runtime_env(root, tier=tier)
+    layout = checkout_runtime_env_layout(str(root), tier=tier)
     host_python = Path(layout.host_python)
     host_python.unlink()
     host_python.write_text(
@@ -93,12 +108,13 @@ def test_build_runtime_pythonpath_uses_canonical_root(tmp_path):
     )
 
     parts = out.split(":")
-    assert parts[0] == str(env_root / "site-packages")
-    assert str(env_root / "src" / "Megatron-Bridge" / "src") in parts
-    assert str(env_root / "src" / "Megatron-Bridge") in parts
-    assert str(env_root / "src" / "verl") in parts
-    assert str(env_root / "src" / "openpi" / "src") in parts
-    assert str(env_root / "src" / "Megatron-LM") in parts
+    tier_root = env_root / TIER_GPU_RL
+    assert parts[0] == str(tier_root / "site-packages")
+    assert str(tier_root / "src" / "Megatron-Bridge" / "src") in parts
+    assert str(tier_root / "src" / "Megatron-Bridge") in parts
+    assert str(tier_root / "src" / "verl") in parts
+    assert str(tier_root / "src" / "Megatron-LM") in parts
+    assert str(tier_root / "src" / "openpi" / "src") not in parts
     assert parts[-2] == "/vePFS/code/yiwen/mint-server"
     assert parts[-1] == "/vePFS/hf/modules"
 
@@ -122,7 +138,7 @@ def test_config_prepends_actor_extra_pythonpath(tmp_path):
     actor_env = payload["runtime_env"]
     parts = actor_env["PYTHONPATH"].split(":")
     assert parts[0] == str(extra)
-    assert str(env_root / "site-packages") in parts
+    assert str(env_root / TIER_GPU_RL / "site-packages") in parts
     assert actor_env["MINT_ACTOR_EXTRA_PYTHONPATH"] == str(extra)
 
 
@@ -140,17 +156,9 @@ def test_build_runtime_pythonpath_fails_on_incomplete_root(tmp_path):
 def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
     env_root = tmp_path / "runtime"
     layout = checkout_runtime_env_layout(str(env_root))
-    manifest = {
-        "runtime_env": {
-            "site_packages_dir": "site-packages",
-            "source_dir": "src",
-            "base_python_dir": "base-python",
-            "host_venv_dir": "host-venv",
-        },
-        "sources": tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["tool"]["mint"]["runtime_env"]["sources"],
-    }
-    env_root.mkdir(parents=True, exist_ok=True)
-    (env_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    tier_root = env_root / TIER_GPU_RL
+    tier_root.mkdir(parents=True, exist_ok=True)
+    (tier_root / "manifest.json").write_text(json.dumps(_runtime_manifest()), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:
         Path(entry).mkdir(parents=True, exist_ok=True)
@@ -161,7 +169,7 @@ def test_build_runtime_pythonpath_does_not_require_host_python(tmp_path):
         pfs_hf_modules_path="/hf",
     )
 
-    assert str(env_root / "site-packages") in out.split(":")
+    assert str(tier_root / "site-packages") in out.split(":")
 
 
 def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
@@ -175,8 +183,9 @@ def test_bootstrap_runtime_pythonpath_prefers_runtime_root(tmp_path):
 
     out = bootstrap_runtime_pythonpath(environ, repo_root="/repo")
 
-    assert str(env_root / "site-packages") in out.split(":")
-    assert str(env_root / "src" / "vllm") in out.split(":")
+    tier_root = env_root / TIER_GPU_RL
+    assert str(tier_root / "site-packages") in out.split(":")
+    assert str(tier_root / "src" / "vllm") in out.split(":")
     assert "/pfs/code/mint-server" in out.split(":")
     assert "/pfs/hf/modules" in out.split(":")
 
@@ -216,12 +225,12 @@ def test_runtime_env_layout_tracks_pyproject_source_pythonpaths():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     expected = []
     for source in data["tool"]["mint"]["runtime_env"]["sources"]:
-        if source.get("host_only", False):
+        if source.get("host_only", False) or source.get("tier", TIER_GPU_RL) != TIER_GPU_RL:
             continue
         for rel in source.get("pythonpath", ["."]):
             rel_str = str(rel).strip()
             suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
-            expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
+            expected.append(f"/tmp/runtime/{TIER_GPU_RL}/src/{source['name']}{suffix}")
     layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.pythonpath_entries[1:]) == expected
 
@@ -230,12 +239,12 @@ def test_runtime_env_layout_tracks_host_only_pythonpaths():
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     expected = []
     for source in data["tool"]["mint"]["runtime_env"]["sources"]:
-        if not source.get("host_only", False):
+        if not source.get("host_only", False) or source.get("tier", TIER_GPU_RL) != TIER_GPU_RL:
             continue
         for rel in source.get("pythonpath", ["."]):
             rel_str = str(rel).strip()
             suffix = "" if rel_str in ("", ".") else f"/{rel_str}"
-            expected.append(f"/tmp/runtime/src/{source['name']}{suffix}")
+            expected.append(f"/tmp/runtime/{TIER_GPU_RL}/src/{source['name']}{suffix}")
     layout = checkout_runtime_env_layout("/tmp/runtime")
     assert list(layout.host_pythonpath_entries) == expected
 
@@ -246,20 +255,20 @@ def test_host_venv_site_packages_points_inside_runtime_root(tmp_path):
 
     out = host_venv_site_packages(str(env_root))
 
-    assert out.startswith(str(env_root / "host-venv"))
+    assert out.startswith(str(env_root / TIER_GPU_RL / "host-venv"))
     assert out.endswith("site-packages")
 
 
 def test_runtime_env_layout_includes_openpi_source_checkout():
-    layout = checkout_runtime_env_layout("/tmp/runtime")
+    layout = checkout_runtime_env_layout("/tmp/runtime", tier=TIER_GPU_VLA)
 
-    assert str(Path("/tmp/runtime/src/openpi/src")) in layout.pythonpath_entries
+    assert str(Path(f"/tmp/runtime/{TIER_GPU_VLA}/src/openpi/src")) in layout.pythonpath_entries
 
 
 def test_runtime_env_layout_includes_openpi_client_source_checkout():
-    layout = checkout_runtime_env_layout("/tmp/runtime")
+    layout = checkout_runtime_env_layout("/tmp/runtime", tier=TIER_GPU_VLA)
 
-    assert str(Path("/tmp/runtime/src/openpi/packages/openpi-client/src")) in layout.pythonpath_entries
+    assert str(Path(f"/tmp/runtime/{TIER_GPU_VLA}/src/openpi/packages/openpi-client/src")) in layout.pythonpath_entries
 
 
 def test_runtime_env_host_dependencies_include_openpi_worker_stack():
@@ -451,7 +460,17 @@ def test_create_host_venv_installs_torch_backend_and_generic_requirements_separa
     generic_requirements = tmp_path / "host-requirements-generic.txt"
     assert python == host_venv / "bin" / "python"
     assert calls[0] == [str(base_python), "-m", "venv", "--copies", str(host_venv)]
-    assert calls[1] == [str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"]
+    assert calls[1] == [
+        str(python),
+        "-m",
+        "pip",
+        "install",
+        "--break-system-packages",
+        "--upgrade",
+        "pip",
+        "setuptools",
+        "wheel",
+    ]
     assert calls[2] == [
         "/fake/uv",
         "pip",
@@ -493,13 +512,14 @@ def test_write_host_pth_prepends_runtime_paths(tmp_path, monkeypatch):
         lambda *args, **kwargs: str(purelib),
     )
 
-    build_runtime_env._write_host_pth(env_root, env_root / "host-venv" / "bin" / "python")
+    tier_root = env_root / TIER_GPU_RL
+    build_runtime_env._write_host_pth(env_root, tier_root / "host-venv" / "bin" / "python")
 
     line = (purelib / "mint_runtime_env.pth").read_text(encoding="utf-8").strip()
     original_sys_path = sys.path[:]
     sys.path[:] = [
         "/host/site-packages",
-        str(env_root / "src" / "openpi" / "src"),
+        str(tier_root / "src" / "vllm"),
         "/other",
     ]
     try:
@@ -509,17 +529,15 @@ def test_write_host_pth_prepends_runtime_paths(tmp_path, monkeypatch):
         sys.path[:] = original_sys_path
 
     expected = [
-        str(env_root / "site-packages"),
-        str(env_root / "src" / "Megatron-LM"),
-        str(env_root / "src" / "Megatron-Bridge" / "src"),
-        str(env_root / "src" / "Megatron-Bridge"),
-        str(env_root / "src" / "verl"),
-        str(env_root / "src" / "openpi" / "src"),
-        str(env_root / "src" / "openpi" / "packages" / "openpi-client" / "src"),
-        str(env_root / "src" / "vllm"),
+        str(tier_root / "site-packages"),
+        str(tier_root / "src" / "Megatron-LM"),
+        str(tier_root / "src" / "Megatron-Bridge" / "src"),
+        str(tier_root / "src" / "Megatron-Bridge"),
+        str(tier_root / "src" / "verl"),
+        str(tier_root / "src" / "vllm"),
     ]
     assert actual[: len(expected)] == expected
-    assert actual.count(str(env_root / "src" / "openpi" / "src")) == 1
+    assert actual.count(str(tier_root / "src" / "vllm")) == 1
 
 
 def test_build_runtime_env_normalizes_host_only_vllm_source_metadata(tmp_path):
@@ -633,10 +651,10 @@ def test_inspect_runtime_env_reports_probe_results(tmp_path):
     )
 
     assert snapshot["env_root"] == str(env_root)
-    assert snapshot["manifest_path"] == str(env_root / "manifest.json")
+    assert snapshot["manifest_path"] == str(env_root / TIER_GPU_RL / "manifest.json")
     assert snapshot["valid_layout"] is True
     assert snapshot["missing_paths"] == []
-    assert snapshot["host_python"] == str(env_root / "host-venv" / "bin" / "python")
+    assert snapshot["host_python"] == str(env_root / TIER_GPU_RL / "host-venv" / "bin" / "python")
     assert snapshot["probe_results"]["json"]["ok"] is True
     assert snapshot["probe_results"]["pathlib"]["ok"] is True
 
@@ -682,8 +700,8 @@ def test_promote_runtime_symlink_updates_link_atomically(tmp_path):
     from scripts import build_runtime_env as build_runtime_env
 
     runtime_root = tmp_path / "mint" / "prod" / "runtime-builds" / "build-1"
-    runtime_root.mkdir(parents=True)
-    (runtime_root / "manifest.json").write_text("{}", encoding="utf-8")
+    (runtime_root / TIER_GPU_RL).mkdir(parents=True)
+    (runtime_root / TIER_GPU_RL / "manifest.json").write_text("{}", encoding="utf-8")
     link = tmp_path / "mint" / "prod" / "runtime"
 
     build_runtime_env._promote_runtime_symlink(runtime_root, link)
@@ -697,23 +715,25 @@ def test_copy_runtime_env_rewrites_embedded_runtime_metadata(tmp_path, monkeypat
 
     src = tmp_path / "src"
     _materialize_runtime_env_with_real_host_python(src)
-    (src / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     (src / "payload.txt").write_text("ok", encoding="utf-8")
     dst = tmp_path / "dst"
     monkeypatch.setattr(
         build_runtime_env.subprocess,
         "check_output",
-        lambda *args, **kwargs: str(dst / "host-venv" / "lib" / "python3.12" / "site-packages"),
+        lambda *args, **kwargs: str(
+            dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages"
+        ),
     )
 
     build_runtime_env.copy_runtime_env(src, dst)
 
-    manifest = json.loads((dst / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["env_root"] == str(dst)
-    assert manifest["host_python"] == str(dst / "host-venv" / "bin" / "python")
-    pth = dst / "host-venv" / "lib" / "python3.12" / "site-packages" / "mint_runtime_env.pth"
-    assert str(dst / "site-packages") in pth.read_text(encoding="utf-8")
-    assert str(src / "site-packages") not in pth.read_text(encoding="utf-8")
+    manifest = json.loads((dst / TIER_GPU_RL / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["env_root"] == str(dst / TIER_GPU_RL)
+    assert manifest["host_python"] == str(dst / TIER_GPU_RL / "host-venv" / "bin" / "python")
+    pth = dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages" / "mint_runtime_env.pth"
+    assert str(dst / TIER_GPU_RL / "site-packages") in pth.read_text(encoding="utf-8")
+    assert str(src / TIER_GPU_RL / "site-packages") not in pth.read_text(encoding="utf-8")
     assert f"export PFS_RUNTIME_ENV_ROOT={dst}" in (dst / "activate_runtime_env.sh").read_text(encoding="utf-8")
     assert (dst / "payload.txt").read_text(encoding="utf-8") == "ok"
     with pytest.raises(RuntimeError, match="already exists"):
@@ -725,12 +745,21 @@ def test_mint_runtime_cli_copies_and_promotes(tmp_path, monkeypatch, capsys):
 
     src = tmp_path / "prod-source"
     _materialize_runtime_env_with_real_host_python(src)
-    (src / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
     monkeypatch.setattr(
         build_runtime_env.subprocess,
         "check_output",
         lambda *args, **kwargs: str(
-            tmp_path / "mint" / "dev" / "runtime-builds" / "copy-1" / "host-venv" / "lib" / "python3.12" / "site-packages"
+            tmp_path
+            / "mint"
+            / "dev"
+            / "runtime-builds"
+            / "copy-1"
+            / TIER_GPU_RL
+            / "host-venv"
+            / "lib"
+            / "python3.12"
+            / "site-packages"
         ),
     )
 
@@ -784,17 +813,18 @@ def test_runtime_env_layout_prefers_manifest_sources(tmp_path):
             },
         ],
     }
-    env_root.mkdir(parents=True, exist_ok=True)
-    (env_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    tier_root = env_root / TIER_GPU_RL
+    tier_root.mkdir(parents=True, exist_ok=True)
+    (tier_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     layout = runtime_env_layout(str(env_root))
     assert list(layout.pythonpath_entries) == [
-        str(env_root / "site-packages"),
-        str(env_root / "src" / "CustomSource" / "src"),
+        str(tier_root / "site-packages"),
+        str(tier_root / "src" / "CustomSource" / "src"),
     ]
-    assert layout.base_python_root == str(env_root / "base-python")
+    assert layout.base_python_root == str(tier_root / "base-python")
     assert list(layout.host_pythonpath_entries) == [
-        str(env_root / "src" / "HostOnlySource"),
+        str(tier_root / "src" / "HostOnlySource"),
     ]
 
 
@@ -817,7 +847,7 @@ def test_preferred_vllm_python_executable_prefers_explicit_env(monkeypatch, tmp_
 def test_validate_runtime_env_layout_requires_base_python_when_host_python_required(tmp_path):
     env_root = tmp_path / "runtime"
     _materialize_runtime_env(env_root)
-    shutil.rmtree(env_root / "base-python")
+    shutil.rmtree(env_root / TIER_GPU_RL / "base-python")
     with pytest.raises(RuntimeError, match="missing="):
         validate_runtime_env_layout(str(env_root), require_host_python=True)
 
@@ -1097,7 +1127,10 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
             "MINT_VLLM_MAX_CPU_LORAS": "8",
             "MINT_VLLM_MAX_LORA_RANK": "16",
             "MINT_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
+            "MINT_SGLANG_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.18","gpu_count":4}}',
+            "MINT_DENSE_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-0.6B":{"replica":0,"node_ip":"10.0.0.19","gpu_count":1}}',
             "MINT_MEGATRON_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}',
+            "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON": '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.20","gpu_count":4}}',
             "MINT_MODEL_ACTOR_REPLICA_ID": "replica-0",
         },
     )
@@ -1118,8 +1151,16 @@ def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):
     assert actor_env["MINT_VLLM_MAX_LORAS"] == "4"
     assert actor_env["MINT_VLLM_MAX_CPU_LORAS"] == "8"
     assert actor_env["MINT_VLLM_MAX_LORA_RANK"] == "16"
+    assert data["MINT_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
+    assert data["MINT_SGLANG_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.18","gpu_count":4}}'
+    assert data["MINT_DENSE_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-0.6B":{"replica":0,"node_ip":"10.0.0.19","gpu_count":1}}'
+    assert data["MINT_MEGATRON_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.17","gpu_count":4}}'
+    assert data["MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON"] == '{"Qwen/Qwen3-30B-A3B-Instruct-2507":{"replica":0,"node_ip":"10.0.0.20","gpu_count":4}}'
     assert "MINT_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_SGLANG_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_DENSE_MODEL_PLACEMENT_JSON" not in actor_env
     assert "MINT_MEGATRON_MODEL_PLACEMENT_JSON" not in actor_env
+    assert "MINT_BUMBLEBEE_MODEL_PLACEMENT_JSON" not in actor_env
     assert "MINT_MODEL_ACTOR_REPLICA_ID" not in actor_env
 
 
@@ -1438,7 +1479,7 @@ def test_actor_runtime_env_vars_blanks_ray_attach_hints_when_disabled(tmp_path):
         "MINT_RAY_NODE_IP_ADDRESS",
         "MINT_RAY_TEMP_DIR",
     ):
-        assert data[key] == ""
+        assert key not in data
     assert "RAY_ADDRESS" not in data
     assert data["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
 
@@ -1454,11 +1495,13 @@ def test_actor_runtime_env_vars_forwards_state_store_paths(tmp_path):
             "RAY_ADDRESS": "ray://cfg-test",
             "MINT_RAY_GCS_ADDRESS": "192.168.39.87:6379",
             "MINT_TASK_STATE_STORE_DB_PATH": ":memory:",
+            "MINT_TASK_HOT_KV_STORE_DB_PATH": str(tmp_path / "task-hot-kv.rocksdb"),
             "MINT_FUTURE_STATE_STORE_DB_PATH": str(tmp_path / "future.rocksdb"),
         },
     )
     data = payload["runtime_env"]
     assert data["MINT_TASK_STATE_STORE_DB_PATH"] == ":memory:"
+    assert data["MINT_TASK_HOT_KV_STORE_DB_PATH"] == str(tmp_path / "task-hot-kv.rocksdb")
     assert data["MINT_FUTURE_STATE_STORE_DB_PATH"] == str(tmp_path / "future.rocksdb")
 
 
@@ -1566,8 +1609,8 @@ def test_actor_runtime_env_without_attach_hints_does_not_set_actor_python(tmp_pa
     assert "py_executable" not in data
     assert env_vars["MINT_RAY_GCS_ADDRESS"] == "192.168.39.87:6379"
     assert "RAY_ADDRESS" not in env_vars
-    assert env_vars["RAY_CLIENT_ADDRESS"] == ""
-    assert env_vars["MINT_RAY_CLIENT_ADDRESS"] == ""
+    assert "RAY_CLIENT_ADDRESS" not in env_vars
+    assert "MINT_RAY_CLIENT_ADDRESS" not in env_vars
 
 
 def test_actor_runtime_env_keeps_local_working_dir_for_direct_ray(tmp_path):

@@ -46,7 +46,7 @@ def test_issue_396_compute_topk_validation_error_does_not_kill_actor(
         _initialized=True,
         max_model_len=None,
         registry=_RegistryStub(),
-        actor_name="mint_vllm_qwen3-30b-a3b-instruct-2507",
+        actor_name="mint_vllm_qwen3_30b_a3b_instruct_2507",
         engine=fake_engine,
     )
 

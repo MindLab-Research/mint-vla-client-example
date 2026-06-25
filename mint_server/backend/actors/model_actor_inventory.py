@@ -36,6 +36,7 @@ class ActorType(Enum):
     DENSE = "dense"        # Dense training (1 GPU)
     OPENPI = "openpi"      # OpenPI shared training (1 GPU)
     VLLM = "vllm"          # Inference (1-4 GPUs)
+    SGLANG = "sglang"      # SGLang inference
 
 
 @dataclass
@@ -72,7 +73,7 @@ class ActorEntry:
             return False
         if self.inflight_count > 0:
             return False
-        if self.actor_type == ActorType.VLLM:
+        if self.actor_type in {ActorType.VLLM, ActorType.SGLANG}:
             return self.idle_time() > session_idle_timeout
         if self.current_session is None:
             return True
@@ -389,7 +390,7 @@ def _metadata_backend_label(entry: ActorEntry) -> str | None:
         if raw is None:
             continue
         value = str(raw).strip().lower()
-        if value in {"bumblebee", "megatron", "openpi", "peft", "vllm"}:
+        if value in {"bumblebee", "megatron", "openpi", "peft", "vllm", "sglang"}:
             return value
     return None
 
@@ -406,11 +407,13 @@ def _backend_for_entry(entry: ActorEntry) -> str:
         return "openpi"
     if entry.actor_type == ActorType.MEGATRON:
         return "megatron"
+    if entry.actor_type == ActorType.SGLANG:
+        return "sglang"
     return "vllm"
 
 
 def _role_for_entry(entry: ActorEntry) -> str:
-    return "inference" if entry.actor_type == ActorType.VLLM else "trainer"
+    return "inference" if entry.actor_type in {ActorType.VLLM, ActorType.SGLANG} else "trainer"
 
 
 def _exclude_actor_types(values: tuple[ActorType, ...]) -> list[str]:
@@ -433,6 +436,9 @@ def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | Non
     node_id = payload.get("node_id")
     if isinstance(node_id, str) and node_id.strip():
         out["node_id"] = node_id.strip()
+    node_ip = payload.get("node_ip")
+    if isinstance(node_ip, str) and node_ip.strip():
+        out["node_ip"] = node_ip.strip()
     gpu_indices = payload.get("gpu_indices")
     if isinstance(gpu_indices, list):
         out["gpu_indices"] = [int(idx) for idx in gpu_indices if isinstance(idx, (int, float, str)) and str(idx).strip()]
@@ -451,6 +457,9 @@ def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | Non
                 "node_id": binding.get("node_id"),
                 "rank": binding.get("rank"),
             }
+            binding_node_ip = binding.get("node_ip")
+            if isinstance(binding_node_ip, str) and binding_node_ip.strip():
+                clean_binding["node_ip"] = binding_node_ip.strip()
             ray_gpu_id = binding.get("ray_gpu_id")
             if isinstance(ray_gpu_id, str) and ray_gpu_id.strip():
                 clean_binding["ray_gpu_id"] = ray_gpu_id.strip()
@@ -485,7 +494,7 @@ def _normalize_actor_observability_payload(payload: Any) -> dict[str, Any] | Non
         "prefix_cache_hit_ratio",
         "learning_rate",
     }
-    skip_fields = {"hostname", "node_id", "gpu_indices", "gpu_bindings", "rank"}
+    skip_fields = {"hostname", "node_id", "node_ip", "gpu_indices", "gpu_bindings", "rank"}
     for src, value in payload.items():
         if src in skip_fields:
             continue
@@ -818,7 +827,7 @@ class ModelActorInventory:
         now: float,
         sample_source: str = "cached_snapshot",
     ) -> None:
-        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON}:
+        if entry.actor_type not in {ActorType.VLLM, ActorType.SGLANG, ActorType.MEGATRON}:
             return
         if self._metadata_is_fresh(entry, now=now):
             self._record_metadata_metric(entry.actor_type, "cache_hits_total")
@@ -853,7 +862,7 @@ class ModelActorInventory:
         now: float,
         sample_source: str = "cached_snapshot",
     ) -> None:
-        if entry.actor_type not in {ActorType.VLLM, ActorType.MEGATRON}:
+        if entry.actor_type not in {ActorType.VLLM, ActorType.SGLANG, ActorType.MEGATRON}:
             return
         if self._metadata_is_fresh(entry, now=now):
             self._record_metadata_metric(entry.actor_type, "cache_hits_total")

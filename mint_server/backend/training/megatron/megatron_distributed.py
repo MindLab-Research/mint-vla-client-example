@@ -652,6 +652,182 @@ def _make_megatron_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMES
     return _make_megatron_pg_name_from_actor_name(actor_name, namespace=namespace)
 
 
+def _megatron_reclaim_sampling_on_launch_enabled() -> bool:
+    raw = os.environ.get("MINT_MEGATRON_RECLAIM_SAMPLING_ON_LAUNCH")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reclaim_same_model_sglang_resources_for_megatron(
+    *,
+    base_model: str,
+    observability_base_model: str | None = None,
+    context: str,
+    namespace: str = PERSISTENT_NAMESPACE,
+) -> dict[str, list[str]]:
+    if not _megatron_reclaim_sampling_on_launch_enabled():
+        return {"killed_actor_names": []}
+    try:
+        from mint_server.backend.sampling_backend import actor_name_for_sampling_base_model
+    except Exception:
+        return {"killed_actor_names": []}
+
+    model_keys: list[str] = []
+    for candidate in (
+        observability_base_model,
+        _model_key_from_base_model(base_model),
+        base_model,
+    ):
+        value = str(candidate or "").strip()
+        if value and value not in model_keys:
+            model_keys.append(value)
+
+    killed_actor_names: list[str] = []
+    inspected_actor_names: list[str] = []
+    for model_key in model_keys:
+        try:
+            actor_name = actor_name_for_sampling_base_model(model_key, backend="sglang")
+        except Exception:
+            continue
+        if actor_name in inspected_actor_names:
+            continue
+        inspected_actor_names.append(actor_name)
+        try:
+            actor = ray.get_actor(actor_name, namespace=namespace)
+        except ValueError:
+            actor = None
+        except Exception as exc:
+            logger.warning(
+                "[MegatronWorkerGroup] could not inspect same-model SGLang actor actor=%s model_key=%s namespace=%s context=%s error_type=%s error=%s",
+                actor_name,
+                model_key,
+                namespace,
+                context,
+                type(exc).__name__,
+                exc,
+            )
+            actor = None
+        if actor is not None:
+            try:
+                ray_kill.kill(
+                    actor,
+                    reason="megatron_launch_same_model_sglang_preempt",
+                    actor_name=actor_name,
+                    namespace=namespace,
+                    no_restart=True,
+                    verify_absent=True,
+                )
+                killed_actor_names.append(actor_name)
+            except Exception as exc:
+                logger.warning(
+                    "[MegatronWorkerGroup] failed to preempt same-model SGLang actor actor=%s model_key=%s namespace=%s context=%s error_type=%s error=%s",
+                    actor_name,
+                    model_key,
+                    namespace,
+                    context,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    if killed_actor_names:
+        logger.warning(
+            "[MegatronWorkerGroup] reclaimed same-model SGLang resources base_model=%s observability_base_model=%s context=%s actors=%s",
+            base_model,
+            observability_base_model,
+            context,
+            killed_actor_names,
+        )
+        for model_key in model_keys:
+            try:
+                from mint_server.backend.sglang_engine import get_cached_sglang_engine_for_model
+
+                cached = get_cached_sglang_engine_for_model(model_key)
+                if cached is not None:
+                    cached.invalidate_cached_handles()
+            except Exception:
+                logger.debug(
+                    "[MegatronWorkerGroup] failed to clear cached SGLang engine after reclaim",
+                    exc_info=True,
+                )
+    else:
+        logger.info(
+            "[MegatronWorkerGroup] no same-model SGLang actor to reclaim base_model=%s observability_base_model=%s context=%s actors=%s namespace=%s",
+            base_model,
+            observability_base_model,
+            context,
+            inspected_actor_names,
+            namespace,
+        )
+    return {"killed_actor_names": killed_actor_names}
+
+
+def _assert_node_ip_capacity_after_reclaim(
+    *,
+    required_gpus_by_node_ip: dict[str, int],
+    context: str,
+    ignore_placement_group_names: set[str] | None = None,
+    ignore_placement_group_namespace: str | None = None,
+    reclaimed_actor_names: list[str] | None = None,
+) -> None:
+    reclaimed_actor_names = [str(name) for name in (reclaimed_actor_names or []) if str(name)]
+    if not reclaimed_actor_names:
+        assert_node_ip_capacity(
+            required_gpus_by_node_ip=required_gpus_by_node_ip,
+            context=context,
+            ignore_placement_group_names=ignore_placement_group_names,
+            ignore_placement_group_namespace=ignore_placement_group_namespace,
+        )
+        return
+
+    wait_timeout_s = float(os.environ.get("MINT_MEGATRON_RECLAIM_CAPACITY_WAIT_S", "90") or 90)
+    poll_s = float(os.environ.get("MINT_MEGATRON_RECLAIM_CAPACITY_POLL_S", "1") or 1)
+    wait_timeout_s = max(0.0, wait_timeout_s)
+    poll_s = max(0.1, poll_s)
+    deadline = time.monotonic() + wait_timeout_s
+    attempts = 0
+
+    while True:
+        try:
+            assert_node_ip_capacity(
+                required_gpus_by_node_ip=required_gpus_by_node_ip,
+                context=context,
+                ignore_placement_group_names=ignore_placement_group_names,
+                ignore_placement_group_namespace=ignore_placement_group_namespace,
+            )
+            if attempts:
+                logger.info(
+                    "[MegatronWorkerGroup] node capacity became available after same-model SGLang reclaim "
+                    "context=%s reclaimed_actors=%s wait_attempts=%s",
+                    context,
+                    reclaimed_actor_names,
+                    attempts,
+                )
+            return
+        except Exception as exc:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "[MegatronWorkerGroup] node capacity still unavailable after same-model SGLang reclaim "
+                    "context=%s reclaimed_actors=%s wait_timeout_s=%.1f error_type=%s error=%s",
+                    context,
+                    reclaimed_actor_names,
+                    wait_timeout_s,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            if attempts == 0:
+                logger.info(
+                    "[MegatronWorkerGroup] waiting for node capacity after same-model SGLang reclaim "
+                    "context=%s reclaimed_actors=%s wait_timeout_s=%.1f",
+                    context,
+                    reclaimed_actor_names,
+                    wait_timeout_s,
+                )
+            attempts += 1
+            time.sleep(poll_s)
+
+
 def _get_or_create_megatron_placement_group(*, pg_name: str, bundles: list[dict[str, float | int]]):
     return get_or_create_named_placement_group(
         pg_name,
@@ -872,7 +1048,7 @@ class MegatronRankWorker:
         observability_actor_name: str | None = None,
     ):
         """Create worker but don't initialize distributed yet.
-        
+
         Distributed init is deferred to initialize() to avoid deadlock.
         All workers must be created first, then initialize() called on all
         simultaneously so they can reach init_process_group barrier together.
@@ -2325,7 +2501,7 @@ class MegatronRankWorker:
 
     def initialize(self, traceparent: str | None = None, request_id: str | None = None):
         """Initialize distributed backend and Megatron engine.
-        
+
         Must be called on all workers simultaneously after all workers are created.
         This ensures all workers reach init_process_group barrier together.
         """
@@ -2615,13 +2791,15 @@ class MegatronRankWorker:
             # moe_router_topk = num_experts_per_tok (active experts per token)
             num_experts_per_tok = getattr(hf_config, "num_experts_per_tok", 2)
             override_tf_config["moe_router_topk"] = num_experts_per_tok
-            # need TE 2.1+
-            override_tf_config["moe_permute_fusion"] = True
+            moe_permute_fusion = _env_flag("MINT_MEGATRON_MOE_PERMUTE_FUSION", default=True)
+            override_tf_config["moe_permute_fusion"] = moe_permute_fusion
+            moe_grouped_gemm = _env_flag("MINT_MEGATRON_MOE_GROUPED_GEMM", default=True)
             override_tf_config["moe_shared_expert_overlap"] = True
-            override_tf_config["moe_grouped_gemm"] = True
+            override_tf_config["moe_grouped_gemm"] = moe_grouped_gemm
             logger.info(
                 f"[Rank {self.rank}] MoE config: {num_experts} experts, "
-                f"top-{num_experts_per_tok} routing, permute_fusion=True"
+                f"top-{num_experts_per_tok} routing, "
+                f"permute_fusion={moe_permute_fusion}, grouped_gemm={moe_grouped_gemm}"
             )
             enable_deepep = (
                 _env_flag("MINT_MEGATRON_ENABLE_DEEPEP", default=False)
@@ -2671,7 +2849,27 @@ class MegatronRankWorker:
                 f"[Rank {self.rank}] gradient_accumulation_fusion=False "
                 f"(available={grad_accum_fusion_available}, lora_rank={self.lora_rank})"
             )
-        override_tf_config["persist_layer_norm"] = True
+        override_tf_config["persist_layer_norm"] = _env_flag("MINT_MEGATRON_PERSIST_LAYER_NORM", default=True)
+        if not override_tf_config["persist_layer_norm"]:
+            logger.info(f"[Rank {self.rank}] persist_layer_norm=False")
+        if os.environ.get("MINT_MEGATRON_MEMORY_EFFICIENT_LAYER_NORM") is not None:
+            override_tf_config["memory_efficient_layer_norm"] = _env_flag(
+                "MINT_MEGATRON_MEMORY_EFFICIENT_LAYER_NORM",
+                default=False,
+            )
+            logger.info(
+                f"[Rank {self.rank}] memory_efficient_layer_norm="
+                f"{override_tf_config['memory_efficient_layer_norm']}"
+            )
+        if os.environ.get("MINT_MEGATRON_MASKED_SOFTMAX_FUSION") is not None:
+            override_tf_config["masked_softmax_fusion"] = _env_flag(
+                "MINT_MEGATRON_MASKED_SOFTMAX_FUSION",
+                default=False,
+            )
+            logger.info(
+                f"[Rank {self.rank}] masked_softmax_fusion="
+                f"{override_tf_config['masked_softmax_fusion']}"
+            )
         override_tf_config["bias_activation_fusion"] = True
         override_tf_config["bias_dropout_fusion"] = True
         # For LoRA training, disable grad_offload to keep gradient buffers allocated.
@@ -2763,7 +2961,16 @@ class MegatronRankWorker:
             override_tf_config["recompute_modules"] = recompute_modules
             logger.info("selective_recompute_enabled___s", rank=self.rank)
 
-        logger.info("override_transformer_config___s", rank=self.rank)
+        logger.info("override_transformer_config___s", rank=self.rank, override_tf_config=override_tf_config)
+        use_remove_padding = has_mla_attention
+        if os.environ.get("MINT_MEGATRON_USE_REMOVE_PADDING") is not None:
+            use_remove_padding = _env_flag("MINT_MEGATRON_USE_REMOVE_PADDING", default=has_mla_attention)
+        logger.info(
+            "megatron_remove_padding_config",
+            rank=self.rank,
+            use_remove_padding=use_remove_padding,
+            has_mla_attention=has_mla_attention,
+        )
 
         with start_as_current_span(
             "training.create_model.megatron.rank_worker.build_engine_config",
@@ -2776,6 +2983,7 @@ class MegatronRankWorker:
                 "base_model": str(self.base_model),
                 "num_experts": None if num_experts is None else int(num_experts),
                 "uses_mla_attention": bool(has_mla_attention),
+                "use_remove_padding": bool(use_remove_padding),
                 "use_fp8": bool(self.config.use_fp8),
                 "use_grad_offload": bool(use_grad_offload),
             },
@@ -2786,6 +2994,7 @@ class MegatronRankWorker:
                 "expert_model_parallel_size": self.config.expert_parallel_size,
                 "expert_tensor_parallel_size": self.config.expert_tensor_parallel_size,
                 "context_parallel_size": self.config.context_parallel_size,
+                "sequence_parallel": _env_flag("MINT_MEGATRON_SEQUENCE_PARALLEL", default=True),
                 "param_offload": True,
                 "optimizer_offload": True,
                 "grad_offload": use_grad_offload,
@@ -2795,7 +3004,7 @@ class MegatronRankWorker:
                 # causing long-context training to fall back to O(seq^2) softmax and OOM at ~38K tokens.
                 #
                 # Disable remove-padding for non-MLA models so FlashAttention can be selected in BSHD.
-                "use_remove_padding": has_mla_attention,
+                "use_remove_padding": use_remove_padding,
                 "use_mbridge": True,
                 "vanilla_mbridge": False,  # Required for LoRA - enables provider initialization
                 "use_distributed_optimizer": True,  # Keep distributed optimizer for efficiency
@@ -4822,10 +5031,6 @@ class MegatronRankWorker:
         )
         return adapter_state
 
-    
-
-    
-
     def get_lora_weight_norm(self) -> float:
         """Compute L2 norm of all LoRA weights for debugging."""
         assert self.engine is not None
@@ -5588,9 +5793,12 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
+            "inference_mode": True,
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -5670,9 +5878,12 @@ class MegatronRankWorker:
         config = {
             "r": effective_rank,
             "lora_alpha": effective_rank * 2,
+            "lora_dropout": 0.0,
             "target_modules": target_modules,
             "bias": "none",
             "task_type": "CAUSAL_LM",
+            "peft_type": "LORA",
+            "inference_mode": True,
             "base_model_name_or_path": self.base_model,
         }
         with open(os.path.join(save_path, "adapter_config.json"), "w") as f:
@@ -7509,11 +7720,18 @@ class MegatronWorkerGroup:
                         f"need {world_size} GPUs, got {preferred_placement.total_gpus}"
                     )
                 pg_name = _make_megatron_pg_name(self.base_model)
-                assert_node_ip_capacity(
+                reclaimed = _reclaim_same_model_sglang_resources_for_megatron(
+                    base_model=self.base_model,
+                    observability_base_model=self.observability_base_model,
+                    context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}:initialize",
+                    namespace=PERSISTENT_NAMESPACE,
+                )
+                _assert_node_ip_capacity_after_reclaim(
                     required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
                     context=f"[MegatronWorkerGroup] node pinning base_model={self.base_model}",
                     ignore_placement_group_names={pg_name},
                     ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
+                    reclaimed_actor_names=reclaimed["killed_actor_names"],
                 )
                 bundles = preferred_placement.pg_bundles(cpu_per_gpu=1)
                 logger.info(
@@ -7631,6 +7849,17 @@ class MegatronWorkerGroup:
             "MINT_MEGATRON_MOE_FLEX_DISPATCHER_BACKEND",
             "MINT_MEGATRON_MOE_ROUTER_DTYPE",
             "MINT_MEGATRON_MOE_DEEPEP_NUM_SMS",
+            "MINT_MEGATRON_MOE_PERMUTE_FUSION",
+            "MINT_MEGATRON_MOE_GROUPED_GEMM",
+            "MINT_MEGATRON_PERSIST_LAYER_NORM",
+            "MINT_MEGATRON_MEMORY_EFFICIENT_LAYER_NORM",
+            "MINT_MEGATRON_MASKED_SOFTMAX_FUSION",
+            "MINT_MEGATRON_USE_REMOVE_PADDING",
+            "MINT_MEGATRON_SEQUENCE_PARALLEL",
+            "MINT_MEGATRON_TRANSFORMER_LAYER_SPEC",
+            "MINT_VERL_LOCAL_ATTENTION_PATCHES",
+            "MINT_MODEL_PLACEMENT_JSON",
+            "MINT_MEGATRON_MODEL_PLACEMENT_JSON",
         ):
             v = os.environ.get(k)
             if v is not None:
@@ -9312,12 +9541,25 @@ class MegatronWorkerGroup:
             model_is_mla = get_model_config(self.base_model).is_mla
         except ValueError:
             model_is_mla = False
-        target_modules = [
-            "q_proj", "k_proj", "v_proj", "o_proj",
-        ] if not model_is_mla else [
-            "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj",
-        ]
-        target_modules += ["gate_proj", "up_proj", "down_proj"]
+        train_attn = bool(getattr(self, "_train_attn", True))
+        train_mlp = bool(getattr(self, "_train_mlp", True))
+        train_unembed = bool(getattr(self, "_train_unembed", True))
+        target_modules: list[str] = []
+        if train_attn:
+            if model_is_mla:
+                target_modules += [
+                    "q_a_proj",
+                    "q_b_proj",
+                    "kv_a_proj_with_mqa",
+                    "kv_b_proj",
+                    "o_proj",
+                ]
+            else:
+                target_modules += ["q_proj", "k_proj", "v_proj", "o_proj"]
+        if train_mlp:
+            target_modules += ["gate_proj", "up_proj", "down_proj"]
+        if train_unembed:
+            target_modules += ["lm_head", "output_layer"]
 
         # Use actual session rank (Phase 7) or fall back to max_lora_rank
         effective_rank = self._actual_rank or self.lora_rank
@@ -11065,11 +11307,19 @@ def get_or_create_megatron_worker_group(
                 )
             # For strict node-pinned launches, unrelated GPUs outside the requested slice
             # must not block bringup. Check the requested nodes directly and fail closed.
-            assert_node_ip_capacity(
+            capacity_context = f"[MegatronWorkerGroup] precreate node pinning base_model={base_model}"
+            reclaimed = _reclaim_same_model_sglang_resources_for_megatron(
+                base_model=base_model,
+                observability_base_model=observability_model,
+                context=f"{capacity_context}:precreate",
+                namespace=PERSISTENT_NAMESPACE,
+            )
+            _assert_node_ip_capacity_after_reclaim(
                 required_gpus_by_node_ip=preferred_placement.required_gpus_by_node_ip(),
-                context=f"[MegatronWorkerGroup] precreate node pinning base_model={base_model}",
+                context=capacity_context,
                 ignore_placement_group_names={pg_name},
                 ignore_placement_group_namespace=PERSISTENT_NAMESPACE,
+                reclaimed_actor_names=reclaimed["killed_actor_names"],
             )
 
         from mint_server.config import (actor_runtime_env_vars,
@@ -11130,6 +11380,15 @@ def get_or_create_megatron_worker_group(
             "MINT_BENCH_RECORD_TOPK",
             "MINT_BENCH_RECORD_INPUTS",
             "MINT_BENCH_RECORD_MODEL_STATE",
+            "MINT_MEGATRON_MOE_PERMUTE_FUSION",
+            "MINT_MEGATRON_MOE_GROUPED_GEMM",
+            "MINT_MEGATRON_PERSIST_LAYER_NORM",
+            "MINT_MEGATRON_MEMORY_EFFICIENT_LAYER_NORM",
+            "MINT_MEGATRON_MASKED_SOFTMAX_FUSION",
+            "MINT_MEGATRON_USE_REMOVE_PADDING",
+            "MINT_MEGATRON_SEQUENCE_PARALLEL",
+            "MINT_MEGATRON_TRANSFORMER_LAYER_SPEC",
+            "MINT_VERL_LOCAL_ATTENTION_PATCHES",
         ):
             v = os.environ.get(k)
             if v is not None:

@@ -508,6 +508,33 @@ def init_ray(**kwargs: Any) -> Any:
             )
             try:
                 result = ray.init(**kwargs)
+            except ValueError as e:
+                msg = str(e)
+                if (
+                    isinstance(desired_address, str)
+                    and desired_address.startswith("ray://")
+                    and "already connected to the cluster with allow_multiple=True" in msg
+                    and "allow_multiple" not in kwargs
+                ):
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["allow_multiple"] = True
+                    logger.warning(
+                        "ray.init retrying with allow_multiple=True pid=%s address=%r namespace=%r",
+                        pid,
+                        retry_kwargs.get("address"),
+                        namespace,
+                    )
+                    result = ray.init(**retry_kwargs)
+                else:
+                    logger.exception(
+                        "ray.init failed pid=%s address=%r namespace=%r lock_wait_s=%.3f elapsed_s=%.3f",
+                        pid,
+                        kwargs.get("address"),
+                        namespace,
+                        lock_wait_s,
+                        time.monotonic() - t0,
+                    )
+                    raise
             except Exception:
                 logger.exception(
                     "ray.init failed pid=%s address=%r namespace=%r lock_wait_s=%.3f elapsed_s=%.3f",

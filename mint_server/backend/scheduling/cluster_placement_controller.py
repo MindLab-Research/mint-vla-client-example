@@ -640,7 +640,7 @@ class ClusterPlacementController:
     async def _available_gpus_by_node_unlocked(self) -> dict[str, int]:
         raw = self._observed_free_gpus_by_node()
         observed = await raw if inspect.isawaitable(raw) else raw
-        available = dict(_normalize_gpu_by_node(observed))
+        available = dict(_normalize_available_gpus_by_node(observed))
         for node_ip, gpu_count in self._rebuilt_gpus_by_node.items():
             available = _subtract_available_gpus(
                 available,
@@ -864,6 +864,24 @@ def _normalize_gpu_by_node(values: Mapping[str, int]) -> GpuByNode:
         gpu_count = int(raw_gpu_count)
         if gpu_count <= 0:
             raise ValueError(f"GPU count for node {node_ip!r} must be positive, got {raw_gpu_count!r}")
+        normalized[node_ip] = normalized.get(node_ip, 0) + gpu_count
+    return _gpu_by_node_tuple(normalized)
+
+
+def _normalize_available_gpus_by_node(values: Mapping[str, int]) -> GpuByNode:
+    """Normalize observed/available free-GPU counts.
+
+    Unlike :func:`_normalize_gpu_by_node` (which validates *required* GPU
+    requests and so rejects non-positive counts), observed free-GPU counts may
+    legitimately be zero for a node whose GPUs are fully occupied. Keep zero
+    entries and drop only negatives, merging duplicate node IPs.
+    """
+    normalized: dict[str, int] = {}
+    for raw_node_ip, raw_gpu_count in values.items():
+        node_ip = str(raw_node_ip).strip()
+        if not node_ip:
+            raise ValueError("node IP must be non-empty")
+        gpu_count = max(0, int(raw_gpu_count))
         normalized[node_ip] = normalized.get(node_ip, 0) + gpu_count
     return _gpu_by_node_tuple(normalized)
 

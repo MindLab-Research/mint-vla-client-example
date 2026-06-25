@@ -8,6 +8,7 @@ import types
 from dataclasses import dataclass, replace
 from typing import Any, Literal, get_args, get_origin
 
+from mint_server.backend.sampling_backend import SamplingServingBackend
 from mint_server.ray.runtime_env import env_get
 
 logger = structlog.get_logger(__name__)
@@ -71,6 +72,11 @@ class ModelConfig:
     max_loras: int | None = None  # None = use default (1 for MoE, 64 for dense), 0 = disable LoRA
     max_cpu_loras: int | None = None  # None = vLLM default (max_cpu_loras=max_loras)
     max_lora_rank: int | None = None  # None = use global default, or override for large models
+    # SGLang LoRA defaults. These are separate from vLLM knobs because SGLang
+    # pre-initializes LoRA shapes by target module and loaded-adapter capacity.
+    sglang_max_loaded_loras: int | None = None
+    sglang_max_lora_rank: int | None = None
+    sglang_lora_target_modules: list[str] | None = None
     max_num_seqs: int | None = None  # None = use default (256), or lower for large MoE models with KV cache constraints
     # prompt_logprobs/logits can spike memory; lower values reduce peak usage at the cost of speed.
     max_num_batched_tokens: int | None = None  # None = use engine default heuristic
@@ -85,6 +91,9 @@ class ModelConfig:
     # - "mp": single-node multiprocessing TP (avoid Ray compiled DAG)
     # - "ray": Ray distributed executor (uses Ray compiled DAG; keep for K2)
     vllm_distributed_executor_backend: Literal["mp", "ray"] = "mp"
+    # Text sampling backend descriptor. vLLM is the compatibility default; live
+    # routing to non-vLLM backends is enabled only when their launcher exists.
+    serving_backend: SamplingServingBackend = "vllm"
     # Cross-family dispatch metadata. Defaults preserve current text-model behavior.
     policy_family: Literal["text_lm", "ar_action_tokens", "flow_action"] = "text_lm"
     inference_modality: Literal["tokens", "actions"] = "tokens"
@@ -311,6 +320,9 @@ MODEL_CONFIGS = {
         max_loras=8,
         max_cpu_loras=80,
         max_lora_rank=64,
+        sglang_max_loaded_loras=1,
+        sglang_max_lora_rank=64,
+        sglang_lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         max_model_len=32768,  # 32K context
         max_num_seqs=288,  # 32 * N_long (N_long=9) for short-request headroom
         max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024
@@ -330,6 +342,9 @@ MODEL_CONFIGS = {
         max_loras=8,
         max_cpu_loras=80,
         max_lora_rank=64,
+        sglang_max_loaded_loras=1,
+        sglang_max_lora_rank=64,
+        sglang_lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
         max_model_len=32768,  # 32K context
         max_num_seqs=288,  # 32 * N_long (N_long=9) for short-request headroom
         max_num_batched_tokens=1024,  # Prompt-logprob path chunks internally at 1024

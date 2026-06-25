@@ -194,7 +194,7 @@ def test_vllm_requires_model_specific_actor_name() -> None:
     from mint_server.backend.ray_cluster.model_actor_names import vllm_actor_name as _model_to_actor_name
 
     actor_name = _model_to_actor_name("Qwen/Qwen3-30B-A3B-Instruct-2507")
-    assert actor_name == "mint_vllm_qwen3-30b-a3b-instruct-2507"
+    assert actor_name == "mint_vllm_qwen3_30b_a3b_instruct_2507"
     assert actor_name != "mint" + "_vllm" + "_server"
 
     try:

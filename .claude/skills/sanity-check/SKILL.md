@@ -22,6 +22,7 @@ Procedure contract:
 Hard rules:
 - Production only. The base URL for this workflow is exactly `https://mint.macaron.xin`.
 - Refuse to run if the effective base URL is anything else, including localhost, SSH tunnels, dev ports, `https://mint.macaron.im`, or an internal host/port.
+- Dev or issue-scoped SGLang backend validation is out of scope; use the `sglang-backend` skill for that workflow.
 - No requirement substitution: do not use inference-only, reduced health checks, or ad-hoc smoke tests as PASS evidence.
 - Ops only during a sanity-check run: do not make non-trivial product code changes as part of remediation.
 - Minimize downtime: prefer killing one specific actor for one specific model over restarting the API process; do not restart Ray/head/worker nodes as first response.

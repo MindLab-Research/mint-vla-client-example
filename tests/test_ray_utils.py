@@ -143,6 +143,69 @@ def test_init_ray_prefers_ray_client_over_gcs_address(monkeypatch):
     assert ray_utils.preferred_ray_gcs_address() == "192.168.38.184:6379"
 
 
+def test_init_ray_keeps_default_context_for_ray_client(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.71:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert calls[0]["address"] == "ray://192.168.40.71:10001"
+    assert "allow_multiple" not in calls[0]
+
+
+def test_init_ray_retries_allow_multiple_collision_for_ray_client(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    def _init(**kwargs):
+        calls.append(dict(kwargs))
+        if "allow_multiple" not in kwargs:
+            raise ValueError(
+                "The client has already connected to the cluster with allow_multiple=True. "
+                "Please set allow_multiple=True to proceed"
+            )
+        return {"ok": True}
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=_init,
+    )
+
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.71:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
+
+    assert out == {"ok": True}
+    assert len(calls) == 2
+    assert "allow_multiple" not in calls[0]
+    assert calls[1]["allow_multiple"] is True
+
+
+def test_init_ray_does_not_override_explicit_allow_multiple(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    fake_ray = SimpleNamespace(
+        is_initialized=lambda: False,
+        init=lambda **kwargs: calls.append(dict(kwargs)) or {"ok": True},
+    )
+
+    monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.40.71:10001")
+    monkeypatch.setitem(sys.modules, "ray", fake_ray)
+
+    out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True, allow_multiple=False)
+
+    assert out == {"ok": True}
+    assert calls[0]["allow_multiple"] is False
+
+
 def test_gcs_address_helpers_ignore_legacy_ray_address(monkeypatch):
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
     monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
@@ -188,6 +251,7 @@ def test_init_ray_blanks_attach_hints_in_ray_client_job_runtime_env(monkeypatch)
     monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
     monkeypatch.setenv("RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/shared/code")
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
     out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
@@ -212,6 +276,7 @@ def test_init_ray_does_not_promote_legacy_ray_address_to_job_gcs_hint(monkeypatc
     monkeypatch.setenv("RAY_ADDRESS", "192.168.38.184:6379")
     monkeypatch.delenv("MINT_RAY_GCS_ADDRESS", raising=False)
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
+    monkeypatch.setenv("MINT_CODE_ROOT", "/shared/code")
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
     out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)
@@ -239,6 +304,7 @@ def test_init_ray_does_not_set_job_py_executable_for_ray_client_workers(monkeypa
     monkeypatch.setenv("MINT_RAY_GCS_ADDRESS", "192.168.38.184:6379")
     monkeypatch.setenv("MINT_RAY_CLIENT_ADDRESS", "ray://192.168.38.184:10001")
     monkeypatch.setenv("MINT_VLLM_CHILD_PYTHON_EXECUTABLE", str(wrapper))
+    monkeypatch.setenv("MINT_CODE_ROOT", "/shared/code")
     monkeypatch.setitem(sys.modules, "ray", fake_ray)
 
     out = ray_utils.init_ray(namespace="mint", ignore_reinit_error=True)

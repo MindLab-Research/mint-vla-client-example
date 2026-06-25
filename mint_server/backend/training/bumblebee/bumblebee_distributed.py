@@ -15,6 +15,7 @@ import os
 import socket
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,11 @@ from typing import Any
 
 import ray
 
-from mint_server.backend.ray_cluster.model_actor_names import bumblebee_actor_name
+from mint_server.backend.ray_cluster.model_actor_names import (
+    bumblebee_actor_name,
+    default_model_actor_name,
+)
+from mint_server.backend.sampling_backend import actor_name_for_sampling_base_model
 from mint_server.backend.training.megatron.megatron_distributed import (
     DistributedConfig,
     _bundle_node_ip,
@@ -87,7 +92,155 @@ BUMBLEBEE_RUNTIME_ENV_PASSTHROUGH_KEYS = (
     "NVTE_DEBUG",
     "NVTE_DEBUG_LEVEL",
     "BUMBLEBEE_TE_SDPA_FALLBACK",
+    "MINT_VERL_LOCAL_ATTENTION_PATCHES",
 )
+
+
+def _is_capacity_block_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "pinned node capacity check failed" in msg
+        or "insufficient gpu" in msg
+        or "insufficient pinned gpu" in msg
+        or "blocking_placement_groups" in msg
+    )
+
+
+def _bumblebee_reclaim_sglang_enabled() -> bool:
+    raw = os.environ.get("MINT_BUMBLEBEE_RECLAIM_SGLANG_ON_TRAINING_LAUNCH")
+    if raw is None:
+        raw = os.environ.get("MINT_BUMBLEBEE_RECLAIM_SGLANG_ON_CAPACITY_BLOCK")
+    if raw is None:
+        return True
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _reclaim_same_model_sglang_resources_for_bumblebee(
+    *,
+    model_name: str,
+    context: str,
+    namespace: str = PERSISTENT_NAMESPACE,
+) -> dict[str, list[str]]:
+    if not _bumblebee_reclaim_sglang_enabled():
+        return {"killed_actor_names": []}
+
+    model_key = _model_key_from_base_model(model_name)
+    sglang_actor_name = actor_name_for_sampling_base_model(model_key, backend="sglang")
+    runtime_actor_name = default_model_actor_name(f"sglang:{model_key}", "replica-0")
+    target_names = {sglang_actor_name, runtime_actor_name}
+    try:
+        for actor_info in ray.util.list_named_actors(all_namespaces=True):
+            actor_namespace = str(actor_info.get("namespace") or actor_info.get("ray_namespace") or "")
+            actor_name = str(actor_info.get("name") or actor_info.get("actor_name") or "")
+            if actor_namespace != namespace:
+                continue
+            if actor_name.startswith(f"{sglang_actor_name}_rank"):
+                target_names.add(actor_name)
+    except Exception as exc:
+        logger.warning(
+            "Bumblebee launch could not list SGLang actors for same-model reclaim model=%s model_key=%s namespace=%s context=%s error_type=%s error=%s",
+            model_name,
+            model_key,
+            namespace,
+            context,
+            type(exc).__name__,
+            exc,
+        )
+
+    killed_actor_names: list[str] = []
+    for actor_name in sorted(target_names):
+        try:
+            actor = ray.get_actor(actor_name, namespace=namespace)
+        except ValueError:
+            continue
+        except Exception as exc:
+            logger.warning(
+                "Bumblebee launch could not inspect same-model SGLang actor actor=%s namespace=%s context=%s error_type=%s error=%s",
+                actor_name,
+                namespace,
+                context,
+                type(exc).__name__,
+                exc,
+            )
+            continue
+        try:
+            ray_kill.kill(
+                actor,
+                reason="bumblebee_launch_same_model_sglang_preempt",
+                actor_name=actor_name,
+                namespace=namespace,
+                no_restart=True,
+                verify_absent=True,
+            )
+            killed_actor_names.append(actor_name)
+        except Exception as exc:
+            logger.warning(
+                "Bumblebee launch failed to preempt same-model SGLang actor actor=%s namespace=%s context=%s error_type=%s error=%s",
+                actor_name,
+                namespace,
+                context,
+                type(exc).__name__,
+                exc,
+            )
+
+    if killed_actor_names:
+        try:
+            from mint_server.backend.sglang_engine import _invalidate_model_session_loras
+
+            _invalidate_model_session_loras(model_key)
+        except Exception as exc:
+            logger.warning(
+                "Bumblebee launch failed to invalidate same-model SGLang LoRA cache model=%s model_key=%s context=%s error_type=%s error=%s",
+                model_name,
+                model_key,
+                context,
+                type(exc).__name__,
+                exc,
+            )
+        logger.warning(
+            "Bumblebee launch reclaimed same-model SGLang resources model=%s model_key=%s context=%s actors=%s",
+            model_name,
+            model_key,
+            context,
+            sorted(set(killed_actor_names)),
+        )
+    return {"killed_actor_names": sorted(set(killed_actor_names))}
+
+
+def _assert_bumblebee_node_ip_capacity_with_sglang_reclaim(
+    *,
+    model_name: str,
+    required_gpus_by_node_ip: dict[str, int],
+    context: str,
+    ignore_placement_group_names: set[str] | None = None,
+    ignore_placement_group_namespace: str | None = None,
+) -> None:
+    try:
+        assert_node_ip_capacity(
+            required_gpus_by_node_ip=required_gpus_by_node_ip,
+            context=context,
+            ignore_placement_group_names=ignore_placement_group_names,
+            ignore_placement_group_namespace=ignore_placement_group_namespace,
+        )
+        return
+    except Exception as exc:
+        if not _is_capacity_block_error(exc):
+            raise
+        first_error = exc
+
+    reclaimed = _reclaim_same_model_sglang_resources_for_bumblebee(
+        model_name=model_name,
+        context=context,
+        namespace=PERSISTENT_NAMESPACE,
+    )
+    if not reclaimed["killed_actor_names"]:
+        raise first_error
+    assert_node_ip_capacity(
+        required_gpus_by_node_ip=required_gpus_by_node_ip,
+        context=context,
+        ignore_placement_group_names=ignore_placement_group_names,
+        ignore_placement_group_namespace=ignore_placement_group_namespace,
+    )
 
 DEFAULT_BUMBLEBEE_FLASH_ATTN_OVERLAY_RELATIVE = "overlays/flash_attn_2_8_3_cu12_torch2_9_cp312"
 
@@ -141,6 +294,135 @@ def _normalize_bumblebee_peft_adapter_config(adapter_dir: str | Path) -> dict[st
     if changed:
         config_path.write_text(json.dumps(loaded, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return loaded
+
+
+def _peft_target_modules_from_adapter_config(adapter_config: dict[str, Any]) -> set[str] | None:
+    raw_targets = adapter_config.get("target_modules")
+    if not isinstance(raw_targets, list) or not all(isinstance(value, str) for value in raw_targets):
+        return None
+
+    native_to_peft = {
+        "linear_qkv": {"q_proj", "k_proj", "v_proj"},
+        "linear_proj": {"o_proj"},
+        "linear_fc1": {"gate_proj", "up_proj"},
+        "linear_fc2": {"down_proj"},
+    }
+    out: set[str] = set()
+    for target in raw_targets:
+        out.update(native_to_peft.get(target, {target}))
+    return out
+
+
+def _peft_target_modules_for_bumblebee_targets(target_modules: list[str] | tuple[str, ...]) -> list[str]:
+    native_to_peft = {
+        "linear_qkv": ["q_proj", "k_proj", "v_proj"],
+        "linear_proj": ["o_proj"],
+        "linear_fc1": ["gate_proj", "up_proj"],
+        "linear_fc2": ["down_proj"],
+    }
+    out: list[str] = []
+    for target in target_modules:
+        mapped = native_to_peft.get(str(target), [str(target)])
+        for value in mapped:
+            if value not in out:
+                out.append(value)
+    return out
+
+
+def _bumblebee_adapter_tensor_matches_targets(name: str, target_modules: set[str]) -> bool:
+    for module in target_modules:
+        if f".self_attn.{module}." in name:
+            return True
+        if ".mlp.experts." in name and f".{module}." in name:
+            return True
+        if f".{module}." in name and (".lm_head." in name or ".output_layer." in name):
+            return True
+
+    known_lora_tensor = (
+        ".self_attn." in name
+        or ".mlp.experts." in name
+        or ".lm_head." in name
+        or ".output_layer." in name
+    ) and ".lora_" in name
+    return not known_lora_tensor
+
+
+def _filter_bumblebee_adapter_model_for_target_modules(
+    adapter_dir: str | Path,
+    adapter_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Drop Bumblebee-exported LoRA tensors not listed in adapter_config target_modules."""
+    if not adapter_config:
+        return None
+    target_modules = _peft_target_modules_from_adapter_config(adapter_config)
+    if not target_modules:
+        return None
+
+    adapter_path = Path(adapter_dir) / "adapter_model.safetensors"
+    if not adapter_path.is_file():
+        return None
+
+    from safetensors.torch import load_file, save_file
+
+    state = load_file(str(adapter_path), device="cpu")
+    filtered = {
+        name: tensor
+        for name, tensor in state.items()
+        if _bumblebee_adapter_tensor_matches_targets(name, target_modules)
+    }
+    removed_tensors = len(state) - len(filtered)
+    if removed_tensors <= 0:
+        return {
+            "num_tensors": len(filtered),
+            "num_parameters": int(sum(tensor.numel() for tensor in filtered.values())),
+            "filtered_removed_tensors": 0,
+            "filtered_removed_parameters": 0,
+            "filtered_target_modules": sorted(target_modules),
+        }
+    if state and not filtered:
+        raise RuntimeError(
+            "Bumblebee adapter target_modules filtering would remove every tensor from "
+            f"{adapter_path}; target_modules={sorted(target_modules)}"
+        )
+
+    original_parameters = int(sum(tensor.numel() for tensor in state.values()))
+    filtered_parameters = int(sum(tensor.numel() for tensor in filtered.values()))
+    # Rewrite in place: adapter_path is the file the worker group just produced
+    # for this save (see save_lora_weights), not a pre-existing shared checkpoint
+    # owned by another consumer. We write a sibling .tmp and os.replace() it, which
+    # is atomic on POSIX, so any concurrent reader on a shared path (CPFS/object
+    # store export) sees either the complete pre-filter file or the complete
+    # post-filter file -- never a torn write.
+    tmp_path = adapter_path.with_name(f"{adapter_path.name}.tmp")
+    save_file(filtered, str(tmp_path))
+    os.replace(tmp_path, adapter_path)
+
+    meta_update = {
+        "num_tensors": len(filtered),
+        "num_parameters": filtered_parameters,
+        "filtered_removed_tensors": int(removed_tensors),
+        "filtered_removed_parameters": int(original_parameters - filtered_parameters),
+        "filtered_target_modules": sorted(target_modules),
+    }
+    meta_path = Path(adapter_dir) / "bumblebee_adapter_meta.json"
+    if meta_path.is_file():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to read Bumblebee adapter metadata at {meta_path}: {exc}") from exc
+        if not isinstance(meta, dict):
+            raise RuntimeError(f"Bumblebee adapter metadata must be a JSON object, got {type(meta).__name__}")
+        meta.update(meta_update)
+        meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    logger.info(
+        "Filtered Bumblebee adapter tensors by target_modules: path=%s kept=%s removed=%s targets=%s",
+        adapter_path,
+        len(filtered),
+        removed_tensors,
+        sorted(target_modules),
+    )
+    return meta_update
 
 
 def _infer_bumblebee_reference_actual_rank(checkpoint_path: str | Path) -> int | None:
@@ -274,7 +556,6 @@ def _model_key_from_base_model(base_model: str) -> str:
 _make_bumblebee_actor_name = bumblebee_actor_name
 
 
-
 def _make_bumblebee_pg_name(base_model: str, *, namespace: str = PERSISTENT_NAMESPACE) -> str:
     return f"{bumblebee_actor_name(base_model)}_{_make_namespace_pg_suffix(namespace)}_pg"
 
@@ -341,6 +622,45 @@ def _target_modules(*, train_attn: bool, train_mlp: bool, train_unembed: bool) -
     if not targets:
         raise ValueError("Bumblebee LoRA requires train_attn or train_mlp to be enabled")
     return targets
+
+
+def _normalize_bumblebee_target_modules(target_modules: list[str] | tuple[str, ...] | None) -> tuple[str, ...]:
+    if target_modules is None:
+        return tuple(_target_modules(train_attn=True, train_mlp=True, train_unembed=True))
+    normalized = tuple(str(module) for module in target_modules if str(module))
+    if not normalized:
+        raise ValueError("Bumblebee LoRA requires at least one target module")
+    return normalized
+
+
+def _bumblebee_target_modules_for_flags(
+    *,
+    train_attn: bool = True,
+    train_mlp: bool = True,
+    train_unembed: bool = True,
+) -> tuple[str, ...]:
+    return tuple(
+        _target_modules(
+            train_attn=bool(train_attn),
+            train_mlp=bool(train_mlp),
+            train_unembed=bool(train_unembed),
+        )
+    )
+
+
+def _use_bumblebee_dense_dp0_attention_export(
+    parallel_state: Any,
+    *,
+    train_attn: bool,
+    train_mlp: bool,
+    train_unembed: bool,
+) -> bool:
+    return (
+        bool(train_attn)
+        and not bool(train_mlp)
+        and not bool(train_unembed)
+        and int(getattr(parallel_state, "dp_size", 1) or 1) > 1
+    )
 
 
 def _coerce_scalar(value: Any, default: float = 0.0) -> float:
@@ -543,6 +863,9 @@ class BumblebeeSessionMeta:
     step_count: int = 0
     learning_rate: float = 0.0
     actual_rank: int | None = None
+    train_attn: bool = True
+    train_mlp: bool = True
+    train_unembed: bool = True
 
 
 @ray.remote(num_gpus=1, num_cpus=0)
@@ -558,6 +881,7 @@ class BumblebeeRankWorker:
         lora_rank: int,
         learning_rate: float,
         distributed_config: DistributedConfig,
+        target_modules: list[str] | tuple[str, ...] | None = None,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
@@ -567,6 +891,7 @@ class BumblebeeRankWorker:
         self.lora_rank = int(lora_rank)
         self.learning_rate = float(learning_rate)
         self.config = distributed_config
+        self.target_modules = _normalize_bumblebee_target_modules(target_modules)
         self.rt = None
         self.handle = None
         self._current_session: str | None = None
@@ -623,7 +948,7 @@ class BumblebeeRankWorker:
                         "rank": int(self.lora_rank),
                         "max_rank": int(self.lora_rank),
                         "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
-                        "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
+                        "target_modules": list(self.target_modules),
                     },
                 },
             )
@@ -632,7 +957,13 @@ class BumblebeeRankWorker:
             logger.info("bumblebee_rank_build_model_start", rank=self.rank)
             self.handle = self.rt.build_model()
             logger.info("bumblebee_rank_initialize_done", rank=self.rank)
-            return {"rank": self.rank, "world_size": self.world_size, "backend": "bumblebee", "bumblebee_repo": repo}
+            return {
+                "rank": self.rank,
+                "world_size": self.world_size,
+                "backend": "bumblebee",
+                "bumblebee_repo": repo,
+                "target_modules": list(self.target_modules),
+            }
         except BaseException:
             logger.exception("Bumblebee rank initialize failed: rank=%s world_size=%s", self.rank, self.world_size)
             raise
@@ -644,12 +975,93 @@ class BumblebeeRankWorker:
             "hostname": socket.gethostname(),
             "pid": os.getpid(),
             "session_id": self._current_session,
+            "target_modules": list(self.target_modules),
         }
 
     def _require_runtime(self):
         if self.rt is None or self.handle is None:
             raise RuntimeError("Bumblebee runtime is not initialized")
         return self.rt, self.handle
+
+    def _save_lora_adapter_artifacts_dense_dp0_attention_only(
+        self,
+        chunks: list[Any] | tuple[Any, ...],
+        model_cfg: Any,
+        parallel_state: Any,
+        save_path: str,
+        *,
+        session_id: str,
+        actual_rank: int | None,
+        target_modules: list[str],
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        import torch.distributed as dist
+
+        is_export_dp_rank = int(getattr(parallel_state, "dp_rank", 0) or 0) == 0
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+        result: dict[str, Any] = {}
+        if is_export_dp_rank:
+            from bumblebee.model.qwen3_moe.lite.lora_adapter import (
+                export_lora_adapter_state,
+            )
+            from safetensors.torch import save_file
+
+            state = export_lora_adapter_state(chunks, model_cfg, parallel_state, cpu=True)
+            if rank == 0:
+                logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
+                output = Path(save_path)
+                output.mkdir(parents=True, exist_ok=True)
+                save_file(state, str(output / "adapter_model.safetensors"))
+                config = {
+                    "r": logical_rank,
+                    "lora_alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+                    "target_modules": _peft_target_modules_for_bumblebee_targets(target_modules),
+                    "bias": "none",
+                    "task_type": "CAUSAL_LM",
+                    "base_model_name_or_path": self.base_model,
+                }
+                (output / "adapter_config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+                meta = {
+                    "format": "bumblebee_qwen3_moe_lora_peft_v1",
+                    "num_tensors": len(state),
+                    "num_parameters": int(sum(tensor.numel() for tensor in state.values())),
+                    "parallel": {
+                        "tp": int(getattr(parallel_state, "tp_size", 1)),
+                        "ep": int(getattr(parallel_state, "ep_size", 1)),
+                        "etp": int(getattr(parallel_state, "etp_size", 1)),
+                        "pp": int(getattr(parallel_state, "pp_size", 1)),
+                    },
+                    "model": {
+                        "num_hidden_layers": getattr(model_cfg, "num_hidden_layers", None),
+                        "hidden_size": getattr(model_cfg, "hidden_size", None),
+                        "num_attention_heads": getattr(model_cfg, "num_attention_heads", None),
+                        "num_key_value_heads": getattr(model_cfg, "num_key_value_heads", None),
+                        "head_dim": getattr(model_cfg, "head_dim", None),
+                        "num_experts": getattr(model_cfg, "num_experts", None),
+                        "moe_intermediate_size": getattr(model_cfg, "moe_intermediate_size", None),
+                    },
+                    "metadata": {
+                        **dict(metadata or {}),
+                        "dense_dp0_attention_export": True,
+                        "export_dp_rank": int(getattr(parallel_state, "dp_rank", 0) or 0),
+                        "export_dp_size": int(getattr(parallel_state, "dp_size", 1) or 1),
+                    },
+                }
+                (output / "bumblebee_adapter_meta.json").write_text(
+                    json.dumps(meta, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                result = {
+                    "path": str(output),
+                    "adapter_model": str(output / "adapter_model.safetensors"),
+                    "adapter_config": str(output / "adapter_config.json"),
+                    **meta,
+                }
+
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        return result
 
     def _iter_lora_modules(self):
         _, handle = self._require_runtime()
@@ -1076,16 +1488,71 @@ class BumblebeeRankWorker:
             name="actor_logprobs",
         )
 
-    def _ensure_session_loaded(self, session_id: str, actual_rank: int | None) -> dict[str, Any]:
+    def _update_session_train_flags(
+        self,
+        session_id: str,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> BumblebeeSessionMeta:
+        meta = self._session_meta.setdefault(
+            session_id,
+            BumblebeeSessionMeta(learning_rate=float(self.learning_rate)),
+        )
+        if train_attn is not None:
+            meta.train_attn = bool(train_attn)
+        if train_mlp is not None:
+            meta.train_mlp = bool(train_mlp)
+        if train_unembed is not None:
+            meta.train_unembed = bool(train_unembed)
+        return meta
+
+    def _assert_session_targets_supported(self, session_meta: BumblebeeSessionMeta) -> None:
+        requested = _bumblebee_target_modules_for_flags(
+            train_attn=bool(session_meta.train_attn),
+            train_mlp=bool(session_meta.train_mlp),
+            train_unembed=bool(session_meta.train_unembed),
+        )
+        if requested != self.target_modules:
+            raise RuntimeError(
+                "Bumblebee actor LoRA target_modules mismatch: "
+                f"actor={list(self.target_modules)} requested={list(requested)}. "
+                "Recycle the actor with matching train_attn/train_mlp/train_unembed flags."
+            )
+
+    def _ensure_session_loaded(
+        self,
+        session_id: str,
+        actual_rank: int | None,
+        *,
+        train_attn: bool | None = None,
+        train_mlp: bool | None = None,
+        train_unembed: bool | None = None,
+    ) -> dict[str, Any]:
         rt, handle = self._require_runtime()
+        meta = self._update_session_train_flags(
+            session_id,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        self._assert_session_targets_supported(meta)
+        meta.actual_rank = actual_rank
         if self._current_session == session_id:
             return {"session_state": "current", "rank": self.rank}
         if self._current_session is not None:
+            current_meta = self._session_meta.get(self._current_session, BumblebeeSessionMeta())
             rt.save_adapter_train_state(
                 handle,
                 self._current_session,
                 include_optimizer=True,
-                metadata={"rank": self.rank},
+                metadata={
+                    "rank": self.rank,
+                    "train_attn": bool(current_meta.train_attn),
+                    "train_mlp": bool(current_meta.train_mlp),
+                    "train_unembed": bool(current_meta.train_unembed),
+                },
             )
         store = handle._extras.setdefault("adapter_train_states", {})
         if session_id in store:
@@ -1106,15 +1573,17 @@ class BumblebeeRankWorker:
                 handle,
                 session_id,
                 include_optimizer=True,
-                metadata={"rank": self.rank, "fresh": True},
+                metadata={
+                    "rank": self.rank,
+                    "fresh": True,
+                    "train_attn": bool(meta.train_attn),
+                    "train_mlp": bool(meta.train_mlp),
+                    "train_unembed": bool(meta.train_unembed),
+                },
             )
             session_state = "fresh"
         self._set_logical_rank(actual_rank)
         self._current_session = session_id
-        self._session_meta.setdefault(
-            session_id,
-            BumblebeeSessionMeta(learning_rate=float(self.learning_rate), actual_rank=actual_rank),
-        )
         return {"session_state": session_state, "rank": self.rank}
 
     def forward_backward(
@@ -1130,9 +1599,14 @@ class BumblebeeRankWorker:
         train_mlp: bool = True,
         train_unembed: bool = True,
     ) -> dict[str, Any]:
-        del train_attn, train_mlp, train_unembed
         rt, handle = self._require_runtime()
-        switch = self._ensure_session_loaded(session_id, actual_rank)
+        switch = self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         loss_cfg = dict(loss_fn_config or {})
         if rollout_correction_config:
             loss_cfg["rollout_correction_config"] = dict(rollout_correction_config)
@@ -1304,9 +1778,14 @@ class BumblebeeRankWorker:
         train_mlp: bool = True,
         train_unembed: bool = True,
     ) -> dict[str, Any]:
-        del train_attn, train_mlp, train_unembed
         rt, handle = self._require_runtime()
-        switch = self._ensure_session_loaded(session_id, actual_rank)
+        switch = self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
 
         from bumblebee.runtime.adapters.mint import mint_datums_to_packed_batch
 
@@ -1448,9 +1927,19 @@ class BumblebeeRankWorker:
         learning_rate: float | None,
         session_id: str,
         actual_rank: int | None,
+        *,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
         rt, handle = self._require_runtime()
-        self._ensure_session_loaded(session_id, actual_rank)
+        self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         if learning_rate is not None:
             self.learning_rate = float(learning_rate)
         update_successful, grad_norm, num_zeros = rt.optimizer_step(handle)
@@ -1477,30 +1966,68 @@ class BumblebeeRankWorker:
         *,
         session_id: str,
         actual_rank: int | None,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
-        self._ensure_session_loaded(session_id, actual_rank)
-        _, handle = self._require_runtime()
-        save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
-
-        chunks = handle._extras.get("model_chunks", [handle._model])
-        meta = save_lora_adapter(
-            chunks,
-            handle._extras["model_cfg"],
-            handle._parallel_state,
-            save_path,
-            base_model_name_or_path=self.base_model,
-            lora_config={
-                "rank": int(actual_rank if actual_rank is not None else self.lora_rank),
-                "max_rank": int(self.lora_rank),
-                "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
-                "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
-            },
-            metadata={
-                "backend": "bumblebee",
-                "session_id": session_id,
-                "rank": self.rank,
-            },
+        target_modules = _target_modules(
+            train_attn=bool(train_attn),
+            train_mlp=bool(train_mlp),
+            train_unembed=bool(train_unembed),
         )
+        self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
+        _, handle = self._require_runtime()
+        chunks = handle._extras.get("model_chunks", [handle._model])
+        model_cfg = handle._extras["model_cfg"]
+        parallel_state = handle._parallel_state
+        metadata = {
+            "backend": "bumblebee",
+            "session_id": session_id,
+            "rank": self.rank,
+            "train_attn": bool(train_attn),
+            "train_mlp": bool(train_mlp),
+            "train_unembed": bool(train_unembed),
+        }
+        use_dense_dp0_export = _use_bumblebee_dense_dp0_attention_export(
+            parallel_state,
+            train_attn=bool(train_attn),
+            train_mlp=bool(train_mlp),
+            train_unembed=bool(train_unembed),
+        )
+        if use_dense_dp0_export:
+            meta = self._save_lora_adapter_artifacts_dense_dp0_attention_only(
+                chunks,
+                model_cfg,
+                parallel_state,
+                save_path,
+                session_id=session_id,
+                actual_rank=actual_rank,
+                target_modules=target_modules,
+                metadata=metadata,
+            )
+        else:
+            save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
+
+            meta = save_lora_adapter(
+                chunks,
+                model_cfg,
+                parallel_state,
+                save_path,
+                base_model_name_or_path=self.base_model,
+                lora_config={
+                    "rank": int(actual_rank if actual_rank is not None else self.lora_rank),
+                    "max_rank": int(self.lora_rank),
+                    "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+                    "target_modules": target_modules,
+                },
+                metadata=metadata,
+            )
         session_meta = self._session_meta.get(session_id, BumblebeeSessionMeta())
         meta.update(
             {
@@ -1508,6 +2035,9 @@ class BumblebeeRankWorker:
                 "learning_rate": float(session_meta.learning_rate or self.learning_rate),
                 "actual_rank": int(actual_rank if actual_rank is not None else self.lora_rank),
                 "checkpoint_path": str(Path(save_path).resolve()),
+                "train_attn": bool(session_meta.train_attn),
+                "train_mlp": bool(session_meta.train_mlp),
+                "train_unembed": bool(session_meta.train_unembed),
             }
         )
         return meta
@@ -1519,31 +2049,64 @@ class BumblebeeRankWorker:
         session_id: str,
         actual_rank: int | None,
         checkpoint_type: str,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
         _, handle = self._require_runtime()
-        save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
 
         logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
-        chunks = handle._extras.get("model_chunks", [handle._model])
-        meta = save_lora_adapter(
-            chunks,
-            handle._extras["model_cfg"],
-            handle._parallel_state,
-            save_path,
-            base_model_name_or_path=self.base_model,
-            lora_config={
-                "rank": logical_rank,
-                "max_rank": int(self.lora_rank),
-                "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
-                "target_modules": ["linear_qkv", "linear_proj", "linear_fc1", "linear_fc2"],
-            },
-            metadata={
-                "backend": "bumblebee",
-                "checkpoint_type": checkpoint_type,
-                "session_id": session_id,
-                "rank": self.rank,
-            },
+        target_modules = _target_modules(
+            train_attn=bool(train_attn),
+            train_mlp=bool(train_mlp),
+            train_unembed=bool(train_unembed),
         )
+        chunks = handle._extras.get("model_chunks", [handle._model])
+        model_cfg = handle._extras["model_cfg"]
+        parallel_state = handle._parallel_state
+        metadata = {
+            "backend": "bumblebee",
+            "checkpoint_type": checkpoint_type,
+            "session_id": session_id,
+            "rank": self.rank,
+            "train_attn": bool(train_attn),
+            "train_mlp": bool(train_mlp),
+            "train_unembed": bool(train_unembed),
+        }
+        use_dense_dp0_export = _use_bumblebee_dense_dp0_attention_export(
+            parallel_state,
+            train_attn=bool(train_attn),
+            train_mlp=bool(train_mlp),
+            train_unembed=bool(train_unembed),
+        )
+        if use_dense_dp0_export:
+            meta = self._save_lora_adapter_artifacts_dense_dp0_attention_only(
+                chunks,
+                model_cfg,
+                parallel_state,
+                save_path,
+                session_id=session_id,
+                actual_rank=logical_rank,
+                target_modules=target_modules,
+                metadata=metadata,
+            )
+        else:
+            save_lora_adapter = _bumblebee_lora_adapter_module(self.base_model).save_lora_adapter
+
+            meta = save_lora_adapter(
+                chunks,
+                model_cfg,
+                parallel_state,
+                save_path,
+                base_model_name_or_path=self.base_model,
+                lora_config={
+                    "rank": logical_rank,
+                    "max_rank": int(self.lora_rank),
+                    "alpha": int(_env_int("MINT_BUMBLEBEE_LORA_ALPHA", self.lora_rank * 2)),
+                    "target_modules": target_modules,
+                },
+                metadata=metadata,
+            )
         return meta
 
     def save_training_state(
@@ -1553,10 +2116,19 @@ class BumblebeeRankWorker:
         session_id: str,
         actual_rank: int | None,
         include_optimizer: bool = True,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
         import torch
 
-        self._ensure_session_loaded(session_id, actual_rank)
+        self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         rt, handle = self._require_runtime()
         session_meta = self._session_meta.get(session_id, BumblebeeSessionMeta())
         logical_rank = int(actual_rank if actual_rank is not None else self.lora_rank)
@@ -1573,6 +2145,9 @@ class BumblebeeRankWorker:
                 "actual_rank": logical_rank,
                 "current_step": int(session_meta.step_count),
                 "learning_rate": float(session_meta.learning_rate or self.learning_rate),
+                "train_attn": bool(session_meta.train_attn),
+                "train_mlp": bool(session_meta.train_mlp),
+                "train_unembed": bool(session_meta.train_unembed),
             },
             store=True,
         )
@@ -1611,6 +2186,9 @@ class BumblebeeRankWorker:
             "has_optimizer": state.optimizer_state is not None,
             "has_lr_scheduler": state.lr_scheduler_state is not None,
             "has_rng": state.rng_state is not None,
+            "train_attn": bool(session_meta.train_attn),
+            "train_mlp": bool(session_meta.train_mlp),
+            "train_unembed": bool(session_meta.train_unembed),
         }
         if self.rank == 0:
             (root / BUMBLEBEE_TRAIN_STATE_META_FILE).write_text(
@@ -1622,6 +2200,9 @@ class BumblebeeRankWorker:
             session_id=session_id,
             actual_rank=actual_rank,
             checkpoint_type="training",
+            train_attn=bool(session_meta.train_attn),
+            train_mlp=bool(session_meta.train_mlp),
+            train_unembed=bool(session_meta.train_unembed),
         )
         if adapter_meta:
             meta.update(adapter_meta)
@@ -1634,12 +2215,18 @@ class BumblebeeRankWorker:
         *,
         session_id: str,
         actual_rank: int | None = None,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
         return self.load_training_state(
             load_path,
             load_optimizer=load_optimizer,
             session_id=session_id,
             actual_rank=actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
         )
 
     def _load_megatron_peft_adapter_for_bumblebee(
@@ -1734,6 +2321,10 @@ class BumblebeeRankWorker:
             except Exception:
                 logger.warning("ignoring_invalid_migrated_checkpoint_learning_rate", learning_rate=lr)
         session_meta.actual_rank = actual_rank
+        for key in ("train_attn", "train_mlp", "train_unembed"):
+            value = training_meta.get(key, metadata.get(key))
+            if value is not None:
+                setattr(session_meta, key, bool(value))
         self._current_session = session_id
         return {
             "backend": "bumblebee",
@@ -1748,6 +2339,9 @@ class BumblebeeRankWorker:
             "optimizer_restored": False,
             "optimizer_reset": True,
             "requested_optimizer_restore": bool(requested_optimizer_restore),
+            "train_attn": bool(session_meta.train_attn),
+            "train_mlp": bool(session_meta.train_mlp),
+            "train_unembed": bool(session_meta.train_unembed),
             **dict(load_meta or {}),
         }
 
@@ -1758,10 +2352,19 @@ class BumblebeeRankWorker:
         *,
         session_id: str,
         actual_rank: int | None = None,
+        train_attn: bool = True,
+        train_mlp: bool = True,
+        train_unembed: bool = True,
     ) -> dict[str, Any]:
         import torch
 
-        self._ensure_session_loaded(session_id, actual_rank)
+        self._ensure_session_loaded(
+            session_id,
+            actual_rank,
+            train_attn=train_attn,
+            train_mlp=train_mlp,
+            train_unembed=train_unembed,
+        )
         rt, handle = self._require_runtime()
         root = Path(load_path).resolve()
         state_path = root / f"rank_{self.rank:05d}" / BUMBLEBEE_TRAIN_STATE_FILE
@@ -1826,6 +2429,9 @@ class BumblebeeRankWorker:
         if lr is not None:
             session_meta.learning_rate = float(lr)
         session_meta.actual_rank = actual_rank
+        for key in ("train_attn", "train_mlp", "train_unembed"):
+            if key in loaded_meta:
+                setattr(session_meta, key, bool(loaded_meta[key]))
         self._current_session = session_id
         return {
             "backend": "bumblebee",
@@ -1838,6 +2444,9 @@ class BumblebeeRankWorker:
             "has_optimizer": payload.get("optimizer_state") is not None,
             "has_lr_scheduler": payload.get("lr_scheduler_state") is not None,
             "has_rng": payload.get("rng_state") is not None,
+            "train_attn": bool(session_meta.train_attn),
+            "train_mlp": bool(session_meta.train_mlp),
+            "train_unembed": bool(session_meta.train_unembed),
         }
 
     def mark_session_loaded(self, session_id: str, **kwargs: Any) -> dict[str, Any]:
@@ -1848,6 +2457,9 @@ class BumblebeeRankWorker:
             meta.learning_rate = float(kwargs["learning_rate"])
         if kwargs.get("actual_rank") is not None:
             meta.actual_rank = int(kwargs["actual_rank"])
+        for key in ("train_attn", "train_mlp", "train_unembed"):
+            if kwargs.get(key) is not None:
+                setattr(meta, key, bool(kwargs[key]))
         self._current_session = session_id
         return {"status": "ok", "backend": "bumblebee"}
 
@@ -1870,6 +2482,7 @@ class BumblebeeWorkerGroup:
         lora_rank: int,
         learning_rate: float,
         distributed_config: DistributedConfig | None = None,
+        target_modules: list[str] | tuple[str, ...] | None = None,
         observability_base_model: str | None = None,
         traceparent: str | None = None,
         request_id: str | None = None,
@@ -1879,6 +2492,7 @@ class BumblebeeWorkerGroup:
         self.lora_rank = int(lora_rank)
         self.learning_rate = float(learning_rate)
         self.config = distributed_config or DistributedConfig()
+        self.target_modules = _normalize_bumblebee_target_modules(target_modules)
         self.traceparent = traceparent
         self.request_id = str(request_id or "") or None
         self.workers: list[ray.actor.ActorHandle] = []
@@ -1902,6 +2516,7 @@ class BumblebeeWorkerGroup:
         return True
 
     def heartbeat(self) -> dict[str, Any]:
+        self._ensure_initialized()
         self._assert_rank_workers_ready(timeout_s=10.0)
         return {
             "ok": True,
@@ -1915,12 +2530,14 @@ class BumblebeeWorkerGroup:
         }
 
     def get_diagnostics(self) -> dict[str, Any]:
+        self._ensure_initialized()
         self._assert_rank_workers_ready(timeout_s=10.0)
         return {
             "backend": "bumblebee",
             "base_model": self.base_model,
             "observability_base_model": self.observability_base_model,
             "lora_rank": int(self.lora_rank),
+            "target_modules": list(self.target_modules),
             "world_size": int(self.config.world_size),
             "rank_workers": len(self.workers),
             "step": int(self._step_count),
@@ -2001,7 +2618,8 @@ class BumblebeeWorkerGroup:
                     f"Bumblebee placement GPU count mismatch for base_model={self.base_model!r}: "
                     f"need {world_size}, got {placement.total_gpus}"
                 )
-            assert_node_ip_capacity(
+            _assert_bumblebee_node_ip_capacity_with_sglang_reclaim(
+                model_name=self.base_model,
                 required_gpus_by_node_ip=placement.required_gpus_by_node_ip(),
                 context=f"[BumblebeeWorkerGroup] node pinning base_model={self.base_model}",
                 ignore_placement_group_names={_make_bumblebee_pg_name(self.base_model)},
@@ -2073,6 +2691,7 @@ class BumblebeeWorkerGroup:
                 lora_rank=self.lora_rank,
                 learning_rate=self.learning_rate,
                 distributed_config=self.config,
+                target_modules=self.target_modules,
             )
             self.workers.append(worker)
         ray.get([worker.__ray_ready__.remote() for worker in self.workers])
@@ -2301,10 +2920,17 @@ class BumblebeeWorkerGroup:
         train_mlp: bool = True,
         train_unembed: bool = True,
     ) -> dict[str, Any]:
-        del traceparent, train_attn, train_mlp, train_unembed
+        del traceparent
         self._ensure_initialized()
         refs = [
-            worker.optimizer_step.remote(learning_rate, session_id, actual_rank)
+            worker.optimizer_step.remote(
+                learning_rate,
+                session_id,
+                actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
             for worker in self.workers
         ]
         results = self._ray_get_group_results(refs, op="optim_step")
@@ -2363,25 +2989,39 @@ class BumblebeeWorkerGroup:
         train_mlp: bool = True,
         train_unembed: bool = True,
     ) -> dict[str, Any]:
-        del traceparent, train_attn, train_mlp, train_unembed
+        if traceparent:
+            self.traceparent = traceparent
+        del traceparent
         self._ensure_initialized()
         sid = session_id or self._current_session
         if not sid:
             raise RuntimeError("save_lora_weights requires session_id")
         refs = [
-            worker.save_lora_weights.remote(save_path, session_id=sid, actual_rank=actual_rank)
+            worker.save_lora_weights.remote(
+                save_path,
+                session_id=sid,
+                actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
+            )
             for worker in self.workers
         ]
         results = self._ray_get_group_results(refs, op="save_lora_weights")
         adapter_config = _normalize_bumblebee_peft_adapter_config(save_path)
+        adapter_filter = _filter_bumblebee_adapter_model_for_target_modules(save_path, adapter_config)
         for result in results:
             if isinstance(result, dict) and result.get("adapter_config"):
                 if adapter_config is not None:
                     result["adapter_config"] = adapter_config
+                if adapter_filter is not None:
+                    result.update(adapter_filter)
                 return result
         result = {"checkpoint_path": str(Path(save_path).resolve()), "backend": "bumblebee"}
         if adapter_config is not None:
             result["adapter_config"] = adapter_config
+        if adapter_filter is not None:
+            result.update(adapter_filter)
         return result
 
     def save_checkpoint(self, save_path: str, **kwargs: Any) -> dict[str, Any]:
@@ -2399,7 +3039,7 @@ class BumblebeeWorkerGroup:
         train_unembed: bool = True,
         include_optimizer: bool = True,
     ) -> dict[str, Any]:
-        del traceparent, train_attn, train_mlp, train_unembed
+        del traceparent
         self._ensure_initialized()
         sid = session_id or self._current_session
         if not sid:
@@ -2410,6 +3050,9 @@ class BumblebeeWorkerGroup:
                 session_id=sid,
                 actual_rank=actual_rank,
                 include_optimizer=include_optimizer,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
             for worker in self.workers
         ]
@@ -2429,12 +3072,18 @@ class BumblebeeWorkerGroup:
         if not sid:
             raise RuntimeError("load_training_state requires session_id")
         actual_rank = kwargs.get("actual_rank")
+        train_attn = bool(kwargs.get("train_attn", True))
+        train_mlp = bool(kwargs.get("train_mlp", True))
+        train_unembed = bool(kwargs.get("train_unembed", True))
         refs = [
             worker.load_training_state.remote(
                 load_path,
                 load_optimizer,
                 session_id=sid,
                 actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
             )
             for worker in self.workers
         ]
@@ -2502,6 +3151,9 @@ def get_or_create_bumblebee_worker_group(
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
     actual_rank: int | None = None,
+    train_attn: bool = True,
+    train_mlp: bool = True,
+    train_unembed: bool = True,
     observability_base_model: str | None = None,
     traceparent: str | None = None,
     request_id: str | None = None,
@@ -2516,10 +3168,19 @@ def get_or_create_bumblebee_worker_group(
     config = distributed_config or DistributedConfig()
     actor_name = bumblebee_actor_name(base_model)
     observability_model = str(observability_base_model or base_model or "unknown")
+    target_modules = _bumblebee_target_modules_for_flags(
+        train_attn=bool(train_attn),
+        train_mlp=bool(train_mlp),
+        train_unembed=bool(train_unembed),
+    )
     rank_metadata = {
         "backend": "bumblebee",
         "max_lora_rank": int(lora_rank),
         "actual_rank": int(actual_rank if actual_rank is not None else lora_rank),
+        "target_modules": list(target_modules),
+        "train_attn": bool(train_attn),
+        "train_mlp": bool(train_mlp),
+        "train_unembed": bool(train_unembed),
     }
 
     with _get_bumblebee_create_lock(actor_name):
@@ -2573,6 +3234,21 @@ def get_or_create_bumblebee_worker_group(
                     verify_absent=True,
                 )
                 raise ValueError("Bumblebee actor lora_rank mismatch, will recreate")
+            observed_target_modules = (
+                tuple(str(module) for module in diagnostics.get("target_modules", ()) if str(module))
+                if isinstance(diagnostics, dict)
+                else ()
+            )
+            if observed_target_modules != target_modules:
+                ray_kill.kill(
+                    actor,
+                    reason="bumblebee_actor_lora_target_modules_mismatch",
+                    actor_name=actor_name,
+                    namespace=PERSISTENT_NAMESPACE,
+                    no_restart=True,
+                    verify_absent=True,
+                )
+                raise ValueError("Bumblebee actor LoRA target_modules mismatch, will recreate")
             publish_backend_model_actor(
                 BackendModelActorLaunch(
                     actor_name=actor_name,
@@ -2587,7 +3263,12 @@ def get_or_create_bumblebee_worker_group(
             )
             return actor
         except ValueError:
-            logger.info("creating_new_detached_bumblebee_actor___s_for__s")
+            logger.info(
+                "creating_new_detached_bumblebee_actor",
+                actor=actor_name,
+                base_model=observability_model,
+                world_size=int(config.world_size),
+            )
 
         runtime_pythonpath = _bumblebee_runtime_pythonpath(base_model)
         runtime_env = {
@@ -2627,6 +3308,13 @@ def get_or_create_bumblebee_worker_group(
         if placement is not None and placement.node_ips:
             manager_options["resources"] = _node_affinity_resources(placement.node_ips[0])
 
+        create_t0 = time.perf_counter()
+        logger.info(
+            "bumblebee_worker_group_create_start",
+            actor=actor_name,
+            base_model=observability_model,
+            world_size=int(config.world_size),
+        )
         actor = BumblebeeWorkerGroup.options(
             **manager_options,
         ).remote(
@@ -2634,6 +3322,7 @@ def get_or_create_bumblebee_worker_group(
             lora_rank=lora_rank,
             learning_rate=learning_rate,
             distributed_config=config,
+            target_modules=target_modules,
             observability_base_model=observability_model,
             traceparent=traceparent,
             request_id=request_id,
@@ -2651,6 +3340,54 @@ def get_or_create_bumblebee_worker_group(
             ),
             ready=False,
         )
+        try:
+            initialize_t0 = time.perf_counter()
+            logger.info(
+                "bumblebee_worker_group_initialize_start",
+                actor=actor_name,
+                base_model=observability_model,
+                world_size=int(config.world_size),
+            )
+            ray.get(
+                actor.initialize.remote(),
+                timeout=float(server_config.training_remote_call_timeout_s or 1800.0),
+            )
+        except Exception:
+            logger.warning(
+                "bumblebee_worker_group_initialize_failed",
+                actor=actor_name,
+                base_model=observability_model,
+                elapsed_s=round(time.perf_counter() - initialize_t0, 3),
+            )
+            ray_kill.kill(
+                actor,
+                reason="bumblebee_actor_initialize_failed",
+                actor_name=actor_name,
+                namespace=PERSISTENT_NAMESPACE,
+                no_restart=True,
+                verify_absent=True,
+            )
+            raise
+        logger.info(
+            "bumblebee_worker_group_initialize_done",
+            actor=actor_name,
+            base_model=observability_model,
+            initialize_elapsed_s=round(time.perf_counter() - initialize_t0, 3),
+            total_create_elapsed_s=round(time.perf_counter() - create_t0, 3),
+        )
+        publish_backend_model_actor(
+            BackendModelActorLaunch(
+                actor_name=actor_name,
+                actor_type=ActorType.MEGATRON,
+                num_gpus=int(config.world_size),
+                actor_handle=actor,
+                namespace=PERSISTENT_NAMESPACE,
+                base_model=observability_model,
+                protected=is_topology_desired_model(base_model),
+                metadata=rank_metadata,
+            ),
+            ready=True,
+        )
         return actor
 
 
@@ -2661,6 +3398,9 @@ async def async_get_or_create_bumblebee_worker_group(
     distributed_config: DistributedConfig | None = None,
     session_id: str | None = None,
     actual_rank: int | None = None,
+    train_attn: bool = True,
+    train_mlp: bool = True,
+    train_unembed: bool = True,
     observability_base_model: str | None = None,
     traceparent: str | None = None,
     request_id: str | None = None,
@@ -2679,6 +3419,9 @@ async def async_get_or_create_bumblebee_worker_group(
         distributed_config,
         session_id,
         actual_rank,
+        train_attn,
+        train_mlp,
+        train_unembed,
         observability_base_model,
         traceparent or get_current_traceparent(),
         request_id or get_request_id(),

@@ -31,6 +31,12 @@ def _stub_training_inflight(monkeypatch, tr) -> list[tuple[str, int]]:
     return calls
 
 
+def _stub_vllm_sampling_backend(monkeypatch, tr) -> None:
+    monkeypatch.setattr(
+        tr, "_sampling_serving_backend_for_base_model", lambda _base_model: "vllm"
+    )
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -44,6 +50,7 @@ async def test_issue_408_save_weights_for_sampler_registers_lazy_multilora_sessi
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    _stub_vllm_sampling_backend(monkeypatch, tr)
     monkeypatch.setattr(
         tr, "_materialize_training_session_for_stateful_use", _identity_materialize
     )
@@ -177,6 +184,7 @@ async def test_issue_408_save_weights_for_sampler_reuses_pending_warm_task(
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    _stub_vllm_sampling_backend(monkeypatch, tr)
     monkeypatch.setattr(
         tr, "_materialize_training_session_for_stateful_use", _identity_materialize
     )
@@ -299,6 +307,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_immediate_engine
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    _stub_vllm_sampling_backend(monkeypatch, tr)
     monkeypatch.setattr(
         tr, "_materialize_training_session_for_stateful_use", _identity_materialize
     )
@@ -399,6 +408,7 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     from mint_server.models.types import SaveWeightsForSamplerRequest
 
     tr = _import_training_route()
+    _stub_vllm_sampling_backend(monkeypatch, tr)
     monkeypatch.setattr(
         tr, "_materialize_training_session_for_stateful_use", _identity_materialize
     )
@@ -490,3 +500,36 @@ async def test_issue_408_save_weights_for_sampler_fails_fast_on_async_warm_error
     assert resolved == {}
     assert registration == {}
     assert inflight_calls == [("run-408", -1)]
+
+
+@pytest.mark.anyio
+async def test_save_weights_background_warm_uses_sglang_backend(monkeypatch) -> None:
+    tr = _import_training_route()
+    calls: list[object] = []
+
+    class _SGLangEngine:
+        async def initialize(self) -> None:
+            calls.append("initialize")
+
+    async def _fake_get_sglang_engine_for_model(base_model: str):
+        calls.append(("sglang", base_model))
+        return _SGLangEngine()
+
+    fake_sglang_engine = types.ModuleType("mint_server.backend.sglang_engine")
+    fake_sglang_engine.get_sglang_engine_for_model = _fake_get_sglang_engine_for_model
+    monkeypatch.setitem(sys.modules, "mint_server.backend.sglang_engine", fake_sglang_engine)
+
+    class _VLLMInferenceManager:
+        async def get_engine_for_model(self, _base_model: str):
+            raise AssertionError("SGLang warm must not use the vLLM inference manager")
+
+    await tr._warm_sampling_engine_for_base_model(
+        _VLLMInferenceManager(),
+        "Qwen/Qwen3-30B-A3B-Instruct-2507",
+        "sglang",
+    )
+
+    assert calls == [
+        ("sglang", "Qwen/Qwen3-30B-A3B-Instruct-2507"),
+        "initialize",
+    ]

@@ -114,6 +114,7 @@ def _runtime_manifest() -> dict:
             "host_venv_dir": runtime.get("host_venv_dir", "host-venv"),
         },
         "sources": runtime["sources"],
+        "tier": "gpu_rl",
     }
 
 
@@ -121,8 +122,9 @@ def _materialize_runtime_env(root: Path, *, with_host_python: bool) -> object:
     from mint_server.ray.runtime_env import checkout_runtime_env_layout
 
     layout = checkout_runtime_env_layout(str(root))
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "manifest.json").write_text(json.dumps(_runtime_manifest()), encoding="utf-8")
+    tier_root = root / "gpu_rl"
+    tier_root.mkdir(parents=True, exist_ok=True)
+    (tier_root / "manifest.json").write_text(json.dumps(_runtime_manifest()), encoding="utf-8")
     Path(layout.site_packages).mkdir(parents=True, exist_ok=True)
     Path(layout.base_python_root).mkdir(parents=True, exist_ok=True)
     for entry in layout.pythonpath_entries[1:]:

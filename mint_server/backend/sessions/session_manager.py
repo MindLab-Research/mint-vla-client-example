@@ -551,15 +551,43 @@ class SessionManager:
         if info.uses_multi_lora:
             self._cleanup_sampler_indices(session_id)
 
-            # Best-effort: remove LoRA from vLLM and delete ephemeral adapter dir.
-            manager = self.get_multi_model_manager()
-            if manager is not None and info.base_model:
-                engine = manager.get_engine_if_exists(info.base_model)
-                if engine is not None:
+            # Best-effort: remove LoRA from the active serving backend and delete ephemeral adapter dir.
+            serving_backend = "vllm"
+            if info.base_model:
+                try:
+                    from mint_server.backend.core.model_registry import get_model_config
+                    from mint_server.backend.sampling_backend import normalize_sampling_backend
+
+                    serving_backend = normalize_sampling_backend(
+                        getattr(get_model_config(info.base_model), "serving_backend", "vllm")
+                    )
+                except Exception as e:
+                    logger.debug("Failed to resolve serving backend for session %s: %s", session_id, e)
+            if serving_backend == "sglang":
+                if info.base_model:
                     try:
-                        await engine.remove_session(session_id)
-                    except Exception:
-                        logger.warning("failed_to_remove_multi_lora_session__s_from_engine___s")
+                        from mint_server.backend.sglang_engine import (
+                            get_cached_sglang_engine_for_model,
+                            remove_sglang_session_from_existing_actor,
+                        )
+
+                        removed = False
+                        engine = get_cached_sglang_engine_for_model(info.base_model)
+                        if engine is not None:
+                            removed = await engine.remove_session(session_id)
+                        if not removed:
+                            await remove_sglang_session_from_existing_actor(info.base_model, session_id)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove SGLang session {session_id} from engine: {e}")
+            else:
+                manager = self.get_multi_model_manager()
+                if manager is not None and info.base_model:
+                    engine = manager.get_engine_if_exists(info.base_model)
+                    if engine is not None:
+                        try:
+                            await engine.remove_session(session_id)
+                        except Exception as e:
+                            logger.warning(f"Failed to remove multi-LoRA session {session_id} from engine: {e}")
 
             # Drop per-session sampling locks only after teardown has finished.
             from mint_server.routes.sampling import _drop_lora_load_lock
@@ -791,16 +819,21 @@ class SessionManager:
         *,
         lora_int_id: int | None = None,
     ) -> None:
-        info = self._get_session_info(session_id)
+        info = self._get_session_info(session_id, touch=False)
         if info is None:
             return
+        normalized_lora_int_id = None if lora_int_id is None else int(lora_int_id)
         before = SessionInfo(**vars(info))
         new_loaded = bool(loaded)
         changed = bool(info.lora_loaded) != new_loaded
+        info.last_activity = time.time()
         info.lora_loaded = new_loaded
-        if lora_int_id is not None:
-            changed = changed or (info.lora_int_id != int(lora_int_id))
-            info.lora_int_id = int(lora_int_id)
+        if not new_loaded:
+            changed = changed or info.lora_int_id is not None
+            info.lora_int_id = None
+        elif normalized_lora_int_id is not None:
+            changed = changed or (info.lora_int_id != normalized_lora_int_id)
+            info.lora_int_id = normalized_lora_int_id
         if changed:
             info.metadata_version = max(1, int(info.metadata_version) + 1)
         self._persist_sampling_session_info(session_id, info)
@@ -816,7 +849,7 @@ class SessionManager:
         """
         count = 0
         now = time.time()
-        for info in self._sessions.values():
+        for session_id, info in self._sessions.items():
             if not info.uses_multi_lora:
                 continue
             if info.uses_base_model:
@@ -830,6 +863,9 @@ class SessionManager:
             before = SessionInfo(**vars(info))
             info.last_activity = now
             info.lora_loaded = False
+            info.lora_int_id = None
+            info.metadata_version = max(1, int(info.metadata_version) + 1)
+            self._persist_sampling_session_info(session_id, info)
             self._refresh_sampling_observability(before=before, after=info)
             count += 1
         return count

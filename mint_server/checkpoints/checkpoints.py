@@ -789,6 +789,8 @@ def resolve_checkpoint_uri(
 
     if uri.startswith("mint://"):
         raw_path_part = uri[len("mint://") :]
+    elif uri.startswith("tinker://"):
+        raw_path_part = uri[len("tinker://") :]
     else:
         return uri
 

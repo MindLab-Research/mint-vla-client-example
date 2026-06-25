@@ -1942,12 +1942,12 @@ class VerlTrainingEngine:
         *,
         op: str,
         worker: ray.actor.ActorHandle,
-    ) -> None:
+    ) -> ray.actor.ActorHandle:
         if session.backend != "megatron" or not self._megatron_guard_preflight_enabled():
-            return
+            return worker
         get_guard_state = getattr(worker, "get_session_guard_state", None)
         if get_guard_state is None:
-            return
+            return worker
         guard_timeout_s = self._megatron_guard_query_timeout_s()
         try:
             guard_state = await self._await_with_keepalive(
@@ -1957,10 +1957,32 @@ class VerlTrainingEngine:
                 timeout_s=guard_timeout_s,
             )
         except Exception as e:
-            raise RuntimeError(
-                f"[{session.model_id}] failed to query megatron session guard before op={op}: "
-                f"{type(e).__name__}: {e}"
-            ) from e
+            if self._is_dead_actor_error(e):
+                logger.warning(
+                    "[%s] megatron session guard actor dead before op=%s; rebinding worker",
+                    session.model_id,
+                    op,
+                    exc_info=True,
+                )
+                worker = await self._rebind_megatron_worker(
+                    session,
+                    reason=f"{op}:session_guard:{type(e).__name__}",
+                    allow_create=True,
+                )
+                get_guard_state = getattr(worker, "get_session_guard_state", None)
+                if get_guard_state is None:
+                    return worker
+                guard_state = await self._await_with_keepalive(
+                    get_guard_state.remote(session.model_id),
+                    session,
+                    interval_s=30.0,
+                    timeout_s=guard_timeout_s,
+                )
+            else:
+                raise RuntimeError(
+                    f"[{session.model_id}] failed to query megatron session guard before op={op}: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
         if not isinstance(guard_state, dict):
             raise RuntimeError(
                 f"[{session.model_id}] invalid megatron session guard payload type "
@@ -1969,7 +1991,7 @@ class VerlTrainingEngine:
         contaminated = bool(guard_state.get("contaminated", False))
         blocked = bool(guard_state.get("blocked", False))
         if not contaminated and not blocked:
-            return
+            return worker
         contamination_reason = guard_state.get("contamination_reason")
         block_reason = guard_state.get("block_reason")
         raise RuntimeError(
@@ -2311,6 +2333,14 @@ class VerlTrainingEngine:
             router_replay_mode=server_config.router_replay_mode,
         )
 
+    @staticmethod
+    def _session_lora_train_flags(session: "TrainingSession") -> tuple[bool, bool, bool]:
+        lora_cfg = getattr(session, "lora_config", None)
+        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
+        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
+        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        return train_attn, train_mlp, train_unembed
+
     async def _rebind_megatron_worker(
         self,
         session: "TrainingSession",
@@ -2344,6 +2374,7 @@ class VerlTrainingEngine:
                 distributed_config=distributed_config,
                 session_id=session.model_id,
                 actual_rank=actual_rank,
+                observability_base_model=requested_model or base_model,
             )
             ready_timeout_s = (
                 float(server_config.training_actor_ready_timeout_s)
@@ -2420,6 +2451,7 @@ class VerlTrainingEngine:
             requested_model=requested_model,
             base_model=base_model,
         )
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
 
         if allow_create:
             worker = await async_get_or_create_bumblebee_worker_group(
@@ -2429,6 +2461,9 @@ class VerlTrainingEngine:
                 distributed_config=distributed_config,
                 session_id=session.model_id,
                 actual_rank=actual_rank,
+                train_attn=train_attn,
+                train_mlp=train_mlp,
+                train_unembed=train_unembed,
                 observability_base_model=requested_model or base_model,
             )
             ready_timeout_s = (
@@ -2467,6 +2502,9 @@ class VerlTrainingEngine:
                     "backend": "bumblebee",
                     "max_lora_rank": trainer_lora_rank,
                     "actual_rank": actual_rank,
+                    "train_attn": bool(train_attn),
+                    "train_mlp": bool(train_mlp),
+                    "train_unembed": bool(train_unembed),
                 },
             ),
             refresh_observability=False,
@@ -3571,10 +3609,12 @@ class VerlTrainingEngine:
                 requested_model=requested_model,
                 base_model=base_model,
             )
+            train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
             logger.info(
                 "[%s] Creating BumblebeeWorkerGroup for MoE model "
                 "(base=%s, requested=%s, actual_rank=%s, trainer_lora_rank=%s, "
-                "TP=%s, PP=%s, EP=%s, CP=%s, ETP=%s, world_size=%s)",
+                "TP=%s, PP=%s, EP=%s, CP=%s, ETP=%s, world_size=%s, "
+                "train_attn=%s, train_mlp=%s, train_unembed=%s)",
                 model_id,
                 base_model,
                 requested_model,
@@ -3586,6 +3626,9 @@ class VerlTrainingEngine:
                 distributed_config.context_parallel_size,
                 distributed_config.expert_tensor_parallel_size,
                 distributed_config.world_size,
+                bool(train_attn),
+                bool(train_mlp),
+                bool(train_unembed),
             )
             bumblebee_timeout_s = float(server_config.training_megatron_create_timeout_s)
             print(
@@ -3603,6 +3646,9 @@ class VerlTrainingEngine:
                             distributed_config=distributed_config,
                             session_id=session.model_id,
                             actual_rank=lora_rank,
+                            train_attn=train_attn,
+                            train_mlp=train_mlp,
+                            train_unembed=train_unembed,
                             observability_base_model=observability_base_model,
                         ),
                         timeout=bumblebee_timeout_s,
@@ -3620,6 +3666,9 @@ class VerlTrainingEngine:
                         "train_ep": int(distributed_config.expert_parallel_size),
                         "train_cp": int(distributed_config.context_parallel_size),
                         "bumblebee_timeout_s": float(bumblebee_timeout_s),
+                        "train_attn": bool(train_attn),
+                        "train_mlp": bool(train_mlp),
+                        "train_unembed": bool(train_unembed),
                     },
                 )
             except asyncio.TimeoutError:
@@ -3824,7 +3873,7 @@ class VerlTrainingEngine:
 
             # Mark actor as recently used for supervisor inventory and admin visibility.
             self._touch_actor(session)
-            await self._ensure_megatron_session_guard_clean(
+            worker = await self._ensure_megatron_session_guard_clean(
                 session,
                 op="forward_backward",
                 worker=worker,
@@ -3850,10 +3899,7 @@ class VerlTrainingEngine:
                 rollout_correction_config,
             )
 
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
 
         if session.backend == "bumblebee":
@@ -3953,10 +3999,7 @@ class VerlTrainingEngine:
                     },
                 }
             )
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
 
         if session.backend == "megatron":
@@ -4094,7 +4137,7 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used for supervisor inventory and admin visibility.
         self._touch_actor(session)
-        await self._ensure_megatron_session_guard_clean(
+        worker = await self._ensure_megatron_session_guard_clean(
             session,
             op="forward",
             worker=worker,
@@ -4104,10 +4147,7 @@ class VerlTrainingEngine:
         # ForwardRequest uses forward_input (not forward_backward_input)
         data_items = [item.model_dump() for item in request.forward_input.data]
 
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
 
         # Remote call - pass session_id for stateless trainer pattern
@@ -4214,7 +4254,7 @@ class VerlTrainingEngine:
 
             # Mark actor as recently used for supervisor inventory and admin visibility.
             self._touch_actor(session)
-            await self._ensure_megatron_session_guard_clean(
+            worker = await self._ensure_megatron_session_guard_clean(
                 session,
                 op="optim_step",
                 worker=worker,
@@ -4225,10 +4265,7 @@ class VerlTrainingEngine:
         if lr is not None:
             session.learning_rate = lr
 
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
 
         if session.backend == "bumblebee":
@@ -4313,7 +4350,7 @@ class VerlTrainingEngine:
 
             # Mark actor as recently used for supervisor inventory and admin visibility.
             self._touch_actor(session)
-            await self._ensure_megatron_session_guard_clean(
+            worker = await self._ensure_megatron_session_guard_clean(
                 session,
                 op="train_step",
                 worker=worker,
@@ -4341,10 +4378,7 @@ class VerlTrainingEngine:
         lr = request.adam_params.learning_rate if request.adam_params else session.learning_rate
         session.learning_rate = lr
 
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
 
         # Only MoE models use the combined MegatronWorkerGroup.train_step path.
@@ -4505,7 +4539,7 @@ class VerlTrainingEngine:
 
         # Mark actor as recently used
         self._touch_actor(session)
-        await self._ensure_megatron_session_guard_clean(
+        worker = await self._ensure_megatron_session_guard_clean(
             session,
             op="reset_expert_bias",
             worker=worker,
@@ -4648,7 +4682,7 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_lora_weights_for_sampler")
-        await self._ensure_megatron_session_guard_clean(
+        worker = await self._ensure_megatron_session_guard_clean(
             session,
             op="save_lora_weights_for_sampler",
             worker=worker,
@@ -4672,10 +4706,7 @@ class VerlTrainingEngine:
             default_timeout_s = 300
         timeout_s = int(os.environ.get("MINT_SAVE_LORA_TIMEOUT_S", str(default_timeout_s)))
 
-        lora_cfg = getattr(session, "lora_config", None)
-        train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-        train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-        train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+        train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
         traceparent = get_current_traceparent()
         meta_ref = worker.save_lora_weights.remote(
             abs_path,
@@ -4755,7 +4786,7 @@ class VerlTrainingEngine:
 
         model_id = session.model_id
         worker = await self._get_live_worker(session, op="save_weights")
-        await self._ensure_megatron_session_guard_clean(
+        worker = await self._ensure_megatron_session_guard_clean(
             session,
             op="save_weights",
             worker=worker,
@@ -4781,15 +4812,13 @@ class VerlTrainingEngine:
 
         if session.backend in _DISTRIBUTED_MOE_BACKENDS:
             traceparent = get_current_traceparent()
-            lora_cfg = getattr(session, "lora_config", None)
-            train_attn = True if lora_cfg is None else bool(getattr(lora_cfg, "train_attn", True))
-            train_mlp = True if lora_cfg is None else bool(getattr(lora_cfg, "train_mlp", True))
-            train_unembed = True if lora_cfg is None else bool(getattr(lora_cfg, "train_unembed", True))
+            train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
+            lora_config = getattr(session, "lora_config", None)
             meta_ref = worker.save_checkpoint.remote(
                 abs_path,
                 traceparent=traceparent,
                 session_id=session.model_id,
-                actual_rank=getattr(lora_cfg, "rank", None),
+                actual_rank=getattr(lora_config, "rank", None),
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
@@ -4890,6 +4919,10 @@ class VerlTrainingEngine:
         }
         if session.backend == "bumblebee" and session.lora_config is not None:
             kwargs["actual_rank"] = session.lora_config.rank
+            train_attn, train_mlp, train_unembed = self._session_lora_train_flags(session)
+            kwargs["train_attn"] = train_attn
+            kwargs["train_mlp"] = train_mlp
+            kwargs["train_unembed"] = train_unembed
         if session.backend == "megatron" and not os.path.isfile(os.path.join(load_path, "adapter_config.json")):
             lora_config = getattr(session, "lora_config", None)
             for key in ("train_attn", "train_mlp", "train_unembed"):

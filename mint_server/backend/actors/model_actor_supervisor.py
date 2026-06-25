@@ -40,6 +40,7 @@ from mint_server.backend.actors.model_actor_inventory import (
 from mint_server.backend.actors.model_actor_launchers import (
     ModelActorLauncherRegistry,
     default_model_actor_launcher_registry,
+    launcher_process_env,
 )
 from mint_server.backend.actors.model_actor_placement import (
     _default_gpu_actor_lister,
@@ -51,6 +52,10 @@ from mint_server.backend.observability.node_metrics_daemon import (
     NodeMetricsDaemonSpec,
     get_or_create_node_metrics_collector_actor,
     node_metrics_actor_name,
+)
+from mint_server.backend.sampling_backend import (
+    base_model_from_sampling_domain_key,
+    domain_key_for_sampling_base_model,
 )
 from mint_server.backend.actors.node_placement import parse_model_gpu_placement
 from mint_server.backend.stores.supervisor_state_store import (
@@ -78,6 +83,7 @@ __all__ = [
     "async_actor_observability_metadata",
     "default_model_actor_name",
     "domain_key_for_internal_runtime",
+    "domain_key_for_sampling_base_model",
     "domain_key_for_training_base_model",
     "domain_key_for_vllm_base_model",
     "get_model_actor_supervisor",
@@ -173,7 +179,7 @@ def _prom_number(value: object) -> float | None:
 
 
 def _actor_workload(actor_type: object) -> str:
-    return "sample" if str(actor_type or "").strip().lower() == "vllm" else "train"
+    return "sample" if str(actor_type or "").strip().lower() in {"vllm", "sglang"} else "train"
 
 
 def _model_actor_inventory_gpu_bindings(rec: dict[str, object]) -> list[dict[str, str]]:
@@ -477,10 +483,7 @@ class ControlPlaneDependency:
 
 
 def domain_key_for_vllm_base_model(base_model: str) -> str:
-    model = str(base_model).strip()
-    if not model:
-        raise ValueError("base_model is required")
-    return f"vllm:{model}"
+    return domain_key_for_sampling_base_model(base_model, backend="vllm")
 
 
 def _normalize_megatron_domain_key(base_model: str) -> str:
@@ -550,16 +553,25 @@ def _replica_int(value: Any) -> int:
 
 def _spec_from_obj(obj: Any) -> ModelActorSpec:
     if isinstance(obj, str):
-        return ModelActorSpec(domain_key=domain_key_for_vllm_base_model(obj), base_model=obj)
+        return ModelActorSpec(domain_key=domain_key_for_sampling_base_model(obj), base_model=obj)
     if not isinstance(obj, dict):
         raise TypeError(f"model actor spec must be dict or str, got {type(obj)}")
 
     base_model = obj.get("base_model") or obj.get("model") or obj.get("model_id")
     domain_key = obj.get("domain_key")
+    backend = str(obj.get("serving_backend") or obj.get("sampling_backend") or "").strip()
+    if not backend and domain_key is not None:
+        domain = str(domain_key).strip()
+        if domain.startswith("sglang:"):
+            backend = "sglang"
+        elif domain.startswith("vllm:"):
+            backend = "vllm"
+    if not backend:
+        backend = "vllm"
     if domain_key is None:
         if base_model is None:
             raise ValueError(f"model actor spec missing domain_key/base_model: {obj!r}")
-        domain_key = domain_key_for_vllm_base_model(str(base_model))
+        domain_key = domain_key_for_sampling_base_model(str(base_model), backend=backend)
     raw_node_pins = obj.get("node_pins")
     if raw_node_pins is None:
         raw_node_pins = obj.get("node_pin")
@@ -581,7 +593,7 @@ def _spec_from_obj(obj: Any) -> ModelActorSpec:
         replica_id=_replica_id(obj.get("replica_id", obj.get("replica", 0))),
         base_model=None if base_model is None else str(base_model),
         actor_name=None if obj.get("actor_name") is None else str(obj["actor_name"]),
-        launcher_key=str(obj.get("launcher_key") or "vllm"),
+        launcher_key=str(obj.get("launcher_key") or backend),
         node_pin=None if obj.get("node_pin") is None else str(obj["node_pin"]),
         node_pins=node_pins,
         worker_alias=None if obj.get("worker_alias") is None else str(obj["worker_alias"]),
@@ -671,14 +683,14 @@ def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[Mod
         base_model = str(model).strip()
         if not base_model:
             continue
-        for launcher_key in ("vllm", "training", "megatron", "bumblebee"):
+        for launcher_key in ("vllm", "sglang", "training", "megatron", "bumblebee"):
             raw_launcher_cfg = raw_cfg.get(launcher_key)
             if raw_launcher_cfg is None:
                 continue
             launcher_cfg = raw_launcher_cfg if isinstance(raw_launcher_cfg, dict) else {}
             backend_override = launcher_cfg.get("backend", launcher_cfg.get("training_backend"))
-            if launcher_key == "vllm":
-                domain_key = domain_key_for_vllm_base_model(base_model)
+            if launcher_key in {"vllm", "sglang"}:
+                domain_key = domain_key_for_sampling_base_model(base_model, backend=launcher_key)
             elif launcher_key == "bumblebee":
                 domain_key = domain_key_for_training_base_model(base_model, backend="bumblebee")
             elif launcher_key == "megatron":
@@ -800,9 +812,9 @@ def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
         if not supported:
             supported = "Qwen/Qwen3-0.6B"
         logger.warning(
-            "supported_model_specs_resolved_from_env",
-            supported=supported,
-            env=os.environ.get("MINT_SUPPORTED_MODELS", ""),
+            "supported_model_specs_resolved_from_env supported=%s env=%s",
+            supported,
+            os.environ.get("MINT_SUPPORTED_MODELS", ""),
         )
 
         specs = []
@@ -811,7 +823,7 @@ def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
                 continue
             specs.append(
                 ModelActorSpec(
-                    domain_key=domain_key_for_vllm_base_model(model),
+                    domain_key=domain_key_for_sampling_base_model(model),
                     base_model=model,
                     launcher_key="vllm",
                 )
@@ -839,13 +851,22 @@ def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | Non
         return supported[domain]
 
     if domain.startswith("vllm:"):
-        base_model = domain.removeprefix("vllm:").strip()
+        base_model = base_model_from_sampling_domain_key(domain)
         if not base_model:
             return None
         return ModelActorSpec(
             domain_key=domain,
             base_model=base_model,
             launcher_key="vllm",
+        )
+    if domain.startswith("sglang:"):
+        base_model = base_model_from_sampling_domain_key(domain)
+        if not base_model:
+            return None
+        return ModelActorSpec(
+            domain_key=domain,
+            base_model=base_model,
+            launcher_key="sglang",
         )
     if domain.startswith("training:"):
         base_model = domain.removeprefix("training:").strip()
@@ -3311,8 +3332,7 @@ def _create_ray_actor(*, require_ready: bool = True):
     extra_env = otel_env_vars()
     if CURRENT_CODE_IDENTITY:
         extra_env["MINT_GIT_SHA"] = str(CURRENT_CODE_IDENTITY)
-    if "MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM" in os.environ:
-        extra_env["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"] = os.environ["MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM"]
+    extra_env.update(launcher_process_env())
     if "MINT_SUPPORTED_MODELS" in os.environ:
         extra_env["MINT_SUPPORTED_MODELS"] = os.environ["MINT_SUPPORTED_MODELS"]
     for key in (

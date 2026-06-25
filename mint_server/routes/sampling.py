@@ -27,6 +27,11 @@ from mint_server.backend.scheduling.queue_stage_timing import (
     attach_queue_stage_timing,
     build_queue_stage_timing,
 )
+from ..backend.sampling_backend import (
+    domain_key_for_sampling_base_model,
+    normalize_sampling_backend,
+    sampling_backend_from_domain_key,
+)
 from mint_server.backend.stores.task_state_store import (
     FutureStatus,
     TaskStateStoreUnavailableError,
@@ -519,6 +524,9 @@ async def _enqueue_sampling_request_with_trace(
     enqueue_coro,
     session_id: str | None = None,
     base_model: str | None = None,
+    backend: str | None = None,
+    domain_key: str | None = None,
+    affinity_group: str | None = None,
 ) -> object:
     tracer = get_otel_tracer()
     future_ready_elapsed_ms = (time.perf_counter() - route_start_s) * 1000.0
@@ -533,6 +541,12 @@ async def _enqueue_sampling_request_with_trace(
             span.set_attribute("sampling_session_id", str(session_id))
         if base_model:
             span.set_attribute("base_model", str(base_model))
+        if backend:
+            span.set_attribute("backend", str(backend))
+        if domain_key:
+            span.set_attribute("domain_key", str(domain_key))
+        if affinity_group:
+            span.set_attribute("affinity_group", str(affinity_group))
         span.add_event(
             "task_futures_ready",
             {
@@ -556,11 +570,49 @@ async def _enqueue_sampling_request_with_trace(
         return out
 
 
+def _sampling_execution_span_attrs(
+    *,
+    session_id: str | None,
+    backend: str | None,
+    base_model: str | None,
+    actor_name: str | None = None,
+    prompt_tokens: int | None = None,
+    max_tokens: int | None = None,
+    num_samples: int | None = None,
+    lora_rank: int | None = None,
+    uses_base_model: bool | None = None,
+    topk: int | None = None,
+) -> dict[str, object]:
+    attrs: dict[str, object] = {}
+    if session_id is not None:
+        attrs["sampling_session_id"] = str(session_id)
+    if backend is not None:
+        attrs["backend"] = str(backend)
+    if base_model is not None:
+        attrs["base_model"] = str(base_model)
+    if actor_name is not None:
+        attrs["actor_name"] = str(actor_name)
+    if prompt_tokens is not None:
+        attrs["prompt_tokens"] = int(prompt_tokens)
+    if max_tokens is not None:
+        attrs["max_tokens"] = int(max_tokens)
+    if num_samples is not None:
+        attrs["num_samples"] = int(num_samples)
+    if lora_rank is not None:
+        attrs["lora_rank"] = int(lora_rank)
+    if uses_base_model is not None:
+        attrs["uses_base_model"] = bool(uses_base_model)
+    if topk is not None:
+        attrs["topk"] = int(topk)
+    return attrs
+
+
 async def _ensure_session_lora_loaded(
     engine,
     session_id: str,
     *,
     snapshot: SamplingSessionSnapshot | None = None,
+    force_backend_confirm: bool = False,
 ) -> None:
     manager = _active_session_manager()
     if manager is None:
@@ -574,7 +626,7 @@ async def _ensure_session_lora_loaded(
     if int(snap.lora_rank) <= 0:
         return
 
-    if snap.lora_loaded and snap.lora_int_id is not None:
+    if snap.lora_loaded and snap.lora_int_id is not None and not force_backend_confirm:
         return
     if snap.lora_loaded and snap.lora_int_id is None:
         logger.warning(
@@ -606,6 +658,7 @@ async def _ensure_session_lora_loaded(
                 refreshed is not None
                 and refreshed.lora_loaded
                 and refreshed.lora_int_id is not None
+                and not force_backend_confirm
             ):
                 return
             if refreshed is not None and refreshed.adapter_path:
@@ -619,6 +672,9 @@ async def _ensure_session_lora_loaded(
                 )
 
             load_snapshot = refreshed or snap
+            validate_adapter = getattr(engine, "validate_lora_adapter_supported", None)
+            if callable(validate_adapter):
+                validate_adapter(adapter_path)
             with start_as_current_span(
                 "sampling.ensure_session_lora_loaded.add_from_path",
                 component="routes.sampling",
@@ -636,7 +692,20 @@ async def _ensure_session_lora_loaded(
                 lora_int_id = await add_from_path(
                     sampling_session_id=session_id, lora_path=adapter_path
                 )
-            manager.mark_session_lora_loaded(session_id, True, lora_int_id=lora_int_id)
+            if lora_int_id is None:
+                raise RuntimeError(
+                    f"Engine for session {session_id} returned no lora_int_id after loading adapter"
+                )
+            try:
+                normalized_lora_int_id = int(lora_int_id)
+            except (TypeError, ValueError) as e:
+                raise RuntimeError(
+                    f"Engine for session {session_id} returned invalid lora_int_id={lora_int_id!r} "
+                    "after loading adapter"
+                ) from e
+            manager.mark_session_lora_loaded(
+                session_id, True, lora_int_id=normalized_lora_int_id
+            )
 
 
 async def _register_coalesced_abort_aliases(
@@ -680,60 +749,92 @@ async def _abort_engine_request(engine, request_id: str) -> None:
 
 
 async def _await_with_external_fail_abort(*, engine, request_id: str, awaitable):
+    return await _await_with_external_fail_abort_for_engine_request(
+        engine=engine,
+        future_request_id=request_id,
+        engine_request_id=request_id,
+        awaitable=awaitable,
+    )
+
+
+async def _await_with_external_fail_abort_for_engine_request(
+    *,
+    engine,
+    future_request_id: str,
+    engine_request_id: str,
+    awaitable,
+):
     task = asyncio.create_task(awaitable)
     started = time.monotonic()
     last_log = started
-    await_timeout_s = float(os.environ.get("MINT_SAMPLE_AWAIT_TIMEOUT_S", "0"))
+    try:
+        await_timeout_s = max(0.0, float(os.environ.get("MINT_SAMPLE_AWAIT_TIMEOUT_S", "0")))
+    except (TypeError, ValueError):
+        await_timeout_s = 0.0
     logger.info(
-        f"[sample await start] request_id={request_id} await_timeout_s={await_timeout_s}"
+        f"[sample await start] request_id={future_request_id} engine_request_id={engine_request_id} "
+        f"await_timeout_s={await_timeout_s}"
     )
     try:
         while True:
-            done, _ = await asyncio.wait({task}, timeout=0.5)
+            wait_s = 0.5
+            if await_timeout_s > 0:
+                elapsed_before_wait = time.monotonic() - started
+                remaining_s = await_timeout_s - elapsed_before_wait
+                if remaining_s <= 0:
+                    wait_s = 0.0
+                else:
+                    wait_s = min(wait_s, remaining_s)
+            done, _ = await asyncio.wait({task}, timeout=wait_s)
             if done:
                 elapsed = time.monotonic() - started
                 logger.info(
-                    f"[sample await done] request_id={request_id} elapsed_s={elapsed:.1f}"
+                    f"[sample await done] request_id={future_request_id} "
+                    f"engine_request_id={engine_request_id} elapsed_s={elapsed:.1f}"
                 )
                 return await task
             try:
-                status = await task_futures.async_get_status(request_id)
+                status = await task_futures.async_get_status(future_request_id)
             except KeyError:
                 status = FutureStatus.PENDING
             now = time.monotonic()
             elapsed = now - started
             if now - last_log >= 30.0:
                 logger.info(
-                    f"[sample await progress] request_id={request_id} elapsed_s={elapsed:.1f} future_status={status.value}"
+                    f"[sample await progress] request_id={future_request_id} "
+                    f"engine_request_id={engine_request_id} elapsed_s={elapsed:.1f} "
+                    f"future_status={status.value}"
                 )
                 last_log = now
             if await_timeout_s > 0 and elapsed >= await_timeout_s:
-                await _abort_engine_request(engine, request_id)
+                await _abort_engine_request(engine, engine_request_id)
                 task.cancel()
                 try:
                     await task
-                except Exception:
+                except (asyncio.CancelledError, Exception):
                     pass
                 raise RuntimeError(
-                    f"request_id={request_id} timed out in _await_with_external_fail_abort "
+                    f"request_id={future_request_id} engine_request_id={engine_request_id} "
+                    f"timed out in _await_with_external_fail_abort "
                     f"after {elapsed:.1f}s (MINT_SAMPLE_AWAIT_TIMEOUT_S={await_timeout_s})"
                 )
             if status != FutureStatus.PENDING:
-                await _abort_engine_request(engine, request_id)
+                await _abort_engine_request(engine, engine_request_id)
                 task.cancel()
                 try:
                     await task
-                except Exception:
+                except (asyncio.CancelledError, Exception):
                     pass
                 raise RuntimeError(
-                    f"request_id={request_id} canceled due to future_status={status.value}"
+                    f"request_id={future_request_id} engine_request_id={engine_request_id} "
+                    f"canceled due to future_status={status.value}"
                 )
     except asyncio.CancelledError:
-        await _abort_engine_request(engine, request_id)
+        await _abort_engine_request(engine, engine_request_id)
         task.cancel()
         try:
             await task
-        except Exception:
+        except (asyncio.CancelledError, Exception):
             pass
         raise
 
@@ -749,7 +850,48 @@ def _payload_hash(payload: bytes) -> str:
 
 
 def _model_work_domain_key(base_model: str) -> str:
-    return f"vllm:{str(base_model).strip()}"
+    from ..backend.core.model_registry import get_model_config
+
+    backend = normalize_sampling_backend(getattr(get_model_config(base_model), "serving_backend", "vllm"))
+    return domain_key_for_sampling_base_model(base_model, backend=backend)
+
+
+def _sampling_backend_for_base_model(base_model: str) -> str:
+    from ..backend.core.model_registry import get_model_config
+
+    return normalize_sampling_backend(getattr(get_model_config(base_model), "serving_backend", "vllm"))
+
+
+async def _get_engine_for_sampling_session(
+    *,
+    manager: SessionManager,
+    session_id: str,
+    snapshot: SamplingSessionSnapshot | None,
+):
+    base_model = snapshot.base_model if snapshot is not None else manager.get_session_base_model(session_id)
+    if not base_model:
+        raise RuntimeError(f"Session {session_id!r} missing base_model")
+    backend = _sampling_backend_for_base_model(str(base_model))
+    if backend == "vllm":
+        return await manager.get_engine_for_session(session_id), backend
+    from ..backend.sglang_engine import get_sglang_engine_for_model
+
+    return await get_sglang_engine_for_model(str(base_model)), backend
+
+
+def _backend_sampling_session_id(
+    *,
+    engine_backend: str,
+    session_id: str,
+    snapshot: SamplingSessionSnapshot | None,
+) -> str:
+    if engine_backend == "vllm":
+        return session_id
+    if engine_backend == "sglang":
+        if snapshot is not None and not snapshot.uses_base_model:
+            return session_id
+        return "__base__"
+    return session_id
 
 
 def _model_work_affinity_group(snapshot: SamplingSessionSnapshot) -> str:
@@ -1285,11 +1427,13 @@ async def _asample_impl(
             prompt_token_count = len(request.prompt.to_token_ids())
         token_cost = max(1, (prompt_token_count + max_tokens) * num_samples)
         domain_key = _model_work_domain_key(str(base_model))
+        backend = normalize_sampling_backend(sampling_backend_from_domain_key(domain_key))
         affinity_group = _model_work_affinity_group(snapshot)
         ordering_key = f"session:{session_id}"
         queued_meta = {
             "op": "sampling.asample",
             "sampling_session_id": str(session_id),
+            "backend": backend,
             "queue_state": "queued",
             "queued_at": time.time(),
             "stage": "queued",
@@ -1337,6 +1481,9 @@ async def _asample_impl(
                 "route_start_s": route_start_s,
                 "session_id": session_id,
                 "base_model": base_model,
+                "backend": backend,
+                "domain_key": domain_key,
+                "affinity_group": affinity_group,
             },
         )
     except ModelWorkAdmissionRejectedError as e:
@@ -1750,11 +1897,13 @@ async def _do_sample(
                         "engine_acquire_started_at": engine_acquire_started_at,
                     },
                 )
-                assert manager is not None
-                assert manager is not None
-                engine = await run_async_with_otel_span(
+                engine_result = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: manager.get_engine_for_session(session_id),  # type: ignore[reportOptionalMemberAccess]
+                    lambda: _get_engine_for_sampling_session(
+                        manager=manager,
+                        session_id=session_id,
+                        snapshot=snapshot,
+                    ),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -1771,6 +1920,7 @@ async def _do_sample(
                         else None,
                     },
                 )
+                engine, engine_backend = engine_result
                 await _safe_update_sample_meta(
                     request_id,
                     {
@@ -1799,12 +1949,13 @@ async def _do_sample(
                 model_actor_supervisor.mark_inflight(
                     model_actor_supervisor_actor_name, +1
                 )
-                _record_vllm_workload_start(
-                    actor_name=model_actor_supervisor_actor_name,
-                    base_model=workload_base_model,
-                    op="asample",
-                )
-                workload_started = True
+                if engine_backend == "vllm":
+                    _record_vllm_workload_start(
+                        actor_name=model_actor_supervisor_actor_name,
+                        base_model=workload_base_model,
+                        op="asample",
+                    )
+                    workload_started = True
 
                 logger.info(
                     f"[sample path] session_id={session_id} "
@@ -1816,44 +1967,53 @@ async def _do_sample(
                     request_id,
                     {
                         "stage": "lora_load",
+                        "backend": engine_backend,
                         "lora_load_started_at": lora_load_started_at,
                     },
                 )
-                await run_async_with_otel_span(
-                    "sampling.ensure_lora_loaded",
-                    lambda: _ensure_session_lora_loaded(
-                        engine, session_id, snapshot=snapshot
-                    ),
-                    component="sampling",
-                    op="sampling.ensure_lora_loaded",
-                    request_id=request_id,
-                    attributes={
-                        "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model
-                        if snapshot is not None
-                        else None,
-                        "lora_rank": int(snapshot.lora_rank)
-                        if snapshot is not None
-                        else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded)
-                        if snapshot is not None
-                        else None,
-                        "has_adapter_path": bool(snapshot.adapter_path)
-                        if snapshot is not None
-                        else None,
-                    },
-                )
+                if engine_backend == "vllm" or (engine_backend == "sglang" and snapshot is not None and not snapshot.uses_base_model):
+                    await run_async_with_otel_span(
+                        "sampling.ensure_lora_loaded",
+                        lambda: _ensure_session_lora_loaded(
+                            engine,
+                            session_id,
+                            snapshot=snapshot,
+                            force_backend_confirm=(engine_backend == "sglang"),
+                        ),
+                        component="sampling",
+                        op="sampling.ensure_lora_loaded",
+                        request_id=request_id,
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "backend": engine_backend,
+                            "base_model": snapshot.base_model if snapshot is not None else None,
+                            "actor_name": model_actor_supervisor_actor_name,
+                            "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                            "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                            "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                        },
+                    )
                 await _safe_update_sample_meta(
                     request_id,
                     {
                         "stage": "decode",
-                        "lora_load_s": max(0.0, time.perf_counter() - lora_load_t0),
+                        "backend": engine_backend,
+                        "lora_load_s": (
+                            max(0.0, time.perf_counter() - lora_load_t0)
+                            if engine_backend == "vllm" or (engine_backend == "sglang" and snapshot is not None and not snapshot.uses_base_model)
+                            else 0.0
+                        ),
                         "generate_started_at": time.time(),
                         "max_tokens": int(request.sampling_params.max_tokens),
                     },
                 )
                 logger.info(
                     f"[sample path] session_id={session_id} stage=after_lora_load"
+                )
+                backend_session_id = _backend_sampling_session_id(
+                    engine_backend=engine_backend,
+                    session_id=session_id,
+                    snapshot=snapshot,
                 )
 
                 gen_many = getattr(engine, "generate_many", None)
@@ -1863,6 +2023,7 @@ async def _do_sample(
                     and request.topk_prompt_logprobs == 0
                     and _SAMPLE_COALESCE_MAX_BATCH > 1
                     and gen_many is not None
+                    and engine_backend == "vllm"
                     and request.num_samples <= _SAMPLE_COALESCE_MAX_SAMPLES
                 )
                 if engine.__class__.__name__ == "MultiNodeInferenceEngine":
@@ -1900,10 +2061,17 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate",
                         request_id=request_id,
-                        attributes={
-                            "sampling_session_id": session_id,
-                            "num_samples": request.num_samples,
-                        },
+                        attributes=_sampling_execution_span_attrs(
+                            session_id=session_id,
+                            backend=engine_backend,
+                            base_model=base_model,
+                            actor_name=model_actor_supervisor_actor_name,
+                            prompt_tokens=len(token_ids),
+                            max_tokens=request.sampling_params.max_tokens,
+                            num_samples=request.num_samples,
+                            lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                            uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+                        ),
                     )
                 elif request.num_samples == 1:
                     logger.info("branch=generate_single")
@@ -1914,7 +2082,7 @@ async def _do_sample(
                             engine=engine,
                             request_id=request_id,
                             awaitable=engine.generate(
-                                sampling_session_id=session_id,
+                                sampling_session_id=backend_session_id,
                                 prompt_ids=token_ids,
                                 request_id=request_id,
                                 max_tokens=request.sampling_params.max_tokens,
@@ -1928,10 +2096,17 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate",
                         request_id=request_id,
-                        attributes={
-                            "sampling_session_id": session_id,
-                            "num_samples": 1,
-                        },
+                        attributes=_sampling_execution_span_attrs(
+                            session_id=session_id,
+                            backend=engine_backend,
+                            base_model=base_model,
+                            actor_name=model_actor_supervisor_actor_name,
+                            prompt_tokens=len(token_ids),
+                            max_tokens=request.sampling_params.max_tokens,
+                            num_samples=1,
+                            lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                            uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+                        ),
                     )
                     results = [one_result]
                 else:
@@ -1947,7 +2122,7 @@ async def _do_sample(
                             engine=engine,
                             request_id=request_id,
                             awaitable=gen_many(
-                                sampling_session_id=session_id,
+                                sampling_session_id=backend_session_id,
                                 prompt_ids=token_ids,
                                 request_id=request_id,
                                 num_samples=request.num_samples,
@@ -1962,10 +2137,17 @@ async def _do_sample(
                         component="sampling",
                         op="sampling.generate_many",
                         request_id=request_id,
-                        attributes={
-                            "sampling_session_id": session_id,
-                            "num_samples": request.num_samples,
-                        },
+                        attributes=_sampling_execution_span_attrs(
+                            session_id=session_id,
+                            backend=engine_backend,
+                            base_model=base_model,
+                            actor_name=model_actor_supervisor_actor_name,
+                            prompt_tokens=len(token_ids),
+                            max_tokens=request.sampling_params.max_tokens,
+                            num_samples=request.num_samples,
+                            lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                            uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+                        ),
                     )
                 generate_s = max(0.0, time.perf_counter() - generate_t0)
             else:
@@ -2014,6 +2196,7 @@ async def _do_sample(
                 request_id,
                 {
                     "stage": "postprocess",
+                    "backend": engine_backend if "engine_backend" in locals() else None,
                     "generate_s": generate_s if "generate_s" in locals() else None,
                     "generated_tokens": int(generated_tokens),
                     "sequence_count": len(sequences),
@@ -2029,20 +2212,35 @@ async def _do_sample(
                     engine_for_logprobs = engine
                     if engine_for_logprobs is None:
                         raise RuntimeError(f"No engine found for session {session_id}")
+                    prompt_logprobs_request_id = f"{request_id}_prompt_logprobs"
                     computed_logprobs = await run_async_with_otel_span(
                         "sampling.compute_prompt_logprobs",
-                        lambda: engine_for_logprobs.compute_logprobs(
-                            sampling_session_id=session_id,
-                            prompt_ids=token_ids,
-                            request_id=f"{request_id}_prompt_logprobs",
+                        lambda: _await_with_external_fail_abort_for_engine_request(
+                            engine=engine_for_logprobs,
+                            future_request_id=request_id,
+                            engine_request_id=prompt_logprobs_request_id,
+                            awaitable=engine_for_logprobs.compute_logprobs(
+                                sampling_session_id=_backend_sampling_session_id(
+                                    engine_backend=engine_backend,
+                                    session_id=session_id,
+                                    snapshot=snapshot,
+                                ),
+                                prompt_ids=token_ids,
+                                request_id=prompt_logprobs_request_id,
+                            ),
                         ),
                         component="sampling",
                         op="sampling.compute_prompt_logprobs",
                         request_id=request_id,
-                        attributes={
-                            "sampling_session_id": session_id,
-                            "prompt_tokens": len(token_ids),
-                        },
+                        attributes=_sampling_execution_span_attrs(
+                            session_id=session_id,
+                            backend=engine_backend,
+                            base_model=base_model,
+                            actor_name=model_actor_supervisor_actor_name,
+                            prompt_tokens=len(token_ids),
+                            lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                            uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+                        ),
                     )
                 else:
                     computed_logprobs = await engine.compute_logprobs(
@@ -2059,22 +2257,37 @@ async def _do_sample(
                     engine_for_topk = engine
                     if engine_for_topk is None:
                         raise RuntimeError(f"No engine found for session {session_id}")
+                    topk_request_id = f"{request_id}_topk"
                     computed_topk = await run_async_with_otel_span(
                         "sampling.compute_prompt_topk",
-                        lambda: engine_for_topk.compute_topk(
-                            sampling_session_id=session_id,
-                            prompt_ids=token_ids,
-                            request_id=f"{request_id}_topk",
-                            k=request.topk_prompt_logprobs,
+                        lambda: _await_with_external_fail_abort_for_engine_request(
+                            engine=engine_for_topk,
+                            future_request_id=request_id,
+                            engine_request_id=topk_request_id,
+                            awaitable=engine_for_topk.compute_topk(
+                                sampling_session_id=_backend_sampling_session_id(
+                                    engine_backend=engine_backend,
+                                    session_id=session_id,
+                                    snapshot=snapshot,
+                                ),
+                                prompt_ids=token_ids,
+                                request_id=topk_request_id,
+                                k=request.topk_prompt_logprobs,
+                            ),
                         ),
                         component="sampling",
                         op="sampling.compute_prompt_topk",
                         request_id=request_id,
-                        attributes={
-                            "sampling_session_id": session_id,
-                            "prompt_tokens": len(token_ids),
-                            "topk": request.topk_prompt_logprobs,
-                        },
+                        attributes=_sampling_execution_span_attrs(
+                            session_id=session_id,
+                            backend=engine_backend,
+                            base_model=base_model,
+                            actor_name=model_actor_supervisor_actor_name,
+                            prompt_tokens=len(token_ids),
+                            lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                            uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+                            topk=request.topk_prompt_logprobs,
+                        ),
                     )
                 else:
                     assert engine.server is not None
@@ -2124,6 +2337,7 @@ async def _do_sample(
                 build_queue_stage_timing(
                     {
                         **(response_meta if isinstance(response_meta, dict) else {}),
+                        "backend": engine_backend if "engine_backend" in locals() else None,
                         "generate_s": generate_s if "generate_s" in locals() else None,
                     },
                     now=time.time(),
@@ -2159,7 +2373,7 @@ async def _do_sample(
                 str(session_id),
                 classify_failure_reason(e),
                 type(e).__name__,
-                "check_sampling_session_and_vllm_actor",
+                "check_sampling_session_and_sampling_backend_actor",
             )
             await task_futures.async_fail(request_id, str(e))
     finally:
@@ -2309,6 +2523,7 @@ async def compute_logprobs(
             detail=f"Session {request.sampling_session_id!r} missing base_model",
         )
     domain_key = _model_work_domain_key(str(base_model))
+    backend = normalize_sampling_backend(sampling_backend_from_domain_key(domain_key))
     affinity_group = (
         _model_work_affinity_group(snapshot)
         if snapshot is not None
@@ -2336,6 +2551,7 @@ async def compute_logprobs(
             queued_meta={
                 "op": "sampling.compute_logprobs",
                 "sampling_session_id": str(request.sampling_session_id),
+                "backend": backend,
                 "queue_state": "queued",
                 "queued_at": time.time(),
                 "stage": "queued",
@@ -2350,6 +2566,9 @@ async def compute_logprobs(
                 "route_start_s": route_start_s,
                 "session_id": request.sampling_session_id,
                 "base_model": base_model,
+                "backend": backend,
+                "domain_key": domain_key,
+                "affinity_group": affinity_group,
             },
         )
     except Exception as e:
@@ -2396,6 +2615,16 @@ async def _do_compute_logprobs(
             if snapshot is not None
             else manager.get_session_base_model(session_id)
         )
+        span_backend = None
+        if base_model:
+            try:
+                span_backend = _sampling_backend_for_base_model(str(base_model))
+            except Exception:
+                logger.debug(
+                    "Failed to resolve sampling backend for compute_logprobs span: base_model=%s",
+                    base_model,
+                    exc_info=True,
+                )
 
         async def _compute_logprobs_action():
             nonlocal \
@@ -2424,10 +2653,13 @@ async def _do_compute_logprobs(
                     )
 
             if is_multi_lora:
-                assert manager is not None
-                multi_lora_engine = await run_async_with_otel_span(
+                engine_result = await run_async_with_otel_span(
                     "sampling.get_engine_for_session",
-                    lambda: manager.get_engine_for_session(session_id),  # type: ignore[reportOptionalMemberAccess]
+                    lambda: _get_engine_for_sampling_session(
+                        manager=manager,
+                        session_id=session_id,
+                        snapshot=snapshot,
+                    ),
                     component="sampling",
                     op="sampling.get_engine_for_session",
                     request_id=request_id,
@@ -2444,6 +2676,7 @@ async def _do_compute_logprobs(
                         else None,
                     },
                 )
+                multi_lora_engine, engine_backend = engine_result
                 if multi_lora_engine is None:
                     raise RuntimeError(f"No engine found for session {session_id}")
                 from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
@@ -2462,40 +2695,67 @@ async def _do_compute_logprobs(
                 model_actor_supervisor.mark_inflight(
                     model_actor_supervisor_actor_name, +1
                 )
-                _record_vllm_workload_start(
-                    actor_name=model_actor_supervisor_actor_name,
-                    base_model=workload_base_model,
-                    op="compute_logprobs",
-                )
-                workload_started = True
-                await run_async_with_otel_span(
-                    "sampling.ensure_lora_loaded",
-                    lambda: _ensure_session_lora_loaded(
-                        multi_lora_engine, session_id, snapshot=snapshot
+                if engine_backend == "vllm":
+                    _record_vllm_workload_start(
+                        actor_name=model_actor_supervisor_actor_name,
+                        base_model=workload_base_model,
+                        op="compute_logprobs",
+                    )
+                    workload_started = True
+                    await run_async_with_otel_span(
+                        "sampling.ensure_lora_loaded",
+                        lambda: _ensure_session_lora_loaded(multi_lora_engine, session_id, snapshot=snapshot),
+                        component="sampling",
+                        op="sampling.ensure_lora_loaded",
+                        request_id=request_id,
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "backend": engine_backend,
+                            "base_model": snapshot.base_model if snapshot is not None else None,
+                            "actor_name": model_actor_supervisor_actor_name,
+                            "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                            "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                            "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                        },
+                    )
+                elif (
+                    engine_backend == "sglang"
+                    and snapshot is not None
+                    and not snapshot.uses_base_model
+                ):
+                    await run_async_with_otel_span(
+                        "sampling.ensure_lora_loaded",
+                        lambda: _ensure_session_lora_loaded(
+                            multi_lora_engine,
+                            session_id,
+                            snapshot=snapshot,
+                            force_backend_confirm=True,
+                        ),
+                        component="sampling",
+                        op="sampling.ensure_lora_loaded",
+                        request_id=request_id,
+                        attributes={
+                            "sampling_session_id": session_id,
+                            "backend": engine_backend,
+                            "base_model": snapshot.base_model if snapshot is not None else None,
+                            "actor_name": model_actor_supervisor_actor_name,
+                            "lora_rank": int(snapshot.lora_rank) if snapshot is not None else None,
+                            "lora_loaded_before": bool(snapshot.lora_loaded) if snapshot is not None else None,
+                            "has_adapter_path": bool(snapshot.adapter_path) if snapshot is not None else None,
+                        },
+                    )
+                return await _await_with_external_fail_abort(
+                    engine=multi_lora_engine,
+                    request_id=request_id,
+                    awaitable=multi_lora_engine.compute_logprobs(
+                        sampling_session_id=_backend_sampling_session_id(
+                            engine_backend=engine_backend,
+                            session_id=session_id,
+                            snapshot=snapshot,
+                        ),
+                        prompt_ids=token_ids,
+                        request_id=request_id,
                     ),
-                    component="sampling",
-                    op="sampling.ensure_lora_loaded",
-                    request_id=request_id,
-                    attributes={
-                        "sampling_session_id": session_id,
-                        "base_model": snapshot.base_model
-                        if snapshot is not None
-                        else None,
-                        "lora_rank": int(snapshot.lora_rank)
-                        if snapshot is not None
-                        else None,
-                        "lora_loaded_before": bool(snapshot.lora_loaded)
-                        if snapshot is not None
-                        else None,
-                        "has_adapter_path": bool(snapshot.adapter_path)
-                        if snapshot is not None
-                        else None,
-                    },
-                )
-                return await multi_lora_engine.compute_logprobs(
-                    sampling_session_id=session_id,
-                    prompt_ids=token_ids,
-                    request_id=request_id,
                 )
 
             assert manager is not None
@@ -2509,9 +2769,13 @@ async def _do_compute_logprobs(
                 op="compute_logprobs",
             )
             workload_started = True
-            return await engine.compute_logprobs(
-                prompt_ids=token_ids,
+            return await _await_with_external_fail_abort(
+                engine=engine,
                 request_id=request_id,
+                awaitable=engine.compute_logprobs(
+                    prompt_ids=token_ids,
+                    request_id=request_id,
+                ),
             )
 
         logprobs = await run_async_with_otel_span(
@@ -2520,11 +2784,14 @@ async def _do_compute_logprobs(
             component="routes.sampling",
             op="sampling.compute_logprobs",
             request_id=str(request_id),
-            attributes={
-                "sampling_session_id": str(session_id),
-                "base_model": str(base_model) if base_model else None,
-                "prompt_tokens": int(len(token_ids)),
-            },
+            attributes=_sampling_execution_span_attrs(
+                session_id=session_id,
+                backend=span_backend,
+                base_model=str(base_model) if base_model else None,
+                prompt_tokens=len(token_ids),
+                lora_rank=int(snapshot.lora_rank) if snapshot is not None else None,
+                uses_base_model=bool(snapshot.uses_base_model) if snapshot is not None else None,
+            ),
         )
 
         logprobs = normalize_prompt_logprobs_for_tinker(

@@ -669,14 +669,23 @@ def _checkpoint_owner_id(explicit_owner_id: str | None = None) -> str | None:
     return _env_object_id("MINT_TEST_CHECKPOINT_OWNER_ID")
 
 
-def _checkpoint_owner_id_from_save_result(save_result: Any) -> str:
-    return str(getattr(save_result, "owner_id", None) or "anonymous")
+def _checkpoint_owner_id_from_save_result(save_result: Any) -> str | None:
+    owner_id = getattr(save_result, "owner_id", None)
+    if owner_id is None:
+        return None
+    value = str(owner_id).strip()
+    if not value or value == "anonymous":
+        return None
+    return value
 
 
-def _mint_checkpoint_uri(model_path: str) -> str:
-    if model_path.startswith("mint://"):
+def _checkpoint_api_uri(model_path: str) -> str:
+    if model_path.startswith(("mint://", "tinker://")):
         return model_path
-    raise ValueError(f"checkpoint model_path must start with 'mint://', got {model_path!r}")
+    raise ValueError(
+        "checkpoint model_path must start with 'mint://' or 'tinker://', "
+        f"got {model_path!r}"
+    )
 
 
 def _create_sampling_client_for_checkpoint(
@@ -696,7 +705,7 @@ def _create_sampling_client_for_checkpoint(
         )
 
     holder = service_client.holder
-    model_path = _mint_checkpoint_uri(model_path)
+    model_path = _checkpoint_api_uri(model_path)
     assert holder._sampling_client_counter is not None
     sampling_session_seq_id = holder._sampling_client_counter
     holder._sampling_client_counter += 1
@@ -1586,6 +1595,22 @@ if NUM_RL_STEPS > 0 and completed_rl_steps < NUM_RL_STEPS:
 
 print("\nRL training complete!")
 
+rl_checkpoint = None
+if args.save_ckpt:
+    # Persist training state before final SGLang evaluation can evict the trainer.
+    final_state_name = "arithmetic-rl-final-state"
+    save_state_future = training_client.save_state(name=final_state_name)
+    rl_checkpoint = _result_with_heartbeat(
+        save_state_future,
+        label="SaveState",
+        timeout_s=TIMEOUT_S,
+        stage_name="save_state",
+        extra={"name": final_state_name},
+    )
+    print(f"Final checkpoint: {rl_checkpoint.path}")
+else:
+    print("Skipping checkpoint save (--no-save-ckpt).")
+
 # Get final RL model
 final_path = training_client.save_weights_for_sampler(
     name="arithmetic-rl-final",
@@ -1704,18 +1729,6 @@ if rl_metrics:
         print("Skipping rl_training_results.png: matplotlib not installed")
 
 if args.save_ckpt:
-    # Save final RL checkpoint
-    final_state_name = "arithmetic-rl-final-state"
-    save_state_future = training_client.save_state(name=final_state_name)
-    rl_checkpoint = _result_with_heartbeat(
-        save_state_future,
-        label="SaveState",
-        timeout_s=TIMEOUT_S,
-        stage_name="save_state",
-        extra={"name": final_state_name},
-    )
-    print(f"Final checkpoint: {rl_checkpoint.path}")
-
     ckpt_info = {
         "experiment_dir": str(EXPERIMENT_DIR.resolve()),
         "base_model": BASE_MODEL,
@@ -1737,5 +1750,3 @@ if args.save_ckpt:
     print(
         f"  client = service_client.create_training_client_from_state('{rl_checkpoint.path}')"
     )
-else:
-    print("Skipping checkpoint save (--no-save-ckpt).")

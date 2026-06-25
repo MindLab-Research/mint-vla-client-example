@@ -206,6 +206,33 @@ def _current_inference_manager():
     return inference_manager
 
 
+def _sampling_serving_backend_for_base_model(base_model: str) -> str:
+    from mint_server.backend.core.model_registry import get_model_config
+    from mint_server.backend.sampling_backend import normalize_sampling_backend
+
+    return normalize_sampling_backend(
+        getattr(get_model_config(base_model), "serving_backend", "vllm")
+    )
+
+
+async def _warm_sampling_engine_for_base_model(
+    inf_mgr: Any,
+    base_model: str,
+    serving_backend: str,
+) -> None:
+    if serving_backend == "sglang":
+        from mint_server.backend.sglang_engine import get_sglang_engine_for_model
+
+        engine = await get_sglang_engine_for_model(base_model)
+        await engine.initialize()
+        return
+    await inf_mgr.get_engine_for_model(base_model)
+
+
+def _background_engine_warm_key(base_model: str, serving_backend: str) -> str:
+    return f"{serving_backend}:{base_model}"
+
+
 def _require_write_access(request: Request) -> None:
     if not can_write(request):
         raise HTTPException(status_code=403, detail="Write access required")
@@ -4332,12 +4359,14 @@ async def _do_save_weights_for_sampler(
             sampling_session_id = str(uuid.uuid4())
             lora_rank = session.lora_config.rank if session.lora_config else 32
             base_model = session.base_model
+            serving_backend = _sampling_serving_backend_for_base_model(base_model)
 
-            # Do not block save-time on vLLM actor cold-start. Kick off engine
-            # warm in the background, but still fail fast if the warm task trips
-            # an immediate configuration or capacity error before we return a
-            # sampling_session_id. Allow one short grace window so async failures
-            # that happen right after the first await still surface on save.
+            # Do not block save-time on sampling actor cold-start. Kick off the
+            # model's configured serving backend in the background, but still
+            # fail fast if the warm task trips an immediate configuration or
+            # capacity error before we return a sampling_session_id. Allow one
+            # short grace window so async failures that happen right after the
+            # first await still surface on save.
             warm_traceparent = get_current_traceparent()
 
             async def _warm_engine() -> None:
@@ -4352,17 +4381,23 @@ async def _do_save_weights_for_sampler(
                         "sampling_session_id": str(sampling_session_id),
                         "base_model": str(base_model),
                         "save_mode": "ephemeral",
+                        "serving_backend": str(serving_backend),
                     },
                 ):
                     assert inf_mgr is not None
-                    await inf_mgr.get_engine_for_model(base_model)
+                    await _warm_sampling_engine_for_base_model(
+                        inf_mgr,
+                        base_model,
+                        serving_backend,
+                    )
 
             pending_warms = getattr(inf_mgr, "_background_engine_warm_tasks", None)
             if not isinstance(pending_warms, dict):
                 pending_warms = {}
                 setattr(inf_mgr, "_background_engine_warm_tasks", pending_warms)
 
-            existing_warm = pending_warms.get(base_model)
+            warm_key = _background_engine_warm_key(base_model, serving_backend)
+            existing_warm = pending_warms.get(warm_key)
             warm_schedule_t0 = time.perf_counter()
             await _safe_update_training_meta(
                 request_id,
@@ -4380,6 +4415,7 @@ async def _do_save_weights_for_sampler(
                     "model_id": str(request.model_id),
                     "sampling_session_id": str(sampling_session_id),
                     "base_model": str(base_model),
+                    "serving_backend": str(serving_backend),
                     "warm_timeout_s": 0.05,
                     "reused_existing_task": bool(
                         isinstance(existing_warm, asyncio.Task)
@@ -4391,11 +4427,11 @@ async def _do_save_weights_for_sampler(
                     warm_task = existing_warm
                 else:
                     warm_task = asyncio.create_task(_warm_engine())
-                    pending_warms[base_model] = warm_task
+                    pending_warms[warm_key] = warm_task
 
                     def _log_warm_failure(task: asyncio.Task[object]) -> None:
-                        if pending_warms.get(base_model) is task:
-                            pending_warms.pop(base_model, None)
+                        if pending_warms.get(warm_key) is task:
+                            pending_warms.pop(warm_key, None)
                         if task.cancelled():
                             return
                         try:
@@ -4405,8 +4441,9 @@ async def _do_save_weights_for_sampler(
                         if exc is not None:
                             logger.warning(
                                 "[save_weights_for_sampler] background engine warm failed: "
-                                "model=%s err=%s",
+                                "model=%s backend=%s err=%s",
                                 base_model,
+                                serving_backend,
                                 exc,
                             )
 

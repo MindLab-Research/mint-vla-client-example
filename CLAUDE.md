@@ -11,6 +11,7 @@
 | `volcano-cluster` | Ray cluster lifecycle (create/teardown worker tasks) |
 | `aliyun-cluster` | Aliyun DLC cluster lifecycle (create/stop/list jobs, logs) |
 | `merge-gate` | Pre-merge testing |
+| `sglang-backend` | SGLang sampling backend bringup and dev/issue-scoped sanity validation |
 | `vllm-knob-calculation` | Back-of-envelope sizing for vLLM serving knobs |
 | `megatron-memory-estimation` | Back-of-envelope Megatron memory sizing and admission |
 

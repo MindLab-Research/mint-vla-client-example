@@ -237,6 +237,11 @@ ssh mint-dev 'tail -50 /vePFS-Mindverse/share/mint/dev/logs/mint-dev-server.log'
 ssh mint-dev 'curl -s http://<HEAD_IP>:8265/api/cluster_status'
 ```
 
+For SGLang sampling backend bringup or issue-scoped SGLang RL sanity, read and
+use the `sglang-backend` skill after identifying the target dev API URL. This
+skill owns dev topology and lifecycle only; `sglang-backend` owns SGLang model
+capability checks, runtime env checks, and `scripts/tools/sglang_train_check.py`.
+
 ## RL Sanity Check
 
 After starting the dev server, run the RL check:
