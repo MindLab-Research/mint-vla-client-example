@@ -684,7 +684,9 @@ class ModelEngineHost:
         return int(self._config.max_claim), int(token_budget)
 
     def _is_vllm_domain(self) -> bool:
-        return str(self._config.domain_key).startswith("vllm:")
+        from mint_server.backend.actors.domain_keys import is_vllm_domain
+
+        return is_vllm_domain(str(self._config.domain_key))
 
     def _executes_leases_concurrently(self) -> bool:
         return self._is_vllm_domain()
@@ -745,7 +747,9 @@ class ModelEngineHost:
     def _vllm_actor_name(self) -> str | None:
         base_model = str(self._config.base_model or "").strip()
         if not base_model and self._is_vllm_domain():
-            base_model = str(self._config.domain_key).removeprefix("vllm:").strip()
+            from mint_server.backend.actors.domain_keys import base_model_from_domain_key
+
+            base_model = base_model_from_domain_key(str(self._config.domain_key)) or ""
         if not base_model:
             return None
         return vllm_actor_name(base_model)

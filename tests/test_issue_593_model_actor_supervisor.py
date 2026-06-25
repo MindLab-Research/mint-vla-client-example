@@ -34,6 +34,7 @@ from mint_server.backend.actors.model_actor_supervisor import (
     ModelActorSpec,
     ModelActorSupervisorClient,
     ModelActorSupervisor,
+    _spec_for_scheduler_domain_from_env,
     desired_specs_from_env,
     domain_key_for_training_base_model,
     domain_key_for_vllm_base_model,
@@ -41,6 +42,11 @@ from mint_server.backend.actors.model_actor_supervisor import (
 )
 from mint_server.backend.actors import model_actor_placement as placement_module
 from mint_server.backend.actors.model_actor_placement import ModelActorPlacementReconciler
+from mint_server.backend.actors.model_actor_launchers import _base_model_from_spec as _base_model_from_spec_launchers
+from mint_server.backend.actors.model_actor_placement import _base_model_from_spec as _base_model_from_spec_placement
+from mint_server.backend.scheduling.cluster_placement_controller import (
+    _base_model_from_spec as _base_model_from_spec_controller,
+)
 from mint_server.backend.stores.supervisor_state_store import (
     SupervisorMemoryStateStore,
     SupervisorSQLiteStateStore,
@@ -3544,3 +3550,54 @@ def test_issue_593_supervisor_defaults_to_cluster_placement_controller_for_real_
     )
 
     assert isinstance(supervisor._placement_controller, ClusterPlacementController)
+
+
+def test_verl_fsdp2_lora_domain_key_recognized_in_spec_for_scheduler_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_spec_for_scheduler_domain_from_env must handle verl_fsdp2_lora: prefix.
+
+    Regression test for the bug where verl_fsdp2_lora: domain keys were not
+    recognized, causing create_model requests to stay assigned=False.
+    """
+    # _supported_model_specs_from_env uses structlog-style logging which isn't
+    # configured in the test environment. Stub it to return empty so the prefix
+    # fallback path is exercised.
+    import mint_server.backend.actors.model_actor_supervisor as _mod
+
+    monkeypatch.setattr(_mod, "_supported_model_specs_from_env", lambda: {})
+
+    spec = _spec_for_scheduler_domain_from_env("verl_fsdp2_lora:Qwen/Qwen3.6-27B")
+    assert spec is not None
+    assert spec.domain_key == "verl_fsdp2_lora:Qwen/Qwen3.6-27B"
+    assert spec.base_model == "Qwen/Qwen3.6-27B"
+    assert spec.launcher_key == "training"
+
+
+def test_verl_fsdp2_lora_domain_key_empty_base_model_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Empty base model after prefix removal should return None."""
+    import mint_server.backend.actors.model_actor_supervisor as _mod
+
+    monkeypatch.setattr(_mod, "_supported_model_specs_from_env", lambda: {})
+
+    assert _spec_for_scheduler_domain_from_env("verl_fsdp2_lora:") is None
+    assert _spec_for_scheduler_domain_from_env("verl_fsdp2_lora:   ") is None
+
+
+def test_base_model_from_spec_handles_verl_fsdp2_lora_prefix() -> None:
+    """All three _base_model_from_spec implementations must handle verl_fsdp2_lora:."""
+    domain = "verl_fsdp2_lora:Qwen/Qwen3.6-27B"
+
+    # When base_model is set on spec, all implementations should return it directly
+    spec_with_base = SimpleNamespace(domain_key=domain, base_model="Qwen/Qwen3.6-27B")
+    assert _base_model_from_spec_launchers(spec_with_base) == "Qwen/Qwen3.6-27B"
+    assert _base_model_from_spec_placement(spec_with_base) == "Qwen/Qwen3.6-27B"
+    assert _base_model_from_spec_controller(spec_with_base) == "Qwen/Qwen3.6-27B"
+
+    # When base_model is None, fall back to parsing domain_key
+    spec_without_base = SimpleNamespace(domain_key=domain, base_model=None)
+    assert _base_model_from_spec_launchers(spec_without_base) == "Qwen/Qwen3.6-27B"
+    assert _base_model_from_spec_placement(spec_without_base) == "Qwen/Qwen3.6-27B"
+    assert _base_model_from_spec_controller(spec_without_base) == "Qwen/Qwen3.6-27B"

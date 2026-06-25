@@ -157,17 +157,9 @@ def _base_model_from_spec(spec: ModelActorSpecLike) -> str | None:
     base_model = getattr(spec, "base_model", None)
     if base_model:
         return str(base_model)
-    domain_key = str(getattr(spec, "domain_key", "") or "")
-    if domain_key.startswith("vllm:"):
-        model = domain_key.removeprefix("vllm:").strip()
-        return model or None
-    if domain_key.startswith("sglang:"):
-        model = domain_key.removeprefix("sglang:").strip()
-        return model or None
-    if domain_key.startswith("training:"):
-        model = domain_key.removeprefix("training:").strip()
-        return model or None
-    return None
+    from mint_server.backend.actors.domain_keys import base_model_from_domain_key
+
+    return base_model_from_domain_key(str(getattr(spec, "domain_key", "") or ""))
 
 
 def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
@@ -259,7 +251,9 @@ def placement_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
 
 
 def megatron_env_for_spec(spec: ModelActorSpecLike) -> dict[str, str]:
-    if not str(getattr(spec, "domain_key", "") or "").startswith("megatron:"):
+    from mint_server.backend.actors.domain_keys import is_megatron_domain
+
+    if not is_megatron_domain(str(getattr(spec, "domain_key", "") or "")):
         return {}
     out: dict[str, str] = {}
     for key in (
@@ -308,12 +302,14 @@ def launcher_process_env() -> dict[str, str]:
 
 
 def _model_runtime_max_claim_for_spec(spec: ModelActorSpecLike) -> int:
+    from mint_server.backend.actors.domain_keys import is_vllm_domain, is_megatron_domain, is_bumblebee_domain
+
     domain_key = str(getattr(spec, "domain_key", "") or "")
-    if domain_key.startswith("vllm:"):
+    if is_vllm_domain(domain_key):
         return max(1, int(os.environ.get("MINT_VLLM_MODEL_RUNTIME_MAX_CLAIM", "64")))
     if domain_key.startswith("sglang:"):
         return max(1, int(os.environ.get("MINT_SGLANG_MODEL_RUNTIME_MAX_CLAIM", "1")))
-    if domain_key.startswith(("bumblebee:", "megatron:")):
+    if is_megatron_domain(domain_key) or is_bumblebee_domain(domain_key):
         return max(1, int(os.environ.get("MINT_TRAINING_MODEL_RUNTIME_MAX_CLAIM", "16")))
     return max(1, int(os.environ.get("MINT_MODEL_RUNTIME_MAX_CLAIM", "1")))
 
@@ -333,16 +329,18 @@ def _positive_env_int(*keys: str) -> int | None:
 
 
 def _model_runtime_token_budget_for_spec(spec: ModelActorSpecLike) -> int | None:
+    from mint_server.backend.actors.domain_keys import is_vllm_domain, is_bumblebee_domain, is_megatron_domain
+
     domain_key = str(getattr(spec, "domain_key", "") or "")
-    if domain_key.startswith("vllm:"):
+    if is_vllm_domain(domain_key):
         return None
-    if domain_key.startswith("bumblebee:"):
+    if is_bumblebee_domain(domain_key):
         return _positive_env_int(
             "MINT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET",
             "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",
             "MINT_MODEL_RUNTIME_TOKEN_BUDGET",
         ) or DEFAULT_BUMBLEBEE_MODEL_RUNTIME_TOKEN_BUDGET
-    if domain_key.startswith("megatron:"):
+    if is_megatron_domain(domain_key):
         return _positive_env_int(
             "MINT_MEGATRON_MODEL_RUNTIME_TOKEN_BUDGET",
             "MINT_TRAINING_MODEL_RUNTIME_TOKEN_BUDGET",

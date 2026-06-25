@@ -118,6 +118,46 @@ def _set_multinode_fully_sharded_loras_env(
 
 
 def _import_vllm_async_engine_components() -> tuple[type[Any], type[Any]]:
+    # When using the isolated qwen36-vllm-deps (vLLM 0.19 + torch 2.10),
+    # the system's editable-install /vllm (vLLM 0.16) still appears in
+    # sys.path via __editable__.vllm-*.pth. We must insert the isolated
+    # deps path at position 0 so `import vllm` finds 0.19 first.
+    qwen36_vllm_deps = os.environ.get(
+        "MINT_QWEN36_VLLM_DEPS_PATH",
+        "/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/qwen36-vllm-deps",
+    )
+    if os.path.isdir(qwen36_vllm_deps) and qwen36_vllm_deps not in sys.path[:1]:
+        sys.path.insert(0, qwen36_vllm_deps)
+        # Also prepend qwen36-deps (transformers v5) so vLLM can inspect qwen3_5
+        qwen36_training_deps = os.environ.get(
+            "MINT_QWEN36_DEPS_PATH",
+            "/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/qwen36-deps",
+        )
+        if os.path.isdir(qwen36_training_deps) and qwen36_training_deps not in sys.path[:2]:
+            sys.path.insert(1, qwen36_training_deps)
+        # Purge cached vllm/torch/transformers/torchaudio/torchvision modules
+        # so the isolated versions from qwen36-*-deps are reimported fresh.
+        for _mod in list(sys.modules):
+            if (
+                _mod == "vllm" or _mod.startswith("vllm.")
+                or _mod == "torch" or _mod.startswith("torch.")
+                or _mod == "torchaudio" or _mod.startswith("torchaudio.")
+                or _mod == "torchvision" or _mod.startswith("torchvision.")
+                or _mod == "transformers" or _mod.startswith("transformers.")
+            ):
+                del sys.modules[_mod]
+        # Block system torchaudio (compiled for torch 2.9) from loading.
+        sys.modules["torchaudio"] = None  # type: ignore[assignment]
+
+        # Update PYTHONPATH env var so vLLM subprocesses (spawned via
+        # subprocess.run for model inspection) inherit the isolated deps.
+        # sys.path.insert() above only affects the current process;
+        # subprocesses inherit os.environ, not sys.path.
+        _env_pythonpath = os.environ.get("PYTHONPATH", "")
+        _new_pythonpath = ":".join(
+            p for p in [qwen36_vllm_deps, qwen36_training_deps, _env_pythonpath] if p
+        )
+        os.environ["PYTHONPATH"] = _new_pythonpath
     try:
         from vllm import AsyncEngineArgs, AsyncLLMEngine
     except ImportError as top_level_error:
@@ -683,6 +723,16 @@ def _create_mint_vllm_multinode_actor(
             max_num_batched_tokens: int | None = None,
         ):
             init_actor_observability()
+            # Resolve HF model names to local snapshot paths so vLLM's LoRA
+            # system can find base weights on the filesystem.
+            if model_path and "/" in model_path and not os.path.isdir(model_path):
+                try:
+                    from mint_server.backend.inference.multi_lora_engine import _resolve_model_path
+                    resolved = _resolve_model_path(model_path)
+                    if resolved and os.path.isdir(resolved):
+                        model_path = resolved
+                except Exception:
+                    pass
             self.model_path = model_path
             self.tensor_parallel_size = tensor_parallel_size
             self.pipeline_parallel_size = pipeline_parallel_size
@@ -2360,6 +2410,16 @@ class MultiNodeInferenceEngine:
         shared_adapter_dir: str = "/vePFS-Mindverse/share/mint/adapters",
         distributed_executor_backend: str = "ray",
     ):
+        # Resolve HF model names to local snapshot paths so vLLM's LoRA
+        # system can find base weights on the filesystem.
+        if model_path and "/" in model_path and not os.path.isdir(model_path):
+            try:
+                from mint_server.backend.inference.multi_lora_engine import _resolve_model_path
+                resolved = _resolve_model_path(model_path)
+                if resolved and os.path.isdir(resolved):
+                    model_path = resolved
+            except Exception:
+                pass
         self.model_path = model_path
         self.model_name = model_name
         self.tensor_parallel_size = tensor_parallel_size
@@ -2672,17 +2732,73 @@ class MultiNodeInferenceEngine:
                 actor_runtime_env_vars,
                 otel_env_vars,
             )
-            worker_pythonpath = join_pythonpath(
-                "/vllm",
-                sanitize_worker_pythonpath(
-                    PFS_PYTHONPATH,
-                    env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
-                ),
+            # Qwen3.6 models use an isolated vLLM 0.19 + torch 2.10 stack
+            # (qwen36-vllm-deps) that natively supports the qwen3_5 architecture.
+            # For other models, fall back to the system vLLM 0.16 at /vllm.
+            _is_qwen36 = False
+            try:
+                from mint_server.backend.qwen36_verl_fsdp2_lora import is_qwen36_model
+                _is_qwen36 = is_qwen36_model(self.model_path)
+            except Exception:
+                _is_qwen36 = "qwen3.6-27b" in str(self.model_path or "").lower()
+
+            qwen36_vllm_deps = os.environ.get(
+                "MINT_QWEN36_VLLM_DEPS_PATH",
+                "/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/qwen36-vllm-deps",
             )
+            # flash_attn 2.8.3 compiled against torch 2.10 lives here
+            qwen36_flash_attn = os.path.join(qwen36_vllm_deps, "flash_attn_build")
+
+            if _is_qwen36 and os.path.isdir(qwen36_vllm_deps):
+                # Use isolated vLLM 0.19 + torch 2.10 stack.
+                # Also prepend qwen36-deps (transformers v5) so vLLM can
+                # inspect the qwen3_5 model architecture.
+                qwen36_training_deps = os.environ.get(
+                    "MINT_QWEN36_DEPS_PATH",
+                    "/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/qwen36-deps",
+                )
+                worker_pythonpath = join_pythonpath(
+                    qwen36_vllm_deps,
+                    qwen36_flash_attn if os.path.isdir(qwen36_flash_attn) else None,
+                    qwen36_training_deps,
+                    sanitize_worker_pythonpath(
+                        PFS_PYTHONPATH,
+                        env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                    ),
+                )
+                # nvidia libs from qwen36-vllm-deps must take priority over system
+                # vLLM 0.23 uses nvidia/cu13/lib (unified), nvidia/cudnn/lib,
+                # nvidia/nccl/lib, nvidia/nvshmem/lib
+                _nvidia_lib_dirs = ":".join(
+                    d for d in [
+                        os.path.join(qwen36_vllm_deps, "nvidia", "cu13", "lib"),
+                        os.path.join(qwen36_vllm_deps, "nvidia", "cudnn", "lib"),
+                        os.path.join(qwen36_vllm_deps, "nvidia", "nccl", "lib"),
+                        os.path.join(qwen36_vllm_deps, "nvidia", "nvshmem", "lib"),
+                    ]
+                    if os.path.isdir(d)
+                )
+                worker_ld_library_path = ":".join(
+                    d for d in [_nvidia_lib_dirs, actor_ld_library_path()] if d
+                )
+            else:
+                # System vLLM (editable install at /vllm)
+                worker_pythonpath = join_pythonpath(
+                    "/vllm",
+                    sanitize_worker_pythonpath(
+                        PFS_PYTHONPATH,
+                        env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                    ),
+                )
+                worker_ld_library_path = actor_ld_library_path()
             env_vars = actor_runtime_env_vars(
                 pythonpath=worker_pythonpath,
                 extra={
-                "LD_LIBRARY_PATH": actor_ld_library_path(),
+                "LD_LIBRARY_PATH": worker_ld_library_path,
+                # Use fork for qwen36 so Worker_TP subprocesses inherit
+                # monkey-patches (set_moe_parameters, weight key mapping) installed
+                # in the actor's __init__.  spawn creates a fresh Python process
+                # that re-imports vLLM without the patches.
                 "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",

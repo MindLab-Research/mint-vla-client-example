@@ -719,7 +719,10 @@ def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRe
     if launcher_key == "cpu_runtime" or int(getattr(spec, "gpu_count", 1) or 0) <= 0:
         raise ValueError(f"spec does not require GPU placement: {replica_key}")
 
-    if launcher_key == "dense" or domain_key.startswith("dense:"):
+    from mint_server.backend.actors import domain_keys as dk
+    from mint_server.backend.actors.domain_keys import is_megatron_domain, is_bumblebee_domain
+
+    if launcher_key == "dense" or dk.domain_key_prefix(domain_key) == dk.DENSE_PREFIX:
         dense_actor_name = _dense_actor_name(base_model or domain_key)
         return PlacementGroupBundleRequest.for_dense(
             replica_key=replica_key,
@@ -728,10 +731,10 @@ def placement_group_bundle_request_for_spec(spec: Any) -> PlacementGroupBundleRe
             namespace=namespace,
         )
 
-    if launcher_key in {"megatron", "bumblebee"} or domain_key.startswith(("megatron:", "bumblebee:")):
+    if launcher_key in {"megatron", "bumblebee"} or is_megatron_domain(domain_key) or is_bumblebee_domain(domain_key):
         training_actor_name = (
             _bumblebee_actor_name(base_model or domain_key)
-            if launcher_key == "bumblebee" or domain_key.startswith("bumblebee:")
+            if launcher_key == "bumblebee" or is_bumblebee_domain(domain_key)
             else _megatron_actor_name(base_model or domain_key)
         )
         return PlacementGroupBundleRequest.for_distributed_training(
@@ -767,12 +770,9 @@ def _base_model_from_spec(spec: Any) -> str | None:
     raw = getattr(spec, "base_model", None)
     if raw:
         return str(raw)
-    domain_key = str(getattr(spec, "domain_key", "") or "")
-    for prefix in ("vllm:", "training:", "megatron:", "bumblebee:", "dense:"):
-        if domain_key.startswith(prefix):
-            model = domain_key.removeprefix(prefix).strip()
-            return model or None
-    return None
+    from mint_server.backend.actors.domain_keys import base_model_from_domain_key
+
+    return base_model_from_domain_key(str(getattr(spec, "domain_key", "") or ""))
 
 
 def _spec_node_pins(spec: Any) -> tuple[str, ...]:

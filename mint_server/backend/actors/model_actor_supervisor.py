@@ -54,7 +54,6 @@ from mint_server.backend.observability.node_metrics_daemon import (
     node_metrics_actor_name,
 )
 from mint_server.backend.sampling_backend import (
-    base_model_from_sampling_domain_key,
     domain_key_for_sampling_base_model,
 )
 from mint_server.backend.actors.node_placement import parse_model_gpu_placement
@@ -483,7 +482,10 @@ class ControlPlaneDependency:
 
 
 def domain_key_for_vllm_base_model(base_model: str) -> str:
-    return domain_key_for_sampling_base_model(base_model, backend="vllm")
+    """Backward-compatible alias for :func:`domain_keys.domain_key_for_vllm`."""
+    from mint_server.backend.actors.domain_keys import domain_key_for_vllm
+
+    return domain_key_for_vllm(base_model)
 
 
 def _normalize_megatron_domain_key(base_model: str) -> str:
@@ -518,17 +520,17 @@ def _selected_moe_training_backend(model: str, backend: str | None = None) -> st
 
 
 def domain_key_for_training_base_model(base_model: str, *, backend: str | None = None) -> str:
-    model = str(base_model).strip()
-    if not model:
-        raise ValueError("base_model is required")
-    if _is_moe_training_model(model):
-        moe_backend = _selected_moe_training_backend(model, backend=backend)
-        return f"{moe_backend}:{_normalize_megatron_domain_key(model)}"
-    return f"training:{model}"
+    """Backward-compatible alias for :func:`domain_keys.domain_key_for_training`."""
+    from mint_server.backend.actors.domain_keys import domain_key_for_training
+
+    return domain_key_for_training(base_model, backend=backend)
 
 
 def domain_key_for_internal_runtime() -> str:
-    return "internal:runtime"
+    """Backward-compatible alias for :func:`domain_keys.domain_key_for_internal_runtime`."""
+    from mint_server.backend.actors.domain_keys import domain_key_for_internal_runtime
+
+    return domain_key_for_internal_runtime()
 
 
 def default_model_actor_name(domain_key: str, replica_id: str) -> str:
@@ -676,6 +678,8 @@ def _has_env_placement_override() -> bool:
 
 
 def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[ModelActorSpec]:
+    from mint_server.backend.actors import domain_keys as _dk
+
     specs: list[ModelActorSpec] = []
     for model, raw_cfg in sorted(models.items()):
         if not isinstance(raw_cfg, dict):
@@ -707,7 +711,7 @@ def _topology_model_specs_from_config_models(models: dict[str, Any]) -> list[Mod
                     base_model,
                     backend=None if backend_override is None else str(backend_override),
                 )
-            if launcher_key in {"megatron", "bumblebee"} and domain_key.startswith("training:"):
+            if launcher_key in {"megatron", "bumblebee"} and _dk.is_training_domain(domain_key):
                 continue
             placement_items = launcher_cfg.get("placement") or []
             if isinstance(placement_items, dict):
@@ -841,6 +845,8 @@ def _supported_model_specs_from_env() -> dict[str, ModelActorSpec]:
 
 
 def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | None:
+    from mint_server.backend.actors import domain_keys as dk
+
     domain = str(domain_key).strip()
     if not domain or domain == domain_key_for_internal_runtime():
         return None
@@ -850,34 +856,16 @@ def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | Non
     if domain in supported:
         return supported[domain]
 
-    if domain.startswith("vllm:"):
-        base_model = base_model_from_sampling_domain_key(domain)
-        if not base_model:
-            return None
-        return ModelActorSpec(
-            domain_key=domain,
-            base_model=base_model,
-            launcher_key="vllm",
-        )
-    if domain.startswith("sglang:"):
-        base_model = base_model_from_sampling_domain_key(domain)
-        if not base_model:
-            return None
-        return ModelActorSpec(
-            domain_key=domain,
-            base_model=base_model,
-            launcher_key="sglang",
-        )
-    if domain.startswith("training:"):
-        base_model = domain.removeprefix("training:").strip()
-        if not base_model:
-            return None
-        return ModelActorSpec(
-            domain_key=domain,
-            base_model=base_model,
-            launcher_key="training",
-        )
-    if domain.startswith(("megatron:", "bumblebee:")):
+    base_model = dk.base_model_from_domain_key(domain)
+    if not base_model:
+        return None
+
+    launcher_key = dk.launcher_key_for_domain(domain)
+
+    # megatron/bumblebee domain keys use sanitised model names, so they need
+    # to be matched against the pre-registered specs rather than constructed
+    # directly from the base_model string.
+    if dk.is_megatron_domain(domain) or dk.is_bumblebee_domain(domain):
         for spec in supported.values():
             if spec.domain_key == domain:
                 return spec
@@ -902,7 +890,13 @@ def _spec_for_scheduler_domain_from_env(domain_key: str) -> ModelActorSpec | Non
                     gpu_count=spec.gpu_count,
                     enabled=spec.enabled,
                 )
-    return None
+    # All other recognised prefixes (vllm, training, verl_fsdp2_lora, dense)
+    # can be constructed directly from the base_model string.
+    return ModelActorSpec(
+        domain_key=domain,
+        base_model=base_model,
+        launcher_key=launcher_key,
+    )
 
 
 def _active_scheduler_domains(stats: dict[str, Any]) -> set[str]:

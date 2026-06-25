@@ -3699,11 +3699,59 @@ class VerlTrainingEngine:
             self._touch_actor(session)
         elif use_verl_fsdp2_lora:
             session.backend = VERL_FSDP2_LORA_BACKEND
-            raise NotImplementedError(
-                "Qwen3.6-27B is configured for veRL FSDP2 + PEFT LoRA. "
-                "The MinT per-request TrainingWorker API cannot materialize this backend yet; "
-                "launch it through a veRL job with MINT_QWEN36_VERL_FSDP2_LORA_PATCHES=1."
+            import asyncio as _asyncio
+            from mint_server.backend.training.qwen36.qwen36_trainer_manager import get_or_create_qwen36_trainer
+
+            qwen36_get_timeout_s = float(os.environ.get("MINT_QWEN36_GET_OR_CREATE_TIMEOUT_S", "600"))
+            print(f"[DEBUG {model_id}] qwen36 get_or_create start: timeout_s={qwen36_get_timeout_s}", flush=True)
+            qwen36 = await _asyncio.wait_for(
+                _asyncio.to_thread(
+                    get_or_create_qwen36_trainer,
+                    base_model=base_model,
+                    model_key=requested_model,
+                    lora_rank=lora_rank,
+                    learning_rate=session.learning_rate,
+                    session_id=session.model_id,
+                    max_lora_rank=int(server_config.max_lora_rank),
+                ),
+                timeout=qwen36_get_timeout_s,
             )
+            print(f"[DEBUG {model_id}] qwen36 get_or_create done: max_rank={qwen36.max_lora_rank}", flush=True)
+            worker = qwen36.actor
+            self._actor_recycler.bind_session_actor(model_id, qwen36.actor_name)
+            session.actor_name = qwen36.actor_name
+            session.namespace = RAY_NAMESPACE
+            self._touch_actor(session)
+
+            # Reinitialize LoRA weights for fresh session
+            logger.info("qwen36_reinitializing_lora_weights", model_id=model_id, lr=session.learning_rate)
+            reinit_timeout_s = float(server_config.training_reinit_lora_timeout_s)
+            effective_reinit_timeout_s = reinit_timeout_s if reinit_timeout_s > 0 else None
+            traceparent = get_current_traceparent()
+            try:
+                result = await self._await_worker_call(
+                    worker.reinit_lora_weights.remote(
+                        session.learning_rate,
+                        actual_rank=lora_rank,
+                        traceparent=traceparent,
+                    ),
+                    session,
+                    op="create_training_session.qwen36_reinit_lora_weights",
+                    worker=worker,
+                    interval_s=30.0,
+                    timeout_s=effective_reinit_timeout_s,
+                )
+            except Exception:
+                self._actor_recycler.unbind_session_actor(model_id)
+                self._workers.pop(model_id, None)
+                try:
+                    from mint_server.backend.actors.model_actor_supervisor import get_model_actor_supervisor
+                    get_model_actor_supervisor().clear_session(model_id)
+                except Exception:
+                    pass
+                raise
+            print(f"[DEBUG {model_id}] qwen36 reinit_lora_weights done", flush=True)
+            logger.info("qwen36_lora_weights_reinitialized", model_id=model_id, lr_updated=result.get("lr_updated", False))
         else:
             logger.info(
                 f"[{model_id}] Using pooled PEFT trainer actors for dense model (base={base_model}, lora_rank={lora_rank})"

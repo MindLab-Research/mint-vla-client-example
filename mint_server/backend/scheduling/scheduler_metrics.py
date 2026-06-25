@@ -28,14 +28,9 @@ def metric_number(value: object) -> float | None:
 
 
 def scheduler_domain_base_model(domain_key: object) -> str | None:
-    domain = str(domain_key or "").strip()
-    if not domain or ":" not in domain:
-        return None
-    backend, model = domain.split(":", 1)
-    if backend.strip().lower() != "vllm":
-        return None
-    model = model.strip()
-    return model or None
+    from mint_server.backend.actors.domain_keys import base_model_from_domain_key
+
+    return base_model_from_domain_key(str(domain_key or ""))
 
 
 class SchedulerMetrics:

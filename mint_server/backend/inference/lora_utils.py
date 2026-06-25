@@ -154,7 +154,18 @@ def _model_weight_map(base_model_path: str) -> dict[str, str] | None:
     weight_map = payload.get("weight_map")
     if not isinstance(weight_map, dict):
         raise ValueError(f"Invalid safetensors index: {index_path}")
-    return {str(k): str(v) for k, v in weight_map.items()}
+    result = {str(k): str(v) for k, v in weight_map.items()}
+    # For Qwen3.5/3.6 models, the checkpoint uses "model.language_model.X"
+    # prefix but vLLM's LoRA system expects "model.X". Add non-prefixed
+    # aliases so base weight lookups succeed.
+    aliases = {}
+    for key, shard in result.items():
+        if key.startswith("model.language_model."):
+            aliases["model." + key[len("model.language_model."):]] = shard
+        elif key.startswith("language_model."):
+            aliases["model." + key[len("language_model."):]] = shard
+    result.update(aliases)
+    return result
 
 
 def _resolve_base_weight_file(base_model_path: str, tensor_name: str) -> str:
@@ -187,10 +198,16 @@ def _resolve_base_weight_file(base_model_path: str, tensor_name: str) -> str:
 def _base_weight_shape(base_model_path: str, tensor_name: str) -> tuple[int, ...]:
     path = _resolve_base_weight_file(base_model_path, tensor_name)
     with safe_open(path, framework="pt", device="cpu") as handle:
-        if tensor_name not in handle.keys():
-            raise KeyError(f"Base weight {tensor_name!r} not found in {path!r}")
-        tensor = handle.get_tensor(tensor_name)
-        return tuple(int(dim) for dim in tensor.shape)
+        if tensor_name in handle.keys():
+            tensor = handle.get_tensor(tensor_name)
+            return tuple(int(dim) for dim in tensor.shape)
+        # Try language_model prefix variant (Qwen3.5/3.6 checkpoint key format)
+        if tensor_name.startswith("model.layers."):
+            alt_name = "model.language_model." + tensor_name[len("model."):]
+            if alt_name in handle.keys():
+                tensor = handle.get_tensor(alt_name)
+                return tuple(int(dim) for dim in tensor.shape)
+        raise KeyError(f"Base weight {tensor_name!r} not found in {path!r}")
 
 
 def _is_tp_sharded_dim(base_dim: int, shard_dim: int, *, tp_size: int) -> bool:
@@ -242,8 +259,22 @@ def validate_peft_adapter_checkpoint_shapes(
     """
     if not adapter_dir or not os.path.isdir(adapter_dir):
         raise ValueError(f"Adapter directory not found: {adapter_dir!r}")
-    if not base_model_path or not os.path.isdir(base_model_path):
-        raise ValueError(f"Base model path not found: {base_model_path!r}")
+    # base_model_path may be an HF model name (e.g. "Qwen/Qwen3.6-27B")
+    # which is not a local directory. Skip the directory check for non-path values.
+    if not base_model_path:
+        raise ValueError("Base model path is empty")
+    if "/" in base_model_path and not os.path.isdir(base_model_path):
+        # Try to resolve as HF hub path
+        try:
+            from huggingface_hub import try_to_load_from_cache
+            resolved = try_to_load_from_cache(
+                base_model_path, "config.json",
+                cache_dir=os.environ.get("HF_HOME"),
+            )
+            if resolved is None and os.environ.get("HF_HUB_OFFLINE") != "1":
+                raise ValueError(f"Base model path not found: {base_model_path!r}")
+        except ImportError:
+            pass  # huggingface_hub not available, skip check
 
     weights_path = os.path.join(adapter_dir, "adapter_model.safetensors")
     if not os.path.isfile(weights_path):
@@ -397,6 +428,14 @@ def maybe_validate_peft_adapter_checkpoint_shapes(
 ) -> None:
     """Run shape validation unless the explicit runtime bypass flag is set."""
     if _env_flag("MINT_VLLM_SKIP_PEFT_SHAPE_VALIDATION", default=False):
+        return
+    # Skip validation if base_model_path is an HF model name (not a local path)
+    # or if the safetensors index doesn't exist. This is a pre-flight check,
+    # not critical for loading.
+    if not base_model_path or not os.path.isdir(base_model_path):
+        return
+    index_path = os.path.join(base_model_path, "model.safetensors.index.json")
+    if not os.path.isfile(index_path):
         return
     validate_peft_adapter_checkpoint_shapes(
         adapter_dir,

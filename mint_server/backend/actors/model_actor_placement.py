@@ -64,18 +64,18 @@ def _base_model_from_spec(spec: Any) -> str | None:
     base_model = getattr(spec, "base_model", None)
     if isinstance(base_model, str) and base_model.strip():
         return base_model.strip()
-    domain_key = str(getattr(spec, "domain_key", "") or "")
-    if domain_key.startswith("vllm:"):
-        model = domain_key.removeprefix("vllm:").strip()
-        return model or None
-    return None
+    from mint_server.backend.actors.domain_keys import base_model_from_domain_key
+
+    return base_model_from_domain_key(str(getattr(spec, "domain_key", "") or ""))
 
 
 def _owned_actor_names_for_spec(spec: Any) -> set[str]:
+    from mint_server.backend.actors.domain_keys import is_vllm_domain
+
     name = str(spec.normalized_actor_name())
     names = {name} if name else set()
     domain_key = str(getattr(spec, "domain_key", "") or "")
-    if domain_key.startswith("vllm:"):
+    if is_vllm_domain(domain_key):
         base_model = _base_model_from_spec(spec)
         if base_model:
             legacy_name = vllm_actor_name(base_model)

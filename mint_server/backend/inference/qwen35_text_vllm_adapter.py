@@ -494,20 +494,23 @@ def _map_qwen35_text_weights(config: Any, weights: Any, *, inner_model: bool):  
         elif name.startswith("language_model."):
             name = "model." + name[len("language_model.") :]
 
-        if inner_model:
-            match = _QWEN35_LINEAR_ATTN_SPLIT_RE.match(name)
-            if match:
-                prefix = match.group("prefix")
-                part = match.group("part")
-                parts = pending_linear_attn.setdefault(prefix, {})
-                if part in parts:
-                    raise ValueError(
-                        "Duplicate Qwen3.5 linear attention split weight: "
-                        f"{prefix}.{part}.weight"
-                    )
-                parts[part] = loaded_weight
-                yield from _pop_if_complete(prefix)
-                continue
+        # Linear attention packing must run for BOTH inner_model and outer
+        # (Qwen3NextForCausalLM). AutoWeightsLoader in the outer class
+        # delegates to child modules, so the split weights (in_proj_qkv +
+        # in_proj_z) must be packed into in_proj_qkvz before loading.
+        match = _QWEN35_LINEAR_ATTN_SPLIT_RE.match(name)
+        if match:
+            prefix = match.group("prefix")
+            part = match.group("part")
+            parts = pending_linear_attn.setdefault(prefix, {})
+            if part in parts:
+                raise ValueError(
+                    "Duplicate Qwen3.5 linear attention split weight: "
+                    f"{prefix}.{part}.weight"
+                )
+            parts[part] = loaded_weight
+            yield from _pop_if_complete(prefix)
+            continue
 
         yield name, loaded_weight
 

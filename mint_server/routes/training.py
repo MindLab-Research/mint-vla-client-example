@@ -26,7 +26,6 @@ import inspect
 import json
 import structlog
 import os
-import re
 import shutil
 import time
 import uuid
@@ -393,15 +392,19 @@ async def _safe_update_training_meta(request_id: str, meta: dict[str, object]) -
 def _training_model_work_domain_key(
     *, backend: str, base_model: str, model_id: str
 ) -> str:
+    from mint_server.backend.actors.domain_keys import (
+        VERL_FSDP2_LORA_PREFIX,
+        TRAINING_SESSION_PREFIX,
+        domain_key_for_training,
+    )
+
     backend_value = str(backend or "").strip()
     base = str(base_model or "").strip()
     if backend_value in {"bumblebee", "megatron"} and base:
-        from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
-
-        return domain_key_for_training_base_model(base, backend=backend_value)
+        return domain_key_for_training(base, backend=backend_value)
     if base:
-        return f"{backend_value}:{base}" if backend_value == "verl_fsdp2_lora" else f"training:{base}"
-    return f"training_session:{model_id}"
+        return f"{backend_value}:{base}" if backend_value == VERL_FSDP2_LORA_PREFIX else f"training:{base}"
+    return f"{TRAINING_SESSION_PREFIX}:{model_id}"
 
 
 async def _enqueue_training_model_work_route(
@@ -1844,7 +1847,9 @@ def _build_training_scheduler_extra(
     if openpi_train_step:
         enabled = True
     if backend == "verl_fsdp2_lora" and base_model:
-        domain_key = f"verl_fsdp2_lora:{base_model}"
+        from mint_server.backend.actors.domain_keys import VERL_FSDP2_LORA_PREFIX
+
+        domain_key = f"{VERL_FSDP2_LORA_PREFIX}:{base_model}"
     elif backend in {"bumblebee", "megatron"} and base_model:
         domain_key = domain_key_for_training_base_model(base_model, backend=backend)
     else:
@@ -1914,13 +1919,13 @@ def _build_create_scheduler_extra(
     model_id: str,
     training_op: str,
 ) -> dict[str, Any]:
-    from mint_server.backend.actors.model_actor_supervisor import domain_key_for_training_base_model
+    from mint_server.backend.actors.domain_keys import VERL_FSDP2_LORA_PREFIX, domain_key_for_training
 
     backend = _infer_training_backend_for_base_model(base_model)
     scheduler_domain = (
-        f"verl_fsdp2_lora:{base_model}"
-        if backend == "verl_fsdp2_lora"
-        else domain_key_for_training_base_model(base_model)
+        f"{VERL_FSDP2_LORA_PREFIX}:{base_model}"
+        if backend == VERL_FSDP2_LORA_PREFIX
+        else domain_key_for_training(base_model)
     )
     return {
         "scheduler_enabled": str(os.environ.get("MINT_SCHEDULER_ENABLE", "1"))
