@@ -245,10 +245,8 @@ docker build --build-arg RAY_VERSION=2.52.0 \
 
 ## Cluster deployment templates
 
-Volcano and (future) Aliyun task YAML templates live under `docker/volc/`
-and `docker/aliyun/` respectively. These are the canonical deployment
-configs — the `.claude/skills/volcano-cluster/configs/` copies are kept
-in sync.
+Volcano and Aliyun deployment templates live under `docker/volc/` and
+`docker/aliyun/` respectively. These are the canonical deployment configs.
 
 ```
 docker/
@@ -257,8 +255,13 @@ docker/
 │   ├── dev-worker.yaml     ← dev GPU worker (ml.hpcpni2l.28xlarge)
 │   ├── prod-head.yaml     ← prod CPU head
 │   └── prod-worker.yaml   ← prod GPU worker
-└── aliyun/                  ← (future)
+└── aliyun/
+    ├── dlc-lib.sh         ← Helper functions (get-head-ip, list/stop jobs)
+    ├── head.sh            ← Ray head DLC job (CPU, large memory, runs GCS)
+    └── worker.sh          ← GPU worker DLC job (supports COUNT, WORKER_ID)
 ```
+
+### Volcano (Volc Engine ML Platform)
 
 Submit:
 ```bash
@@ -271,6 +274,63 @@ volc ml_task submit -c docker/volc/dev-worker.yaml
 
 The worker template uses `TaskName: mint-dev-worker`. To launch multiple
 workers, change the `TaskName` field for each submission.
+
+### Aliyun (PAI-DLC)
+
+Aliyun DLC uses CLI flags, not YAML. Architecture:
+
+```
+DSW instance (driver)   → mint-server, ray start --address joins cluster
+DLC job (head)          → GCS + dashboard, large memory (32Gi)
+DLC jobs (workers)      → GPU compute (8× L20X/H20 each)
+```
+
+Workers from different resource queues can join the same head — VPC
+networking is shared across queues. `DLC_RESOURCE_ID` only controls
+which GPU pool the pod is scheduled on, not Ray networking.
+
+Worker join mechanism: `ray_entrypoint.sh` reads `MINT_RAY_ROLE=worker`
+and `HEAD_IP` env vars, waits for GCS on port 6379, then starts a Ray
+worker node via `Node(ray_params, head=False)`.
+
+```bash
+# 0. List available resource queues (REQUIRED before submit)
+source docker/aliyun/dlc-lib.sh
+dlc-list-quotas
+
+# 1. Submit head DLC job (CPU, 32Gi memory for GCS)
+DLC_RESOURCE_ID=<quota_id> docker/aliyun/head.sh
+
+# 2. Get head pod IP
+HEAD_IP=$(dlc-get-head-ip <head_job_id>)
+
+# 3. Submit workers (batch or single)
+DLC_RESOURCE_ID=<quota_id> HEAD_IP=$HEAD_IP NAME_PREFIX=mint-qwen COUNT=4 docker/aliyun/worker.sh
+# Or scale out with a specific ID:
+DLC_RESOURCE_ID=<quota_id> HEAD_IP=$HEAD_IP NAME_PREFIX=mint-qwen WORKER_ID=5 docker/aliyun/worker.sh
+# Cross-queue: workers from a different queue joining the same head:
+DLC_RESOURCE_ID=<other_quota_id> HEAD_IP=$HEAD_IP NAME_PREFIX=mint-qwen WORKER_ID=6 docker/aliyun/worker.sh
+
+# 4. List / stop jobs
+dlc-list-jobs mint-qwen
+dlc-stop-jobs mint-qwen
+
+# 5. On DSW instance, join as driver
+ray start --address=<head_ip>:6379 --num-cpus=16
+```
+
+Required environment variables:
+- `DLC_RESOURCE_ID` — resource queue (run `dlc-list-quotas` to see options)
+- `HEAD_IP` — Ray head pod IP (worker.sh only)
+- `NAME_PREFIX` — job name prefix (worker.sh only)
+
+Optional defaults:
+- `DLC_IMAGE`: `acr-qhxx-registry.cn-beijing.cr.aliyuncs.com/mindverse/mint:latest-sm90`
+- `DLC_WORKSPACE_ID`: `341495`
+- `DLC_DATASETS`: `d-t3o24m34nmm1oksycx:v2:/vePFS-Mindverse/share/` (dataset mount, NOT raw URI)
+- `COUNT`: `1` (number of workers to submit)
+- Head: `HEAD_CPU=8`, `HEAD_MEMORY=32Gi`, `HEAD_GPU=0`
+- Worker: `WORKER_CPU=160`, `WORKER_MEMORY=1600Gi`, `WORKER_GPU=8`
 
 ## Environment variables
 
