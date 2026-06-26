@@ -37,7 +37,7 @@ from mint_server.backend.sglang_engine import (
     GenerateResult,
     SGLangInferenceEngine,
     _assert_single_node_sglang_schedulable,
-    _assert_sglang_node_ip_capacity_with_training_reclaim,
+    _assert_sglang_node_ip_capacity,
     _default_sglang_engine_ready_wait_s,
     _sglang_pythonpath,
     _sglang_pycache_prefix,
@@ -1822,53 +1822,56 @@ def test_sglang_engine_actor_launch_respects_explicit_ready_wait_override(monkey
     assert captured_timeouts == [42.0]
 
 
-def test_sglang_capacity_check_reclaims_same_model_training_resources_once(monkeypatch) -> None:
+def test_sglang_capacity_check_passes_through_when_node_has_room(monkeypatch) -> None:
     capacity_calls: list[dict[str, object]] = []
-    reclaim_calls: list[dict[str, object]] = []
 
     def fake_assert_node_ip_capacity(**kwargs):
         capacity_calls.append(kwargs)
-        if len(capacity_calls) == 1:
-            raise RuntimeError("pinned node capacity check failed: training placement group blocks node")
-
-    def fake_reclaim(**kwargs):
-        reclaim_calls.append(kwargs)
-        return {
-            "killed_actor_names": ["mint_bumblebee_qwen3_235b_a22b_instruct_2507"],
-            "removed_placement_group_names": [
-                "mint_bumblebee_qwen3_235b_a22b_instruct_2507_mint_codex_sgla_147f03cc_pg"
-            ],
-        }
 
     monkeypatch.setattr("mint_server.backend.sglang_engine.assert_node_ip_capacity", fake_assert_node_ip_capacity)
-    monkeypatch.setattr(
-        "mint_server.backend.sglang_engine._reclaim_same_model_training_resources_for_sglang",
-        fake_reclaim,
-    )
 
-    _assert_sglang_node_ip_capacity_with_training_reclaim(
+    _assert_sglang_node_ip_capacity(
         model_name="Qwen/Qwen3-235B-A22B-Instruct-2507",
         required_gpus_by_node_ip={"192.0.2.10": 8, "192.0.2.11": 8},
         context="multinode_sglang model='Qwen/Qwen3-235B-A22B-Instruct-2507'",
     )
 
+    # Capacity is asserted exactly once; the sampler is placed on its own GPUs
+    # with no eviction of any same-model trainer.
     assert capacity_calls == [
         {
             "required_gpus_by_node_ip": {"192.0.2.10": 8, "192.0.2.11": 8},
             "context": "multinode_sglang model='Qwen/Qwen3-235B-A22B-Instruct-2507'",
-        },
-        {
-            "required_gpus_by_node_ip": {"192.0.2.10": 8, "192.0.2.11": 8},
-            "context": "multinode_sglang model='Qwen/Qwen3-235B-A22B-Instruct-2507'",
-        },
-    ]
-    assert reclaim_calls == [
-        {
-            "model_name": "Qwen/Qwen3-235B-A22B-Instruct-2507",
-            "context": "multinode_sglang model='Qwen/Qwen3-235B-A22B-Instruct-2507'",
-            "namespace": PERSISTENT_NAMESPACE,
         }
     ]
+
+
+def test_sglang_capacity_block_fails_closed_without_reclaiming_trainer(monkeypatch) -> None:
+    capacity_calls: list[dict[str, object]] = []
+
+    def fake_assert_node_ip_capacity(**kwargs):
+        capacity_calls.append(kwargs)
+        raise RuntimeError("pinned node capacity check failed: training placement group blocks node")
+
+    # No reclaim helper exists anymore; assert we never kill an actor either.
+    def fail_if_killed(*args, **kwargs):
+        raise AssertionError("SGLang launch must not kill any actor on capacity block")
+
+    monkeypatch.setattr("mint_server.backend.sglang_engine.assert_node_ip_capacity", fake_assert_node_ip_capacity)
+    monkeypatch.setattr("mint_server.backend.sglang_engine.ray_kill.kill", fail_if_killed)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        _assert_sglang_node_ip_capacity(
+            model_name="Qwen/Qwen3-235B-A22B-Instruct-2507",
+            required_gpus_by_node_ip={"192.0.2.10": 8, "192.0.2.11": 8},
+            context="multinode_sglang model='Qwen/Qwen3-235B-A22B-Instruct-2507'",
+        )
+
+    message = str(excinfo.value)
+    assert "insufficient GPU capacity" in message
+    assert "does not preempt live training actors" in message
+    # Capacity is checked once and the block is surfaced immediately (no retry-after-kill).
+    assert len(capacity_calls) == 1
 
 
 def test_sglang_engine_actor_launch_uses_explicit_multinode_rank_actors(monkeypatch) -> None:

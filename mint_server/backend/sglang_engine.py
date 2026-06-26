@@ -31,7 +31,6 @@ from .actors.model_actor_publication import BackendModelActorLaunch, publish_bac
 from .actors.model_actor_inventory import ActorType
 from .inference.multi_lora_engine import GenerateResult, _float_or_none, _resolve_model_path
 from .actors.node_placement import assert_node_ip_capacity, parse_model_gpu_placement
-from .ray_cluster.ray_placement_groups import remove_named_placement_group
 from .actors.ray_keepalive import ray_get_with_model_actor_supervisor_keepalive
 from .sampling_backend import actor_name_for_sampling_base_model
 logger = logging.getLogger(__name__)
@@ -490,163 +489,37 @@ def _is_capacity_block_error(exc: BaseException) -> bool:
     )
 
 
-def _sglang_reclaim_training_placement_enabled() -> bool:
-    raw = os.environ.get("MINT_SGLANG_RECLAIM_TRAINING_PLACEMENT_ON_LAUNCH")
-    if raw is None:
-        return True
-    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _training_actor_and_pg_names_for_model(
-    model_name: str,
-    *,
-    namespace: str,
-) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    actor_to_pg_names: dict[str, list[str]] = {}
-
-    def add_entry(actor_name: str | None, *pg_names: str | None) -> None:
-        if not actor_name:
-            return
-        existing = actor_to_pg_names.setdefault(actor_name, [])
-        for pg_name in pg_names:
-            if pg_name and pg_name not in existing:
-                existing.append(pg_name)
-
-    try:
-        from .training.megatron.megatron_distributed import (
-            _make_megatron_actor_name,
-            _make_megatron_pg_name,
-        )
-
-        actor_name = _make_megatron_actor_name(model_name)
-        add_entry(
-            actor_name,
-            f"{actor_name}_pg",
-            _make_megatron_pg_name(model_name, namespace=namespace),
-        )
-    except Exception:
-        pass
-    try:
-        from .training.bumblebee.bumblebee_distributed import (
-            _make_bumblebee_actor_name,
-            _make_bumblebee_pg_name,
-        )
-
-        actor_name = _make_bumblebee_actor_name(model_name)
-        add_entry(
-            actor_name,
-            f"{actor_name}_pg",
-            _make_bumblebee_pg_name(model_name, namespace=namespace),
-        )
-    except Exception:
-        pass
-    return tuple((actor_name, tuple(pg_names)) for actor_name, pg_names in actor_to_pg_names.items())
-
-
-def _reclaim_same_model_training_resources_for_sglang(
-    *,
-    model_name: str,
-    context: str,
-    namespace: str = PERSISTENT_NAMESPACE,
-) -> dict[str, list[str]]:
-    if not _sglang_reclaim_training_placement_enabled():
-        return {"killed_actor_names": [], "removed_placement_group_names": []}
-
-    killed_actor_names: list[str] = []
-    removed_pg_names: list[str] = []
-    for actor_name, pg_names in _training_actor_and_pg_names_for_model(model_name, namespace=namespace):
-        try:
-            actor = ray.get_actor(actor_name, namespace=namespace)
-        except ValueError:
-            actor = None
-        except Exception as exc:
-            logger.warning(
-                "SGLang launch could not inspect same-model training actor actor=%s namespace=%s context=%s error_type=%s error=%s",
-                actor_name,
-                namespace,
-                context,
-                type(exc).__name__,
-                exc,
-            )
-            actor = None
-        if actor is not None:
-            try:
-                ray_kill.kill(
-                    actor,
-                    reason="sglang_launch_same_model_training_preempt",
-                    actor_name=actor_name,
-                    namespace=namespace,
-                    no_restart=True,
-                    verify_absent=True,
-                )
-                killed_actor_names.append(actor_name)
-            except Exception as exc:
-                logger.warning(
-                    "SGLang launch failed to preempt same-model training actor actor=%s namespace=%s context=%s error_type=%s error=%s",
-                    actor_name,
-                    namespace,
-                    context,
-                    type(exc).__name__,
-                    exc,
-                )
-
-        for pg_name in pg_names:
-            try:
-                if remove_named_placement_group(pg_name, namespace=namespace):
-                    removed_pg_names.append(pg_name)
-            except Exception as exc:
-                logger.warning(
-                    "SGLang launch failed to remove same-model training placement group actor=%s pg=%s namespace=%s context=%s error_type=%s error=%s",
-                    actor_name,
-                    pg_name,
-                    namespace,
-                    context,
-                    type(exc).__name__,
-                    exc,
-                )
-
-    if killed_actor_names or removed_pg_names:
-        logger.warning(
-            "SGLang launch reclaimed same-model training resources model=%s context=%s actors=%s placement_groups=%s",
-            model_name,
-            context,
-            sorted(set(killed_actor_names)),
-            sorted(set(removed_pg_names)),
-        )
-    return {
-        "killed_actor_names": sorted(set(killed_actor_names)),
-        "removed_placement_group_names": sorted(set(removed_pg_names)),
-    }
-
-
-def _assert_sglang_node_ip_capacity_with_training_reclaim(
+def _assert_sglang_node_ip_capacity(
     *,
     model_name: str,
     required_gpus_by_node_ip: dict[str, int],
     context: str,
 ) -> None:
+    """Assert the node(s) can host the SGLang sampler without evicting a live trainer.
+
+    The SGLang sampler is placed on its own GPUs and must co-reside with any
+    same-model trainer, mirroring the production topology (e.g. mint-worker-0
+    hosting 30B vLLM + 30B Megatron). We never tear down a live training actor to
+    free GPU: doing so corrupts in-flight multi-step RL sessions (see #770). When
+    the node genuinely cannot co-host both engines we fail closed here with an
+    actionable capacity error instead of preempting the trainer.
+    """
     try:
         assert_node_ip_capacity(
             required_gpus_by_node_ip=required_gpus_by_node_ip,
             context=context,
         )
-        return
     except Exception as exc:
         if not _is_capacity_block_error(exc):
             raise
-        first_error = exc
-
-    reclaimed = _reclaim_same_model_training_resources_for_sglang(
-        model_name=model_name,
-        context=context,
-        namespace=PERSISTENT_NAMESPACE,
-    )
-    if not (reclaimed["killed_actor_names"] or reclaimed["removed_placement_group_names"]):
-        raise first_error
-    assert_node_ip_capacity(
-        required_gpus_by_node_ip=required_gpus_by_node_ip,
-        context=context,
-    )
+        raise RuntimeError(
+            f"{context}: insufficient GPU capacity to launch the SGLang sampler "
+            f"({required_gpus_by_node_ip}) alongside any same-model trainer already "
+            "resident on the node. The SGLang backend does not preempt live training "
+            "actors to free GPU (that would corrupt in-flight RL sessions); size the "
+            "node/topology so the trainer and sampler co-reside on disjoint GPUs "
+            "(see issue #770)."
+        ) from exc
 
 
 def _assert_single_node_sglang_schedulable(*, required_gpus: int, context: str) -> None:
@@ -726,7 +599,7 @@ class SGLangInferenceEngine:
     async def _launch_single_node_actor(self, *, plan: _SGLangPlacementPlan, max_concurrency: int) -> Any:
         total_gpus = int(plan.total_gpus)
         if plan.mode == "single_pinned":
-            _assert_sglang_node_ip_capacity_with_training_reclaim(
+            _assert_sglang_node_ip_capacity(
                 model_name=self.model_name,
                 required_gpus_by_node_ip=plan.required_gpus_by_node_ip(),
                 context=f"single_node_sglang model={self.model_name!r} actor={self.actor_name!r}_pin",
@@ -787,7 +660,7 @@ class SGLangInferenceEngine:
             )
         if not plan.node_gpus:
             raise RuntimeError(f"SGLang multi-node placement is empty for model {self.model_name}")
-        _assert_sglang_node_ip_capacity_with_training_reclaim(
+        _assert_sglang_node_ip_capacity(
             model_name=self.model_name,
             required_gpus_by_node_ip=plan.required_gpus_by_node_ip(),
             context=f"multinode_sglang model={self.model_name!r} actor={self.actor_name!r}",
