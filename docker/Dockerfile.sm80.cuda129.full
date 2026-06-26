@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   rsync \
   build-essential \
   ninja-build \
-  python3.12-venv \
+  software-properties-common \
   ibverbs-providers \
   ibverbs-utils \
   libibverbs-dev \
@@ -49,7 +49,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   strace \
   gdb \
   htop \
-  && rm -rf /var/lib/apt/lists/*
+  && add-apt-repository -y ppa:deadsnakes/ppa \
+  && apt-get update && apt-get install -y --no-install-recommends \
+  python3.13 \
+  python3.13-venv \
+  python3.13-dev \
+  && rm -rf /var/lib/apt/lists/* \
+  && ln -sf /usr/bin/python3.13 /usr/local/bin/python3 \
+  && ln -sf /usr/bin/python3.13 /usr/local/bin/python
 
 # ─── SSH ────────────────────────────────────────────────────────────
 RUN mkdir -p /run/sshd && \
@@ -72,7 +79,7 @@ RUN python -m pip install --no-cache-dir --upgrade \
   wheel
 
 # ─── CUDA paths ────────────────────────────────────────────────────
-ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.13/dist-packages/torch/lib:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:${LD_LIBRARY_PATH}"
 ENV CUDA_HOME="/usr/local/cuda"
 ENV NCCL_IB_DISABLE=0
 ENV NCCL_NET_GDR_LEVEL=2

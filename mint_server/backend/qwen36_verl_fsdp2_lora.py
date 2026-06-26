@@ -40,7 +40,14 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def is_qwen36_model(model: str | None) -> bool:
-    return "qwen3.6-27b" in str(model or "").lower()
+    """Match all Qwen3.6 models (dense 27B and MoE 35B-A3B).
+
+    Used for vLLM isolated stack selection (qwen36-vllm-deps / vLLM 0.23)
+    and HF snapshot path resolution.  The training-backend dispatch is
+    handled separately by ``_uses_verl_fsdp2_lora_backend`` (dense only)
+    and ``_uses_distributed_training_backend`` (MoE via bumblebee).
+    """
+    return "qwen3.6" in str(model or "").lower()
 
 
 def qwen36_model_path_override(model: str | None) -> str | None:

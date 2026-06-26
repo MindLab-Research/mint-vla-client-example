@@ -34,7 +34,7 @@ from mint_server.observability.logging_context import (
     traced_async_from_traceparent,
 )
 from mint_server.ray.ray_utils import init_ray
-from mint_server.ray.runtime_env import join_pythonpath, sanitize_worker_pythonpath
+from mint_server.ray.runtime_env import join_pythonpath, sanitize_worker_pythonpath, split_pythonpath
 
 import mint_server.backend.ray_cluster.ray_kill as ray_kill
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
@@ -755,6 +755,7 @@ def _create_mint_vllm_multinode_actor(
             )
 
             self.engine: Any = None
+
             self._initialized = False
             self._rw_lock = _AsyncRWLock()
             self._lock_mode = os.environ.get("MINT_VLLM_ENGINE_LOCK_MODE", "rw").strip().lower()
@@ -1160,11 +1161,38 @@ def _create_mint_vllm_multinode_actor(
             # include per-iteration token and executor timing signals.
             install_vllm_iteration_observability_patches()
 
-            # Create engine - vLLM will spawn Ray workers across nodes
-            self.engine = AsyncLLMEngine.from_engine_args(
-                engine_args,
-                stat_loggers=[make_vllm_stats_logger_factory(self._vllm_stats_observer)],
+            # Redirect stdout/stderr fd to a PFS log file before vLLM engine
+            # creation.  vLLM spawns EngineCore as a multiprocessing.Process;
+            # fork inherits the redirected file descriptors, so the subprocess's
+            # stdout/stderr (including Python tracebacks and C-level errors)
+            # land on PFS where the dev driver can read them.  After init we
+            # restore the parent's fds — the already-running subprocess keeps
+            # writing to the PFS file because it inherited the fd at fork time.
+            _vllm_log_path = os.path.join(
+                os.path.dirname(os.environ.get("MINT_LOG_FILE", "/tmp/mint_server.log")),
+                f"vllm-subprocess-{str(self.model_path or 'unknown').replace('/', '_').replace('.', '_')}.log",
             )
+            _saved_stdout_fd = os.dup(1)
+            _saved_stderr_fd = os.dup(2)
+            try:
+                os.makedirs(os.path.dirname(_vllm_log_path), exist_ok=True)
+                _vllm_log_fd = os.open(
+                    _vllm_log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644,
+                )
+                os.dup2(_vllm_log_fd, 1)
+                os.dup2(_vllm_log_fd, 2)
+                os.close(_vllm_log_fd)
+
+                # Create engine - vLLM will spawn Ray workers across nodes
+                self.engine = AsyncLLMEngine.from_engine_args(
+                    engine_args,
+                    stat_loggers=[make_vllm_stats_logger_factory(self._vllm_stats_observer)],
+                )
+            finally:
+                os.dup2(_saved_stdout_fd, 1)
+                os.dup2(_saved_stderr_fd, 2)
+                os.close(_saved_stdout_fd)
+                os.close(_saved_stderr_fd)
             try:
                 info = await self.get_kv_debug_info()
                 capacity = int(info.get("kv_cache_capacity_tokens") or 0)
@@ -2750,21 +2778,30 @@ class MultiNodeInferenceEngine:
             qwen36_flash_attn = os.path.join(qwen36_vllm_deps, "flash_attn_build")
 
             if _is_qwen36 and os.path.isdir(qwen36_vllm_deps):
-                # Use isolated vLLM 0.19 + torch 2.10 stack.
+                # Use isolated vLLM 0.23 + torch 2.11 stack.
                 # Also prepend qwen36-deps (transformers v5) so vLLM can
                 # inspect the qwen3_5 model architecture.
                 qwen36_training_deps = os.environ.get(
                     "MINT_QWEN36_DEPS_PATH",
                     "/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/qwen36-deps",
                 )
+                # vLLM 0.23 bundles its own flash_attn (vllm_flash_attn with
+                # abi3 .so).  The standalone flash_attn from
+                # MINT_ACTOR_EXTRA_PYTHONPATH is compiled for cp312 and will
+                # crash on Python 3.13.  Filter it out of the worker PYTHONPATH.
+                _sanitized_pfs = sanitize_worker_pythonpath(
+                    PFS_PYTHONPATH,
+                    env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
+                )
+                _sanitized_pfs = join_pythonpath(
+                    p for p in split_pythonpath(_sanitized_pfs)
+                    if "flash-attn" not in p and "flash_attn" not in p
+                )
                 worker_pythonpath = join_pythonpath(
                     qwen36_vllm_deps,
                     qwen36_flash_attn if os.path.isdir(qwen36_flash_attn) else None,
                     qwen36_training_deps,
-                    sanitize_worker_pythonpath(
-                        PFS_PYTHONPATH,
-                        env_root=os.environ.get("PFS_RUNTIME_ENV_ROOT"),
-                    ),
+                    _sanitized_pfs,
                 )
                 # nvidia libs from qwen36-vllm-deps must take priority over system
                 # vLLM 0.23 uses nvidia/cu13/lib (unified), nvidia/cudnn/lib,
@@ -2799,7 +2836,7 @@ class MultiNodeInferenceEngine:
                 # monkey-patches (set_moe_parameters, weight key mapping) installed
                 # in the actor's __init__.  spawn creates a fresh Python process
                 # that re-imports vLLM without the patches.
-                "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+                "VLLM_WORKER_MULTIPROC_METHOD": "fork",
                 "HF_HOME": "/vePFS-Mindverse/share/huggingface",
                 "HF_HUB_OFFLINE": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",

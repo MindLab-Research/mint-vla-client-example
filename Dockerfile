@@ -28,11 +28,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   git \
   build-essential \
   ninja-build \
-  python3.12-venv \
+  software-properties-common \
   ibverbs-providers \
   ibverbs-utils \
   libibverbs-dev \
-  && rm -rf /var/lib/apt/lists/*
+  && add-apt-repository -y ppa:deadsnakes/ppa \
+  && apt-get update && apt-get install -y --no-install-recommends \
+  python3.13 \
+  python3.13-venv \
+  python3.13-dev \
+  && rm -rf /var/lib/apt/lists/* \
+  && ln -sf /usr/bin/python3.13 /usr/local/bin/python3 \
+  && ln -sf /usr/bin/python3.13 /usr/local/bin/python
 
 # Virtualenv + tooling.
 # Use `--system-site-packages` so we can import torch/vLLM/DeepEP from the base image.
@@ -49,7 +56,7 @@ RUN python -m pip install --no-cache-dir --upgrade \
 
 # Ensure torch shared libs are visible to CUDA extensions (flash-attn, transformer_engine, etc.).
 # Prefer the system-site-packages torch path from the base image.
-ENV LD_LIBRARY_PATH="/usr/local/lib/python3.12/dist-packages/torch/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+ENV LD_LIBRARY_PATH="/usr/local/lib/python3.13/dist-packages/torch/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
 
 # Verify torch + DeepEP + vLLM from the base image.
 # NOTE: DeepEP's compiled extension is ABI-sensitive to torch; keep them consistent.

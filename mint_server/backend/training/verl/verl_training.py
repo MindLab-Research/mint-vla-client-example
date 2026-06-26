@@ -33,6 +33,7 @@ from mint_server.backend.core.training_backend_selection import (
     _DISTRIBUTED_MOE_BACKENDS,
     _is_qwen3_30b_model,
     _is_qwen35_model,
+    _is_qwen36_moe_model,
     _select_moe_training_backend,
     _uses_distributed_training_backend,
 )
@@ -61,11 +62,14 @@ def _is_qwen36_model(model: str | None) -> bool:
 
         return is_qwen36_model(model)
     except Exception:
-        return "qwen3.6-27b" in str(model or "").lower()
+        return "qwen3.6" in str(model or "").lower()
 
 
 def _uses_verl_fsdp2_lora_backend(requested_model: str | None) -> bool:
     if _is_qwen36_model(requested_model):
+        # Qwen3.6 MoE models (e.g. 35B-A3B) use bumblebee, not verl_fsdp2_lora.
+        if _uses_distributed_training_backend(requested_model):
+            return False
         return True
     try:
         from mint_server.backend.core.model_registry import get_model_config
@@ -2321,6 +2325,8 @@ class VerlTrainingEngine:
             train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 4, 1, 1
         elif _is_qwen35_model(model_key):
             train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 2, 1, 1
+        elif _is_qwen36_moe_model(model_key):
+            train_tp, train_pp, train_ep, train_cp, train_etp = 4, 1, 4, 1, 1
         else:
             train_tp, train_pp, train_ep, train_cp, train_etp = get_training_parallelism(model_key)
         return DistributedConfig(

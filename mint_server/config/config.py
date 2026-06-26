@@ -361,6 +361,9 @@ def actor_runtime_env_vars(
         "MINT_MODEL_CONFIG_OVERRIDES_JSON",
         "MINT_CHECKPOINT_DIR",
         "MINT_RUNTIME_CHECKPOINT_DIR",
+        "MINT_LOG_FILE",
+        "MINT_LOG_MAX_BYTES",
+        "MINT_LOG_BACKUP_COUNT",
     ):
         if not include_ray_attach_hints and key in _RAY_ATTACH_RUNTIME_ENV_KEYS:
             continue

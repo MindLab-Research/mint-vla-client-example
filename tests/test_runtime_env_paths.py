@@ -427,7 +427,7 @@ def test_partition_host_requirements_keeps_only_torch_on_torch_backend():
 def test_create_host_venv_installs_torch_backend_and_generic_requirements_separately(tmp_path, monkeypatch):
     from scripts import build_runtime_env as build_runtime_env
 
-    base_python = tmp_path / "base-python" / "bin" / "python3.12"
+    base_python = tmp_path / "base-python" / "bin" / "python3.13"
     base_python.parent.mkdir(parents=True, exist_ok=True)
     base_python.write_text("", encoding="utf-8")
     host_venv = tmp_path / "host-venv"
@@ -586,7 +586,7 @@ def test_materialize_base_python_uses_current_uv_find_args(tmp_path, monkeypatch
     from scripts import build_runtime_env as build_runtime_env
 
     bootstrap_root = tmp_path / "bootstrap-root"
-    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python = bootstrap_root / "bin" / "python3.13"
     bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
     bootstrap_python.write_text("", encoding="utf-8")
     seen: list[list[str]] = []
@@ -602,7 +602,7 @@ def test_materialize_base_python_uses_current_uv_find_args(tmp_path, monkeypatch
     materialized = build_runtime_env._materialize_base_python("3.12.14", tmp_path / "runtime" / "base-python")
 
     assert seen == [["/tmp/fake-uv", "python", "find", "--managed-python", "3.12.14"]]
-    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.13"
     assert materialized.exists()
 
 
@@ -610,7 +610,7 @@ def test_materialize_base_python_reuses_current_base_executable(tmp_path, monkey
     from scripts import build_runtime_env as build_runtime_env
 
     bootstrap_root = tmp_path / "bootstrap-root"
-    bootstrap_python = bootstrap_root / "bin" / "python3.12"
+    bootstrap_python = bootstrap_root / "bin" / "python3.13"
     bootstrap_python.parent.mkdir(parents=True, exist_ok=True)
     bootstrap_python.write_text("", encoding="utf-8")
 
@@ -623,7 +623,7 @@ def test_materialize_base_python_reuses_current_base_executable(tmp_path, monkey
             {
                 "version_info": (3, 12, 13),
                 "_base_executable": str(bootstrap_python),
-                "executable": str(tmp_path / "venv" / "bin" / "python3.12"),
+                "executable": str(tmp_path / "venv" / "bin" / "python3.13"),
             },
         )(),
     )
@@ -635,7 +635,7 @@ def test_materialize_base_python_reuses_current_base_executable(tmp_path, monkey
 
     materialized = build_runtime_env._materialize_base_python("3.12.13", tmp_path / "runtime" / "base-python")
 
-    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.12"
+    assert materialized == tmp_path / "runtime" / "base-python" / "bin" / "python3.13"
     assert materialized.exists()
 
 
@@ -715,14 +715,14 @@ def test_copy_runtime_env_rewrites_embedded_runtime_metadata(tmp_path, monkeypat
 
     src = tmp_path / "src"
     _materialize_runtime_env_with_real_host_python(src)
-    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
     (src / "payload.txt").write_text("ok", encoding="utf-8")
     dst = tmp_path / "dst"
     monkeypatch.setattr(
         build_runtime_env.subprocess,
         "check_output",
         lambda *args, **kwargs: str(
-            dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages"
+            dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.13" / "site-packages"
         ),
     )
 
@@ -731,7 +731,7 @@ def test_copy_runtime_env_rewrites_embedded_runtime_metadata(tmp_path, monkeypat
     manifest = json.loads((dst / TIER_GPU_RL / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["env_root"] == str(dst / TIER_GPU_RL)
     assert manifest["host_python"] == str(dst / TIER_GPU_RL / "host-venv" / "bin" / "python")
-    pth = dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages" / "mint_runtime_env.pth"
+    pth = dst / TIER_GPU_RL / "host-venv" / "lib" / "python3.13" / "site-packages" / "mint_runtime_env.pth"
     assert str(dst / TIER_GPU_RL / "site-packages") in pth.read_text(encoding="utf-8")
     assert str(src / TIER_GPU_RL / "site-packages") not in pth.read_text(encoding="utf-8")
     assert f"export PFS_RUNTIME_ENV_ROOT={dst}" in (dst / "activate_runtime_env.sh").read_text(encoding="utf-8")
@@ -745,7 +745,7 @@ def test_mint_runtime_cli_copies_and_promotes(tmp_path, monkeypatch, capsys):
 
     src = tmp_path / "prod-source"
     _materialize_runtime_env_with_real_host_python(src)
-    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.12" / "site-packages").mkdir(parents=True)
+    (src / TIER_GPU_RL / "host-venv" / "lib" / "python3.13" / "site-packages").mkdir(parents=True)
     monkeypatch.setattr(
         build_runtime_env.subprocess,
         "check_output",
@@ -758,7 +758,7 @@ def test_mint_runtime_cli_copies_and_promotes(tmp_path, monkeypatch, capsys):
             / TIER_GPU_RL
             / "host-venv"
             / "lib"
-            / "python3.12"
+            / "python3.13"
             / "site-packages"
         ),
     )
@@ -1084,8 +1084,8 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
                     str(Path.cwd() / "scripts"),
                     "/home/yiwen/.local/lib/python3.14/site-packages",
                     "/home/yiwen/mint_project/mindlab-toolkit/src",
-                    "/opt/host-venv/lib/python3.12",
-                    "/usr/lib/python3.12",
+                    "/opt/host-venv/lib/python3.13",
+                    "/usr/lib/python3.13",
                 ],
                 "prefix": "/opt/host-venv",
                 "exec_prefix": "/opt/host-venv",
@@ -1101,8 +1101,8 @@ def test_set_exact_pythonpath_removes_local_checkout_masking(monkeypatch):
     assert str(Path.cwd() / "scripts") not in run_server.sys.path
     assert "/home/yiwen/.local/lib/python3.14/site-packages" not in run_server.sys.path
     assert "/home/yiwen/mint_project/mindlab-toolkit/src" not in run_server.sys.path
-    assert "/opt/host-venv/lib/python3.12" in run_server.sys.path
-    assert "/usr/lib/python3.12" in run_server.sys.path
+    assert "/opt/host-venv/lib/python3.13" in run_server.sys.path
+    assert "/usr/lib/python3.13" in run_server.sys.path
 
 
 def test_actor_runtime_env_vars_forwards_vllm_envs(tmp_path):

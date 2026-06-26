@@ -475,7 +475,7 @@ def test_openpi_fast_runtime_build_env_does_not_inherit_parent_pythonpath(
     runtime_env = configure_runtime_env()
     monkeypatch.setenv(
         "PYTHONPATH",
-        "/vePFS-Mindverse/share/code/mint-server-auth/.venv31213/lib/python3.12/site-packages",
+        "/vePFS-Mindverse/share/code/mint-server-auth/.venv31213/lib/python3.13/site-packages",
     )
 
     spec = OpenPIFastRuntimeSpec.from_env()

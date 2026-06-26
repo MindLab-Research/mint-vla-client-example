@@ -375,7 +375,7 @@ def test_issue_627_volcano_sdk_import_falls_back_to_host_venv_site_packages(
     sdk = _install_fake_volcano_sdk(monkeypatch)
     monkeypatch.delitem(sys.modules, "volcenginesdkmlplatform20240701")
     runtime_root = tmp_path / "runtime"
-    host_site = tmp_path / "runtime" / "host-venv" / "lib" / "python3.12" / "site-packages"
+    host_site = tmp_path / "runtime" / "host-venv" / "lib" / "python3.13" / "site-packages"
     host_site.mkdir(parents=True)
     (runtime_root / "manifest.json").write_text(
         json.dumps(

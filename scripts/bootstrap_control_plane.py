@@ -129,7 +129,15 @@ async def _bootstrap_async(args: argparse.Namespace) -> dict:
             "actor_name": cron_snapshot.get("actor_name"),
             "epoch_id": cron_snapshot.get("epoch_id"),
         },
+        "model_actor_supervisor": {
+            "reconcile_loop_running": supervisor_snapshot.get("reconcile_loop_running", False),
+            "desired_total": supervisor_snapshot.get("desired_total", 0),
+            "managed_total": supervisor_snapshot.get("managed_total", 0),
+            "skipped": supervisor_snapshot.get("skipped", False),
+        },
     }
+
+    return summary
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -65,9 +65,11 @@ def split_pythonpath(raw: str | None) -> list[str]:
     return [part for part in str(raw).split(":") if part]
 
 
-def join_pythonpath(*parts: str | Sequence[str]) -> str:
+def join_pythonpath(*parts: str | Sequence[str] | None) -> str:
     flat: list[str] = []
     for part in parts:
+        if part is None:
+            continue
         if isinstance(part, str):
             flat.extend(split_pythonpath(part))
         else:

@@ -470,17 +470,25 @@ def _is_qwen35_model(model: str | None) -> bool:
     return "qwen3.5-27b" in str(model or "").lower()
 
 
+def _is_qwen36_moe_model(model: str | None) -> bool:
+    return "qwen3.6-35b" in str(model or "").lower()
+
+
 def _bumblebee_model_name_for_base_model(base_model: str | None) -> str:
     configured = os.environ.get("MINT_BUMBLEBEE_MODEL_NAME", "").strip()
     if configured:
         return configured
-    if _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+    model_key = _model_key_from_base_model(str(base_model or ""))
+    if _is_qwen35_model(model_key):
         return "qwen3_5"
+    if _is_qwen36_moe_model(model_key):
+        return "qwen3_5"  # same bumblebee module; lite2 impl handles MoE
     return "qwen3_moe"
 
 
 def _bumblebee_default_megatron_lm_path(base_model: str | None) -> str | None:
-    if not _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+    model_key = _model_key_from_base_model(str(base_model or ""))
+    if not (_is_qwen35_model(model_key) or _is_qwen36_moe_model(model_key)):
         return None
     runtime_root = os.environ.get("PFS_RUNTIME_ENV_ROOT", "").strip()
     if runtime_root:
@@ -491,11 +499,12 @@ def _bumblebee_default_megatron_lm_path(base_model: str | None) -> str | None:
 
 
 def _bumblebee_runtime_env_defaults(base_model: str | None) -> dict[str, str]:
-    if not _is_qwen35_model(_model_key_from_base_model(str(base_model or ""))):
+    model_key = _model_key_from_base_model(str(base_model or ""))
+    if not (_is_qwen35_model(model_key) or _is_qwen36_moe_model(model_key)):
         return {}
     defaults = {
         "MINT_BUMBLEBEE_MODEL_NAME": "qwen3_5",
-        "MINT_BUMBLEBEE_IMPL": "lite",
+        "MINT_BUMBLEBEE_IMPL": "lite2" if _is_qwen36_moe_model(model_key) else "lite",
         "MINT_BUMBLEBEE_OPTIMIZER": "mc_full",
     }
     megatron_lm_path = (

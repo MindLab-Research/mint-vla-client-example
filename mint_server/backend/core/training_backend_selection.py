@@ -34,6 +34,10 @@ def _is_qwen35_model(model: str | None) -> bool:
     return "qwen3.5-27b" in str(model or "").lower()
 
 
+def _is_qwen36_moe_model(model: str | None) -> bool:
+    return "qwen3.6-35b" in str(model or "").lower()
+
+
 def _uses_distributed_training_backend(requested_model: str | None) -> bool:
     try:
         from mint_server.backend.core.model_registry import get_model_config
@@ -54,6 +58,8 @@ def _select_moe_training_backend(requested_model: str | None) -> str:
         env_name = "MINT_QWEN3_235B_TRAINING_BACKEND"
     elif _is_qwen35_model(requested_model):
         env_name = "MINT_QWEN35_TRAINING_BACKEND"
+    elif _is_qwen36_moe_model(requested_model):
+        env_name = "MINT_QWEN36_TRAINING_BACKEND"
     if env_name and os.environ.get(env_name):
         return _canonical_moe_training_backend(os.environ.get(env_name))
     return _canonical_moe_training_backend(os.environ.get("MINT_MOE_TRAINING_BACKEND"))

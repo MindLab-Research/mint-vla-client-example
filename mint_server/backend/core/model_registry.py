@@ -267,6 +267,24 @@ MODEL_CONFIGS = {
         supported_modalities=("text",),
         training_backend="verl_fsdp2_lora",
     ),
+    # Qwen3.6 35B-A3B MoE (256 experts, 8 active per token, hybrid linear+full attention)
+    # Inference: TP=4 via isolated vLLM 0.23 stack (Qwen3NextForCausalLM)
+    # Training: bumblebee (qwen3_5/lite2 impl), TP/EP set in _build_bumblebee_distributed_config
+    "Qwen/Qwen3.6-35B-A3B": ModelConfig(
+        num_parameters=35.0,
+        is_moe=True, inference_tp=4, inference_dp=1, train_tp=4, train_ep=4,
+        max_model_len=4096,
+        max_num_seqs=704,
+        max_num_batched_tokens=1024,
+        gpu_memory_utilization=0.90,
+        max_loras=21,
+        max_cpu_loras=210,
+        max_lora_rank=64,
+        gradient_checkpointing=True,
+        vllm_engine="async",
+        vllm_distributed_executor_backend="mp",
+        supported_modalities=("text",),
+    ),
     # MoE models - Qwen3 30B variants (40K context per model config)
     # Inference: TP=4, DP=1 (4 GPUs) - EP not supported in vLLM LoRA
     # Training: TP=4, EP=1 (4 GPUs) - reduced from TP=4,EP=2 for smaller clusters

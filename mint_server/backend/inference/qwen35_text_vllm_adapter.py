@@ -19,11 +19,16 @@ from typing import Any
 logger = structlog.get_logger(__name__)
 
 QWEN35_MODEL_TYPE = "qwen3_5"
+QWEN35_MOE_MODEL_TYPE = "qwen3_5_moe"
 QWEN35_TEXT_MODEL_TYPE = "qwen3_5_text"
+QWEN35_MOE_TEXT_MODEL_TYPE = "qwen3_5_moe_text"
 QWEN35_VLLM_ARCHITECTURE = "Qwen3NextForCausalLM"
 QWEN35_TEXT_ONLY_SHIM_MARKER = "mint_qwen35_text_only_shim"
 QWEN35_BUMBLEBEE_TEXT_ONLY_SHIM_MARKER = "bumblebee_qwen35_text_only_shim"
 QWEN35_SUPPORTED_MODALITY = "text_only"
+
+_QWEN35_MODEL_TYPES = frozenset({QWEN35_MODEL_TYPE, QWEN35_MOE_MODEL_TYPE})
+_QWEN35_TEXT_MODEL_TYPES = frozenset({QWEN35_TEXT_MODEL_TYPE, QWEN35_MOE_TEXT_MODEL_TYPE})
 
 _QWEN35_LINEAR_ATTN_SPLIT_RE = re.compile(
     r"^(?P<prefix>.+\.linear_attn)\."
@@ -163,13 +168,18 @@ def is_qwen35_config(raw_config: dict[str, Any] | None) -> bool:
 def _qwen35_text_config(raw_config: dict[str, Any] | None) -> dict[str, Any] | None:
     if not isinstance(raw_config, dict):
         return None
-    if raw_config.get("model_type") != QWEN35_MODEL_TYPE:
+    if raw_config.get("model_type") not in _QWEN35_MODEL_TYPES:
         return None
     text_config = raw_config.get("text_config")
     if not isinstance(text_config, dict):
         return None
-    if text_config.get("model_type") != QWEN35_TEXT_MODEL_TYPE:
+    if text_config.get("model_type") not in _QWEN35_TEXT_MODEL_TYPES:
         return None
+    # MoE models (e.g. Qwen3.6-35B-A3B) don't carry intermediate_size in
+    # text_config; default to moe_intermediate_size so validation passes.
+    # vLLM uses moe_intermediate_size for MoE layers, not intermediate_size.
+    if "intermediate_size" not in text_config and text_config.get("num_experts"):
+        text_config = {**text_config, "intermediate_size": text_config.get("moe_intermediate_size", 0)}
     return text_config
 
 
@@ -305,13 +315,14 @@ def qwen35_text_as_qwen3next_config(raw_config: dict[str, Any]) -> dict[str, Any
         rope_parameters.pop("mrope_interleaved", None)
         config["rope_parameters"] = rope_parameters
 
-    # Qwen3.5-27B uses the Qwen3Next hybrid attention stack, but it is a dense
-    # model. Current vLLM Qwen3Next code expects MoE metadata unless these are
-    # explicitly dense/no-MoE.
-    config["num_experts"] = 0
-    config["num_experts_per_tok"] = 0
-    config["moe_intermediate_size"] = 0
-    config["shared_expert_intermediate_size"] = 0
+    # Dense models (e.g. Qwen3.5-27B) need MoE fields zeroed so vLLM's
+    # Qwen3NextForCausalLM treats them as no-MoE. MoE models (e.g.
+    # Qwen3.6-35B-A3B) carry these fields in text_config; preserve them.
+    if int(config.get("num_experts", 0)) == 0:
+        config["num_experts"] = 0
+        config["num_experts_per_tok"] = 0
+        config["moe_intermediate_size"] = 0
+        config["shared_expert_intermediate_size"] = 0
     config.setdefault("decoder_sparse_step", 1)
     config.setdefault("mlp_only_layers", [])
     config.setdefault("norm_topk_prob", True)
@@ -335,7 +346,7 @@ def materialize_qwen35_text_vllm_config(
     raw_config = read_hf_config_json(config_source_dir)
     if not isinstance(raw_config, dict):
         return None
-    if raw_config.get("model_type") != QWEN35_MODEL_TYPE:
+    if raw_config.get("model_type") not in _QWEN35_MODEL_TYPES:
         return None
     vllm_config = qwen35_text_as_qwen3next_config(raw_config)
     digest = hashlib.sha1(
@@ -375,82 +386,21 @@ def is_qwen35_text_only_shim_model(model: Any) -> bool:
 
 
 def install_vllm_qwen35_text_only_adapter_patches() -> None:
-    """Install vLLM patches gated by the text-only shim marker."""
-
-    patch_vllm_qwen3next_dense_moe_metadata()
-    patch_vllm_qwen35_language_model_weight_prefix()
+    """No-op: weight mapping and dense-MoE handling are now handled by
+    ``MintQwen3NextForCausalLM`` (registered via ``.pth`` file in
+    ``qwen36-vllm-deps``).  See ``mint_server/backend/inference/mint_vllm_models.py``.
+    """
+    pass
 
 
 def patch_vllm_qwen3next_dense_moe_metadata() -> None:
-    """Allow dense Qwen3Next initialization only for Qwen3.5 text shim configs."""
-
-    try:
-        import vllm.model_executor.models.qwen3_next as qwen3_next
-    except Exception:
-        logger.debug("Unable to import vLLM qwen3_next for dense metadata patch", exc_info=True)
-        return
-
-    mixin = getattr(qwen3_next, "QwenNextMixtureOfExperts", None)
-    original = getattr(mixin, "set_moe_parameters", None)
-    if not callable(original):
-        logger.debug("vLLM qwen3_next has no QwenNextMixtureOfExperts.set_moe_parameters")
-        return
-    if getattr(original, "_mint_qwen35_text_dense_patch", False):
-        return
-
-    def _set_moe_parameters_allow_qwen35_text_dense(self):  # type: ignore[no-untyped-def]
-        try:
-            return original(self)
-        except RuntimeError as exc:
-            if "No Qwen3Next layer found" not in str(exc):
-                raise
-            if not is_qwen35_text_only_shim_model(self):
-                raise
-            self.expert_weights = []
-            self.moe_layers = []
-            self.num_moe_layers = 0
-            self.num_expert_groups = 0
-            self.num_shared_experts = 0
-            self.num_logical_experts = 0
-            self.num_physical_experts = 0
-            self.num_local_physical_experts = 0
-            self.num_routed_experts = 0
-            self.num_redundant_experts = 0
-
-    _set_moe_parameters_allow_qwen35_text_dense._mint_qwen35_text_dense_patch = True  # type: ignore[attr-defined]
-    assert mixin is not None
-    mixin.set_moe_parameters = _set_moe_parameters_allow_qwen35_text_dense
+    """Deprecated: replaced by MintQwen3NextForCausalLM.set_moe_parameters override."""
+    pass
 
 
 def patch_vllm_qwen35_language_model_weight_prefix() -> None:
-    """Map Qwen3.5 text checkpoint weights onto vLLM Qwen3Next names."""
-
-    try:
-        import vllm.model_executor.models.qwen3_next as qwen3_next
-    except Exception:
-        logger.debug("Unable to import vLLM qwen3_next for Qwen3.5 text weight patch", exc_info=True)
-        return
-
-    def _wrap_load_weights(cls, *, inner_model: bool = False):  # type: ignore[no-untyped-def]
-        if cls is None:
-            return
-        original = getattr(cls, "load_weights", None)
-        if not callable(original):
-            logger.debug("vllm_qwen3_next_class_missing_load_weights", cls=cls)
-            return
-        if getattr(original, "_mint_qwen35_text_weight_patch", False):
-            return
-
-        def _load_weights_with_qwen35_text_adapter(self, weights):  # type: ignore[no-untyped-def]
-            if not is_qwen35_text_only_shim_model(self):
-                return original(self, weights)
-            return original(self, _map_qwen35_text_weights(self.config, weights, inner_model=inner_model))
-
-        _load_weights_with_qwen35_text_adapter._mint_qwen35_text_weight_patch = True  # type: ignore[attr-defined]
-        cls.load_weights = _load_weights_with_qwen35_text_adapter
-
-    _wrap_load_weights(getattr(qwen3_next, "Qwen3NextForCausalLM", None))
-    _wrap_load_weights(getattr(qwen3_next, "Qwen3NextModel", None), inner_model=True)
+    """Deprecated: replaced by MintQwen3NextForCausalLM.load_weights override."""
+    pass
 
 
 def _map_qwen35_text_weights(config: Any, weights: Any, *, inner_model: bool):  # type: ignore[no-untyped-def]

@@ -323,7 +323,7 @@ if [ -z "${MINT_RAY_GCS_ADDRESS:-}" ]; then
   exit 1
 fi
 
-py="${PFS_RUNTIME_ENV_ROOT}/cpu/base-python/bin/python3.12"
+py="${PFS_RUNTIME_ENV_ROOT}/cpu/base-python/bin/python3.13"
 if [ ! -x "${py}" ]; then
   echo "error: runtime python not found: ${py}" >&2
   exit 1

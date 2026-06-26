@@ -385,7 +385,7 @@ def _materialize_base_python(
     if base_python_root.exists():
         shutil.rmtree(base_python_root)
     shutil.copytree(bootstrap_root, base_python_root)
-    materialized_python = base_python_root / "bin" / "python3.12"
+    materialized_python = base_python_root / "bin" / "python3.13"
     if not materialized_python.exists():
         executables = sorted((base_python_root / "bin").glob("python*"))
         if executables:
