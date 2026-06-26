@@ -10,6 +10,7 @@ from mint_server.backend.core.model_registry import get_model_config
 from mint_server.backend.qwen36_verl_fsdp2_lora import (
     QWEN36_MODEL_ID,
     QWEN36_VERL_FSDP2_LORA_BACKEND,
+    _patch_transformers_from_pretrained_key_remap,
     is_qwen36_model,
     qwen36_model_path_override,
 )
@@ -112,3 +113,120 @@ def test_sitecustomize_qwen36_patch_gate(monkeypatch) -> None:
     monkeypatch.setenv("MINT_QWEN36_VERL_FSDP2_LORA_PATCHES", "1")
     module._apply_qwen36_verl_fsdp2_lora_patches()
     assert calls == ["install"]
+
+
+def test_patch_from_pretrained_key_remap_injects_mapping():
+    """Verify _patch_transformers_from_pretrained_key_remap injects key-remapping
+    for Qwen3.6 multimodal checkpoints and is a no-op for normal checkpoints.
+
+    Covers both the HF 5.x API (LoadStateDictConfig + WeightRenaming) and
+    the 4.x API (key_mapping kwarg).  The active path is determined at runtime.
+    """
+    import dataclasses
+    import transformers.modeling_utils as mu
+
+    # Detect API version.
+    LoadStateDictConfig = getattr(mu, "LoadStateDictConfig", None)
+    try:
+        from transformers.core_model_loading import WeightRenaming  # type: ignore[import-not-found]
+    except ImportError:
+        WeightRenaming = None  # type: ignore[assignment, misc]
+
+    is_v5 = LoadStateDictConfig is not None and WeightRenaming is not None
+
+    # Save the real _load_pretrained_model so we can restore it.
+    original = mu.PreTrainedModel._load_pretrained_model
+
+    captured: dict = {}
+
+    if is_v5:
+        # 5.x: _load_pretrained_model is a staticmethod, no cls.
+        def fake_original(model, state_dict, checkpoint_files, load_config, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured["load_config"] = load_config
+            captured["kwargs"] = dict(kwargs)
+            return None
+    else:
+        # 4.x: _load_pretrained_model is a classmethod, first arg is cls.
+        def fake_original(cls, model, state_dict, checkpoint_files, pretrained_model_name_or_path, *args, **kwargs):  # type: ignore[no-untyped-def]
+            captured["kwargs"] = dict(kwargs)
+            return None
+
+    # Install fake_original with the same descriptor type as the original.
+    if is_v5:
+        mu.PreTrainedModel._load_pretrained_model = staticmethod(fake_original)
+    else:
+        mu.PreTrainedModel._load_pretrained_model = classmethod(fake_original)
+
+    def _check_remap_injected():  # type: ignore[no-untyped-def]
+        if is_v5:
+            wm = captured.get("load_config")
+            assert wm is not None, "load_config should be passed"
+            assert wm.weight_mapping is not None, "weight_mapping should be injected"
+            # Verify the WeightRenaming objects exist
+            assert len(wm.weight_mapping) >= 2
+        else:
+            km = captured.get("kwargs", {}).get("key_mapping")
+            assert km is not None, "key_mapping should be injected"
+            assert km[r"^model\.language_model\."] == "model."
+            assert km[r"^language_model\."] == "model."
+
+    def _check_remap_not_injected():  # type: ignore[no-untyped-def]
+        if is_v5:
+            wm = captured.get("load_config")
+            assert wm is not None, "load_config should still be passed"
+            assert getattr(wm, "weight_mapping", None) is None or wm.weight_mapping == [], (
+                "weight_mapping should not be injected for non-Qwen3.6 checkpoint"
+            )
+        else:
+            assert "key_mapping" not in captured.get("kwargs", {}), (
+                "key_mapping should not be injected for non-Qwen3.6 checkpoint"
+            )
+
+    def _call(state_dict, sharded_metadata=None):  # type: ignore[no-untyped-def]
+        captured.clear()
+        if is_v5:
+            assert LoadStateDictConfig is not None  # narrowed by is_v5
+            load_cfg = LoadStateDictConfig(sharded_metadata=sharded_metadata)
+            mu.PreTrainedModel._load_pretrained_model(
+                None, state_dict, None, load_cfg,
+            )
+        else:
+            kwargs = {}
+            if sharded_metadata is not None:
+                kwargs["sharded_metadata"] = sharded_metadata
+            mu.PreTrainedModel._load_pretrained_model(
+                None, state_dict, None, None, **kwargs,
+            )
+
+    try:
+        _patch_transformers_from_pretrained_key_remap()
+
+        # --- Case 1: Qwen3.6 checkpoint keys in state_dict → remapping injected
+        _call({
+            "model.language_model.layers.0.self_attn.q_proj.weight": None,
+            "model.visual.blocks.0.weight": None,
+        })
+        _check_remap_injected()
+
+        # --- Case 2: Normal checkpoint → no remapping injected
+        _call({"model.layers.0.self_attn.q_proj.weight": None})
+        _check_remap_not_injected()
+
+        # --- Case 3: Sharded checkpoint via sharded_metadata → remapping injected
+        _call(
+            None,
+            sharded_metadata={
+                "all_checkpoint_keys": [
+                    "model.language_model.layers.0.weight",
+                    "model.visual.blocks.0.weight",
+                ],
+            },
+        )
+        _check_remap_injected()
+
+        # --- Case 4: Patch is idempotent (re-install is a no-op, wrapper still works)
+        _patch_transformers_from_pretrained_key_remap()
+        _call({"model.language_model.layers.0.weight": None})
+        _check_remap_injected()
+    finally:
+        mu.PreTrainedModel._load_pretrained_model = original

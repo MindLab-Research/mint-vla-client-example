@@ -228,6 +228,207 @@ def _patch_accelerate_init_on_device() -> None:
     accelerate.init_on_device = init_on_device
 
 
+def _patch_transformers_from_pretrained_key_remap() -> None:
+    """Patch HF ``_load_pretrained_model`` to remap Qwen3.6 checkpoint keys.
+
+    Qwen3.6-27B checkpoint stores weights with ``model.language_model.*`` prefix
+    (multimodal format).  The text-only ``Qwen3_5ForCausalLM`` model class expects
+    ``model.*`` prefix.  Without remapping, ~850/1199 weight keys are silently
+    skipped by ``from_pretrained``, leaving parameters on ``meta`` device — the
+    model forward-runs but crashes on backward due to meta/cuda gradient mismatch.
+
+    This patch detects the ``model.language_model.`` prefix in the checkpoint
+    state dict and injects key-remapping rules into HF's loading pipeline so
+    that the ``language_model.`` segment is stripped automatically.
+
+    Visual tower weights (``model.visual.*``) and MTP head weights (``mtp.*``)
+    are not remapped — they fall through as "unexpected keys" and are silently
+    skipped by HF, which is the desired behaviour for text-only training.
+
+    Design note: unlike the vLLM inference path — which now remaps keys
+    per-model-class via ``_map_qwen35_text_weights`` (the old
+    ``patch_vllm_qwen35_language_model_weight_prefix`` is deprecated) — the
+    HF transformers training path has no equivalent per-model hook.
+    ``from_pretrained`` is called deep inside veRL's training loop with no
+    opportunity to inject custom key-remapping at the model class level.  A
+    global monkeypatch of ``_load_pretrained_model`` is therefore the
+    least-invasive way to intercept checkpoint loading.
+
+    HF API compatibility: the ``_load_pretrained_model`` signature changed
+    between transformers 4.x and 5.x.  In 4.x, key remapping is via the
+    ``key_mapping`` kwarg (dict of regex patterns).  In 5.x, it is via
+    ``LoadStateDictConfig.weight_mapping`` (a list of ``WeightRenaming``
+    objects).  This patch detects which API is active at call time and
+    uses the appropriate injection mechanism.
+    """
+    try:
+        import transformers.modeling_utils as mu
+    except Exception:
+        return
+
+    original = getattr(mu.PreTrainedModel, "_load_pretrained_model", None)
+    if original is None:
+        return
+    # In 4.x, _load_pretrained_model is a classmethod (original.__func__ works).
+    # In 5.x, it is a staticmethod (original IS the function, no __func__).
+    original_func = getattr(original, "__func__", original)
+    if _is_marked(original_func, "_from_pretrained_key_remap"):
+        return
+
+    # Detect whether the original is a classmethod (4.x) or staticmethod (5.x).
+    # This determines whether the wrapper receives `cls` as the first argument.
+    _is_classmethod = isinstance(
+        inspect.getattr_static(mu.PreTrainedModel, "_load_pretrained_model"),
+        classmethod,
+    )
+
+    # --- API detection -------------------------------------------------------
+    # 5.x: LoadStateDictConfig (frozen dataclass) + WeightRenaming objects.
+    # 4.x: key_mapping kwarg (dict of regex patterns).
+    try:
+        from transformers.modeling_utils import LoadStateDictConfig
+    except ImportError:
+        LoadStateDictConfig = None  # type: ignore[assignment, misc]
+
+    try:
+        from transformers.core_model_loading import WeightRenaming  # type: ignore[import-not-found]
+    except ImportError:
+        WeightRenaming = None  # type: ignore[assignment, misc]
+
+    _HAS_V5_API = LoadStateDictConfig is not None and WeightRenaming is not None
+
+    # --- Key-mapping definitions --------------------------------------------
+    # 4.x: regex patterns applied via re.subn by HF's _get_key_renaming_mapping.
+    _QWEN36_KEY_MAPPING: dict[str, str] = {
+        r"^model\.language_model\.": "model.",
+        r"^language_model\.": "model.",
+    }
+
+    # 5.x: WeightRenaming objects.  The source_patterns are regex; the dot
+    # in "model.language_model." matches a literal dot (and any other char,
+    # which is harmless in practice).  The target is a literal replacement.
+    # Each WeightRenaming is created fresh per call because WeightTransform
+    # holds per-call state (collected_tensors, _was_used, etc.).
+    def _make_v5_renamings():  # type: ignore[no-untyped-def]
+        assert WeightRenaming is not None  # narrowed by _HAS_V5_API at call site
+        return [
+            WeightRenaming("model.language_model.", "model."),
+            WeightRenaming("language_model.", "model."),
+        ]
+
+    # --- The wrapper --------------------------------------------------------
+    # 4.x: _load_pretrained_model is a classmethod → wrapper receives cls as
+    #      the first positional argument.
+    # 5.x: _load_pretrained_model is a staticmethod → no cls; the first
+    #      positional argument is `model`.
+    # We use *args to absorb both calling conventions and dispatch based on
+    # _is_classmethod.
+    def _load_pretrained_model_with_remap(*args, **kwargs):  # type: ignore[no-untyped-def]
+        if _is_classmethod:
+            # args = (cls, model, state_dict, checkpoint_files, fourth_arg, ...)
+            cls = args[0]
+            model = args[1]
+            state_dict = args[2]
+            checkpoint_files = args[3]
+            fourth_arg = args[4]
+            extra_args = args[5:]
+        else:
+            # args = (model, state_dict, checkpoint_files, fourth_arg, ...)
+            cls = None
+            model = args[0]
+            state_dict = args[1]
+            checkpoint_files = args[2]
+            fourth_arg = args[3]
+            extra_args = args[4:]
+
+        # Detect Qwen3.6 checkpoint by scanning available key sources.
+        needs_remap = False
+        sharded_meta = None
+
+        if _HAS_V5_API and isinstance(fourth_arg, LoadStateDictConfig):
+            # ---- 5.x path: sharded_metadata in LoadStateDictConfig ----
+            sharded_meta = fourth_arg.sharded_metadata
+        elif kwargs.get("sharded_metadata") is not None:
+            # ---- 4.x path: sharded_metadata in kwargs ----
+            sharded_meta = kwargs["sharded_metadata"]
+
+        if state_dict is not None:
+            needs_remap = any(
+                k.startswith("model.language_model.") for k in state_dict
+            )
+        elif sharded_meta is not None:
+            all_keys = sharded_meta.get("all_checkpoint_keys", [])
+            needs_remap = any(
+                k.startswith("model.language_model.") for k in all_keys
+            )
+
+        def _call_original(new_fourth_arg):  # type: ignore[no-untyped-def]
+            if _is_classmethod:
+                return original_func(
+                    cls, model, state_dict, checkpoint_files, new_fourth_arg,
+                    *extra_args, **kwargs,
+                )
+            else:
+                return original_func(
+                    model, state_dict, checkpoint_files, new_fourth_arg,
+                    *extra_args, **kwargs,
+                )
+
+        if not needs_remap:
+            return _call_original(fourth_arg)
+
+        if _HAS_V5_API and isinstance(fourth_arg, LoadStateDictConfig):
+            # ---- 5.x: inject WeightRenaming into load_config.weight_mapping ----
+            import dataclasses
+
+            existing_mapping = fourth_arg.weight_mapping or []
+            new_mapping = list(_make_v5_renamings()) + list(existing_mapping)
+            load_config = dataclasses.replace(
+                fourth_arg, weight_mapping=new_mapping
+            )
+            print(
+                "MinT Qwen3.6 patch: injecting WeightRenaming to remap "
+                "model.language_model.* → model.* "
+                "(~850 checkpoint keys expected)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _call_original(load_config)
+        else:
+            # ---- 4.x: inject key_mapping into kwargs ----
+            existing = kwargs.get("key_mapping")
+            if existing is not None:
+                kwargs["key_mapping"] = {**_QWEN36_KEY_MAPPING, **existing}
+            else:
+                kwargs["key_mapping"] = _QWEN36_KEY_MAPPING
+            print(
+                "MinT Qwen3.6 patch: injecting key_mapping to remap "
+                "model.language_model.* → model.* "
+                "(~850 checkpoint keys expected)",
+                file=sys.stderr,
+                flush=True,
+            )
+            return _call_original(fourth_arg)
+
+    _mark(_load_pretrained_model_with_remap, "_from_pretrained_key_remap")
+    # Install with the same descriptor type as the original.
+    if _is_classmethod:
+        mu.PreTrainedModel._load_pretrained_model = classmethod(
+            _load_pretrained_model_with_remap
+        )
+    else:
+        mu.PreTrainedModel._load_pretrained_model = staticmethod(
+            _load_pretrained_model_with_remap
+        )
+    api_tag = "WeightRenaming (5.x)" if _HAS_V5_API else "key_mapping (4.x)"
+    print(
+        f"MinT Qwen3.6 veRL FSDP2 LoRA patch: installed "
+        f"from_pretrained key remap for multimodal checkpoints ({api_tag})",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
 def _patch_verl_attention_utils_module(attention_utils: ModuleType) -> None:
     if _is_marked(attention_utils, "_attention_utils"):
         return
@@ -1251,6 +1452,7 @@ def install_qwen36_verl_fsdp2_lora_patches() -> None:
     os.environ.setdefault(QWEN36_TEXT_ONLY_SKIP_DUMMY_VISUAL_ENV, "1")
     _patch_transformers_auto_model_vision2seq_alias()
     _patch_accelerate_init_on_device()
+    _patch_transformers_from_pretrained_key_remap()
 
     _install_import_patch("verl.utils.attention_utils", _patch_verl_attention_utils_module)
     _install_import_patch("torch.distributed.fsdp._fully_shard._fsdp_param_group", _patch_torch_fsdp2_cpu_offload_validation_module)
