@@ -270,3 +270,6 @@ node_modules/
 !scripts/wip/openpi_libero_fast_real_eval_report.py
 !scripts/wip/openpi_vla_smoke.py
 .pr-review/
+
+# mine
+vllm/

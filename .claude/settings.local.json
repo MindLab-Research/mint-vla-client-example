@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -iA5 'mint-dev')",
+      "Read(//vePFS-Mindverse/share/mint/dev/ray/head-address/**)",
+      "Read(//vePFS-Mindverse/share/mint/dev/**)",
+      "Bash(ping -c1 -W2 192.168.42.141)",
+      "Read(//vePFS-Mindverse/share/mint/runtime/ssh/**)",
+      "Read(//etc/ssh/**)",
+      "Read(//vePFS-Mindverse/share/code/wenxi/**)",
+      "Read(//mnt/tmp/h/t/**)",
+      "Bash(python -c \"import mint, os; print\\(os.path.dirname\\(mint.__file__\\)\\)\")",
+      "Bash(pip show *)",
+      "WebFetch(domain:docs.vllm.ai)",
+      "Bash(uv --version)",
+      "Bash(uv venv *)"
+    ]
+  }
+}

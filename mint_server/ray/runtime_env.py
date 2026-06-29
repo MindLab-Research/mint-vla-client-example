@@ -176,7 +176,7 @@ def _layout_from_settings(env_root: str, settings: RuntimeEnvSettings, *, tier: 
         for repo_name, rel_parts, src_tier in settings.host_sources
         if tier is None or src_tier in _tiers_for(tier)
     ]
-    host_python = os.path.join(host_venv_root, "bin", "python")
+    host_python = os.path.join(host_venv_root, "bin", "python3.13")
     return RuntimeEnvLayout(
         root=root,
         site_packages=site_packages,

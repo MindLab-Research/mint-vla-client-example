@@ -1,0 +1,1 @@
+ssh driver 'kill $(pgrep -f "scripts/run_server.py" | head -1) 2>/dev/null; sleep 2'

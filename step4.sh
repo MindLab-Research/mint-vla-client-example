@@ -1,0 +1,1 @@
+ssh driver 'curl -s http://localhost:30496/api/v1/healthz'
