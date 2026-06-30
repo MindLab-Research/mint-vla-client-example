@@ -106,9 +106,10 @@ PFS 仍挂载 → code mirror + `gpu_rl` runtime tier 路径不变。**去掉** 
    也是 4)。单台 8 卡 worker 放得下。生成器挑剩余 GPU 最多的 worker，单模型单节点直接成立。
 
 4. **runtime 解释器。** `start_dev_server.sh:326` 要求
-   `${PFS_RUNTIME_ENV_ROOT}/cpu/base-python/bin/python3.13` 存在。PFS 已挂载、复用
-   `/vePFS-Mindverse/share/mint/dev/runtime`，该解释器存在。worker 实际 GPU 工作用
-   `gpu_rl` tier(含 torch/vllm)，由 runtime_env 逐 actor 解析，与 API 进程解释器无关。
+   `${PFS_RUNTIME_ENV_ROOT}/cpu/base-python/bin/python3.13` 存在。**已固定到本地**
+   `/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime`（脱离 share，见 Pin_Runtime.md），该解释器存在。worker 实际
+   GPU 工作用 `gpu_rl` tier(含 torch/vllm)，由 runtime_env 逐 actor 解析，与 API
+   进程解释器无关。
 
 5. **同机共存。** `cpu` tier 解释器本意给 CPU-only API host；单 GPU 机上 API 进程与 GPU
    worker 共享机器，没问题——真正决定 GPU 工作的是 worker 的 `gpu_rl` runtime_env。
@@ -121,9 +122,9 @@ PFS 仍挂载 → code mirror + `gpu_rl` runtime tier 路径不变。**去掉** 
 > **先验证、再动手**，任何 `ray start` 之前先把下面这些查清楚并写下来。
 
 ```bash
-# 5.1 PFS 是否可见 + runtime tier 在不在
-ls -ld /vePFS-Mindverse/share/mint/dev/runtime/cpu /vePFS-Mindverse/share/mint/dev/runtime/gpu_rl
-ls /vePFS-Mindverse/share/mint/dev/runtime/cpu/base-python/bin/python3.13
+# 5.1 runtime tier 在不在（已固定到本地 /vePFS-Mindverse/user/intern/wenxi/mint_env，脱离 share）
+ls -ld /vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu /vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl
+ls /vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu/base-python/bin/python3.13
 
 # 5.2 GPU 数量与型号
 nvidia-smi --query-gpu=index,name,memory.total --format=csv
@@ -133,13 +134,17 @@ pgrep -af raylet || echo "no raylet"
 ps aux | grep -E "ray (start|--head)" | grep -v grep || echo "no ray procs"
 
 # 5.4 本机将用于 ray start 的解释器 + Ray 版本（必须与 gpu_rl tier 的 Ray 版本一致）
-PY=/vePFS-Mindverse/share/mint/dev/runtime/cpu/base-python/bin/python3.13
-$PY -c "import ray, sys; print('ray', ray.__version__, 'py', sys.version)"
-GPU_PY=/vePFS-Mindverse/share/mint/dev/runtime/gpu_rl/host-venv/bin/python   # 路径需现场确认
-$GPU_PY -c "import ray, sys; print('gpu_rl ray', ray.__version__, 'py', sys.version)" 2>/dev/null || echo "confirm gpu_rl python path"
+#     注意：standalone 解释器 import ray 需带 site-packages 的 PYTHONPATH。
+PY=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu/base-python/bin/python3.13
+PYTHONPATH=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu/site-packages \
+  $PY -c "import ray, sys; print('cpu ray', ray.__version__, 'py', sys.version.split()[0])"
+GPU_PY=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python3.13
+PYTHONPATH=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/site-packages \
+  $GPU_PY -c "import ray, sys; print('gpu_rl ray', ray.__version__, 'py', sys.version.split()[0])"
+# 已实测：两者均 ray 2.51.1 / py 3.13.14
 
-# 5.5 本机 IP / hostname（确认 raylet 自报的 node_ip 是不是 127.0.0.1）
-hostname -I
+# 5.5 本机 IP / hostname（确认 raylet 自报的 node_ip；单机要 head≠worker IP）
+hostname -I   # 已实测：192.168.42.227（worker 用它，head 用 127.0.0.1）
 ```
 
 **必须确认的两件事：**
@@ -157,21 +162,27 @@ hostname -I
 > 占位变量上机后用 5.x 的实测值替换。
 
 ### step0_ray_up.sh（新增，替代远程 head/worker pod）
+> 蓝图已落地为仓库根的 `step0_ray_up.sh`（用 `/vePFS-Mindverse/user/intern/wenxi/mint_env` runtime）。要点：
 ```bash
-# 用与 gpu_rl tier 一致的 Ray 解释器（pre-flight 5.4 确认）
-PY=/vePFS-Mindverse/share/mint/dev/runtime/cpu/base-python/bin/python3.13
+# standalone 解释器没有 `ray` console-script，且 `python -m ray` 无 __main__，
+# 必须用模块入口：python -m ray.scripts.scripts start ...
+PY=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu/base-python/bin/python3.13
+SP=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu/site-packages
+RAY=(env "PYTHONPATH=${SP}" "$PY" -m ray.scripts.scripts)
 
-# head：0 GPU，启 GCS + dashboard
-$PY -m ray start --head --num-gpus=0 \
-  --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265
+# head：127.0.0.1, 0 GPU，启 GCS + dashboard
+"${RAY[@]}" start --head --node-ip-address=127.0.0.1 --num-gpus=0 \
+  --port=6379 --dashboard-host=0.0.0.0 --dashboard-port=8265 --disable-usage-stats
 
-# worker：注册到本机 GCS，广播 8 卡
-$PY -m ray start --address=127.0.0.1:6379 --num-gpus=8
+# worker：自报真实 IP（192.168.42.227），广播 8 卡，注册到本机 GCS
+#   ⚠️ head 用 127.0.0.1、worker 用真实 IP，二者必须不同，否则 placement
+#      的 node_ip==head_ip 过滤会把 worker 误杀。
+"${RAY[@]}" start --address=127.0.0.1:6379 \
+  --node-ip-address=192.168.42.227 --num-gpus=8
 
-# 验证：head 0 GPU、worker 8 GPU、共 2 节点
-$PY -c "import ray; ray.init(address='127.0.0.1:6379'); print(ray.cluster_resources()); ray.shutdown()"
+# 验证：cluster_resources 见 GPU=8、2 节点
+PYTHONPATH="${SP}" "$PY" -c "import ray; ray.init(address='127.0.0.1:6379'); print(ray.cluster_resources()); ray.shutdown()"
 ```
-（若 head 与 worker 需不同解释器，worker 用 gpu_rl 解释器 `ray start`——上机现场定。）
 
 ### step1_sync.sh（保持不变）
 ```bash
@@ -185,8 +196,8 @@ rm -f /tmp/mint_dev_run.env
 python scripts/tools/gen_dev_placement.py --head-ip 127.0.0.1 \
   --model Qwen/Qwen3.6-27B --gpu-count 4 \
   --output /tmp/mint_dev_run.env
-# 若 raylet 自报 IP 非 127.0.0.1，则 --head-ip 用 hostname -I 的实测 IP
-cat /tmp/mint_dev_run.env   # 确认 node_ip 是本机 worker IP
+# --head-ip 127.0.0.1：既查 head dashboard(:8265)，又不会误杀自报真实 IP 的 worker
+cat /tmp/mint_dev_run.env   # 确认 node_ip 是本机 worker IP（192.168.42.227）
 ```
 
 ### step3_start.sh（本机化：无 ssh，显式 GCS=127.0.0.1）
@@ -202,7 +213,9 @@ MINT_UVICORN_WORKERS=1 \
 MINT_SUPERVISOR_STATE_BACKEND=memory \
 MINT_SUPPORTED_MODELS="Qwen/Qwen3.6-27B,Qwen/Qwen3-0.6B,Qwen/Qwen3-4B-Instruct-2507,Qwen/Qwen3-30B-A3B-Instruct-2507" \
 MINT_DEV_RUN_ENV=/tmp/mint_dev_run.env \
-PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/share/mint/dev/runtime \
+MINT_QWEN36_DEPS_PATH=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/qwen36-deps \
+MINT_QWEN36_VLLM_DEPS_PATH=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/qwen36-vllm-deps \
+PFS_RUNTIME_ENV_ROOT=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime \
 nohup /vePFS-Mindverse/share/code/wenxi/dev_vla_wenxi/scripts/start_dev_server.sh \
   >> /tmp/mint_dev_launch_wenxi.log 2>&1 &
 ```

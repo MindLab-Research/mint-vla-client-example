@@ -102,7 +102,7 @@ def _build_runtime_env() -> dict[str, Any]:
     # Prepend isolated deps
     pythonpath = join_pythonpath(QWEN36_DEPS_PATH, global_pythonpath)
 
-    from mint_server.config import actor_runtime_env_vars, otel_env_vars
+    from mint_server.config import actor_ld_library_path, actor_runtime_env_vars, otel_env_vars
 
     env_vars = actor_runtime_env_vars(
         pythonpath=pythonpath,
@@ -115,6 +115,12 @@ def _build_runtime_env() -> dict[str, Any]:
             "TRANSFORMERS_OFFLINE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            # Training torch is cu13; the GPU host driver (535) only advertises
+            # CUDA 12.2 natively, so the actor must load the CUDA forward-compat
+            # libcuda from /usr/local/cuda/compat (surfaced via actor_ld_library_path).
+            # vLLM/verl actors already set this; qwen36 training previously omitted
+            # it and crashed in torch._C._cuda_init() with "driver too old (12020)".
+            "LD_LIBRARY_PATH": actor_ld_library_path(),
             **otel_env_vars(),
         },
         include_ray_attach_hints=False,
