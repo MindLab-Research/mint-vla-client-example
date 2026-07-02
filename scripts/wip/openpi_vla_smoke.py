@@ -139,7 +139,7 @@ def main() -> int:
             model_path = save_result.get("path")
             if not isinstance(model_path, str) or not model_path:
                 raise RuntimeError(f"save_weights_for_sampler missing path: {save_result!r}")
-            action_created = _post_json(base_url, "/api/v1/mint/action_sessions", headers, {"session_id": f"smoke-action-{uuid.uuid4().hex[:12]}", "base_model": args.model, "model_path": model_path})
+            action_created = _post_json(base_url, "/api/v1/mint/action_sessions", headers, {"session_id": f"smoke-action-{uuid.uuid4().hex[:12]}", "base_model": args.model, "model_path": model_path, "owner_id": save_result.get("owner_id")})
             action_session_id = action_created["action_session_id"]
             action_result = _await_result(base_url, headers, _post_json(base_url, f"/api/v1/mint/action_sessions/{action_session_id}/act", headers, {"observation": datum["observation"]}))
         actors_after = _get_json(base_url, "/internal/actors", headers)

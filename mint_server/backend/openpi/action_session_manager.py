@@ -81,7 +81,7 @@ async def _default_pi05_runtime_factory(
     if direct_enabled:
         spec = dataclasses.replace(
             OpenPIFastActionRuntimeSpec.from_env(),
-            worker_module="mint_server.backend.openpi_pi05_action_worker",
+            worker_module=OPENPI_PI05_ACTION_WORKER_MODULE,
         )
         return await start_openpi_action_ray_runtime(
             action_session_id=action_session_id,

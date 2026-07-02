@@ -755,6 +755,24 @@ class _ModelWorkSchedulerActor:
     def _ensure_reaper_loop_started(self) -> None:
         self._ensure_background_loops_started()
 
+    @staticmethod
+    def _is_scheduler_owned_record(record: dict[str, Any]) -> bool:
+        """True only for tasks this scheduler created via ``create_task``.
+
+        The shared TaskStateStore also holds plain futures created directly by
+        route handlers (e.g. ``async_ensure_pending`` on the OpenPI pi0.5
+        ``DIRECT_RUNTIME`` action path). Those live under ``future:default`` and
+        are resolved by their own request coroutine, never by the scheduler.
+        Only records that carry the scheduler's own append marker are model
+        work the scheduler is responsible for hydrating/reaping. Adopting a
+        plain future would let the scheduler assign/claim/terminalize it out
+        from under the in-flight request, which fails the request's later
+        ``async_resolve`` with a terminal task-state conflict.
+        """
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+        assert metadata is not None
+        return bool(metadata.get("model_work_scheduler_append_attempt_id"))
+
     def _work_item_from_task_record(self, record: dict[str, Any]) -> ModelWorkItem:
         metadata = dict(record.get("metadata") or {})
         extra = dict(metadata)
@@ -832,6 +850,8 @@ class _ModelWorkSchedulerActor:
                 raise TypeError(f"TaskStateStore.list_active_tasks item returned non-TaskRecord: {type(task_record)}")
             record = self._task_record_data(task_record)
             status = str(record.get("status") or "")
+            if not self._is_scheduler_owned_record(record):
+                continue
             item = self._work_item_from_task_record(record)
             if status != "pending":
                 to_requeue.append((item, "scheduler_hydrate_requeue"))
@@ -878,6 +898,8 @@ class _ModelWorkSchedulerActor:
             record = self._task_record_data(task_record)
             scanned += 1
             if str(record.get("status") or "") != "pending":
+                continue
+            if not self._is_scheduler_owned_record(record):
                 continue
             item = self._work_item_from_task_record(record)
             async with self._cv:

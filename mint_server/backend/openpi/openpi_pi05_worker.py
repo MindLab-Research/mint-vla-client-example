@@ -196,6 +196,15 @@ class OpenPIPi05WorkerSession:
         self._ocp = ocp
         self._traverse_util = traverse_util
 
+        # orbax-checkpoint compat: openpi pins orbax==0.11.13 (subscriptable
+        # metadata), the runtime ships 0.11.40 (StepMetadata). Patch
+        # restore_params so the vendored upstream src/ stays unmodified.
+        from mint_server.backend.openpi.openpi_orbax_compat import (
+            install_restore_params_compat,
+        )
+
+        install_restore_params_compat(openpi_model)
+
         self._payload = payload
         self._model_id = str(payload["model_id"])
         self._action_dim = int(payload["action_dim"])

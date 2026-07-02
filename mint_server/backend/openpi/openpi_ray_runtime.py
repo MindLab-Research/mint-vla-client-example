@@ -8,7 +8,7 @@ from typing import Any
 
 import ray
 
-from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_runtime_env_vars
+from mint_server.config import PFS_PYTHONPATH, RAY_NAMESPACE, actor_ld_library_path, actor_runtime_env_vars
 from mint_server.ray.ray_utils import init_ray
 from mint_server.ray.runtime_env import env_nonempty
 from mint_server.backend.ray_cluster.async_ray_control import async_get_ray_ref
@@ -25,6 +25,12 @@ logger = structlog.get_logger(__name__)
 
 def _openpi_runtime_env_vars() -> dict[str, str]:
     extra = {"PYTHONDONTWRITEBYTECODE": "1"}
+    # The pi0.5 worker imports jax (cuda13) inside the Ray actor. jax's cuda
+    # plugin self-locates its nvidia libs, but still needs the forward-compat
+    # libcuda from /usr/local/cuda/compat (surfaced via actor_ld_library_path),
+    # because the host driver (535) predates the cuda13 runtime. Without this
+    # the actor sees 0 GPUs / fails to load libcuda. Same fix as qwen36 trainer.
+    extra["LD_LIBRARY_PATH"] = actor_ld_library_path()
     for key, value in os.environ.items():
         if key.startswith("MINT_OPENPI_"):
             extra[key] = value
@@ -35,6 +41,27 @@ def _openpi_runtime_env_vars() -> dict[str, str]:
         value = os.environ.get(key, "").strip()
         if value:
             extra[key] = value
+    # OPENPI_DATA_HOME must always reach the worker actor: it is openpi's asset
+    # cache root (paligemma tokenizer, norm stats, base checkpoints). If it is
+    # missing, openpi falls back to ~/.cache/openpi, finds no cached tokenizer,
+    # and tries to download gs://big_vision/... via fsspec — which fails hard
+    # because the gpu_rl tier ships neither gcsfs nor gsutil.
+    #
+    # We cannot rely on this env reaching us: the actor is launched from the
+    # detached supervisor, which survives server restarts and may have been
+    # started by an older server invocation (before OPENPI_DATA_HOME was added
+    # to step3_start.sh) or rebuilt from a raylet IDLE worker that never had it.
+    # So default it explicitly when absent. Prefer the weights-path parent (the
+    # data root is its grandparent: <root>/pi05_base/params), else a constant.
+    if not extra.get("OPENPI_DATA_HOME"):
+        weights = os.environ.get("MINT_OPENPI_PI05_WEIGHTS_PATH", "").strip()
+        default_data_home = ""
+        if weights:
+            # <data_home>/pi05_base/params -> <data_home>
+            default_data_home = str(Path(weights).resolve().parent.parent)
+        if not default_data_home or not Path(default_data_home).is_dir():
+            default_data_home = "/vePFS-Mindverse/share/models/openpi"
+        extra["OPENPI_DATA_HOME"] = default_data_home
     return actor_runtime_env_vars(
         pythonpath=PFS_PYTHONPATH,
         extra=extra,

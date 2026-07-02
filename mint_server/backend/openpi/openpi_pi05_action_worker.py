@@ -76,6 +76,12 @@ class OpenPIPi05ActionSession:
         self._pi0_model = pi0_model
         self._pi0_config = pi0_config
 
+        from mint_server.backend.openpi.openpi_orbax_compat import (
+            install_restore_params_compat,
+        )
+
+        install_restore_params_compat(openpi_model)
+
         self._action_session_id = str(payload["action_session_id"])
         self._base_model = str(payload["base_model"])
         self._action_dim = int(payload["action_dim"])

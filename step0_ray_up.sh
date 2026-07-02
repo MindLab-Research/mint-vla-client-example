@@ -20,6 +20,16 @@ RUNTIME_ROOT="${PFS_RUNTIME_ENV_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint_en
 CPU_PY="${RUNTIME_ROOT}/cpu/base-python/bin/python3.13"
 CPU_SP="${RUNTIME_ROOT}/cpu/site-packages"
 
+# CUDA forward-compat libcuda：主机驱动 535 跑 cu13 torch / jax(cuda13) 都需要
+# /usr/local/cuda/compat 里的 580 libcuda。compat/lib 软链（指向 compat 本体，
+# .so 直接在该目录下）是容器本地的，重启易失——这里固化重建，避免 actor 看不到
+# GPU。见 wenxi_dev_md/Pin_Runtime.md 及 cuda13-compat 记忆。
+if [ -d /usr/local/cuda/compat ] && [ ! -e /usr/local/cuda/compat/lib ]; then
+  ln -sfn /usr/local/cuda/compat /usr/local/cuda/compat/lib
+  echo "已重建 compat/lib 软链 -> /usr/local/cuda/compat"
+fi
+
+
 # standalone 解释器没有 `ray` console-script，用模块入口调用。
 RAY=( env "PYTHONPATH=${CPU_SP}" "${CPU_PY}" -m ray.scripts.scripts )
 
