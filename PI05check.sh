@@ -20,7 +20,7 @@ PORT="${MINT_PORT:-30496}"
 CLIENT_PY="${MINT_CLIENT_PYTHON:-/vePFS-Mindverse/user/intern/wenxi/mint/.venv-mindlab/bin/python}"
 CODE_ROOT="${MINT_CODE_ROOT:-/vePFS-Mindverse/share/code/wenxi/dev_vla_wenxi}"
 MODEL="${MINT_PI05_MODEL:-openpi/pi05-libero-low-mem-finetune}"
-OUT_JSON="${MINT_PI05_OUTPUT_JSON:-/tmp/pi05_check.json}"
+OUT_JSON="${MINT_PI05_OUTPUT_JSON:-/vePFS-Mindverse/user/intern/wenxi/results/datas/pi05_check.json}"
 
 if [ ! -x "${CLIENT_PY}" ]; then
   echo "error: client python 不存在: ${CLIENT_PY}" >&2

@@ -386,7 +386,13 @@ class OpenPIPi05ActionSession:
             raw_actions = trace["actions"][0]
         else:
             raw_actions = self._model.sample_actions(rng, observation)[0]
-        actions = np.asarray(raw_actions, dtype=np.float32)[:, :7]
+        # 输出维度:默认切到模型的完整 action_dim(而非 libero 遗留的硬编码 7),
+        # 使 32/26 维动作空间的有效自由度(如 dim 10-13)不被截掉。可用环境变量
+        # MINT_OPENPI_PI05_ACTION_OUT_DIM 覆盖(设为 7 可复现旧行为)。
+        _out_dim_env = str(os.environ.get("MINT_OPENPI_PI05_ACTION_OUT_DIM") or "").strip()
+        out_dim = int(_out_dim_env) if _out_dim_env else self._action_dim
+        out_dim = max(1, min(out_dim, int(np.asarray(raw_actions).shape[-1])))
+        actions = np.asarray(raw_actions, dtype=np.float32)[:, :out_dim]
         infer_ms = (time.monotonic() - started) * 1000.0
         result = {
             "actions": {

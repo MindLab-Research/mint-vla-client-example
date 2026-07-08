@@ -30,10 +30,10 @@ CODE_ROOT="${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint}"
 DRIVER="${CODE_ROOT}/scripts/wip/openpi_vla_smoke_lance.py"
 
 MODEL="${MINT_PI05_MODEL:-openpi/pi05-libero-low-mem-finetune}"
-LANCE_DS="${MINT_LANCE_DATASET:-/vePFS-Mindverse/user/intern/wenxi/pi-finetune/data_source/lance/pi_video_streams_lance_smoke.lance}"
-STEPS="${MINT_PI05_STEPS:-1000}"
+LANCE_DS="${MINT_LANCE_DATASET:-/vePFS-Mindverse/user/intern/wenxi/pi-finetune/data_source/lance/pi_video_streams_full_lance.lance}"
+STEPS="${MINT_PI05_STEPS:-400}"
 BATCH="${MINT_PI05_BATCH:-2}"
-OUT_JSON="${MINT_PI05_OUTPUT_JSON:-/tmp/pi05_lance_smoke.json}"
+OUT_JSON="${MINT_PI05_OUTPUT_JSON:-/vePFS-Mindverse/user/intern/wenxi/results/datas/pi05_lance_smoke.json}"
 
 # openpi 资产缓存（PaliGemma tokenizer 等）与 HF 缓存。
 export OPENPI_DATA_HOME="${OPENPI_DATA_HOME:-/vePFS-Mindverse/share/code/conley/.openpi_cache}"

@@ -13,7 +13,11 @@
       "Bash(pip show *)",
       "WebFetch(domain:docs.vllm.ai)",
       "Bash(uv --version)",
-      "Bash(uv venv *)"
+      "Bash(uv venv *)",
+      "Read(//tmp/**)",
+      "Bash(python3 -c ' *)",
+      "Read(//vePFS-Mindverse/user/intern/wenxi/**)",
+      "Bash(python -c ' *)"
     ]
   }
 }
