@@ -16,7 +16,8 @@
   | `results/datas/` | 数据产物：`.json`（训练/推理/评估结果、norm_stats）、`.lance`（数据集）、图像目录、`.zip` |
   | `results/logs/`  | 运行日志：各脚本 stdout/stderr 重定向的 `.log` |
 
-- 相关代码仓库在 `/vePFS-Mindverse/user/intern/wenxi/mint`（脚本 `PI05*.sh`、`scripts/wip/openpi_vla_*.py`）。
+- 相关代码仓库在 `/vePFS-Mindverse/user/intern/wenxi/mint`（脚本在 `scripts/vla/`
+  与 `scripts/cluster/`、driver 在 `scripts/wip/openpi_vla_*.py`）。
   这些脚本的**默认输出路径已改为指向本 results 目录**（见第 3 节）。
 
 ---
@@ -83,9 +84,9 @@
 改代码时如需调整输出位置，相关默认值在：
 | 脚本 | 变量/参数 | 现默认值 |
 |---|---|---|
-| `PI05lance.sh` | `MINT_PI05_OUTPUT_JSON` | `results/datas/pi05_lance_smoke.json` |
-| `PI05lance_infer.sh` | `MINT_PI05_OUTPUT_JSON` / `MINT_PI05_INFER_JSON` | `results/datas/pi05_lance_smoke.json` / `results/datas/pi05_infer.json` |
-| `PI05check.sh` | `MINT_PI05_OUTPUT_JSON` | `results/datas/pi05_check.json` |
+| `scripts/vla/PI05lance.sh` | `MINT_PI05_OUTPUT_JSON` | `results/datas/pi05_lance_smoke.json` |
+| `scripts/vla/PI05lance_infer.sh` | `MINT_PI05_OUTPUT_JSON` / `MINT_PI05_INFER_JSON` | `results/datas/pi05_lance_smoke.json` / `results/datas/pi05_infer.json` |
+| `scripts/vla/PI05check.sh` | `MINT_PI05_OUTPUT_JSON` | `results/datas/pi05_check.json` |
 | `openpi_export_norm_stats.py` | `--output` | `results/datas/pi05_norm_stats.json` |
 | `read_replay_lance.py` | argv[1] 默认 | `results/datas/pi05_replay_merged.lance` |
 | `openpi_vla_merge_infer_lance.py` | `--output-lance`（无默认，示例已更新） | 传参时请指向 `results/datas/` |
@@ -125,4 +126,5 @@ $PY scripts/wip/openpi_vla_merge_infer_lance.py \
   --output-lance /vePFS-Mindverse/user/intern/wenxi/results/datas/pi05_replay_merged.lance
 ```
 
-> 训练/推理/真机接入的完整说明见仓库根的 `Openpi_usage.md`。本文档只管数据与日志的存储位置。
+> 训练/推理/真机接入的完整说明见同目录的 `Openpi_usage.md`（均在 `wenxi_dev_md/` 下）。
+> 本文档只管数据与日志的存储位置。

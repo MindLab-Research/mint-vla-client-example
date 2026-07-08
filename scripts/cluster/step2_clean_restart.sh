@@ -13,7 +13,7 @@
 #   新 actor 通过 _openpi_runtime_env_vars() 拿到正确的 OPENPI_DATA_HOME，
 #   tokenizer 在 share/models/openpi 命中缓存，全链路才稳定通过。
 #
-# 用法：bash step2_clean_restart.sh   然后  bash PI05check.sh
+# 用法：bash scripts/cluster/step2_clean_restart.sh   然后  bash scripts/vla/PI05check.sh
 set -uo pipefail   # 故意不加 -e：清理步骤允许“目标本就不存在”而不中断
 
 RUNTIME_ROOT=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime
@@ -79,7 +79,7 @@ for i in $(seq 1 20); do
   if curl -s -m 5 "http://localhost:${PORT}/api/v1/healthz" 2>/dev/null | grep -q '"ready"'; then
     echo "    server ready ✓ (port ${PORT})"
     echo
-    echo "现在可以跑：bash PI05check.sh"
+    echo "现在可以跑：bash scripts/vla/PI05check.sh"
     exit 0
   fi
 done

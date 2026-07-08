@@ -17,7 +17,9 @@
       "Read(//tmp/**)",
       "Bash(python3 -c ' *)",
       "Read(//vePFS-Mindverse/user/intern/wenxi/**)",
-      "Bash(python -c ' *)"
+      "Bash(python -c ' *)",
+      "Bash(mkdir -p scripts/cluster/legacy scripts/vla scripts/clean)",
+      "Bash(git mv *)"
     ]
   }
 }

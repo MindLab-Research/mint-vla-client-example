@@ -16,7 +16,7 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint
 curl -s http://localhost:30496/api/v1/healthz   # 期望 {"status":"ready"}
 
 # ② 用【已训练好的权重】直接推理（不重训）
-bash PI05lance_infer.sh                          # 对 lance 样本推理,输出 action chunk
+bash scripts/vla/PI05lance_infer.sh              # 对 lance 样本推理,输出 action chunk
 
 # ③ 量化评估（证明训练有效:MSE vs 真值）
 #   见第 5 节
@@ -68,10 +68,10 @@ mint://lance-smoke-440c1d1c7107_0/sampler_weights/lance_smoke_sampler_c982d5e9
 
 ```bash
 cd /vePFS-Mindverse/user/intern/wenxi/mint
-bash step0_ray_up.sh        # 单机起 Ray(head 0 GPU + worker 8 GPU)
-bash step1.sh               # rsync 本地代码 -> server 代码根
-bash step3.sh               # 启动 dev API server
-bash step4_health.sh        # 健康检查,期望 {"status":"ready"}
+bash scripts/cluster/step0_ray_up.sh   # 单机起 Ray(head 0 GPU + worker 8 GPU)
+bash scripts/cluster/step1.sh          # rsync 本地代码 -> server 代码根
+bash scripts/cluster/step3_start.sh    # 启动 dev API server(本机化版)
+bash scripts/cluster/step4_health.sh   # 健康检查,期望 {"status":"ready"}
 ```
 
 ### 2.3 干净重启（改了代码 / 状态乱了）
@@ -80,8 +80,8 @@ Python server **不热加载**，改完代码必须重启。且它依赖一批 d
 不随进程退出——必须先 kill 再重启：
 
 ```bash
-bash step1.sh                    # 同步最新代码到 server 代码根
-bash step2_clean_restart.sh      # 清 detached actor + 重启 + healthz
+bash scripts/cluster/step1.sh                    # 同步最新代码到 server 代码根
+bash scripts/cluster/step2_clean_restart.sh      # 清 detached actor + 重启 + healthz
 sleep 20                         # 等 scheduler lease 收敛
 ```
 
@@ -91,9 +91,9 @@ sleep 20                         # 等 scheduler lease 收敛
 
 ```bash
 cd /vePFS-Mindverse/user/intern/wenxi/mint
-bash PI05lance.sh                                    # 默认 400 步,batch 2,full 数据集
-MINT_PI05_STEPS=2000 MINT_PI05_BATCH=4 bash PI05lance.sh
-MINT_LANCE_DATASET=/path/to/your.lance bash PI05lance.sh   # 换数据集
+bash scripts/vla/PI05lance.sh                                    # 默认 400 步,batch 2,full 数据集
+MINT_PI05_STEPS=2000 MINT_PI05_BATCH=4 bash scripts/vla/PI05lance.sh
+MINT_LANCE_DATASET=/path/to/your.lance bash scripts/vla/PI05lance.sh   # 换数据集
 ```
 
 `PI05lance.sh` 是**一条龙**：`create_model → 训 N 步 → save_weights_for_sampler
@@ -160,9 +160,9 @@ sampler/
 ### 5.1 用 lance 样本推理
 
 ```bash
-bash PI05lance_infer.sh                          # 自动读上次训练的 sampler,推理 index 0
-MINT_INFER_INDICES=0,1,2 bash PI05lance_infer.sh # 一次推多帧
-MINT_SAMPLER_PATH=mint://... bash PI05lance_infer.sh  # 指定别的权重
+bash scripts/vla/PI05lance_infer.sh                          # 自动读上次训练的 sampler,推理 index 0
+MINT_INFER_INDICES=0,1,2 bash scripts/vla/PI05lance_infer.sh # 一次推多帧
+MINT_SAMPLER_PATH=mint://... bash scripts/vla/PI05lance_infer.sh  # 指定别的权重
 ```
 driver = `scripts/wip/openpi_vla_infer_lance.py`：**只建 action_session + act，
 不 create_model、不 train**（训推解耦）。结果写 `/vePFS-Mindverse/user/intern/wenxi/results/datas/pi05_infer.json`。
@@ -290,7 +290,8 @@ physical = normalized * (std + 1e-6) + mean                     # z-score(非分
 > ⚠️ **动作输出维度**：action worker 曾硬编码 `[:, :7]`（libero 7-DoF 遗留），会把
 > 32 维动作切成 7 维、丢掉主自由度（dim 10-13）和力控维，导致回放几乎不动。已改为
 > 输出完整 `action_dim`（默认 32），可用环境变量 `MINT_OPENPI_PI05_ACTION_OUT_DIM`
-> 覆盖（设 7 复现旧行为）。改 server 代码后需 `bash step1.sh` + `step2_clean_restart.sh`。
+> 覆盖（设 7 复现旧行为）。改 server 代码后需 `bash scripts/cluster/step1.sh` +
+> `scripts/cluster/step2_clean_restart.sh`。
 
 ---
 
@@ -350,15 +351,15 @@ python scripts/wip/read_replay_lance.py /vePFS-Mindverse/user/intern/wenxi/resul
 
 | 文件 | 作用 | 状态 |
 |---|---|---|
-| `PI05lance.sh` | 训练一条龙（lance→LoRA→save→act） | ✅ 实测 |
+| `scripts/vla/PI05lance.sh` | 训练一条龙（lance→LoRA→save→act） | ✅ 实测 |
 | `scripts/wip/openpi_vla_smoke_lance.py` | 上面的 driver（含 Lance→transform 流水线） | ✅ |
-| `PI05lance_infer.sh` + `openpi_vla_infer_lance.py` | 用 lance 样本纯推理（不重训） | ✅ 实测 |
+| `scripts/vla/PI05lance_infer.sh` + `openpi_vla_infer_lance.py` | 用 lance 样本纯推理（不重训） | ✅ 实测 |
 | `scripts/wip/openpi_vla_eval_lance.py` | 验证集 MSE 量化评估 | ✅ 实测(当前权重稳定帧 MSE ~40% 零基线) |
 | `scripts/wip/openpi_export_norm_stats.py` | 导出归一化统计到 json | ✅ 实测 |
 | **`scripts/wip/openpi_vla_infer_obs.py`** | **真机接入接口**（接原始 obs，含 `--unnormalize` 输出物理动作） | ⏸️ 接口就绪+反归一化已验证,真机数据来源待接 |
 | `scripts/wip/openpi_vla_merge_infer_lance.py` | 逐帧推理并**合并回原数据集**（原列+预测列），供回放 | ✅ 实测 |
 | `scripts/wip/read_replay_lance.py` | 最简读取脚本：逐帧打印原始+预测，演示回放读法 | ✅ 实测 |
-| `step0/1/3/4_*.sh`, `step2_clean_restart.sh` | Ray/server 启动与重启 | ✅ |
+| `scripts/cluster/step0_ray_up.sh`,`step1.sh`,`step3_start.sh`,`step4_health.sh`,`step2_clean_restart.sh` | Ray/server 启动与重启（本机化版；旧三机 ssh 版在 `scripts/cluster/legacy/`） | ✅ |
 
 ---
 
@@ -366,11 +367,13 @@ python scripts/wip/read_replay_lance.py /vePFS-Mindverse/user/intern/wenxi/resul
 
 - **act 返回 500 / TaskStateConflictError**：direct-runtime future 被 scheduler
   reaper 误领养的竞态，已修复（`model_work_scheduler._is_scheduler_owned_record`）。
-  若复现：确认 server 跑的是最新代码（`bash step1.sh` 同步后 `step2_clean_restart.sh`）。
+  若复现：确认 server 跑的是最新代码（`bash scripts/cluster/step1.sh` 同步后
+  `scripts/cluster/step2_clean_restart.sh`）。
 - **train 报 actor died / ray.kill**：叠跑竞争（前一次 delete_model 杀了共享 actor）。
-  每次跑前 `step2_clean_restart.sh` + 等 20s，单跑不叠跑。
+  每次跑前 `scripts/cluster/step2_clean_restart.sh` + 等 20s，单跑不叠跑。
 - **推理输出全 0 或异常**：多半是 norm_stats 不匹配。确认用的是**本次训练数据**导出的
   norm_stats，不是 sampler 自带的 libero 统计。
 - **真异常不在结构化日志**：act/train 的真实堆栈在 `/tmp/mint_dev_launch_wenxi.log`
   （launcher 捕获的 stderr），不在 server 结构化日志、不在 Ray worker 日志。
-- **改了代码不生效**：Python server 不热加载，必须 `step1.sh`(同步) + `step2_clean_restart.sh`(重启)。
+- **改了代码不生效**：Python server 不热加载，必须 `scripts/cluster/step1.sh`(同步) +
+  `scripts/cluster/step2_clean_restart.sh`(重启)。
