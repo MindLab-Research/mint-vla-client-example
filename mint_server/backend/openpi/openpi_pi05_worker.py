@@ -351,6 +351,26 @@ class OpenPIPi05WorkerSession:
         lr = self._optax.constant_schedule(learning_rate)
         return optimizer_cfg.create(lr, weight_decay_mask=None)
 
+    def _padded_prompt(self, tokens: Any, mask: Any) -> dict[str, Any]:
+        # pi0.5 tokenizes prompts to a FIXED max_token_len (padding tokens masked
+        # off). Callers may send a variable-length prompt (trimmed to real tokens);
+        # if we fed that straight to JAX, every distinct length would trigger a
+        # fresh XLA compile whose executable is never freed — VRAM climbs until
+        # RESOURCE_EXHAUSTED. Pad/truncate to max_token_len so the traced shape is
+        # constant and the step is compiled exactly once.
+        jnp = self._jnp
+        n = int(self._max_token_len)
+        tok = [int(t) for t in tokens][:n]
+        msk = [bool(m) for m in mask][:n]
+        if len(tok) < n:
+            pad = n - len(tok)
+            tok = tok + [0] * pad
+            msk = msk + [False] * pad
+        return {
+            "tokenized_prompt": jnp.asarray([tok], dtype=jnp.int32),
+            "tokenized_prompt_mask": jnp.asarray([msk], dtype=jnp.bool_),
+        }
+
     def _observation_from_payload(self, item: dict[str, Any]):
         jnp = self._jnp
         images = {
@@ -367,8 +387,7 @@ class OpenPIPi05WorkerSession:
                 "image": images,
                 "image_mask": image_mask,
                 "state": jnp.asarray([item["state"]], dtype=jnp.float32),
-                "tokenized_prompt": jnp.asarray([item["tokenized_prompt"]], dtype=jnp.int32),
-                "tokenized_prompt_mask": jnp.asarray([item["tokenized_prompt_mask"]], dtype=jnp.bool_),
+                **self._padded_prompt(item["tokenized_prompt"], item["tokenized_prompt_mask"]),
             }
         )
         actions = jnp.asarray(item["actions"], dtype=jnp.float32)[None, ...]

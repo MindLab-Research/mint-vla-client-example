@@ -411,6 +411,18 @@ async def retrieve_future(
     a small allowlist of safe, user-actionable errors (e.g. permission/ownership).
     Regular users receive a generic error message for other failures.
     """
+    # OpenPI (pi0.5) runs Ray-free in-process; its futures live in a process-local
+    # store, resolved inline. Serve them before any Ray/gateway path.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    openpi_future = _openpi_local.get_future(body.request_id)
+    if openpi_future is not None:
+        if openpi_future.get("status") == "failed":
+            _record_retrieve_wait(path="openpi_local", outcome="ready", waited=False)
+            return _failed_payload(openpi_future.get("error"), http_request)
+        _record_retrieve_wait(path="openpi_local", outcome="ready", waited=False)
+        return openpi_future.get("result") or {}
+
     from ..gateway import decode_request_id, forward_json, upstream_for_alias
 
     decoded = decode_request_id(body.request_id)

@@ -6,16 +6,10 @@ import structlog
 import uuid
 from typing import Any, Awaitable, Callable
 
-import ray
-
 from mint_server.checkpoints.checkpoints import get_checkpoints_dir, resolve_checkpoint_uri
 from mint_server.models.types import ActRequest, ModelInput, TensorData
 from mint_server.backend.core.model_registry import get_model_config
-from mint_server.backend.openpi.openpi_action_ray_runtime import (
-    OpenPIActionRayRuntimeClient,
-    _actor_ready_timeout_s,
-    start_openpi_action_ray_runtime,
-)
+from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerClient
 from mint_server.backend.openpi.openpi_fast_action_runtime import (
     OPENPI_FAST_ACTION_WORKER_MODULE,
     OpenPIFastActionRuntimeSpec,
@@ -24,13 +18,11 @@ from mint_server.backend.openpi.openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
     get_openpi_fast_config_name,
 )
-from mint_server.backend.openpi.openpi_shared_ray_runtime import OpenPISharedRayRuntimeClient
 from mint_server.backend.openpi.openpi_pi05_training import (
     OPENPI_PI05_TRAINING_BACKEND,
     OPENPI_PI05_ACTION_WORKER_MODULE,
     get_openpi_pi05_config_name,
 )
-from mint_server.backend.actors.model_actor_supervisor import ActorType, get_model_actor_supervisor
 
 logger = structlog.get_logger(__name__)
 
@@ -57,10 +49,10 @@ async def _default_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path, action_session_id, base_model, model_config, config_name
-    raise RuntimeError(
-        "OpenPI FAST action runtime must be reconciled by ModelActorSupervisor before request handling"
-    )
+    # Ray removed: openpi_fast action inference runs in-process via direct client.
+    del action_session_id, base_model, checkpoint_path, model_config, config_name
+    spec = OpenPIFastActionRuntimeSpec(worker_module=OPENPI_FAST_ACTION_WORKER_MODULE)
+    return await OpenPIDirectWorkerClient.start(spec)
 
 
 async def _default_pi05_runtime_factory(
@@ -71,26 +63,17 @@ async def _default_pi05_runtime_factory(
     model_config: Any,
     config_name: str,
 ) -> Any:
-    del checkpoint_path, config_name
-    direct_enabled = os.environ.get("MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-    if direct_enabled:
-        spec = dataclasses.replace(
-            OpenPIFastActionRuntimeSpec.from_env(),
-            worker_module=OPENPI_PI05_ACTION_WORKER_MODULE,
-        )
-        return await start_openpi_action_ray_runtime(
-            action_session_id=action_session_id,
-            base_model=base_model,
-            spec=spec,
-        )
-    del action_session_id, base_model, model_config
-    raise RuntimeError(
-        "OpenPI pi0.5 action runtime must be reconciled by ModelActorSupervisor before request handling"
+    # Ray removed: pi0.5 action inference runs in-process via direct client.
+    from mint_server.backend.openpi.openpi_pi05_local_runtime import (
+        make_local_pi05_action_runtime,
+    )
+
+    return await make_local_pi05_action_runtime(
+        action_session_id=action_session_id,
+        base_model=base_model,
+        checkpoint_path=checkpoint_path,
+        model_config=model_config,
+        config_name=config_name,
     )
 
 
@@ -106,80 +89,12 @@ def _recover_detached_action_runtime_client(
     action_session_id: str,
     supports_base_model: Callable[[str], bool],
     supports_worker_module: Callable[[str], bool],
-) -> OpenPIActionRayRuntimeClient | OpenPISharedRayRuntimeClient | None:
-    pool = get_model_actor_supervisor()
-    shared_candidates: list[tuple[Any, OpenPIFastActionRuntimeSpec]] = []
-    for entry in pool.iter_entries(prune_stale=True):
-        metadata = dict(entry.metadata or {})
-        if entry.actor_type != ActorType.OPENPI:
-            continue
-        base_model = str(entry.base_model or "")
-        if not supports_base_model(base_model):
-            continue
-        worker_module = str(metadata.get("worker_module") or "")
-        if not worker_module or not supports_worker_module(worker_module):
-            continue
-        current = pool.get(entry.actor_name)
-        actor_entry = current or entry
-        actor_handle = actor_entry.actor_handle
-        if actor_handle is None:
-            continue
-        spec = _runtime_spec_for_worker_module(worker_module)
-        is_shared = str(entry.actor_name).startswith(("mint_openpi_shared_", "openpi_shared_runtime_")) or "pool_key" in metadata
-        if is_shared:
-            shared_candidates.append((actor_entry, spec))
-        recovered = str(metadata.get("action_session_id") or entry.current_session or "") == action_session_id
-        if not recovered and str(entry.actor_name or "").startswith(("mint_openpi_shared_", "openpi_shared_runtime_")):
-            try:
-                recovered = action_session_id in _shared_actor_known_sessions(actor_handle)
-            except Exception:
-                recovered = False
-        if not recovered:
-            continue
-        if is_shared:
-            return OpenPISharedRayRuntimeClient(
-                actor=actor_handle,
-                actor_name=actor_entry.actor_name,
-                spec=spec,
-                session_id=action_session_id,
-                ready_timeout_s=_actor_ready_timeout_s(spec),
-            )
-        return OpenPIActionRayRuntimeClient(
-            actor=actor_handle,
-            actor_name=actor_entry.actor_name,
-            spec=spec,
-            action_session_id=action_session_id,
-            ready_timeout_s=_actor_ready_timeout_s(spec),
-        )
-    if len(shared_candidates) == 1:
-        actor_entry, spec = shared_candidates[0]
-        logger.warning(
-            "[action_session_recover] inferring shared action actor without exact session membership: "
-            "action_session_id=%s actor_name=%s base_model=%s worker_module=%s",
-            action_session_id,
-            actor_entry.actor_name,
-            actor_entry.base_model,
-            spec.worker_module,
-        )
-        return OpenPISharedRayRuntimeClient(
-            actor=actor_entry.actor_handle,
-            actor_name=actor_entry.actor_name,
-            spec=spec,
-            session_id=action_session_id,
-            ready_timeout_s=_actor_ready_timeout_s(spec),
-        )
+) -> Any | None:
+    # Ray removed: openpi action runtimes are process-local (held in
+    # self._runtime_clients). There are no detached Ray actors to recover from,
+    # so recovery is a no-op. A missing session simply means it is not local.
+    del action_session_id, supports_base_model, supports_worker_module
     return None
-
-
-def _shared_actor_known_sessions(actor_handle: Any) -> set[str]:
-    describe = getattr(actor_handle, "describe", None)
-    remote = getattr(describe, "remote", None)
-    if not callable(remote):
-        return set()
-    payload = ray.get(remote(), timeout=5.0)
-    if not isinstance(payload, dict):
-        return set()
-    return {str(session_id) for session_id in list(payload.get("known_session_ids") or []) if session_id}
 
 
 def _action_billing_metadata(base_model: str, model_config: Any) -> dict[str, Any]:
@@ -207,18 +122,7 @@ def _is_retryable_openpi_runtime_error(exc: BaseException | None) -> bool:
     if exc is None:
         return False
 
-    retryable_types = tuple(
-        error_type
-        for error_type in (
-            getattr(ray.exceptions, "ActorDiedError", None),
-            getattr(ray.exceptions, "RayActorError", None),
-            getattr(ray.exceptions, "ActorUnavailableError", None),
-        )
-        if isinstance(error_type, type)
-    )
-    if retryable_types and isinstance(exc, retryable_types):
-        return True
-
+    # Ray removed: match by name/message only (no ray.exceptions types).
     cause = getattr(exc, "__cause__", None) or getattr(exc, "cause", None)
     if cause is not None and cause is not exc and _is_retryable_openpi_runtime_error(cause):
         return True
@@ -589,45 +493,9 @@ class ActionSessionRouter:
         raise ValueError(f"Action inference does not support {base_model!r}")
 
     def _recover_manager_for_session(self, action_session_id: str) -> object | None:
-        pool = get_model_actor_supervisor()
-        candidate_managers: dict[int, object] = {}
-        for entry in pool.iter_entries(prune_stale=True):
-            metadata = dict(entry.metadata or {})
-            if entry.actor_type != ActorType.OPENPI:
-                continue
-            worker_module = str(metadata.get("worker_module") or "")
-            if not worker_module.endswith("_action_worker"):
-                continue
-            recovered = str(metadata.get("action_session_id") or entry.current_session or "") == action_session_id
-            if not recovered and str(entry.actor_name or "").startswith(("mint_openpi_shared_", "openpi_shared_runtime_")):
-                actor_handle = entry.actor_handle
-                if actor_handle is not None:
-                    try:
-                        recovered = action_session_id in _shared_actor_known_sessions(actor_handle)
-                    except Exception:
-                        recovered = False
-            if not recovered:
-                continue
-            try:
-                manager = self._manager_for_model(str(entry.base_model or ""))
-            except ValueError:
-                continue
-            candidate_managers.setdefault(id(manager), manager)
-            if not recovered:
-                continue
-            self._manager_for_session[action_session_id] = manager
-            self._billing_metadata[action_session_id] = _action_billing_metadata_for_base_model(
-                str(entry.base_model or "")
-            )
-            return manager
-        if len(candidate_managers) == 1:
-            manager = next(iter(candidate_managers.values()))
-            logger.warning(
-                "[action_session_router] inferring action manager without exact session membership: action_session_id=%s",
-                action_session_id,
-            )
-            self._manager_for_session[action_session_id] = manager
-            return manager
+        # Ray removed: action sessions are process-local (self._manager_for_session).
+        # There are no detached Ray actors to recover from after a restart.
+        del action_session_id
         return None
 
     async def create_session(

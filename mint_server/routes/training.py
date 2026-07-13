@@ -2144,6 +2144,14 @@ async def create_model(
 
     user_id = _get_user_id(http_request)
     webhook_url = _get_webhook_url(http_request)
+
+    # OpenPI (pi0.5) runs Ray-free in-process; bypass the Ray scheduler entirely.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.is_openpi_local_base_model(request.base_model):
+        request_id = await _openpi_local.handle_create_model(request, user_id)
+        return UntypedAPIFuture(request_id=request_id)
+
     scheduler_extra = _build_create_scheduler_extra(
         base_model=request.base_model,
         model_id=model_id,
@@ -3886,6 +3894,17 @@ async def save_weights_for_sampler(
     """Save model weights for inference use."""
     _require_write_access(http_request)
     route_start_s = time.perf_counter()
+
+    # OpenPI (pi0.5) runs Ray-free in-process; it is not in the Ray-backed
+    # training store, so branch before _resolve_training_route_session.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.has_local_training_session(request.model_id):
+        request_id = await _openpi_local.handle_save_weights_for_sampler(
+            request, _get_user_id(http_request)
+        )
+        return UntypedAPIFuture(request_id=request_id)
+
     from ..gateway import (
         async_remote_training_model,
         encode_request_id,
@@ -4914,6 +4933,13 @@ async def list_models():
 async def delete_model(model_id: str, http_request: Request):
     """Delete a training model and release resources."""
     _require_write_access(http_request)
+
+    # OpenPI (pi0.5) runs Ray-free in-process; delete from the local registry.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.has_local_training_session(model_id):
+        _openpi_local.delete_local_training_session(model_id)
+        return {"model_id": model_id, "deleted": True}
 
     _session, route_session_info = await _resolve_training_route_session(model_id)
     if route_session_info is None:

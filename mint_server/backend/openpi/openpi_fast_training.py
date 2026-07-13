@@ -10,8 +10,6 @@ from typing import Any, Awaitable, Callable
 from mint_server.models.types import AdamParams
 from mint_server.backend.core.model_registry import ModelConfig, get_model_config
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
-from mint_server.backend.openpi.openpi_ray_runtime import ensure_openpi_ray_initialized
-from mint_server.backend.openpi.openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 
 
 logger = structlog.get_logger(__name__)
@@ -204,14 +202,16 @@ async def _default_runtime_factory(
     model_config: ModelConfig,
     config_name: str,
 ) -> Any:
-    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
-
-    return await start_openpi_shared_ray_runtime(
-        session=session,
-        spec=OpenPIFastRuntimeSpec.from_env(),
-        config_name=config_name,
-        model_config=model_config,
+    # Ray removed: openpi_fast runs in-process via the direct (non-Ray) worker client.
+    from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerClient
+    from mint_server.backend.openpi.openpi_fast_runtime import (
+        OPENPI_FAST_WORKER_MODULE,
+        OpenPIFastRuntimeSpec,
     )
+
+    del session, model_config, config_name
+    spec = OpenPIFastRuntimeSpec(worker_module=OPENPI_FAST_WORKER_MODULE)
+    return await OpenPIDirectWorkerClient.start(spec)
 
 
 class OpenPIFastTrainingEngine:
@@ -224,7 +224,7 @@ class OpenPIFastTrainingEngine:
         self._runtime_clients: dict[str, Any] = {}
 
     async def initialize(self) -> None:
-        ensure_openpi_ray_initialized()
+        # Ray removed: no cluster init needed for the in-process runtime.
         return None
 
     async def _runtime_for_session(

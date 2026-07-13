@@ -181,8 +181,15 @@ class OpenPIPi05ActionSession:
             dtype=jnp.float32,
         )
 
-        prompt_tokens = jnp.asarray(text_chunks[0]["tokens"], dtype=jnp.int32)[None, ...]
-        prompt_mask = jnp.ones_like(prompt_tokens, dtype=jnp.bool_)
+        # Pad/truncate to the fixed max_token_len so the sampler is compiled once
+        # regardless of prompt length (see openpi_pi05_worker._padded_prompt).
+        n = int(self._max_token_len)
+        toks = [int(t) for t in text_chunks[0]["tokens"]][:n]
+        real = len(toks)
+        if real < n:
+            toks = toks + [0] * (n - real)
+        prompt_tokens = jnp.asarray([toks], dtype=jnp.int32)
+        prompt_mask = jnp.asarray([[i < real for i in range(n)]], dtype=jnp.bool_)
 
         return self._openpi_model.Observation.from_dict(
             {

@@ -478,6 +478,25 @@ async def create_action_session(
             model_path, http_request, owner_id=request.owner_id
         )
 
+    # OpenPI (pi0.5) runs Ray-free in-process; create the action session locally.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.is_openpi_local_base_model(base_model):
+        try:
+            action_session_id = await _openpi_local.handle_create_action_session(
+                session_id=request.session_id,
+                action_session_seq_id=request.action_session_seq_id,
+                base_model=base_model,
+                model_path=model_path,
+                user_id=user_id,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "pinned node capacity check failed" in message:
+                raise HTTPException(status_code=503, detail=message) from exc
+            raise
+        return MintCreateActionSessionResponse(action_session_id=str(action_session_id))
+
     try:
         action_session_id = await action_session_manager.create_session(  # type: ignore[attr-defined]
             session_id=request.session_id,
@@ -506,6 +525,20 @@ async def act(
         raise HTTPException(
             status_code=503, detail="Action session manager not initialized"
         )
+
+    # OpenPI (pi0.5) runs Ray-free in-process; run act inline in the local path.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.has_local_action_session(action_session_id):
+        request_id = await _openpi_local.handle_act(
+            action_session_id=action_session_id,
+            observation=request.observation.model_input,
+            extra_inputs={"state": request.observation.state},
+            temperature=request.temperature,
+            return_rollout_trace=request.return_rollout_trace,
+            rollout_trace_config=request.rollout_trace_config,
+        )
+        return UntypedAPIFuture(request_id=request_id)
 
     queued_request = ActRequest(
         action_session_id=action_session_id,
@@ -599,6 +632,20 @@ async def vla_train_step(
     route_start_s = time.perf_counter()
     from . import training as training_routes
 
+    try:
+        _, max_seq_len = _vla_token_stats(request.data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # OpenPI (pi0.5) runs Ray-free in-process; it is not in the Ray-backed
+    # training store, so branch before the store lookup below.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.has_local_training_session(request.model_id):
+        train_step_request = _lower_vla_train_step_request(request)
+        request_id = await _openpi_local.handle_train_step(train_step_request)
+        return UntypedAPIFuture(request_id=request_id)
+
     session = None
     if training_manager is not None:
         get_session = getattr(training_manager, "get_session", None)
@@ -610,11 +657,6 @@ async def vla_train_step(
         raise HTTPException(
             status_code=404, detail=f"Model '{request.model_id}' not found"
         )
-
-    try:
-        _, max_seq_len = _vla_token_stats(request.data)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     base_model = str(_session_field(session, "base_model", "") or "")
     backend = str(_session_field(session, "backend", "unknown") or "unknown")
@@ -709,6 +751,13 @@ async def vla_train_step(
 async def delete_action_session(
     action_session_id: str,
 ) -> MintDeleteActionSessionResponse:
+    # OpenPI (pi0.5) runs Ray-free in-process; shut down the local session.
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if _openpi_local.has_local_action_session(action_session_id):
+        await _openpi_local.handle_shutdown_action_session(action_session_id)
+        return MintDeleteActionSessionResponse(action_session_id=action_session_id)
+
     if action_session_manager is None:
         raise HTTPException(
             status_code=503, detail="Action session manager not initialized"

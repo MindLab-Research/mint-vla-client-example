@@ -10,8 +10,6 @@ from typing import Any
 from mint_server.models.types import AdamParams
 from mint_server.backend.core.model_registry import ModelConfig, get_model_config
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
-from mint_server.backend.openpi.openpi_ray_runtime import ensure_openpi_ray_initialized
-from mint_server.backend.openpi.openpi_shared_ray_runtime import start_openpi_shared_ray_runtime
 
 
 logger = structlog.get_logger(__name__)
@@ -292,19 +290,11 @@ def build_openpi_pi05_action_observation_payload(
 
 
 async def _default_runtime_factory(*, session: Any, model_config: ModelConfig, config_name: str) -> Any:
-    import dataclasses
+    # Ray removed: pi0.5 runs in-process via the local (non-Ray) runtime factory.
+    from mint_server.backend.openpi.openpi_pi05_local_runtime import make_local_pi05_runtime
 
-    from mint_server.backend.openpi.openpi_fast_runtime import OpenPIFastRuntimeSpec
-
-    spec = dataclasses.replace(
-        OpenPIFastRuntimeSpec.from_env(),
-        worker_module=OPENPI_PI05_WORKER_MODULE,
-    )
-    return await start_openpi_shared_ray_runtime(
-        session=session,
-        spec=spec,
-        config_name=config_name,
-        model_config=model_config,
+    return await make_local_pi05_runtime(
+        session=session, model_config=model_config, config_name=config_name
     )
 
 
@@ -314,7 +304,7 @@ class OpenPIPi05TrainingEngine:
         self._runtime_clients: dict[str, Any] = {}
 
     async def initialize(self) -> None:
-        ensure_openpi_ray_initialized()
+        # Ray removed: no cluster init needed for the in-process runtime.
         return None
 
     def _runtime_for_session(self, session: Any) -> Any:

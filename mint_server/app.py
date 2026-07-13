@@ -241,7 +241,22 @@ async def lifespan(app: FastAPI):
     from mint_server.backend.ops.maintenance_cron_actor import maintenance_cron_actor
     from .config import RAY_NAMESPACE
 
-    init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    # Ray-free mode (openpi Separate): when MINT_ALLOW_NO_RAY is set, a missing
+    # Ray cluster degrades startup instead of crashing, so the API can serve the
+    # in-process OpenPI path without any Ray control plane. Normal deployments
+    # leave the flag unset and keep the hard startup invariant.
+    _allow_no_ray = str(os.environ.get("MINT_ALLOW_NO_RAY", "")).strip().lower() in ("1", "true", "yes")
+    try:
+        init_ray(namespace=RAY_NAMESPACE, ignore_reinit_error=True)
+    except Exception as e:
+        if not _allow_no_ray:
+            raise
+        set_startup_degraded_state(
+            reason="ray_unavailable_no_ray_mode",
+            error=f"{type(e).__name__}: {e}",
+            details={},
+        )
+        logger.warning("ray_init_skipped_no_ray_mode", error=str(e))
 
     from .billing.usage_store import get_usage_store
 
