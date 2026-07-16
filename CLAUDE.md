@@ -14,6 +14,7 @@
 | `sglang-backend` | SGLang sampling backend bringup and dev/issue-scoped sanity validation |
 | `vllm-knob-calculation` | Back-of-envelope sizing for vLLM serving knobs |
 | `megatron-memory-estimation` | Back-of-envelope Megatron memory sizing and admission |
+| `mint-vla-openpi-finetune` | LoRA fine-tune a pi0.5 OpenPI VLA model from a Lance dataset path |
 
 **Use `mint-prod` for production operations. Use `mint-dev` for development.**
 

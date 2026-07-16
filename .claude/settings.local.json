@@ -19,7 +19,12 @@
       "Read(//vePFS-Mindverse/user/intern/wenxi/**)",
       "Bash(python -c ' *)",
       "Bash(mkdir -p scripts/cluster/legacy scripts/vla scripts/clean)",
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(python -m pip --version)",
+      "Bash(python -c \"import ensurepip; print\\('ensurepip OK', ensurepip.__file__\\)\")",
+      "Bash(claude --version)",
+      "Bash(claude update *)",
+      "Bash(python -m py_compile mint_server/backend/openpi/openpi_local_execution.py)"
     ]
   }
 }
