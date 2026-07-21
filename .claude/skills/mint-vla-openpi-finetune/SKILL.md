@@ -67,7 +67,7 @@ and let the user confirm or override:
 |---|---|---|
 | Which Lance dataset path? | (required, no default) | user must provide |
 | Training steps | 400 | `PI05lance_local_norray.sh`'s `MINT_PI05_STEPS` default |
-| Batch size | 2 | same script's `MINT_PI05_BATCH` default |
+| Batch size | 2 (but see multi-GPU note below) | same script's `MINT_PI05_BATCH` default |
 | Checkpoint save name | `<none>` -> auto-generated `vla_lora_sampler_<hex8>` | driver's own fallback if omitted |
 | Run inference smoke check after save? | yes | cheap correctness signal (single `act()` call, not eval) |
 | Base model | `openpi/pi05-libero-low-mem-finetune` | only openpi_pi05-backend model currently in `MODEL_CONFIGS` |
@@ -85,6 +85,26 @@ whether the constraint still holds. Do not claim it will fail as a certainty
 if the user specifically wants to test whether the constraint has been
 relaxed -- say it currently fails, per the last verification, and let them
 try.
+
+**On batch size and multi-GPU**: the worker (`openpi_pi05_worker.py`) now runs
+the flow_matching train step as a single batched, jitted, data-sharded call
+instead of looping per-item -- see `RECURSIVE.md` section 2.4 and
+`ExperimentLog_MultiGPU.md` for the full before/after numbers (measured ~250x
+per-sample throughput improvement on a 4-GPU box, full lance dataset, 20-step
+run). Two things to tell the user when they ask about batch size or why the
+server was started with multiple `CUDA_VISIBLE_DEVICES`:
+- **If `--batch-size` is a multiple of the server's visible device count**
+  (e.g. 4 on a 4-GPU server), the batch is genuinely split across GPUs via
+  `jax.sharding` -- this is the mode that gets the full multi-GPU benefit.
+- **If it isn't** (e.g. the documented default of 2 on a 4-GPU server), the
+  worker degrades gracefully -- it still jits and still runs (does not error),
+  but every visible GPU redundantly computes the same full batch instead of
+  splitting it (JAX's default behavior for a `PartitionSpec()`-replicated
+  input under an active mesh). This still gets the (much larger) jit-only
+  speedup, just not the extra multi-GPU split. When suggesting a batch size to
+  the user on a multi-GPU server, prefer a multiple of the device count over
+  the bare default -- ask how many GPUs the target server will use if not
+  already stated.
 
 If the user already stated steps/batch-size/checkpoint-name earlier in the
 conversation, skip re-asking for just those fields.
@@ -138,9 +158,19 @@ conversation, skip re-asking for just those fields.
    export MINT_RUNTIME_CHECKPOINT_DIR=/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints
    export XLA_FLAGS="--xla_gpu_enable_command_buffer="
    export CUDA_VISIBLE_DEVICES=3,4,5,6   # pin to idle cards on shared GPU box; override if needed
+   export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH}"
    export PYTHONPATH="<repo_root>:${EXTRA_PYDEPS}:${GRB}/site-packages:${GRB}/src/openpi/src:${GRB}/src/openpi/packages/openpi-client/src"
    nohup "${GRB}/host-venv/bin/python" -u <repo_root>/scripts/wip/_run_local_openpi_server.py > <server_log> 2>&1 &
    ```
+
+   The `LD_LIBRARY_PATH` prefix is a CUDA forward-compat shim: the installed
+   driver (535.129.03) natively supports up to CUDA 12.2, but jaxlib in this
+   runtime is built against CUDA 13, so without this prefix every JAX GPU call
+   fails at cuDNN init with `cudaErrorInsufficientDriver` regardless of GPU
+   availability -- this can look exactly like "the GPUs are busy/broken" when
+   they are actually idle. See `ExperimentLog_MultiGPU.md` Step 2's "环境问题"
+   section for the full diagnosis; do not re-diagnose this from scratch if you
+   hit the same error.
 
    Wait for `GET /api/v1/healthz` to return `200` or `503` (both mean ready;
    `503`/"unhealthy" is the **expected** degraded-state marker in Ray-free
@@ -185,7 +215,10 @@ conversation, skip re-asking for just those fields.
    action_dim/zero-padding failure mode). If `--infer-to-lance` was run,
    report the output path and `num_frames_written`. If loss trend is flat or
    rising, mention it may indicate an action_dim / zero-padding issue and
-   point at `ActionHeadSummary.md`.
+   point at `ActionHeadSummary.md`. If `--batch-size` was not a multiple of
+   the server's visible device count, mention (briefly) that the run didn't
+   get the multi-GPU data-parallel speedup, only the jit speedup -- see the
+   "On batch size and multi-GPU" note above.
 
 8. **Cleanup**: the driver's own `finally` block already calls
    `_delete_model` on exit -- this only removes server-side session state,
@@ -193,6 +226,23 @@ conversation, skip re-asking for just those fields.
    disk (those persist independently). If you started a fresh server for
    this run, stop it after reporting results (`kill <server_pid>`) unless the
    user asked to keep it running for further iteration.
+
+   **Why GPU memory stays full after the run finishes**: the server does
+   *not* preload any model at startup -- it starts with zero GPU memory used.
+   The first `create_model` call for a given base model is what triggers
+   `OpenPIPi05WorkerSession` to load the base weights onto every visible GPU
+   and build the sharded mesh (this is the slow, ~80s-for-first-`train_step`
+   cost). After that, JAX's allocator (XLA's BFC allocator) keeps that memory
+   reserved for the rest of the **process's** lifetime -- it does not give it
+   back to the driver just because a training session ended. `_delete_model`
+   only tears down the LoRA session's own state (optimizer state, LoRA
+   params); the base weights, the jitted grad function, and the mesh stay
+   resident. This is why a second `create_model` call against the *same*
+   server (e.g. running another training round right after) skips the ~80s
+   reload/recompile and jumps straight to steady-state step time -- it's
+   reusing what's already in memory, not loading from scratch. The only way
+   to actually release the GPU memory is to kill the server process itself;
+   there is no in-process "unload model" call.
 
 ## Known failure modes
 
@@ -220,6 +270,22 @@ fixes. Summary:
   -> not necessarily a bug; a handful of steps may not be enough to beat the
   all-zero baseline. Only treat this as a real signal after a run long
   enough to expect convergence, and cross-check against the loss curve.
+- **Every JAX GPU call fails with `cudaErrorInsufficientDriver` /
+  `DNN library initialization failed`, on every visible device, even a
+  trivial `jnp.dot`** -> this is the CUDA forward-compat `LD_LIBRARY_PATH`
+  issue (driver 535.129.03 vs jaxlib's CUDA13 runtime), not a GPU
+  availability/hardware problem -- see step 5's `LD_LIBRARY_PATH` line and
+  `ExperimentLog_MultiGPU.md` Step 2's "环境问题" section. Do not assume the
+  GPUs are busy or broken just because this error appears; check
+  `nvidia-smi --query-compute-apps` for actual occupancy first, and apply the
+  `LD_LIBRARY_PATH` fix before concluding anything else is wrong.
+- **`ValueError: ... global size of its dimension 0 should be divisible by
+  N ...` from inside a `train_step` call** -> should not happen anymore as of
+  the multi-GPU data-parallel change (the worker now degrades gracefully to
+  replicated placement when `--batch-size` isn't a multiple of the visible
+  device count). If you see this, the degrade-path logic in
+  `_compute_flow_matching_grads_batched` regressed -- read
+  `ExperimentLog_MultiGPU.md` Step 2's "坑1" before attempting a fix.
 
 ## Reference
 
@@ -235,3 +301,10 @@ fixes. Summary:
 - `references/troubleshooting.md` -- symptom -> cause -> fix table.
 - `ActionHeadSummary.md` (repo root) -- the 10-experiment study establishing
   the action_dim invariant. Do not duplicate its content here; link to it.
+- `ExperimentLog_MultiGPU.md` (repo root) -- the multi-GPU data-parallel
+  investigation and implementation log: why GPU utilization was low before,
+  the jit + `data_sharding` fix, the graceful-degrade behavior for
+  non-divisible batch sizes, the CUDA `LD_LIBRARY_PATH` compat issue, and the
+  measured ~250x per-sample throughput result. Read before touching
+  `forward_backward`'s flow_matching path or debugging a sharding-related
+  error; do not re-derive what's already documented there.

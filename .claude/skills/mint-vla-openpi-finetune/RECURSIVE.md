@@ -24,6 +24,7 @@
 | `scripts/tools/openpi_vla_lora_finetune.py` | 主 driver。`create_model → train_step×N → save_weights_for_sampler → [推理验证] → [MSE评估] → [推理写回lance] → cleanup` | 生产，已端到端验证 |
 | `scripts/tools/openpi_vla_eval_mse.py` | MSE/L1 量化评估（归一化空间对比pred vs gt，含零基线对比）。可独立运行，也被 driver 的 `--eval-mse` 调用 | 生产，已端到端验证 |
 | `scripts/tools/openpi_vla_infer_to_lance.py` | 对数据集逐帧推理，合并预测结果回原 Lance 结构（保留原11列+追加`pred_actions`/`pred_actions_physical`/`pred_action_mse`/`pred_meta`4列）。可独立运行，也被 driver 的 `--infer-to-lance` 调用 | 生产，已端到端验证（用`--max-samples 3`验证过schema正确性） |
+| `scripts/wip/openpi_multi_gpu_repro.py` | 多卡数据并行最小复现实验（不接mint-server，直接用openpi库）。对比"逐条循环无jit" vs "批量stack+jit+data_sharding"两种写法的耗时和多卡利用率，1卡/4卡对照。第2.4节多卡改造的验证依据 | wip，一次性调研用，不被生产代码import |
 
 ### 1.1 与 `scripts/wip/` 原始脚本的对应关系
 
@@ -106,6 +107,61 @@ schema，无 `image`/`wrist_image` 字段）不能直接喂给本 skill 的任�
 **如何验证当前耗时**：跑一次 `--infer-to-lance` 全量（不加 `--max-samples`），记录起止时间，
 把结果补充到这条记录里。
 
+### 2.4 多卡数据并行训练（2026-07-17 实现并验证）
+
+**背景**：本 skill 起server时习惯性pin多张卡（`CUDA_VISIBLE_DEVICES=3,4,5,6`），但
+过去这只是"避免和其他人抢卡"的手段——训练本身从来没有真正用满这些卡，4张卡里实际
+只有1张在算，另外3张只是各存了一份复制的模型权重。完整的根因分析和方案对比见
+`Plan.md`；完整的实验过程（含踩坑记录）见 `ExperimentLog_MultiGPU.md`。
+
+**当前状态**：`mint_server/backend/openpi/openpi_pi05_worker.py::forward_backward`
+的`flow_matching`路径（本skill唯一用到的loss_fn）已经改成"批量stack + `jax.jit` +
+`jax.sharding.NamedSharding`数据并行切分"，取代了之前"逐条Python循环、无jit"的写法：
+
+- **`--batch-size`是可见设备数的倍数时**（比如4卡机器上用`--batch-size 4`或8）：
+  batch真正按`jax.sharding`切分到多卡，端到端实测（20步，full lance数据集，走完整
+  生产API路径）单样本吞吐提升约**250倍**（主要收益来自jit本身消除逐条Python循环
+  开销，约占278倍中的大部分；多卡数据并行切分本身贡献约2倍，是278倍之上的增量）。
+- **`--batch-size`不是可见设备数的倍数时**（比如当前文档默认值2，配4卡server）：
+  优雅退化——不报错，仍然jit，但每张可见的卡都会冗余地跑一份完整batch的计算（不是
+  只用1张卡，是JAX对`PartitionSpec()`复制型输入在有效mesh下的默认行为），仍然享受
+  jit本身的巨大加速，只是没有额外的多卡切分收益。
+
+**本skill的应对方式**：
+- driver脚本（`openpi_vla_lora_finetune.py`）本身**没有改动**——校验/优雅退化逻辑
+  完全在worker端（`_compute_flow_matching_grads_batched`），driver只是把`--batch-size`
+  原样转发给server，不需要在driver侧重复判断。
+- `SKILL.md`的"Inputs required from the user"表格和"On batch size and multi-GPU"
+  说明已更新，指导agent在询问batch size时，如果知道目标server用了几张卡，应该建议
+  用户选设备数的倍数，而不是盲目沿用旧的默认值2。
+
+**改进目标**：
+1. 如果以后需要支持"batch_size小于设备数但仍想用多卡"的场景（比如2条样本，4张
+   卡，希望2张卡各算1条，另外2张空着而不是4张卡全冗余），需要设计一个"部分设备
+   mesh"的sharding方案——当前实现里没有做这个优化，`use_data_sharding`只有"全设备
+   切分"和"全设备冗余"两种模式。
+2. 如果以后要给RL路径（`importance_sampling`/`ppo`）也做同样的批量化+多卡改造，
+   可以参考`_compute_flow_matching_grads_batched`/`_stack_flow_matching_batch`/
+   `_get_flow_matching_grad_fn`的写法——但本次改造明确没有覆盖RL路径（本skill的
+   driver从不用RL loss_fn），如果要做，需要单独验证`_compute_importance_sampling_grads`
+   /`_compute_ppo_grads`里`chains`/`old_logprobs`/`advantages`这些RL专属输入的批量化
+   是否需要额外处理（这次没有分析过）。
+
+**如何验证是否仍然生效**：跑
+```bash
+python scripts/tools/openpi_vla_lora_finetune.py --lance-dataset <path> \
+  --batch-size <设备数的倍数> --steps 20
+```
+用`nvidia-smi dmon -i <server用的device列表> -s um -d 1`全程采样，确认多张卡在
+同一时刻同时出现非零`sm%`利用率（不是只有第一张卡动）。如果只有1张卡有非零利用率，
+说明这次改造的效果已经失效，需要重新排查`forward_backward`是否被改回了逐条循环
+写法。
+
+**环境注意**：如果测试时遇到"所有GPU的JAX调用都报`cudaErrorInsufficientDriver`/
+cuDNN初始化失败，即使GPU显存/利用率显示为0"，这不是GPU被占用，是CUDA
+forward-compat库没加进`LD_LIBRARY_PATH`——见`SKILL.md`步骤5的`LD_LIBRARY_PATH`
+说明和`ExperimentLog_MultiGPU.md`的"环境问题"章节，不要重新排查一遍。
+
 ---
 
 ## 3. 验证历史（每次给 skill 加新功能后，记一行）
@@ -116,6 +172,7 @@ schema，无 `image`/`wrist_image` 字段）不能直接喂给本 skill 的任�
 | 2026-07-15 | 用户真实调用：50步训练 + 推理验证 | ✅ 成功 | loss从0.13降到0.06左右，checkpoint正常落盘 |
 | 2026-07-15 | LoRA rank改为"警告不拦截"后，验证 rank=8 透传服务器400原文 | ✅ 成功 | 确认服务器detail文本被正确显示，不是本地伪造错误 |
 | 2026-07-15 | `--eval-mse` + `--infer-to-lance` 同时启用，`--max-samples 3` 快速验证 | ✅ 成功 | MSE aggregate输出正确；merged lance schema确认15列（原11+新4），pred_actions shape[10,32]正确 |
+| 2026-07-17 | 多卡数据并行改造：`--batch-size 4`（4卡整除）+ `--batch-size 2`（4卡不整除退化）+ 20步吞吐对比 | ✅ 成功 | 4卡dmon确认同步真实利用率；20步单样本吞吐较改造前提升约250倍；退化路径不崩溃；详见 `ExperimentLog_MultiGPU.md` |
 
 ---
 
