@@ -275,6 +275,8 @@ def _open_lance_dataset(
     action_horizon: int,
     max_samples: int | None = None,
     version: int | None = None,
+    slate_size: int = 16,
+    slate_rotate_every: int = 250,
 ) -> "LanceViewpi05Dataset":
     """Open LanceViewpi05Dataset at a specific version.
 
@@ -283,20 +285,26 @@ def _open_lance_dataset(
     without forking that class, monkeypatch lance.dataset for the duration of
     construction only, restoring it immediately after (success or failure).
     """
+    kwargs: dict[str, Any] = {
+        "action_horizon": action_horizon,
+        "max_samples": max_samples,
+        "slate_size": slate_size,
+        "slate_rotate_every": slate_rotate_every,
+    }
     if version is None:
-        return LanceViewpi05Dataset(Path(lance_dataset), action_horizon=action_horizon, max_samples=max_samples)
+        return LanceViewpi05Dataset(Path(lance_dataset), **kwargs)
 
     import lance
 
     original_dataset_fn = lance.dataset
 
-    def _pinned_dataset(path, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-        kwargs.setdefault("version", version)
-        return original_dataset_fn(path, *args, **kwargs)
+    def _pinned_dataset(path, *args, **kwargs2):  # noqa: ANN001, ANN002, ANN003
+        kwargs2.setdefault("version", version)
+        return original_dataset_fn(path, *args, **kwargs2)
 
     lance.dataset = _pinned_dataset
     try:
-        return LanceViewpi05Dataset(Path(lance_dataset), action_horizon=action_horizon, max_samples=max_samples)
+        return LanceViewpi05Dataset(Path(lance_dataset), **kwargs)
     finally:
         lance.dataset = original_dataset_fn
 
@@ -375,6 +383,27 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--slate-size",
+        type=int,
+        default=16,
+        help="Number of episodes kept resident (row-cached) at a time for batch sampling. "
+        "On datasets with many more frames than episodes, pure uniform frame sampling means "
+        "almost every draw hits a fresh episode, and reading one frame out of a Lance "
+        "list<binary> image column requires reading the WHOLE episode row -- this can make "
+        "data loading 5x+ slower than the actual train_step (see ExperimentLog_MultiGPU.md "
+        "Step 6). Episode-slate sampling amortizes that read cost across --slate-rotate-every "
+        "steps instead of paying it on every draw. Increase for more temporal diversity per "
+        "step (more RAM, ~slate_size * per-episode size); has no effect on small datasets "
+        "where episodes <= slate_size (everything just stays resident).",
+    )
+    parser.add_argument(
+        "--slate-rotate-every",
+        type=int,
+        default=250,
+        help="How many train_step calls to reuse the current episode slate before drawing a "
+        "fresh one. Larger = less IO overhead but less temporal diversity across nearby steps.",
+    )
     parser.add_argument(
         "--lora-rank",
         type=int,
@@ -479,6 +508,8 @@ def main() -> int:
         action_horizon=args.action_horizon,
         max_samples=args.max_samples,
         version=args.lance_dataset_version,
+        slate_size=args.slate_size,
+        slate_rotate_every=args.slate_rotate_every,
     )
     model_cfg = _build_model_config(args.action_horizon, action_dim=dataset_action_dim)
     norm_stats = _compute_norm_stats(dataset)
@@ -486,7 +517,14 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
 
     def _sample_indices(n: int) -> list[int]:
-        return [int(rng.integers(0, len(dataset))) for _ in range(n)]
+        # Episode-slate sampling (see LanceViewpi05Dataset.sample_indices'
+        # docstring / ExperimentLog_MultiGPU.md Step 6): on datasets with many
+        # more frames than episodes, pure uniform frame sampling makes data
+        # loading IO-bound (5x+ slower than the actual train_step) because
+        # reading one frame out of a Lance list<binary> image column requires
+        # reading the whole episode row. This keeps a rotating cache of
+        # --slate-size episodes resident and samples frames from within it.
+        return dataset.sample_indices(n, rng)
 
     print(f"lance_dataset: {args.lance_dataset}")
     print(f"samples(frame windows): {len(dataset)}  action_horizon={args.action_horizon}")
