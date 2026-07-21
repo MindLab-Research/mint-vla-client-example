@@ -168,8 +168,8 @@ conversation, skip re-asking for just those fields.
    runtime is built against CUDA 13, so without this prefix every JAX GPU call
    fails at cuDNN init with `cudaErrorInsufficientDriver` regardless of GPU
    availability -- this can look exactly like "the GPUs are busy/broken" when
-   they are actually idle. See `ExperimentLog_MultiGPU.md` Step 2's "环境问题"
-   section for the full diagnosis; do not re-diagnose this from scratch if you
+   they are actually idle. See `references/multi_gpu_implementation.md` section 5.2
+   for the full diagnosis; do not re-diagnose this from scratch if you
    hit the same error.
 
    Wait for `GET /api/v1/healthz` to return `200` or `503` (both mean ready;
@@ -275,7 +275,7 @@ fixes. Summary:
   trivial `jnp.dot`** -> this is the CUDA forward-compat `LD_LIBRARY_PATH`
   issue (driver 535.129.03 vs jaxlib's CUDA13 runtime), not a GPU
   availability/hardware problem -- see step 5's `LD_LIBRARY_PATH` line and
-  `ExperimentLog_MultiGPU.md` Step 2's "环境问题" section. Do not assume the
+  `references/multi_gpu_implementation.md` section 5.2. Do not assume the
   GPUs are busy or broken just because this error appears; check
   `nvidia-smi --query-compute-apps` for actual occupancy first, and apply the
   `LD_LIBRARY_PATH` fix before concluding anything else is wrong.
@@ -285,7 +285,7 @@ fixes. Summary:
   replicated placement when `--batch-size` isn't a multiple of the visible
   device count). If you see this, the degrade-path logic in
   `_compute_flow_matching_grads_batched` regressed -- read
-  `ExperimentLog_MultiGPU.md` Step 2's "坑1" before attempting a fix.
+  `references/multi_gpu_implementation.md` section 6.2 before attempting a fix.
 
 ## Reference
 
@@ -299,12 +299,13 @@ fixes. Summary:
 - `references/api_contracts.md` -- exact request/response field shapes for
   `create_model` / `vla/train_step` / `save_weights_for_sampler`.
 - `references/troubleshooting.md` -- symptom -> cause -> fix table.
+- `references/multi_gpu_implementation.md` -- the multi-GPU data-parallel
+  training implementation: problem analysis, solution design, experimental
+  validation, and performance results (~250x per-sample throughput improvement).
+  Covers jit + data_sharding, graceful degradation for non-divisible batch sizes,
+  episode-slate sampling for large datasets, CUDA forward-compat requirements,
+  and troubleshooting guide. Read before touching `forward_backward`'s flow_matching
+  path or debugging sharding-related errors.
 - `ActionHeadSummary.md` (repo root) -- the 10-experiment study establishing
   the action_dim invariant. Do not duplicate its content here; link to it.
-- `ExperimentLog_MultiGPU.md` (repo root) -- the multi-GPU data-parallel
-  investigation and implementation log: why GPU utilization was low before,
-  the jit + `data_sharding` fix, the graceful-degrade behavior for
-  non-divisible batch sizes, the CUDA `LD_LIBRARY_PATH` compat issue, and the
-  measured ~250x per-sample throughput result. Read before touching
-  `forward_backward`'s flow_matching path or debugging a sharding-related
-  error; do not re-derive what's already documented there.
+

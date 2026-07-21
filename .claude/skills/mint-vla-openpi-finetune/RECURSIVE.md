@@ -172,11 +172,25 @@ forward-compat库没加进`LD_LIBRARY_PATH`——见`SKILL.md`步骤5的`LD_LIBR
 | 2026-07-15 | 用户真实调用：50步训练 + 推理验证 | ✅ 成功 | loss从0.13降到0.06左右，checkpoint正常落盘 |
 | 2026-07-15 | LoRA rank改为"警告不拦截"后，验证 rank=8 透传服务器400原文 | ✅ 成功 | 确认服务器detail文本被正确显示，不是本地伪造错误 |
 | 2026-07-15 | `--eval-mse` + `--infer-to-lance` 同时启用，`--max-samples 3` 快速验证 | ✅ 成功 | MSE aggregate输出正确；merged lance schema确认15列（原11+新4），pred_actions shape[10,32]正确 |
-| 2026-07-17 | 多卡数据并行改造：`--batch-size 4`（4卡整除）+ `--batch-size 2`（4卡不整除退化）+ 20步吞吐对比 | ✅ 成功 | 4卡dmon确认同步真实利用率；20步单样本吞吐较改造前提升约250倍；退化路径不崩溃；详见 `ExperimentLog_MultiGPU.md` |
+| 2026-07-17 | 多卡数据并行改造：`--batch-size 4`（4卡整除）+ `--batch-size 2`（4卡不整除退化）+ 20步吞吐对比 | ✅ 成功 | 4卡dmon确认同步真实利用率；20步单样本吞吐较改造前提升约250倍；退化路径不崩溃；详见 `references/multi_gpu_implementation.md` |
 
 ---
 
-## 4. 如何给这份文档添加新条目
+## 4. References 清单
+
+skill 的 `references/` 目录下的文档，每份的用途和适用场景：
+
+| 文档 | 用途 | 何时查阅 |
+|---|---|---|
+| `pipeline_reference.md` | 完整的脚本图、服务器端约束、已根因分析的历史bug | 开始改动代码前、遇到陌生报错时 |
+| `api_contracts.md` | 精确的请求/响应字段契约、真实响应样例 | 手写HTTP调用时、调试API字段问题时 |
+| `troubleshooting.md` | 症状→原因→修复速查表 | 遇到已知failure mode时快速定位 |
+| `multi_gpu_implementation.md` | 多GPU数据并行训练实现：问题分析、方案设计、实验验证、性能结果（~250x提速）、episode-slate采样、CUDA forward-compat、故障排查 | 改动`forward_backward`的flow_matching路径前、调试sharding相关错误时、需要理解多GPU吞吐优化原理时 |
+| `server_client_usage.md` | Server启动指南 + Client训练脚本 + 手写HTTP字段契约 + 常见问题速查 | 首次起no-ray server时、教别人用API训练时、需要完整端到端流程参考时 |
+
+---
+
+## 5. 如何给这份文档添加新条目
 
 给 skill 加新脚本时：
 1. 在第1节表格加一行（脚本路径、用途、状态）。
@@ -184,3 +198,4 @@ forward-compat库没加进`LD_LIBRARY_PATH`——见`SKILL.md`步骤5的`LD_LIBR
 3. 如果引入了新的、可能随时间变化的约束，在第2节新增一个"2.X"小节，按现有格式写
    "当前状态 / 本skill的应对方式 / 改进目标 / 如何验证是否已变化"四段。
 4. 做完真实端到端验证后，在第3节加一行记录（日期、验证内容、结果、备注）。
+5. 如果添加了新的 reference 文档，在第4节加一行（文档名、用途、何时查阅）。
