@@ -52,7 +52,14 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal[
+    "dummy",
+    "gemma_300m",
+    "gemma_300m_lora",
+    "gemma_300m_lora_r16",
+    "gemma_2b",
+    "gemma_2b_lora",
+]
 
 
 def get_config(variant: Variant) -> Config:
@@ -95,8 +102,10 @@ def get_config(variant: Variant) -> Config:
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
-    if variant == "gemma_300m_lora":
-        # 311M params
+    if variant in {"gemma_300m_lora", "gemma_300m_lora_r16"}:
+        # Keep the released rank-32 variant stable; Scheme-3 uses the explicit
+        # r16 identity so checkpoints cannot silently cross ranks.
+        rank = 16 if variant == "gemma_300m_lora_r16" else 32
         return Config(
             width=1024,
             depth=18,
@@ -104,7 +113,7 @@ def get_config(variant: Variant) -> Config:
             num_heads=8,
             num_kv_heads=1,
             head_dim=256,
-            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+            lora_configs={"attn": lora.LoRAConfig(rank=rank, alpha=float(rank)), "ffn": lora.LoRAConfig(rank=rank, alpha=float(rank))},
         )
     raise ValueError(f"Unknown variant: {variant}")
 
