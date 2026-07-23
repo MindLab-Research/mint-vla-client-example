@@ -69,12 +69,14 @@ class OpenPIPi05ActionSession:
         import openpi.models.model as openpi_model  # type: ignore[reportMissingImports]
         import openpi.models.pi0 as pi0_model  # type: ignore[reportMissingImports]
         import openpi.models.pi0_config as pi0_config  # type: ignore[reportMissingImports]
+        import openpi.training.sharding as sharding_mod  # type: ignore[reportMissingImports]
 
         self._jax = jax
         self._jnp = jnp
         self._openpi_model = openpi_model
         self._pi0_model = pi0_model
         self._pi0_config = pi0_config
+        self._sharding_mod = sharding_mod
 
         from mint_server.backend.openpi.openpi_orbax_compat import (
             install_restore_params_compat,
@@ -104,6 +106,20 @@ class OpenPIPi05ActionSession:
             raise RuntimeError("OpenPI pi0.5 action inference requires MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT")
         self._session_state_manager = OpenPISessionStateManager(state_root)
         self._rng = jax.random.key(0)
+
+        # Batch-inference sharding (see act_batch()). fsdp_devices=1 -> DATA_AXIS
+        # spans every visible device as a pure batch-parallel axis, mirroring
+        # the training worker's self._data_sharding/_replicated_sharding split
+        # (openpi_pi05_worker.py). Built once here since jax.device_count() and
+        # the mesh don't change across calls; the jitted sample_actions fn is
+        # built lazily per (batch_size, use_data_sharding) in _get_batch_sample_fn.
+        self._mesh = sharding_mod.make_mesh(1)
+        self._data_sharding = jax.sharding.NamedSharding(
+            self._mesh, jax.sharding.PartitionSpec(sharding_mod.DATA_AXIS)
+        )
+        self._replicated_sharding = jax.sharding.NamedSharding(self._mesh, jax.sharding.PartitionSpec())
+        self._batch_sample_fn = None
+        self._batch_sample_fn_key: tuple[int, bool] | None = None
 
     def _load_checkpoint_dir(self, checkpoint_dir: Path) -> None:
         self._checkpoint_dir = Path(checkpoint_dir).resolve()
@@ -372,6 +388,176 @@ class OpenPIPi05ActionSession:
             "rng": rng,
         }
 
+    def _observation_numpy_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Like `_observation_from_payload`, but returns plain unbatched numpy
+        arrays (no `[None, ...]` batch dim, no device placement) instead of a
+        batch-of-1 jnp `Observation`. `act_batch()` stacks N of these into a
+        `[batch, ...]` obs_dict before jitting + sharding, mirroring the
+        training worker's `_stack_flow_matching_batch` (openpi_pi05_worker.py).
+        """
+        chunks = list(payload["observation"]["chunks"])
+        image_chunks = [chunk for chunk in chunks if chunk["type"] == "image"]
+        text_chunks = [chunk for chunk in chunks if chunk["type"] == "encoded_text"]
+        if len(image_chunks) != len(self._camera_layout):
+            raise ValueError(
+                f"Expected {len(self._camera_layout)} image chunks, got {len(image_chunks)}"
+            )
+        if len(text_chunks) != 1:
+            raise ValueError("OpenPI pi0.5 action inference expects exactly one encoded_text chunk")
+
+        images = {
+            name: _decode_image(chunk)
+            for name, chunk in zip(self._camera_layout, image_chunks, strict=True)
+        }
+
+        state = _tensor_to_numpy(payload["extra_inputs"]["state"], dtype=np.float32)
+        if state.ndim != 1:
+            state = state.reshape(-1)
+        state = _pad([float(x) for x in state.tolist()], self._action_dim)
+
+        # Pad/truncate to the fixed max_token_len so the sampler is compiled once
+        # regardless of prompt length (see openpi_pi05_worker._padded_prompt).
+        n = int(self._max_token_len)
+        toks = [int(t) for t in text_chunks[0]["tokens"]][:n]
+        real = len(toks)
+        if real < n:
+            toks = toks + [0] * (n - real)
+        prompt_tokens = np.asarray(toks, dtype=np.int32)
+        prompt_mask = np.asarray([i < real for i in range(n)], dtype=bool)
+
+        return {
+            "image": images,
+            "state": state,
+            "tokenized_prompt": prompt_tokens,
+            "tokenized_prompt_mask": prompt_mask,
+        }
+
+    def _stack_observations(self, items: list[dict[str, Any]]) -> dict[str, Any]:
+        """Stack N unbatched observation dicts (from `_observation_numpy_from_payload`)
+        into a single `[batch, ...]` obs_dict of plain numpy arrays. Device
+        placement + sharding happens afterward in `act_batch`, not here --
+        same split as the training worker's `_stack_flow_matching_batch`."""
+        camera_names = list(items[0]["image"].keys())
+        images = {
+            cam: np.stack([item["image"][cam] for item in items], axis=0).astype(np.uint8)
+            for cam in camera_names
+        }
+        image_mask = {cam: np.ones((len(items),), dtype=bool) for cam in camera_names}
+        state = np.stack([item["state"] for item in items], axis=0).astype(np.float32)
+        tokenized_prompt = np.stack([item["tokenized_prompt"] for item in items], axis=0).astype(np.int32)
+        tokenized_prompt_mask = np.stack(
+            [item["tokenized_prompt_mask"] for item in items], axis=0
+        ).astype(bool)
+        return {
+            "image": images,
+            "image_mask": image_mask,
+            "state": state,
+            "tokenized_prompt": tokenized_prompt,
+            "tokenized_prompt_mask": tokenized_prompt_mask,
+        }
+
+    def _get_batch_sample_fn(self, batch_size: int, *, use_data_sharding: bool):
+        """Lazily build + cache a jitted `sample_actions` call for this
+        (batch_size, use_data_sharding) pair -- same cache-key shape as the
+        training worker's `_get_flow_matching_grad_fn`. Unlike the training
+        grad path, there is no backward pass here, so we don't need
+        `nnx.split`/`nnx.merge`/`nnx.value_and_grad`: `self._model` is closed
+        over directly (its params are fixed for the lifetime of this checkpoint
+        session), and `jax.jit` bakes them in as compile-time constants --
+        exactly like the existing un-jitted `self._model.sample_actions(...)`
+        call in `act()`, just compiled once and reused instead of re-traced
+        (and re-executed eagerly) on every single-item call.
+        """
+        cache_key = (batch_size, use_data_sharding)
+        if self._batch_sample_fn is not None and self._batch_sample_fn_key == cache_key:
+            return self._batch_sample_fn
+
+        jax = self._jax
+        model = self._model
+        openpi_model = self._openpi_model
+        replicated_sharding = self._replicated_sharding
+        input_sharding = self._data_sharding if use_data_sharding else replicated_sharding
+
+        def sample_fn(rng, obs_dict_):
+            observation = openpi_model.Observation.from_dict(obs_dict_)
+            return model.sample_actions(rng, observation)
+
+        jitted = jax.jit(
+            sample_fn,
+            in_shardings=(replicated_sharding, input_sharding),
+            out_shardings=replicated_sharding,  # gather output back to all devices before device_get
+        )
+        self._batch_sample_fn = jitted
+        self._batch_sample_fn_key = cache_key
+        return jitted
+
+    def act_batch(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Batched act(): infer N observations in one jitted, data-sharded call.
+
+        Reuses the exact sharding pattern the training worker already uses for
+        multi-GPU `train_step` (`_compute_flow_matching_grads_batched`):
+        `batch_size % jax.device_count() == 0` -> shard the batch dim across
+        every visible device via `PartitionSpec(DATA_AXIS)`; otherwise degrade
+        gracefully to a replicated (still-jitted, still-correct, just not
+        cross-device-split) call. See ExperimentLog_MultiGPU.md and the batch
+        inference experiment docs for why the un-jitted, un-batched single-item
+        `act()` cannot use multi-GPU sharding at all (batch_size is hardcoded
+        to 1 there), and why that is the dominant cost driving single-frame
+        inference latency, not just the lack of data parallelism.
+        """
+        jax = self._jax
+        observations_payload = list(payload["observations"])
+        batch_size = len(observations_payload)
+        if batch_size == 0:
+            raise ValueError("act_batch requires at least one observation")
+        temperature = float(payload.get("temperature", 0.0) or 0.0)
+        if temperature != 0.0:
+            raise ValueError(
+                "OpenPI pi0.5 action inference does not support temperature-based exploration"
+            )
+
+        started = time.monotonic()
+        items = [self._observation_numpy_from_payload(item) for item in observations_payload]
+        obs_dict = self._stack_observations(items)
+
+        device_count = jax.device_count()
+        use_data_sharding = batch_size % device_count == 0
+        input_sharding = self._data_sharding if use_data_sharding else self._replicated_sharding
+        sharded_obs = jax.tree.map(lambda a: jax.device_put(a, input_sharding), obs_dict)
+
+        sample_fn = self._get_batch_sample_fn(
+            batch_size, use_data_sharding=use_data_sharding
+        )
+        self._rng, rng = jax.random.split(self._rng)
+        with self._sharding_mod.set_mesh(self._mesh):
+            raw_actions = sample_fn(rng, sharded_obs)
+        raw_actions = jax.device_get(raw_actions)
+
+        # Same output-dim override as act() -- see its comment for why the
+        # default is the model's full action_dim, not the libero-legacy 7.
+        _out_dim_env = str(os.environ.get("MINT_OPENPI_PI05_ACTION_OUT_DIM") or "").strip()
+        out_dim = int(_out_dim_env) if _out_dim_env else self._action_dim
+        out_dim = max(1, min(out_dim, int(np.asarray(raw_actions).shape[-1])))
+        actions = np.asarray(raw_actions, dtype=np.float32)[:, :, :out_dim]
+        elapsed_ms = (time.monotonic() - started) * 1000.0
+
+        results = []
+        for i in range(batch_size):
+            arr = actions[i]
+            results.append(
+                {
+                    "data": arr.reshape(-1).tolist(),
+                    "shape": list(arr.shape),
+                    "dtype": "float32",
+                }
+            )
+        return {
+            "actions": results,
+            "batch_size": batch_size,
+            "elapsed_ms": elapsed_ms,
+            "used_data_sharding": bool(use_data_sharding),
+        }
+
     def act(self, payload: dict[str, Any]) -> dict[str, Any]:
         temperature = float(payload.get("temperature", 0.0) or 0.0)
         if temperature != 0.0:
@@ -461,6 +647,8 @@ def _dispatch(
         raise RuntimeError("OpenPI pi0.5 action session is not initialized")
     if op == "act":
         return session.act(payload), session
+    if op == "act_batch":
+        return session.act_batch(payload), session
     if op == "save_session_state":
         return session.save_session_state(payload), session
     if op == "load_session_state":

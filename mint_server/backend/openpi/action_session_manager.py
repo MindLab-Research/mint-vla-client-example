@@ -448,7 +448,36 @@ class OpenPIPi05ActionSessionManager:
             return_rollout_trace=return_rollout_trace,
             rollout_trace_config=rollout_trace_config,
         )
-        return await runtime.request("act", request.model_dump(mode="json", exclude_none=True))
+        payload = request.model_dump(mode="json", exclude_none=True)
+        return await runtime.request("act", payload)
+
+    async def act_batch(
+        self,
+        *,
+        action_session_id: str,
+        observations: list[dict[str, Any]],
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        """Batched act(): one HTTP round-trip infers `observations` (list of
+        {"chunks": [...]} model_input dicts already carrying `extra_inputs.state`
+        merged in by the caller -- see routes/mint.py's act_batch endpoint) in a
+        single jitted, data-sharded worker call. See
+        `openpi_pi05_action_worker.OpenPIPi05ActionSession.act_batch` for the
+        sharding mechanics; this method is pure plumbing.
+        """
+        runtime = self._runtime_clients.get(action_session_id)
+        if runtime is None:
+            runtime = _recover_detached_action_runtime_client(
+                action_session_id=action_session_id,
+                supports_base_model=_is_openpi_pi05_model,
+                supports_worker_module=lambda worker_module: worker_module == OPENPI_PI05_ACTION_WORKER_MODULE,
+            )
+            if runtime is not None:
+                self._runtime_clients[action_session_id] = runtime
+        if runtime is None:
+            raise KeyError(f"Unknown action_session_id: {action_session_id}")
+        payload = {"observations": observations, "temperature": temperature}
+        return await runtime.request("act_batch", payload)
 
     async def shutdown_session(self, action_session_id: str) -> None:
         runtime = self._runtime_clients.pop(action_session_id, None)
@@ -549,13 +578,37 @@ class ActionSessionRouter:
             manager = self._recover_manager_for_session(action_session_id)
         if manager is None:
             raise KeyError(f"Unknown action_session_id: {action_session_id}")
-        return await manager.act(  # type: ignore[attr-defined]
+        act_kwargs: dict[str, Any] = dict(
             action_session_id=action_session_id,
             observation=observation,
             extra_inputs=extra_inputs,
             temperature=temperature,
             return_rollout_trace=return_rollout_trace,
             rollout_trace_config=rollout_trace_config,
+        )
+        return await manager.act(**act_kwargs)  # type: ignore[attr-defined]
+
+    async def act_batch(
+        self,
+        *,
+        action_session_id: str,
+        observations: list[dict[str, Any]],
+        temperature: float | None = None,
+    ) -> dict[str, Any]:
+        manager = self._manager_for_session.get(action_session_id)
+        if manager is None:
+            manager = self._recover_manager_for_session(action_session_id)
+        if manager is None:
+            raise KeyError(f"Unknown action_session_id: {action_session_id}")
+        act_batch_fn = getattr(manager, "act_batch", None)
+        if not callable(act_batch_fn):
+            raise NotImplementedError(
+                f"{type(manager).__name__} does not support act_batch (openpi_fast backend not covered yet)"
+            )
+        return await act_batch_fn(
+            action_session_id=action_session_id,
+            observations=observations,
+            temperature=temperature,
         )
 
     async def shutdown_session(self, action_session_id: str) -> None:

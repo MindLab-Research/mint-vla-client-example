@@ -42,6 +42,8 @@ from ..models.mint_types import (
     MintCreateActionSessionRequest,
     MintCreateActionSessionResponse,
     MintDeleteActionSessionResponse,
+    VLAActBatchRequest,
+    VLAActBatchResponse,
     VLAActRequest,
     VLADatum,
     VLATrainStepRequest,
@@ -621,6 +623,54 @@ async def act(
             status_code=503, detail=f"Failed to enqueue action act request: {e}"
         )
 
+    return UntypedAPIFuture(request_id=request_id)
+
+
+@router.post(
+    "/action_sessions/{action_session_id}/act_batch", response_model=UntypedAPIFuture
+)
+async def act_batch(
+    action_session_id: str,
+    request: VLAActBatchRequest,
+    http_request: Request,
+) -> UntypedAPIFuture:
+    """Batched act(): infer N observations against the same action_session in
+    one call, reusing the training path's jit + multi-GPU data-sharding
+    machinery instead of one un-jitted, un-batched `act()` call per frame.
+
+    Ray-free local sessions only for now (mirrors `act`'s
+    `_openpi_local.has_local_action_session` branch) -- the queued/Ray path for
+    `act` is not extended here since MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME is
+    the only path currently exercised in production. See
+    ExperimentLog_MultiGPU.md and the batch inference experiment docs
+    (parallel_inference_experiment.md / batch_api_implementation_guide.md) for
+    why this exists and the measured before/after latency.
+    """
+    if action_session_manager is None:
+        raise HTTPException(
+            status_code=503, detail="Action session manager not initialized"
+        )
+
+    from mint_server.backend.openpi import openpi_local_execution as _openpi_local
+
+    if not _openpi_local.has_local_action_session(action_session_id):
+        raise HTTPException(
+            status_code=501,
+            detail="act_batch is only supported for local (Ray-free) OpenPI pi0.5 action sessions",
+        )
+
+    observations_payload = [
+        {
+            "observation": {"chunks": [chunk.model_dump(mode="json") for chunk in obs.model_input.chunks]},
+            "extra_inputs": {"state": obs.state.model_dump(mode="json")},
+        }
+        for obs in request.observations
+    ]
+    request_id = await _openpi_local.handle_act_batch(
+        action_session_id=action_session_id,
+        observations=observations_payload,
+        temperature=request.temperature,
+    )
     return UntypedAPIFuture(request_id=request_id)
 
 

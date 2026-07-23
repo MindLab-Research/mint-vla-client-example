@@ -419,6 +419,34 @@ async def handle_act(
     return request_id
 
 
+async def handle_act_batch(
+    *,
+    action_session_id: str,
+    observations: list[Any],
+    temperature: float | None,
+) -> str:
+    """Run batched inference inline; see action_session_manager.act_batch and
+    openpi_pi05_action_worker.OpenPIPi05ActionSession.act_batch for why this
+    exists (multi-GPU data-sharded inference instead of one un-jitted,
+    un-batched call per frame -- see ExperimentLog_MultiGPU.md / the batch
+    inference experiment docs for the ~100x+ latency gap this closes)."""
+    request_id = f"act_batch_{uuid.uuid4().hex}"
+    manager = _get_action_manager()
+
+    async def _do() -> dict[str, Any]:
+        out = await manager.act_batch(
+            action_session_id=action_session_id,
+            observations=observations,
+            temperature=temperature,
+        )
+        payload = dict(out)
+        payload["type"] = "act_batch"
+        return payload
+
+    await _run_inline(request_id, _do)
+    return request_id
+
+
 async def handle_shutdown_action_session(action_session_id: str) -> None:
     manager = _get_action_manager()
     try:

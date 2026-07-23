@@ -97,6 +97,28 @@ class VLAActRequest(MintBaseModel):
     rollout_trace_config: dict[str, Any] | None = None
 
 
+class VLAActBatchRequest(MintBaseModel):
+    """Batched act(): one act_session_id, N observations in a single request.
+
+    Lets the worker stack observations into a `[batch, ...]` array and reuse
+    the training path's jit + `jax.sharding` data-parallel machinery instead
+    of looping per-item -- see ExperimentLog_MultiGPU.md / the batch inference
+    experiment docs for why single-item `act()` cannot use multi-GPU sharding.
+    Only supported on the Ray-free local (`MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME`)
+    path; rollout traces are not supported in batch mode.
+    """
+
+    observations: list[VLAObservation]
+    temperature: float | None = None
+
+
+class VLAActBatchResponse(MintBaseModel):
+    actions: list[TensorData]
+    batch_size: int
+    elapsed_ms: float
+    used_data_sharding: bool
+
+
 class MintDeleteActionSessionResponse(MintBaseModel):
     action_session_id: str
     status: Literal["deleted"] = "deleted"

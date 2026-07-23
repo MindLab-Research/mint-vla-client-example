@@ -279,6 +279,19 @@ class OpenPIPi05WorkerSession:
         self._pending_grads = None
         self._closed = False
 
+        # Data-parallel batch sharding (Plan.md "多卡并行训练" 方案A). fsdp_devices=1
+        # (the current default) makes the mesh's DATA_AXIS span every visible device
+        # as a pure batch-parallel axis -- see openpi.training.sharding.make_mesh.
+        # `_flow_matching_grad_fn` is jit-compiled lazily on first use and cached
+        # per (graphdef, batch_size); the cache key check is cheap relative to a
+        # training step, so no need to invalidate it eagerly.
+        self._data_sharding = jax.sharding.NamedSharding(
+            self._mesh, jax.sharding.PartitionSpec(self._sharding_mod.DATA_AXIS)
+        )
+        self._replicated_sharding = jax.sharding.NamedSharding(self._mesh, jax.sharding.PartitionSpec())
+        self._flow_matching_grad_fn = None
+        self._flow_matching_grad_fn_batch_size: tuple[int, bool] | None = None
+
     def _load_weights_and_validate(self, loader: Any, params_shape: Any) -> Any:
         loaded_params = loader.load(params_shape)
         self._array_typing.check_pytree_equality(
@@ -392,6 +405,154 @@ class OpenPIPi05WorkerSession:
         )
         actions = jnp.asarray(item["actions"], dtype=jnp.float32)[None, ...]
         return observation, actions
+
+    def _padded_prompt_arrays(self, tokens: Any, mask: Any) -> tuple[list[int], list[bool]]:
+        """Same padding as `_padded_prompt`, but returns plain lists (for stacking
+        into a batch with np.stack), not a batch=1 jnp-wrapped dict."""
+        n = int(self._max_token_len)
+        tok = [int(t) for t in tokens][:n]
+        msk = [bool(m) for m in mask][:n]
+        if len(tok) < n:
+            pad = n - len(tok)
+            tok = tok + [0] * pad
+            msk = msk + [False] * pad
+        return tok, msk
+
+    def _stack_flow_matching_batch(self, batch: list[dict[str, Any]]) -> tuple[dict[str, Any], Any]:
+        """Vectorize a list of per-item flow_matching payloads into one batched
+        observation dict (plain numpy, not yet placed on any device) + actions
+        array, instead of building `batch_size` separate batch=1 arrays.
+
+        This is the data-parallel counterpart to `_observation_from_payload`: it
+        is what gets `jax.device_put` onto `self._data_sharding` before entering
+        the jitted grad function, so XLA's SPMD partitioner actually splits the
+        batch dimension across the mesh's DATA_AXIS instead of every micro-batch
+        landing on the same default device (see Plan.md 方案A).
+        """
+        camera_names = list(batch[0]["image_bytes"].keys())
+        images = {
+            cam: np.stack([_decode_image(item["image_bytes"][cam]) for item in batch], axis=0).astype(np.uint8)
+            for cam in camera_names
+        }
+        image_mask = {
+            cam: np.asarray([bool(item["image_mask"][cam]) for item in batch], dtype=bool) for cam in camera_names
+        }
+        tokens_masks = [
+            self._padded_prompt_arrays(item["tokenized_prompt"], item["tokenized_prompt_mask"]) for item in batch
+        ]
+        tokenized_prompt = np.asarray([tm[0] for tm in tokens_masks], dtype=np.int32)
+        tokenized_prompt_mask = np.asarray([tm[1] for tm in tokens_masks], dtype=bool)
+        state = np.asarray([item["state"] for item in batch], dtype=np.float32)
+        actions = np.asarray([item["actions"] for item in batch], dtype=np.float32)
+
+        obs_dict = {
+            "image": images,
+            "image_mask": image_mask,
+            "state": state,
+            "tokenized_prompt": tokenized_prompt,
+            "tokenized_prompt_mask": tokenized_prompt_mask,
+        }
+        return obs_dict, actions
+
+    def _get_flow_matching_grad_fn(self, batch_size: int, *, use_data_sharding: bool):
+        """Lazily build (and cache) the jitted flow_matching grad function for a
+        given (batch_size, use_data_sharding). XLA needs a fixed traced shape per
+        distinct batch_size, so the cache key includes it -- this mirrors the
+        existing `_padded_prompt` fixed-shape rationale (recompiling per distinct
+        shape is a slow, VRAM-leaking path; caching by shape avoids that).
+
+        `use_data_sharding=False` degrades to replicated input placement (no
+        cross-device batch split) when `batch_size` isn't a multiple of
+        `jax.device_count()` -- JAX requires the sharded dimension's size to be
+        evenly divisible by the number of devices it's split across (see
+        ExperimentLog_MultiGPU.md Step 2: batch_size=2 on 4 devices hit exactly
+        this with `ValueError: ... global size ... should be divisible by 4 ...
+        but it is equal to 2`). Still jitted either way -- the jit-only speedup
+        (~278x per Step 1) is independent of whether the batch is sharded across
+        devices, only the last ~2x (4 vs 1 GPU) needs the divisibility to hold.
+
+        Returns a callable `(rng, params, obs_dict, actions) -> (mean_loss, per_example_loss, grads)`.
+        `mean_loss` is what feeds the optimizer (openpi upstream semantics: MEAN
+        over the whole batch, NOT the sum-of-per-item-means the old per-item loop
+        used -- see ExperimentLog_MultiGPU.md Step 2 for why this was chosen over
+        preserving the old SUM scale).
+        """
+        cache_key = (batch_size, use_data_sharding)
+        if self._flow_matching_grad_fn is not None and self._flow_matching_grad_fn_batch_size == cache_key:
+            return self._flow_matching_grad_fn
+
+        nnx = self._nnx
+        jax = self._jax
+        jnp = self._jnp
+        diff_state = nnx.DiffState(0, self._config.trainable_filter)
+        graphdef = self._state.model_def
+
+        # `nnx.DiffState`-filtered value_and_grad needs to operate on a merged
+        # Module (matching the existing single-item `_compute_grads`'s pattern),
+        # not the raw `params` State -- merging *inside* loss_fn and passing raw
+        # params as argnums=0 hits a pytree-structure mismatch inside nnx's
+        # custom-node bookkeeping (confirmed by hitting exactly that error here;
+        # verified fix mirrors scripts/wip/openpi_multi_gpu_repro.py's working
+        # merge-outside-loss_fn pattern).
+        def loss_fn(model_obj: Any, rng: Any, obs_dict_: Any, actions_: Any):
+            observation = self._openpi_model.Observation.from_dict(obs_dict_)
+            per_example_loss = model_obj.compute_loss(rng, observation, actions_, train=True)  # [B, action_horizon]
+            return jnp.mean(per_example_loss), jnp.mean(per_example_loss, axis=-1)
+
+        def grad_step(rng: Any, params: Any, obs_dict_: Any, actions_: Any):
+            model_obj = nnx.merge(graphdef, params)
+            model_obj.train()
+            (mean_loss, per_example_loss), grads = nnx.value_and_grad(
+                loss_fn, argnums=diff_state, has_aux=True
+            )(model_obj, rng, obs_dict_, actions_)
+            return mean_loss, per_example_loss, grads
+
+        replicated_sharding = self._replicated_sharding
+        input_sharding = self._data_sharding if use_data_sharding else replicated_sharding
+        jitted = jax.jit(
+            grad_step,
+            in_shardings=(replicated_sharding, replicated_sharding, input_sharding, input_sharding),
+        )
+        self._flow_matching_grad_fn = jitted
+        self._flow_matching_grad_fn_batch_size = cache_key
+        return jitted
+
+    def _compute_flow_matching_grads_batched(
+        self, batch: list[dict[str, Any]]
+    ) -> tuple[Any, list[float], float, float]:
+        """Data-parallel replacement for looping `_compute_grads` once per item.
+
+        Returns (grads, per_example_loss, mean_grad_norm, mean_param_norm) so the
+        caller (`forward_backward`) can keep its existing metrics/loss_fn_outputs
+        shape (one entry per input item) without needing a true per-item forward
+        pass -- `compute_loss` already returns a per-example loss for free
+        (see openpi.models.pi0.Pi0.compute_loss's `[*b, ah]` return shape), we
+        only reduce it once for the aux output instead of running it batch_size
+        times.
+        """
+        jax = self._jax
+        sharding_mod = self._sharding_mod
+
+        batch_size = len(batch)
+        device_count = jax.device_count()
+        use_data_sharding = batch_size % device_count == 0
+        input_sharding = self._data_sharding if use_data_sharding else self._replicated_sharding
+
+        obs_dict, actions = self._stack_flow_matching_batch(batch)
+        sharded_obs = jax.tree.map(lambda a: jax.device_put(a, input_sharding), obs_dict)
+        sharded_actions = jax.device_put(actions, input_sharding)
+
+        grad_fn = self._get_flow_matching_grad_fn(batch_size, use_data_sharding=use_data_sharding)
+        self._rng, step_rng = jax.random.split(self._rng)
+        with sharding_mod.set_mesh(self._mesh):
+            mean_loss, per_example_loss, grads = grad_fn(
+                step_rng, self._state.params, sharded_obs, sharded_actions
+            )
+
+        model = self._nnx.merge(self._state.model_def, self._state.params)
+        grad_norm, param_norm = self._grad_and_param_norm(model, grads)
+        per_example_loss_list = [float(v) for v in np.asarray(jax.device_get(per_example_loss))]
+        return grads, per_example_loss_list, grad_norm, param_norm
 
     def _rl_observation_from_payload(self, item: dict[str, Any]):
         observation, _ = self._observation_from_payload({**item, "actions": [[0.0] * self._action_dim] * self._action_horizon})
@@ -716,6 +877,40 @@ class OpenPIPi05WorkerSession:
             raise ValueError("OpenPI pi0.5 forward_backward requires a non-empty batch")
 
         loss_fn_config = dict(payload.get("loss_fn_config") or {})
+
+        if loss_fn == "flow_matching":
+            # Data-parallel path (Plan.md 方案A): one batched, jitted, sharded
+            # grad call instead of a Python for-loop of batch_size single-item
+            # calls -- see _compute_flow_matching_grads_batched's docstring and
+            # ExperimentLog_MultiGPU.md Step 2 for why this replaced the old loop.
+            grads, per_example_loss, grad_norm, param_norm = self._compute_flow_matching_grads_batched(batch)
+            self._pending_grads = (
+                grads if self._pending_grads is None else self._jax.tree.map(lambda a, b: a + b, self._pending_grads, grads)
+            )
+            loss_fn_outputs = [
+                {"loss": {"data": [loss_value], "shape": [1], "dtype": "float32"}}
+                for loss_value in per_example_loss
+            ]
+            batch_size = float(len(batch))
+            metrics = {
+                # MEAN over the whole batch (openpi upstream semantics), not the
+                # old SUM-of-per-item-means -- see ExperimentLog_MultiGPU.md.
+                "loss:mean": sum(per_example_loss) / max(batch_size, 1.0),
+                "num_samples:sum": batch_size,
+                "num_tokens:sum": batch_size * float(self._action_horizon),
+                "grad_norm:mean": grad_norm,
+                "param_norm:mean": param_norm,
+            }
+            return {
+                "loss_fn_output_type": f"{loss_fn}_loss",
+                "loss_fn_outputs": loss_fn_outputs,
+                "metrics": metrics,
+            }
+
+        # RL paths (importance_sampling / ppo) are unchanged by the multi-GPU
+        # data-parallel work -- Plan.md scoped that to flow_matching only, since
+        # this skill's driver never exercises the RL loss_fns. Still per-item
+        # Python loop, no jit/sharding here.
         total_loss = 0.0
         total_units = 0.0
         total_grad_norm = 0.0
@@ -727,75 +922,61 @@ class OpenPIPi05WorkerSession:
         pending_grads = self._pending_grads
 
         for item in batch:
-            if loss_fn == "flow_matching":
-                observation, actions = self._observation_from_payload(item)
-                grads, loss_value, grad_norm, param_norm = self._compute_grads(observation, actions)
-                unit_count = float(self._action_horizon)
-                loss_fn_outputs.append(
-                    {
-                        "loss": {
-                            "data": [loss_value],
-                            "shape": [1],
-                            "dtype": "float32",
-                        }
-                    }
+            observation, chains, old_logprobs, advantages = self._rl_observation_from_payload(item)
+            if loss_fn == "importance_sampling":
+                (
+                    grads,
+                    loss_value,
+                    grad_norm,
+                    param_norm,
+                    ratio_mean,
+                    unit_count,
+                    new_logprobs,
+                ) = self._compute_importance_sampling_grads(
+                    observation,
+                    chains,
+                    old_logprobs,
+                    advantages,
+                    item,
+                    loss_fn_config,
                 )
+                total_ratio += ratio_mean
+                num_rl_items += 1
             else:
-                observation, chains, old_logprobs, advantages = self._rl_observation_from_payload(item)
-                if loss_fn == "importance_sampling":
-                    (
-                        grads,
-                        loss_value,
-                        grad_norm,
-                        param_norm,
-                        ratio_mean,
-                        unit_count,
-                        new_logprobs,
-                    ) = self._compute_importance_sampling_grads(
-                        observation,
-                        chains,
-                        old_logprobs,
-                        advantages,
-                        item,
-                        loss_fn_config,
-                    )
-                    total_ratio += ratio_mean
-                    num_rl_items += 1
-                else:
-                    (
-                        grads,
-                        loss_value,
-                        grad_norm,
-                        param_norm,
-                        ratio_mean,
-                        clipfrac_mean,
-                        unit_count,
-                        new_logprobs,
-                    ) = self._compute_ppo_grads(
-                        observation,
-                        chains,
-                        old_logprobs,
-                        advantages,
-                        item,
-                        loss_fn_config,
-                    )
-                    total_ratio += ratio_mean
-                    total_clipfrac += clipfrac_mean
-                    num_rl_items += 1
-                loss_fn_outputs.append(
-                    {
-                        "loss": {
-                            "data": [loss_value],
-                            "shape": [1],
-                            "dtype": "float32",
-                        },
-                        "logprobs": {
-                            "data": new_logprobs,
-                            "shape": [self._action_horizon, int(item["source_action_dim"])],
-                            "dtype": "float32",
-                        },
-                    }
+                (
+                    grads,
+                    loss_value,
+                    grad_norm,
+                    param_norm,
+                    ratio_mean,
+                    clipfrac_mean,
+                    unit_count,
+                    new_logprobs,
+                ) = self._compute_ppo_grads(
+                    observation,
+                    chains,
+                    old_logprobs,
+                    advantages,
+                    item,
+                    loss_fn_config,
                 )
+                total_ratio += ratio_mean
+                total_clipfrac += clipfrac_mean
+                num_rl_items += 1
+            loss_fn_outputs.append(
+                {
+                    "loss": {
+                        "data": [loss_value],
+                        "shape": [1],
+                        "dtype": "float32",
+                    },
+                    "logprobs": {
+                        "data": new_logprobs,
+                        "shape": [self._action_horizon, int(item["source_action_dim"])],
+                        "dtype": "float32",
+                    },
+                }
+            )
             pending_grads = (
                 grads
                 if pending_grads is None
