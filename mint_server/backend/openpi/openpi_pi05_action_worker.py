@@ -18,7 +18,7 @@ import numpy as np
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
-from mint_server.backend.openpi.pi05_profiles import get_pi05_profile
+from mint_server.backend.openpi.pi05_profiles import get_pi05_profile, validate_profile_manifest
 
 
 logger = structlog.get_logger(__name__)
@@ -142,6 +142,8 @@ class OpenPIPi05ActionSession:
 
     def _load_checkpoint_dir(self, checkpoint_dir: Path) -> None:
         self._checkpoint_dir = Path(checkpoint_dir).resolve()
+        if self._profile is not None:
+            validate_profile_manifest(self._checkpoint_dir, self._profile)
         self._model = self._model_cfg.load(
             self._openpi_model.restore_params(self._checkpoint_dir / "params", dtype=self._jnp.bfloat16)
         )

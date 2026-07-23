@@ -5,7 +5,13 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import os
+from pathlib import Path
 from typing import Any
+import uuid
+
+
+PROFILE_MANIFEST_FILENAME = "mint_pi05_profile.json"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,3 +83,44 @@ def profile_from_model_config(model_config: Any) -> Pi05Profile:
     if not profile_id:
         raise ValueError("OpenPI pi0.5 model config must declare a profile")
     return get_pi05_profile(profile_id)
+
+
+def profile_manifest_path(root: str | Path) -> Path:
+    return Path(root) / PROFILE_MANIFEST_FILENAME
+
+
+def write_profile_manifest(root: str | Path, profile: Pi05Profile) -> Path:
+    """Atomically writes the exact profile contract before a checkpoint is published."""
+    root_path = Path(root)
+    root_path.mkdir(parents=True, exist_ok=True)
+    destination = profile_manifest_path(root_path)
+    temporary = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
+    payload = json.dumps(profile.checkpoint_manifest(), sort_keys=True, separators=(",", ":"))
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def validate_profile_manifest(root: str | Path, profile: Pi05Profile) -> Path:
+    """Requires an on-disk manifest exactly matching *profile*, including its hash."""
+    path = profile_manifest_path(root)
+    if not path.is_file():
+        raise FileNotFoundError(f"OpenPI pi0.5 profile manifest is required: {path}")
+    try:
+        actual = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"OpenPI pi0.5 profile manifest is invalid JSON: {path}") from exc
+    expected = profile.checkpoint_manifest()
+    if actual != expected:
+        raise ValueError(
+            "OpenPI pi0.5 profile manifest mismatch: "
+            f"expected profile_id={expected['profile_id']!r} hash={expected['manifest_hash']}, "
+            f"got profile_id={actual.get('profile_id')!r} hash={actual.get('manifest_hash')!r}"
+        )
+    return path

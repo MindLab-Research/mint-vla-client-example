@@ -13,6 +13,7 @@ from mint_server.backend.openpi.openpi_direct_runtime import OpenPIDirectWorkerC
 from mint_server.backend.openpi.openpi_fast_action_runtime import (
     OPENPI_FAST_ACTION_WORKER_MODULE,
     OpenPIFastActionRuntimeSpec,
+    find_openpi_policy_checkpoint_dir,
 )
 from mint_server.backend.openpi.openpi_fast_training import (
     OPENPI_FAST_TRAINING_BACKEND,
@@ -23,7 +24,7 @@ from mint_server.backend.openpi.openpi_pi05_training import (
     OPENPI_PI05_ACTION_WORKER_MODULE,
     get_openpi_pi05_config_name,
 )
-from mint_server.backend.openpi.pi05_profiles import profile_from_model_config
+from mint_server.backend.openpi.pi05_profiles import profile_from_model_config, validate_profile_manifest
 
 logger = structlog.get_logger(__name__)
 
@@ -390,6 +391,10 @@ class OpenPIPi05ActionSessionManager:
 
         model_config = get_model_config(base_model)
         checkpoint_path = self._resolve_model_path(model_path, user_id)
+        profile = profile_from_model_config(model_config) if getattr(model_config, "profile", None) else None
+        if profile is not None:
+            policy_checkpoint_dir = find_openpi_policy_checkpoint_dir(checkpoint_path)
+            validate_profile_manifest(policy_checkpoint_dir, profile)
         action_session_id = self._action_session_id(session_id, action_session_seq_id)
         config_name = get_openpi_pi05_config_name(base_model)
         create_payload = {
@@ -402,8 +407,8 @@ class OpenPIPi05ActionSessionManager:
             "max_token_len": int(model_config.max_model_len),
             "camera_layout": list(model_config.camera_layout),
         }
-        if model_config.profile:
-            create_payload["profile"] = profile_from_model_config(model_config).checkpoint_manifest()
+        if profile is not None:
+            create_payload["profile"] = profile.checkpoint_manifest()
         client = await _create_openpi_action_runtime_client(
             runtime_factory=self._runtime_factory,
             action_session_id=action_session_id,

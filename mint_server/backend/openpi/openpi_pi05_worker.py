@@ -22,7 +22,11 @@ import numpy as np
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
-from mint_server.backend.openpi.pi05_profiles import get_pi05_profile
+from mint_server.backend.openpi.pi05_profiles import (
+    get_pi05_profile,
+    validate_profile_manifest,
+    write_profile_manifest,
+)
 
 
 logger = structlog.get_logger(__name__)
@@ -337,6 +341,18 @@ class OpenPIPi05WorkerSession:
             }
         )
 
+    @staticmethod
+    def _trainable_shape_breakdown(params: Any) -> tuple[int, list[str]]:
+        total = 0
+        breakdown: list[str] = []
+        for path, variable in params.flat_state().items():
+            value = getattr(variable, "value", variable)
+            shape = tuple(int(dim) for dim in value.shape)
+            count = int(np.prod(shape, dtype=np.int64))
+            total += count
+            breakdown.append(f"{'/'.join(str(part) for part in path)}: shape={shape} count={count}")
+        return total, breakdown
+
     def _init_train_state(self) -> Any:
         config = self._config
         jax = self._jax
@@ -370,6 +386,20 @@ class OpenPIPi05WorkerSession:
 
         init_rng = jax.random.key(config.seed)
         train_state_shape = jax.eval_shape(init, init_rng)
+        trainable_shape = train_state_shape.params.filter(config.trainable_filter)
+        self._trainable_parameter_count, breakdown = self._trainable_shape_breakdown(trainable_shape)
+        if self._profile is not None and self._trainable_parameter_count != self._profile.expected_trainable_count:
+            details = "\n".join(breakdown)
+            raise ValueError(
+                "OpenPI pi0.5 profile trainable-count mismatch: "
+                f"expected={self._profile.expected_trainable_count}, actual={self._trainable_parameter_count}. "
+                f"Trainable path/shape breakdown:\n{details}"
+            )
+        logger.info(
+            "openpi_pi05_trainable_parameter_count profile=%s count=%s",
+            None if self._profile is None else self._profile.profile_id,
+            self._trainable_parameter_count,
+        )
         state_sharding = self._sharding_mod.fsdp_sharding(train_state_shape, self._mesh, log=True)
         partial_params = self._load_weights_and_validate(
             config.weight_loader,
@@ -1082,7 +1112,17 @@ class OpenPIPi05WorkerSession:
             "action_dim": self._action_dim,
             "action_horizon": self._action_horizon,
             "max_token_len": self._max_token_len,
+            "profile": None if self._profile is None else self._profile.checkpoint_manifest(),
+            "trainable_parameter_count": self._trainable_parameter_count,
         }
+
+    def _write_profile_manifest(self, root: Path) -> None:
+        if self._profile is not None:
+            write_profile_manifest(root, self._profile)
+
+    def _validate_profile_manifest(self, root: Path) -> None:
+        if self._profile is not None:
+            validate_profile_manifest(root, self._profile)
 
     def _save_train_state_checkpoint(self, path: Path, state: Any) -> None:
         checkpoint_path_obj = Path(path).resolve()
@@ -1095,6 +1135,7 @@ class OpenPIPi05WorkerSession:
             resume=False,
         )
         try:
+            self._write_profile_manifest(checkpoint_path_obj)
             checkpoint_step = max(1, _int_scalar(state.step))
             self._checkpoints.save_state(
                 manager,
@@ -1135,6 +1176,7 @@ class OpenPIPi05WorkerSession:
             resume=False,
         )
         try:
+            self._write_profile_manifest(checkpoint_path_obj)
             checkpoint_step = max(1, _int_scalar(state.step))
             # Sampler exports must reflect the current policy params, not a lagging EMA shadow.
             params = state.params
@@ -1151,19 +1193,28 @@ class OpenPIPi05WorkerSession:
                 },
             )
             manager.wait_until_finished()
+            source_dir = find_openpi_policy_checkpoint_dir(checkpoint_path_obj)
+            self._write_profile_manifest(source_dir)
         finally:
             close = getattr(manager, "close", None)
             if callable(close):
                 close()
 
     @staticmethod
-    def _sampler_export_complete(export_dir: Path) -> bool:
-        return (export_dir / "params").is_dir() and (export_dir / "assets").is_dir()
+    def _sampler_export_complete(export_dir: Path, profile: Any | None = None) -> bool:
+        if not ((export_dir / "params").is_dir() and (export_dir / "assets").is_dir()):
+            return False
+        if profile is not None:
+            try:
+                validate_profile_manifest(export_dir, profile)
+            except (FileNotFoundError, ValueError):
+                return False
+        return True
 
     def _save_sampler_export(self, export_path: Path, state: Any) -> Path:
         export_dir = Path(export_path).resolve()
         if export_dir.exists():
-            if OpenPIPi05WorkerSession._sampler_export_complete(export_dir):
+            if OpenPIPi05WorkerSession._sampler_export_complete(export_dir, self._profile):
                 return export_dir
             shutil.rmtree(export_dir)
         temp_dir = export_dir.parent / f".openpi_pi05_sampler_export_{export_dir.name}_{uuid.uuid4().hex}"
@@ -1179,9 +1230,11 @@ class OpenPIPi05WorkerSession:
                 raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing params dir: {params_dir}")
             if not assets_dir.is_dir():
                 raise FileNotFoundError(f"OpenPI pi0.5 sampler export missing assets dir: {assets_dir}")
+            self._validate_profile_manifest(source_dir)
             stage_dir.mkdir(parents=True, exist_ok=False)
             shutil.copytree(params_dir, stage_dir / "params")
             shutil.copytree(assets_dir, stage_dir / "assets")
+            self._write_profile_manifest(stage_dir)
             stage_dir.rename(export_dir)
             return export_dir
         finally:
@@ -1189,7 +1242,9 @@ class OpenPIPi05WorkerSession:
             shutil.rmtree(stage_dir, ignore_errors=True)
 
     def _load_train_state_checkpoint(self, path: Path) -> Any:
-        checkpoint_path = str(Path(path).resolve())
+        checkpoint_path_obj = Path(path).resolve()
+        self._validate_profile_manifest(checkpoint_path_obj)
+        checkpoint_path = str(checkpoint_path_obj)
         manager, resuming = self._checkpoints.initialize_checkpoint_dir(
             checkpoint_path,
             keep_period=None,
@@ -1259,6 +1314,7 @@ class OpenPIPi05WorkerSession:
     def _save_session_train_state_checkpoint(self, path: Path, state: dict[str, Any]) -> None:
         manager, _ = self._initialize_session_checkpoint_dir(path, overwrite=True, resume=False)
         try:
+            self._write_profile_manifest(Path(path).resolve())
             checkpoint_step = max(1, _int_scalar(state["step"]))
             manager.save(checkpoint_step, items={"session_state": state})
             manager.wait_until_finished()
@@ -1268,6 +1324,7 @@ class OpenPIPi05WorkerSession:
                 close()
 
     def _load_session_train_state_checkpoint(self, path: Path) -> Any:
+        self._validate_profile_manifest(Path(path).resolve())
         manager, resuming = self._initialize_session_checkpoint_dir(path, overwrite=False, resume=True)
         if not resuming:
             close = getattr(manager, "close", None)

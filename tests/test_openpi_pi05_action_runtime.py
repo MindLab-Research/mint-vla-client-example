@@ -152,6 +152,46 @@ def test_openpi_pi05_action_session_manager_create_session_starts_runtime_from_c
     )
 
 
+def test_openpi_pi05_action_session_manager_rejects_profiled_checkpoint_before_runtime(
+    monkeypatch, tmp_path: Path
+) -> None:
+    from mint_server.backend.openpi.action_session_manager import OpenPIPi05ActionSessionManager
+
+    profiled_model = "openpi/pi05-action-lora-r16-finetune"
+    monkeypatch.setattr(
+        "mint_server.backend.openpi.action_session_manager.get_model_config",
+        lambda base_model: type(
+            "_Cfg",
+            (),
+            {
+                "training_backend": "openpi_pi05",
+                "camera_layout": ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+                "action_dim": 32,
+                "action_horizon": 10,
+                "max_model_len": 200,
+                "profile": "pi05_action_lora_r16_v1",
+            },
+        )()
+        if base_model == profiled_model
+        else (_ for _ in ()).throw(KeyError(base_model)),
+    )
+    checkpoint_dir = tmp_path / "missing-profile-manifest"
+    (checkpoint_dir / "params").mkdir(parents=True)
+    factory = _FakeActionRuntimeFactory()
+
+    with pytest.raises(FileNotFoundError, match="profile manifest"):
+        asyncio.run(
+            OpenPIPi05ActionSessionManager(runtime_factory=factory).create_session(
+                session_id="session-1",
+                action_session_seq_id=None,
+                base_model=profiled_model,
+                model_path=f"file://{checkpoint_dir}",
+                user_id="admin",
+            )
+        )
+    assert factory.calls == []
+
+
 def test_openpi_pi05_action_session_manager_act_returns_actions(monkeypatch, tmp_path: Path) -> None:
     from mint_server.backend.openpi.action_session_manager import OpenPIPi05ActionSessionManager
 
