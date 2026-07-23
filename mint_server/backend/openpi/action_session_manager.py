@@ -23,6 +23,7 @@ from mint_server.backend.openpi.openpi_pi05_training import (
     OPENPI_PI05_ACTION_WORKER_MODULE,
     get_openpi_pi05_config_name,
 )
+from mint_server.backend.openpi.pi05_profiles import profile_from_model_config
 
 logger = structlog.get_logger(__name__)
 
@@ -391,6 +392,18 @@ class OpenPIPi05ActionSessionManager:
         checkpoint_path = self._resolve_model_path(model_path, user_id)
         action_session_id = self._action_session_id(session_id, action_session_seq_id)
         config_name = get_openpi_pi05_config_name(base_model)
+        create_payload = {
+            "action_session_id": action_session_id,
+            "base_model": base_model,
+            "checkpoint_path": checkpoint_path,
+            "config_name": config_name,
+            "action_dim": int(model_config.action_dim or 0),
+            "action_horizon": int(model_config.action_horizon or 0),
+            "max_token_len": int(model_config.max_model_len),
+            "camera_layout": list(model_config.camera_layout),
+        }
+        if model_config.profile:
+            create_payload["profile"] = profile_from_model_config(model_config).checkpoint_manifest()
         client = await _create_openpi_action_runtime_client(
             runtime_factory=self._runtime_factory,
             action_session_id=action_session_id,
@@ -398,16 +411,7 @@ class OpenPIPi05ActionSessionManager:
             checkpoint_path=checkpoint_path,
             model_config=model_config,
             config_name=config_name,
-            create_payload={
-                "action_session_id": action_session_id,
-                "base_model": base_model,
-                "checkpoint_path": checkpoint_path,
-                "config_name": config_name,
-                "action_dim": int(model_config.action_dim or 0),
-                "action_horizon": int(model_config.action_horizon or 0),
-                "max_token_len": int(model_config.max_model_len),
-                "camera_layout": list(model_config.camera_layout),
-            },
+            create_payload=create_payload,
             log_label="openpi_pi05_action",
         )
 

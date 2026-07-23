@@ -18,6 +18,7 @@ import numpy as np
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
+from mint_server.backend.openpi.pi05_profiles import get_pi05_profile
 
 
 logger = structlog.get_logger(__name__)
@@ -91,14 +92,32 @@ class OpenPIPi05ActionSession:
         self._max_token_len = int(payload["max_token_len"])
         self._camera_layout = tuple(str(name) for name in payload["camera_layout"])
         self._checkpoint_dir = find_openpi_policy_checkpoint_dir(payload["checkpoint_path"])
+        profile_manifest = payload.get("profile")
+        self._profile = None
+        if profile_manifest is not None:
+            self._profile = get_pi05_profile(str(profile_manifest.get("profile_id") or ""))
+            if profile_manifest != self._profile.checkpoint_manifest():
+                raise ValueError("OpenPI pi0.5 action payload profile manifest does not match its profile ID")
+            if (self._action_dim, self._action_horizon, self._max_token_len) != (
+                self._profile.action_dim,
+                self._profile.action_horizon,
+                self._profile.max_token_len,
+            ):
+                raise ValueError("OpenPI pi0.5 action payload dimensions disagree with profile manifest")
 
         self._model_cfg = pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=self._action_dim,
-            action_horizon=self._action_horizon,
-            max_token_len=self._max_token_len,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
+            **(
+                self._profile.pi0_config_kwargs()
+                if self._profile is not None
+                else {
+                    "pi05": True,
+                    "action_dim": self._action_dim,
+                    "action_horizon": self._action_horizon,
+                    "max_token_len": self._max_token_len,
+                    "discrete_state_input": False,
+                    "paligemma_variant": "gemma_2b_lora",
+                }
+            )
         )
         self._load_checkpoint_dir(self._checkpoint_dir)
         state_root = str(os.environ.get("MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT") or "").strip()
@@ -135,6 +154,7 @@ class OpenPIPi05ActionSession:
             "max_token_len": self._max_token_len,
             "camera_layout": list(self._camera_layout),
             "pi05": True,
+            "profile": None if self._profile is None else self._profile.checkpoint_manifest(),
         }
 
     def _save_session_payload(self, path: Path, state: dict[str, Any]) -> None:

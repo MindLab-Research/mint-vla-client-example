@@ -9,6 +9,7 @@ from typing import Any
 
 from mint_server.models.types import AdamParams
 from mint_server.backend.core.model_registry import ModelConfig, get_model_config
+from mint_server.backend.openpi.pi05_profiles import profile_from_model_config
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 
 
@@ -20,6 +21,7 @@ OPENPI_PI05_TRAINING_BACKEND = "openpi_pi05"
 OPENPI_PI05_LORA_RANK = 16
 OPENPI_PI05_CONFIG_NAMES = {
     "openpi/pi05-libero-low-mem-finetune": "pi05_libero",
+    "openpi/pi05-action-lora-r16-finetune": "pi05_libero",
 }
 
 
@@ -322,7 +324,7 @@ class OpenPIPi05TrainingEngine:
         return config
 
     def _create_session_payload(self, *, session: Any, model_config: ModelConfig) -> dict[str, Any]:
-        return {
+        payload = {
             "model_id": session.model_id,
             "session_id": session.session_id,
             "base_model": session.base_model,
@@ -333,6 +335,10 @@ class OpenPIPi05TrainingEngine:
             "max_token_len": int(model_config.max_model_len),
             "camera_layout": list(model_config.camera_layout),
         }
+        if model_config.profile:
+            profile = profile_from_model_config(model_config)
+            payload["profile"] = profile.checkpoint_manifest()
+        return payload
 
     def _optim_payload(self, adam_params: AdamParams | None) -> dict[str, float]:
         params = adam_params or AdamParams()

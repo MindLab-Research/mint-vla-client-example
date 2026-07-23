@@ -22,6 +22,7 @@ import numpy as np
 from mint_server.backend.openpi.openpi_fast_action_runtime import find_openpi_policy_checkpoint_dir
 from mint_server.backend.openpi.openpi_fast_runtime import OPENPI_FAST_WORKER_PROTOCOL_VERSION
 from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateManager
+from mint_server.backend.openpi.pi05_profiles import get_pi05_profile
 
 
 logger = structlog.get_logger(__name__)
@@ -212,6 +213,18 @@ class OpenPIPi05WorkerSession:
         self._config_name = str(payload["config_name"])
         self._learning_rate = float(payload.get("learning_rate") or 0.0)
         self._max_token_len = int(payload["max_token_len"])
+        profile_manifest = payload.get("profile")
+        self._profile = None
+        if profile_manifest is not None:
+            self._profile = get_pi05_profile(str(profile_manifest.get("profile_id") or ""))
+            if profile_manifest != self._profile.checkpoint_manifest():
+                raise ValueError("OpenPI pi0.5 training payload profile manifest does not match its profile ID")
+            if (self._action_dim, self._action_horizon, self._max_token_len) != (
+                self._profile.action_dim,
+                self._profile.action_horizon,
+                self._profile.max_token_len,
+            ):
+                raise ValueError("OpenPI pi0.5 training payload dimensions disagree with profile manifest")
 
         config = config_mod.get_config(self._config_name)
         checkpoint_base_dir = os.environ.get(
@@ -224,14 +237,30 @@ class OpenPIPi05WorkerSession:
         )
 
         model_cfg = pi0_config.Pi0Config(
-            pi05=True,
-            action_dim=self._action_dim,
-            action_horizon=self._action_horizon,
-            max_token_len=self._max_token_len,
-            discrete_state_input=False,
-            paligemma_variant="gemma_2b_lora",
+            **(
+                self._profile.pi0_config_kwargs()
+                if self._profile is not None
+                else {
+                    "pi05": True,
+                    "action_dim": self._action_dim,
+                    "action_horizon": self._action_horizon,
+                    "max_token_len": self._max_token_len,
+                    "discrete_state_input": False,
+                    "paligemma_variant": "gemma_2b_lora",
+                }
+            )
         )
-        freeze_filter = nnx.Not(nnx_utils.PathRegex(".*lora.*"))
+        if self._profile is None:
+            freeze_filter = nnx.Not(nnx_utils.PathRegex(".*lora.*"))
+        else:
+            trainable = nnx.Any(
+                nnx_utils.PathRegex(".*lora.*"),
+                nnx_utils.PathRegex(".*action_in_proj.*"),
+                nnx_utils.PathRegex(".*time_mlp_in.*"),
+                nnx_utils.PathRegex(".*time_mlp_out.*"),
+                nnx_utils.PathRegex(".*action_out_proj.*"),
+            )
+            freeze_filter = nnx.Not(trainable)
 
         self._config = dataclasses.replace(
             config,
