@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 import uuid
 
 
@@ -69,6 +69,54 @@ PI05_ACTION_LORA_R16_V1 = Pi05Profile(
 )
 
 _PROFILES = {PI05_ACTION_LORA_R16_V1.profile_id: PI05_ACTION_LORA_R16_V1}
+
+
+# This is intentionally outside Pi05Profile.manifest(): it is a runtime model-layout
+# contract, while the published checkpoint manifest remains byte-for-byte stable.
+_PI05_ACTION_LORA_R16_V1_TRAINABLE_LEAF_SHAPES: dict[str, tuple[int, ...]] = {
+    "PaliGemma/llm/layers/attn/attn_vec_einsum_1/lora_a": (18, 8, 256, 16),
+    "PaliGemma/llm/layers/attn/attn_vec_einsum_1/lora_b": (18, 8, 16, 1024),
+    "PaliGemma/llm/layers/attn/kv_einsum_1/lora_a": (18, 2, 1, 1024, 16),
+    "PaliGemma/llm/layers/attn/kv_einsum_1/lora_b": (18, 2, 1, 16, 256),
+    "PaliGemma/llm/layers/attn/q_einsum_1/lora_a": (18, 8, 1024, 16),
+    "PaliGemma/llm/layers/attn/q_einsum_1/lora_b": (18, 8, 16, 256),
+    "PaliGemma/llm/layers/mlp_1/gating_einsum_lora_a": (18, 2, 1024, 16),
+    "PaliGemma/llm/layers/mlp_1/gating_einsum_lora_b": (18, 2, 16, 4096),
+    "PaliGemma/llm/layers/mlp_1/linear_lora_a": (18, 4096, 16),
+    "PaliGemma/llm/layers/mlp_1/linear_lora_b": (18, 16, 1024),
+    "action_in_proj/bias": (1024,),
+    "action_in_proj/kernel": (32, 1024),
+    "action_out_proj/bias": (32,),
+    "action_out_proj/kernel": (1024, 32),
+    "time_mlp_in/bias": (1024,),
+    "time_mlp_in/kernel": (1024, 1024),
+    "time_mlp_out/bias": (1024,),
+    "time_mlp_out/kernel": (1024, 1024),
+}
+
+
+def validate_profile_trainable_leaves(
+    profile: Pi05Profile, actual: Mapping[str, tuple[int, ...]]
+) -> None:
+    """Fail closed when a profiled model's trainable leaves differ from its layout contract."""
+    if profile.profile_id != PI05_ACTION_LORA_R16_V1.profile_id:
+        return
+
+    expected = _PI05_ACTION_LORA_R16_V1_TRAINABLE_LEAF_SHAPES
+    normalized_actual = {path: tuple(int(dim) for dim in shape) for path, shape in actual.items()}
+    missing = sorted(set(expected) - set(normalized_actual))
+    unexpected = sorted(set(normalized_actual) - set(expected))
+    wrong_shape = [
+        f"{path}: expected={expected[path]}, actual={normalized_actual[path]}"
+        for path in sorted(set(expected) & set(normalized_actual))
+        if expected[path] != normalized_actual[path]
+    ]
+    if missing or unexpected or wrong_shape:
+        raise ValueError(
+            "OpenPI pi0.5 profile trainable-leaf mismatch: "
+            f"profile={profile.profile_id!r}; missing={missing}; "
+            f"unexpected={unexpected}; wrong_shape={wrong_shape}"
+        )
 
 
 def get_pi05_profile(profile_id: str) -> Pi05Profile:

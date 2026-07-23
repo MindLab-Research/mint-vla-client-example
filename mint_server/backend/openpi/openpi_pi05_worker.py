@@ -25,6 +25,7 @@ from mint_server.backend.openpi.openpi_session_state import OpenPISessionStateMa
 from mint_server.backend.openpi.pi05_profiles import (
     get_pi05_profile,
     validate_profile_manifest,
+    validate_profile_trainable_leaves,
     write_profile_manifest,
 )
 
@@ -342,16 +343,15 @@ class OpenPIPi05WorkerSession:
         )
 
     @staticmethod
-    def _trainable_shape_breakdown(params: Any) -> tuple[int, list[str]]:
+    def _trainable_shape_breakdown(params: Any) -> tuple[int, dict[str, tuple[int, ...]]]:
         total = 0
-        breakdown: list[str] = []
+        leaves: dict[str, tuple[int, ...]] = {}
         for path, variable in params.flat_state().items():
             value = getattr(variable, "value", variable)
             shape = tuple(int(dim) for dim in value.shape)
-            count = int(np.prod(shape, dtype=np.int64))
-            total += count
-            breakdown.append(f"{'/'.join(str(part) for part in path)}: shape={shape} count={count}")
-        return total, breakdown
+            total += int(np.prod(shape, dtype=np.int64))
+            leaves["/".join(str(part) for part in path)] = shape
+        return total, leaves
 
     def _init_train_state(self) -> Any:
         config = self._config
@@ -387,18 +387,27 @@ class OpenPIPi05WorkerSession:
         init_rng = jax.random.key(config.seed)
         train_state_shape = jax.eval_shape(init, init_rng)
         trainable_shape = train_state_shape.params.filter(config.trainable_filter)
-        self._trainable_parameter_count, breakdown = self._trainable_shape_breakdown(trainable_shape)
-        if self._profile is not None and self._trainable_parameter_count != self._profile.expected_trainable_count:
-            details = "\n".join(breakdown)
-            raise ValueError(
-                "OpenPI pi0.5 profile trainable-count mismatch: "
-                f"expected={self._profile.expected_trainable_count}, actual={self._trainable_parameter_count}. "
-                f"Trainable path/shape breakdown:\n{details}"
+        self._trainable_parameter_count, trainable_leaves = self._trainable_shape_breakdown(trainable_shape)
+        profile_id = None if self._profile is None else self._profile.profile_id
+        for path, shape in trainable_leaves.items():
+            logger.info(
+                "openpi_pi05_trainable_leaf",
+                profile=profile_id,
+                path=path,
+                shape=shape,
+                count=int(np.prod(shape, dtype=np.int64)),
             )
+        if self._profile is not None:
+            validate_profile_trainable_leaves(self._profile, trainable_leaves)
+            if self._trainable_parameter_count != self._profile.expected_trainable_count:
+                raise ValueError(
+                    "OpenPI pi0.5 profile trainable-count mismatch: "
+                    f"expected={self._profile.expected_trainable_count}, actual={self._trainable_parameter_count}"
+                )
         logger.info(
-            "openpi_pi05_trainable_parameter_count profile=%s count=%s",
-            None if self._profile is None else self._profile.profile_id,
-            self._trainable_parameter_count,
+            "openpi_pi05_trainable_parameter_count",
+            profile=profile_id,
+            count=self._trainable_parameter_count,
         )
         state_sharding = self._sharding_mod.fsdp_sharding(train_state_shape, self._mesh, log=True)
         partial_params = self._load_weights_and_validate(
