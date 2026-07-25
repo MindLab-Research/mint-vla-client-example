@@ -24,6 +24,40 @@ from mint_server.backend.openpi.pi05_profiles import get_pi05_profile, validate_
 logger = structlog.get_logger(__name__)
 
 
+def configure_jax_compilation_cache(jax_module: Any) -> Path | None:
+    """Enable a durable JAX cache before constructing any compiled policy functions.
+
+    JAX honors ``JAX_COMPILATION_CACHE_DIR`` itself.  The MINT-prefixed alias
+    lets a server launcher configure this runtime without changing global JAX
+    settings for unrelated processes.  An invalid configured path is a hard
+    failure: silently recompiling a pi0.5 sampler costs minutes.
+    """
+    configured = (
+        os.environ.get("MINT_OPENPI_JAX_COMPILATION_CACHE_DIR")
+        or os.environ.get("JAX_COMPILATION_CACHE_DIR")
+        or ""
+    ).strip()
+    if not configured:
+        return None
+
+    cache_dir = Path(configured).expanduser().resolve()
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not cache_dir.is_dir():
+        raise NotADirectoryError(f"JAX compilation cache is not a directory: {cache_dir}")
+    jax_module.config.update("jax_compilation_cache_dir", str(cache_dir))
+    logger.info(
+        "configured OpenPI JAX compilation cache",
+        cache_dir=str(cache_dir),
+        min_compile_time_seconds=jax_module.config.values.get(
+            "jax_persistent_cache_min_compile_time_secs"
+        ),
+        min_entry_size_bytes=jax_module.config.values.get(
+            "jax_persistent_cache_min_entry_size_bytes"
+        ),
+    )
+    return cache_dir
+
+
 def _reply(message: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(message) + "\n")
     sys.stdout.flush()
@@ -66,6 +100,8 @@ class OpenPIPi05ActionSession:
     def __init__(self, payload: dict[str, Any]) -> None:
         import jax
         import jax.numpy as jnp
+
+        configure_jax_compilation_cache(jax)
 
         import openpi.models.model as openpi_model  # type: ignore[reportMissingImports]
         import openpi.models.pi0 as pi0_model  # type: ignore[reportMissingImports]
