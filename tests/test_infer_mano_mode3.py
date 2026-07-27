@@ -15,9 +15,11 @@ def test_b_reconstruction_is_query_anchored_with_absolute_euler():
     query = np.arange(26, dtype=np.float32)
     output = np.full((10, 32), 0.5, dtype=np.float32)
     target = mode3.reconstruct_absolute_target_chunk(query, output)
-    np.testing.assert_allclose(target[:, :3], query[:3] + 0.5)
-    np.testing.assert_allclose(target[:, 3:6], 0.5)
-    np.testing.assert_allclose(target[:, 6:26], query[6:26] + 0.5)
+    expected = np.tile(query, (10, 1))
+    expected[:, :3] += 0.5
+    expected[:, 3:6] = 0.5
+    expected[:, 6:26] += 0.5
+    np.testing.assert_allclose(target, expected)
 
 
 def test_mode3_queries_non_overlapping_ten_frame_chunks_without_smoothing():
@@ -75,7 +77,8 @@ def test_extended_state_uses_pair_presence_and_reference_lift():
 
 def test_norm_failure_fails_before_norm_stats_load(monkeypatch, tmp_path):
     args = SimpleNamespace(
-        base_url="x", act_batch_size=4, contact_context_frames=0, norm_stats_dir=tmp_path,
+        base_url="x", act_batch_size=4, contact_context_frames=0,
+        norm_stats_dir=tmp_path, client_commit=None,
     )
     monkeypatch.setattr(mode3, "parse_args", lambda: args)
     with mock.patch.object(mode3, "verify_locked_norm_stats", side_effect=ValueError("bad sha")), \
