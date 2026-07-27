@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.env.*
+*.swp
+MUJOCO_LOG.TXT
+.tmp/
+.tmp_*/
+
+# Per-user connection settings derived from config/remote.env.example.
+config/remote.env
+.vla_mint_commit
+
+# Generated inference videos, arrays, logs, and provenance copies.
+results/
+
+# Agent state and transcripts are private operational context, not client source.
+.memory/
+.pi-subagents/
+
+# Historical parent-workspace copies are retained locally for lossless
+# consolidation but are not maintained source and may contain machine paths.
+archive/parent-vla-legacy/
