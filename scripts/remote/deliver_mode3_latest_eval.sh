@@ -11,7 +11,7 @@ DATA=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_wit
 MANIFEST=${DATA}.contact_windows.json
 GESTURE=$CLIENT/config/datasets/new_all_generated_mano.index.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
-OUTPUT_ROOT=/vePFS-Mindverse/user/intern/wenxi/results/training/mode3_latest_b_alora_clean_aug_20260727
+OUTPUT_ROOT=${MODE3_OUTPUT_ROOT:-/vePFS-Mindverse/user/intern/wenxi/results/training/mode3_latest_b_alora_clean_aug_20260727}
 ROWS=924,960,914,943,939
 NORM_ROWS=$(python3 -c "print(','.join(str(i) for i in range(810,995)))")
 OWNER_ID=000000000000000000000001
@@ -106,16 +106,20 @@ run_arm(){ (
     export MINT_PERSISTENT_CHECKPOINT_DIR="$train_root/server/runtime_checkpoints/persistent_cache"
     export MINT_TMP_ROOT="$arm_out/server/tmp"
     export MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT_BASE="$arm_out/server/action_state"
-    export MINT_OPENPI_JAX_COMPILATION_CACHE_DIR="$arm_out/server/jax_cache"
-    export JAX_ENABLE_COMPILATION_CACHE=true JAX_COMPILATION_CACHE_DIR="$arm_out/server/jax_cache"
-    export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
-    export JAX_RAISE_PERSISTENT_CACHE_ERRORS=true
+    # Do not enable JAX persistent executable caching here. pi0.5 lowers a
+    # multi-GB executable and this runtime cannot serialize it; the compile
+    # itself succeeds when cache serialization is disabled (the production
+    # Mode4 server contract uses the same no-cache path).
+    unset MINT_OPENPI_JAX_COMPILATION_CACHE_DIR JAX_ENABLE_COMPILATION_CACHE
+    unset JAX_COMPILATION_CACHE_DIR JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
+    unset JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES
+    unset JAX_RAISE_PERSISTENT_CACHE_ERRORS
     export OPENPI_DATA_HOME=/vePFS-Mindverse/share/models/openpi HF_HOME=/vePFS-Mindverse/share/huggingface
     export XLA_FLAGS=--xla_gpu_enable_command_buffer=
     export LD_LIBRARY_PATH=/usr/local/cuda/compat:/usr/local/cuda/lib64:/usr/local/cuda/extras/CUPTI/lib64:/usr/local/nvidia/lib:/usr/local/nvidia/lib64
     export PYTHONPATH=$MINT_ROOT:$OPENPI_ROOT/src:$OPENPI_ROOT/packages/openpi-client/src:$EXTRA:$SITE
     export PYTHONNOUSERSITE=1
-    mkdir -p "$arm_out/server"/{tmp,action_state,jax_cache}
+    mkdir -p "$arm_out/server"/{tmp,action_state}
     exec "$PYTHON" -u -c "import uvicorn; from mint_server.app import app; uvicorn.run(app,host='127.0.0.1',port=$port,workers=1,log_level='info')"
   ) >"$arm_out/server/server.log" 2>&1 &
   server_pid=$!
