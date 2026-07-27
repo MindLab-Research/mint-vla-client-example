@@ -93,6 +93,9 @@ implement the following validated path:
 - cooperative deadline checkpoint saving;
 - Mode4 closed-loop MuJoCo rollout with native position-servo control,
   sim-owned object motion, and fixed-shape `act_batch` requests;
+- Mode3 historical kinematic diagnostic for B-exact v1 checkpoints: predicted
+  MANO qpos and sim cameras are evaluated against the reference object
+  trajectory with `mj_forward` only, never physics integration;
 - five-finger Mode4 contact from object-keypoint pair presence, with no
   `mj_contactForce` or `0.01 N` filter;
 - focused training, inference, contract, migration, and production-path tests.
@@ -170,8 +173,11 @@ Remove `--print-config` only when the printed allocation is correct.
   training client, checkpointing, deadline handling, and locked norm metadata.
 - `scripts/train/openpi_vla_smoke_lance_base.py`: Lance projection and MINT wire
   format.
-- `scripts/eval/infer_mano_mode4.py`: sole MANO closed-loop inference
-  entrypoint.
+- `scripts/eval/infer_mano_mode4.py`: maintained MANO closed-loop real-physics
+  inference entrypoint.
+- `scripts/eval/infer_mano_mode3.py`: dedicated historical kinematic Mode3
+  diagnostic; it is intentionally not a Mode4 alternative or a generic
+  numbered-mode multiplexer.
 - `scripts/eval/mano_physics_core.py`: MuJoCo scene, collision, five-finger
   pair-presence contact, servo, and timing.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,

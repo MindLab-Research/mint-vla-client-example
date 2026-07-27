@@ -105,8 +105,8 @@ episodes.
 
 ### Mode4 physics inference
 
-`scripts/eval/infer_mano_mode4.py` is the only maintained MANO inference
-entrypoint. It always initializes from source frame 0, reconstructs the model's
+`scripts/eval/infer_mano_mode4.py` is the maintained MANO real-physics
+inference entrypoint. It always initializes from source frame 0, reconstructs the model's
 B output into absolute target DOFs, temporally ensembles absolute targets, and
 executes them through MuJoCo's native position servo. The next policy state and
 head/wrist images come from the integrated `MjData`; the object is never reset
@@ -149,6 +149,36 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
 
 Dry-run mode does not contact MINT. It verifies Lance access, selected rows,
 state/action dimensions, normalization, image preprocessing, and batch shape.
+
+### Mode3 historical kinematic diagnostic
+
+`scripts/eval/infer_mano_mode3.py` restores the historical `sim_no_smooth`
+kinematic contract for current B-exact 32D v1 checkpoints. It queries
+non-overlapping 10-frame chunks through a fixed batch-4 request, reconstructs
+B targets from the qpos at that query, and advances the predicted hand without
+temporal ensembling. At every frame it forces the target object to the
+reference trajectory pose, calls `mj_forward`, and renders head and wrist
+observations. It never calls `mj_step`; its output is a visual/state diagnostic,
+not a real-physics grasp result. Mode4 remains the maintained evaluator for
+sim-owned object motion and native position-servo dynamics.
+
+```bash
+./scripts/remote/run_client.sh scripts/eval/infer_mano_mode3.py \
+  --model-path <checkpoint> --owner-id <owner> \
+  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
+  --row-indices 810,811 --normalization-row-indices 810,811 \
+  --contact-window-manifest "${MANIFEST}" --missing-contact-policy error \
+  --extended-state --norm-stats-dir "${NORM}" \
+  --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/mode3
+```
+
+The required extended state is `[predicted_hand_qpos(26), contact(index,thumb,
+ring,middle,pinky), reference_object_z[t]-reference_object_z[0]]`. Contacts are
+target-object × MANO-keypoint pair presence after the frame's forward pass;
+palm is checked while resolving the 16 keypoint geoms but is not emitted. The
+locked norm SHA is checked before it is loaded or queried. Add `--backend-commit`
+and `--model-commit` when those paired source SHAs are available; result metadata
+also records the client commit.
 
 The current pi0.5 setup expects:
 
