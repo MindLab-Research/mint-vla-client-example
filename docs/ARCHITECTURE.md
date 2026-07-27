@@ -74,6 +74,71 @@ call `mj_contactForce`, compute `force_norm`, or apply a `0.01 N` threshold.
 The locked gesture03 v1 norm SHA256 is
 `507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d`.
 
+## Recommended worktree pattern
+
+A branch isolates Git history; a worktree also isolates the filesystem. Do not
+check out a new branch inside the project-owned GPU worktrees while a service
+may be importing code from them. That would change the source beneath the
+running process. Create a new branch and worktree together from the validated
+base instead.
+
+### Client-only development
+
+A user who only calls an existing managed MINT endpoint needs an independent
+clone of this repository and a normal feature branch:
+
+```bash
+git clone git@github.com:MindLab-Research/mint-vla-client-example.git
+cd mint-vla-client-example
+git switch -c users/<user>/<task> origin/main
+```
+
+On a shared machine, a second client worktree is also valid when concurrent
+experiments need different client commits:
+
+```bash
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example \
+  worktree add \
+  -b users/<user>/<task> \
+  /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-<user>-<task> \
+  main
+```
+
+### Independent server or backend/model development
+
+Create a paired MINT and OpenPI worktree from the currently validated
+`action-lora-r16` branches:
+
+```bash
+# MINT
+MINT_COMMON=/vePFS-Mindverse/user/intern/wenxi/mint
+MINT_WORKTREE=/vePFS-Mindverse/user/intern/wenxi/mint-<user>-<task>
+git -C "$MINT_COMMON" worktree add \
+  -b users/<user>/<task> \
+  "$MINT_WORKTREE" \
+  action-lora-r16
+
+# OpenPI
+OPENPI_COMMON=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/src/openpi
+OPENPI_WORKTREE=/vePFS-Mindverse/user/intern/wenxi/openpi-<user>-<task>
+git -C "$OPENPI_COMMON" worktree add \
+  -b users/<user>/<task> \
+  "$OPENPI_WORKTREE" \
+  action-lora-r16
+```
+
+Point the user's private client configuration or server launcher to the pair:
+
+```bash
+MINT_CODE_ROOT=/vePFS-Mindverse/user/intern/wenxi/mint-<user>-<task>
+MINT_OPENPI_ROOT=/vePFS-Mindverse/user/intern/wenxi/openpi-<user>-<task>
+```
+
+Worktrees do not isolate runtime state. Every independently launched server
+also needs a unique TCP port, confirmed GPU set, runtime/checkpoint root,
+temporary root, action-session state root, and log path. Do not remove a
+worktree until its server has stopped and its branch is clean and pushed.
+
 ## Local context policy
 
 The local formal clone may contain an ignored `.memory/` tree used by Pi:

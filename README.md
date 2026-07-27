@@ -79,6 +79,43 @@ The locked gesture03 v1 norm SHA256 is:
 Ports and GPUs are allocated per run. A different port does not imply a
 separate GPU allocation; verify both before starting a server.
 
+## What the current stack implements
+
+The checked-in client and the paired `action-lora-r16` MINT/OpenPI worktrees
+implement the following validated path:
+
+- OpenPI pi0.5 action-expert LoRA, rank 16, trained through the MINT HTTP API;
+- B-exact `urdf_target_absolute` supervision and query-anchored action
+  reconstruction, with `action[26:32]` fixed to physical zero;
+- `mano_five_finger_contact_lift_v1` 32D observations;
+- clean and state-augmented training, with StateAug restricted to MANO qpos;
+- exact-byte normalization locking and state/action provenance metadata;
+- cooperative deadline checkpoint saving;
+- Mode4 closed-loop MuJoCo rollout with native position-servo control,
+  sim-owned object motion, and fixed-shape `act_batch` requests;
+- five-finger Mode4 contact from object-keypoint pair presence, with no
+  `mj_contactForce` or `0.01 N` filter;
+- focused training, inference, contract, migration, and production-path tests.
+
+Existing clean/StateAug checkpoints use this v1 training contract and do not
+require retraining for the pair-presence Mode4 alignment.
+
+## Recommended multi-user usage
+
+| User activity | Client checkout | MINT/OpenPI worktrees |
+| --- | --- | --- |
+| Call an existing managed MINT endpoint | Use the user's own clone of this repository | Not needed |
+| Launch an independent MINT server without source edits | Use the user's own clone | A dedicated MINT + OpenPI pair is recommended for provenance and isolation |
+| Modify MINT backend or OpenPI model code | Use the user's own clone | A dedicated MINT + OpenPI pair is required |
+
+Do not modify the project-owned worktrees
+`mint-action-lora-r16` or `openpi-action-lora-r16` for another user's
+experiment. Creating a worktree isolates source and branch state; it does not
+isolate ports, GPUs, runtime/checkpoint roots, temporary directories, session
+state, or logs. Allocate all of those independently. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#recommended-worktree-pattern) for
+the exact commands.
+
 ## Prepare the formal checkout
 
 On the GPU host:
