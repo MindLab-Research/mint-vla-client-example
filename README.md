@@ -36,8 +36,9 @@ physics state are computed here, before the request reaches MINT.
 - Update it with reviewed commits and `git pull --ff-only`; do not overlay it
   with rsync or maintain a separate `.vla_mint_commit` marker.
 - The former non-Git execution copy
-  `/vePFS-Mindverse/user/intern/wenxi/vla_mint-parallel-preprocess` is retained
-  only as a migration rollback source.
+  `/vePFS-Mindverse/user/intern/wenxi/vla_mint-parallel-preprocess` is retired
+  in place while pre-existing shells finish. It is rollback-only and must not
+  receive new work.
 - Never modify the shared legacy copy
   `/vePFS-Mindverse/user/intern/wenxi/vla_mint`.
 
@@ -141,6 +142,7 @@ Remove `--print-config` only when the printed allocation is correct.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server
   launcher; not a shared-server lifecycle command.
+- `docs/ARCHITECTURE.md`: client/MINT/OpenPI ownership and local-context policy.
 - `docs/CLIENT_FINETUNE.md`: detailed client workflow.
 - `Tutorial.md`: historical MINT no-Ray protocol reference.
 

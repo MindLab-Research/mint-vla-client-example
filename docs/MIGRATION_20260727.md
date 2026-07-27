@@ -41,5 +41,11 @@ The migration did not import:
    `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`.
 5. Keep MINT and OpenPI changes in their own repositories and branches.
 
-The previous non-Git execution copy remains untouched as a rollback reference;
-it is not a second source of truth.
+After validation, the previous non-Git execution copy was retired in place at
+`/vePFS-Mindverse/user/intern/wenxi/vla_mint-parallel-preprocess`. Pre-existing
+idle shells still hold that working directory, so it is not renamed yet; it is
+not a second source of truth or a destination for new work. The previous local
+Git repository's full
+history was preserved in
+`/home/jay/vla/_archive/vla_mint-pre-formal-20260727.bundle`. It remains retired
+in place until pre-existing shells using that working directory exit.
