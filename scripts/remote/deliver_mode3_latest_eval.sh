@@ -13,6 +13,7 @@ GESTURE=$CLIENT/config/datasets/new_all_generated_mano.index.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
 OUTPUT_ROOT=${MODE3_OUTPUT_ROOT:-/vePFS-Mindverse/user/intern/wenxi/results/training/mode3_latest_b_alora_clean_aug_20260727}
 QUERY_STRIDE=${MODE3_QUERY_STRIDE:-10}
+RUN_SMOKE=${MODE3_RUN_SMOKE:-1}
 ROWS=924,960,914,943,939
 NORM_ROWS=$(python3 -c "print(','.join(str(i) for i in range(810,995)))")
 OWNER_ID=000000000000000000000001
@@ -31,6 +32,9 @@ fail(){ mkdir -p "$OUTPUT_ROOT"; log "FAILED: $*" | tee "$FAILED" >&2; exit 1; }
 
 [[ "$QUERY_STRIDE" == 1 || "$QUERY_STRIDE" == 10 ]] || {
   echo "MODE3_QUERY_STRIDE must be 1 or 10, got $QUERY_STRIDE" >&2; exit 2;
+}
+[[ "$RUN_SMOKE" == 0 || "$RUN_SMOKE" == 1 ]] || {
+  echo "MODE3_RUN_SMOKE must be 0 or 1, got $RUN_SMOKE" >&2; exit 2;
 }
 [[ ! -e "$OUTPUT_ROOT" ]] || { echo "output already exists: $OUTPUT_ROOT" >&2; exit 2; }
 mkdir -p "$OUTPUT_ROOT"
@@ -151,13 +155,17 @@ run_arm(){ (
     --client-commit "$CLIENT_COMMIT" --backend-commit "$MINT_COMMIT" --model-commit "$OPENPI_COMMIT"
   )
 
-  # At least two requests exercise model load/JIT, live 32D state, sharding, and warm latency.
-  smoke_frames=$((QUERY_STRIDE + 1))
-  "$PYTHON" -u "$CLIENT/scripts/eval/infer_mano_mode3.py" "${common[@]}" \
-    --row-index 924 --max-frames "$smoke_frames" --output-dir "$arm_out/smoke" \
-    >"$arm_out/smoke/eval.log" 2>&1
-  [[ -s "$arm_out/smoke/mode3/result.json" ]] || { echo "$arm smoke missing result" > "$arm_out/arm.failed"; exit 1; }
-  log "$arm smoke passed"
+  if [[ "$RUN_SMOKE" == 1 ]]; then
+    # At least two requests exercise model load/JIT, live state, sharding, and warm latency.
+    smoke_frames=$((QUERY_STRIDE + 1))
+    "$PYTHON" -u "$CLIENT/scripts/eval/infer_mano_mode3.py" "${common[@]}" \
+      --row-index 924 --max-frames "$smoke_frames" --output-dir "$arm_out/smoke" \
+      >"$arm_out/smoke/eval.log" 2>&1
+    [[ -s "$arm_out/smoke/mode3/result.json" ]] || { echo "$arm smoke missing result" > "$arm_out/arm.failed"; exit 1; }
+    log "$arm smoke passed"
+  else
+    log "$arm standalone smoke skipped; full run is the fail-closed production probe"
+  fi
 
   "$PYTHON" -u "$CLIENT/scripts/eval/infer_mano_mode3.py" "${common[@]}" \
     --row-indices "$ROWS" --output-dir "$arm_out/artifacts" \
