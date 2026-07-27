@@ -32,6 +32,13 @@ class Mode4ContractTests(unittest.TestCase):
         self.assertEqual(MANORL_PHYSICS_SUBSTEPS, 2)
         self.assertEqual(expected_mode4_mj_steps(715), 1428)
 
+    def test_padded_action_chunk_does_not_alias_source_labels(self):
+        actions = np.arange(12 * 32, dtype=np.float32).reshape(12, 32)
+        original = actions.copy()
+        chunk = mode4.pad_actions(actions, frame=1, window_end=11)
+        chunk[:] = -1
+        np.testing.assert_array_equal(actions, original)
+
     def test_native_servo_and_collision_scene(self):
         kp, dampratio, effort = physics.servo_parameters()
         np.testing.assert_allclose(kp[:6], 100)
@@ -91,7 +98,7 @@ class Mode4LoopTests(unittest.TestCase):
             fps=10,
             model="m",
             act_mode="single",
-            extended_state=False,
+            extended_state=True,
             language_conditioning="gesture",
             max_warm_request_seconds=0,
             temporal_decay=0.4,
@@ -122,6 +129,8 @@ class Mode4LoopTests(unittest.TestCase):
                 "max_abs_actuator_force": 3,
             }
 
+        observation_contacts = np.asarray([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
+
         with tempfile.TemporaryDirectory() as out, mock.patch.object(
             mode4.full, "row_frame_count", return_value=2
         ), mock.patch.object(
@@ -144,6 +153,14 @@ class Mode4LoopTests(unittest.TestCase):
             ),
         ), mock.patch.object(
             mode4.physics,
+            "resolve_keypoint_geom_ids",
+            return_value=(object(), object(), object()),
+        ), mock.patch.object(
+            mode4.physics,
+            "finger_contacts_from_mujoco",
+            return_value=observation_contacts,
+        ), mock.patch.object(
+            mode4.physics,
             "physics_substeps_for_row",
             side_effect=AssertionError("metadata timing must not drive Mode4"),
         ), mock.patch.object(
@@ -151,7 +168,7 @@ class Mode4LoopTests(unittest.TestCase):
         ), mock.patch.object(
             mode4.physics,
             "nearest_wrapped_position_target",
-            side_effect=lambda current, delta, limits: (current + delta, None),
+            side_effect=lambda current, delta, limits: (current + delta + 0.001, None),
         ), mock.patch.object(
             mode4.physics, "step_servo", side_effect=step
         ), mock.patch.object(
@@ -184,8 +201,53 @@ class Mode4LoopTests(unittest.TestCase):
             self.assertEqual(result["physics"]["mj_step_calls"], 2)
             self.assertEqual(result["physics"]["intervals"], 1)
             self.assertEqual(result["object_pose_source"], "sim_owned_after_frame0")
+            output = Path(out) / "mode4"
             self.assertAlmostEqual(
-                np.load(Path(out) / "mode4/object_position_sim.npy")[-1, 0], 0.32, places=6
+                np.load(output / "object_position_sim.npy")[-1, 0], 0.32, places=6
+            )
+            expected_arrays = {
+                "actions_raw_pred_normalized",
+                "actions_raw_pred_physical",
+                "actions_commanded_physical",
+                "preclip_absolute_targets",
+                "servo_position_targets",
+                "servo_target_clipping_correction",
+                "actions_applied_physical",
+                "rollout_observation_state",
+                "rollout_observation_contacts",
+                "rollout_observation_lift",
+                "physics_contact_flags",
+                "step_max_contact_force",
+                "hand_state_sim",
+                "object_position_sim",
+                "object_quaternion_sim",
+            }
+            self.assertEqual(set(result["arrays"]), expected_arrays)
+            for name, path in result["arrays"].items():
+                self.assertEqual(Path(path), output / f"{name}.npy")
+                self.assertTrue(Path(path).is_file())
+
+            hand_before = np.load(output / "hand_state_sim.npy")[0]
+            commanded = np.load(output / "actions_commanded_physical.npy")[0]
+            preclip_target = np.load(output / "preclip_absolute_targets.npy")[0]
+            servo_target = np.load(output / "servo_position_targets.npy")[0]
+            correction = np.load(output / "servo_target_clipping_correction.npy")[0]
+            np.testing.assert_allclose(preclip_target, hand_before + commanded[:26])
+            np.testing.assert_array_equal(correction, servo_target - preclip_target)
+
+            observation_state = np.load(output / "rollout_observation_state.npy")
+            np.testing.assert_array_equal(observation_state[0, 26:31], observation_contacts)
+            np.testing.assert_array_equal(
+                np.load(output / "rollout_observation_contacts.npy")[0], observation_contacts
+            )
+            np.testing.assert_array_equal(
+                np.load(output / "rollout_observation_lift.npy"), np.asarray([0.0], np.float32)
+            )
+            np.testing.assert_array_equal(
+                np.load(output / "physics_contact_flags.npy"), np.asarray([[True, False, False]])
+            )
+            np.testing.assert_array_equal(
+                np.load(output / "step_max_contact_force.npy"), np.asarray([2.0], np.float32)
             )
 
 

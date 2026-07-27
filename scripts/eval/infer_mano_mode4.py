@@ -214,7 +214,9 @@ def label(frame: np.ndarray, text: str) -> np.ndarray:
 
 def pad_actions(actions: np.ndarray, frame: int, window_end: int) -> np.ndarray:
     end = min(frame + HORIZON, window_end + 1)
-    result = np.asarray(actions[frame:end], dtype=np.float32)
+    # DeltaActions mutates its input in place. Own this chunk so repeated or
+    # overlapping eval queries cannot corrupt the row's absolute action labels.
+    result = np.array(actions[frame:end], dtype=np.float32, copy=True)
     if result.shape[0] < HORIZON:
         result = np.concatenate(
             [result, np.repeat(result[-1:], HORIZON - result.shape[0], axis=0)],
@@ -406,6 +408,13 @@ def run_variant(
     commanded_steps = []
     servo_targets = []
     applied_steps = []
+    observation_states = []
+    observation_contacts = []
+    observation_lift = []
+    preclip_targets = []
+    clipping_corrections = []
+    physics_contact_flags = []
+    step_max_contact_forces = []
     gt_norm_steps = []
     hand_states = [np.asarray(data.qpos[hand_addrs], dtype=np.float32).copy()]
     object_positions = [
@@ -478,6 +487,10 @@ def run_variant(
                     )
                 else:
                     state[HAND_DIM:] = 0
+                # Record the policy observation before selecting this transition.
+                observation_states.append(state.copy())
+                observation_contacts.append(state[26:31].copy())
+                observation_lift.append(state[31])
                 if frame % args.chunk_stride == 0:
                     head_image, wrist_image = physics.render_current_state(model, data, renderer)
                     datum = build_datum(
@@ -546,6 +559,8 @@ def run_variant(
                     current_q, absolute_target - current_q, limits
                 )
                 record_clipping(clipping, clip_event)
+                preclip_target = np.asarray(absolute_target, dtype=np.float32)
+                servo_target = np.asarray(target, dtype=np.float32)
                 before = current_q.copy()
                 diagnostics = physics.step_servo(
                     model=model,
@@ -563,12 +578,22 @@ def run_variant(
                     max_actuator_force, float(diagnostics["max_abs_actuator_force"])
                 )
                 max_qvel = max(max_qvel, float(np.max(np.abs(data.qvel))))
+                physics_contact_flags.append(
+                    [
+                        diagnostics["hand_object_contact"],
+                        diagnostics["object_floor_contact"],
+                        diagnostics["hand_floor_contact"],
+                    ]
+                )
+                step_max_contact_forces.append(diagnostics["max_contact_force"])
                 raw_norm_steps.append(newest["pred_norm"][local_newest])
                 raw_phys_steps.append(newest["pred_phys"][local_newest])
                 commanded = np.zeros(32, dtype=np.float32)
                 commanded[:HAND_DIM] = absolute_target - current_q
                 commanded_steps.append(commanded)
-                servo_targets.append(np.asarray(target, dtype=np.float32))
+                preclip_targets.append(preclip_target)
+                servo_targets.append(servo_target)
+                clipping_corrections.append(servo_target - preclip_target)
                 applied = np.zeros(32, dtype=np.float32)
                 applied[:HAND_DIM] = (after - before).astype(np.float32)
                 applied_steps.append(applied)
@@ -624,14 +649,47 @@ def run_variant(
     raw_phys_all = np.asarray(raw_phys_steps, dtype=np.float32)
     applied_all = np.asarray(applied_steps, dtype=np.float32)
     gt_norm_all = np.asarray(gt_norm_steps, dtype=np.float32)
-    np.save(out / "actions_raw_pred_normalized.npy", raw_norm_all)
-    np.save(out / "actions_raw_pred_physical.npy", raw_phys_all)
-    np.save(out / "actions_commanded_physical.npy", np.asarray(commanded_steps, dtype=np.float32))
-    np.save(out / "servo_position_targets.npy", np.asarray(servo_targets, dtype=np.float32))
-    np.save(out / "actions_applied_physical.npy", applied_all)
-    np.save(out / "hand_state_sim.npy", np.asarray(hand_states, dtype=np.float32))
-    np.save(out / "object_position_sim.npy", np.asarray(object_positions, dtype=np.float32))
-    np.save(out / "object_quaternion_sim.npy", np.asarray(object_quaternions, dtype=np.float32))
+    arrays = {
+        "actions_raw_pred_normalized": out / "actions_raw_pred_normalized.npy",
+        "actions_raw_pred_physical": out / "actions_raw_pred_physical.npy",
+        "actions_commanded_physical": out / "actions_commanded_physical.npy",
+        "preclip_absolute_targets": out / "preclip_absolute_targets.npy",
+        "servo_position_targets": out / "servo_position_targets.npy",
+        "servo_target_clipping_correction": out / "servo_target_clipping_correction.npy",
+        "actions_applied_physical": out / "actions_applied_physical.npy",
+        "rollout_observation_state": out / "rollout_observation_state.npy",
+        "rollout_observation_contacts": out / "rollout_observation_contacts.npy",
+        "rollout_observation_lift": out / "rollout_observation_lift.npy",
+        "physics_contact_flags": out / "physics_contact_flags.npy",
+        "step_max_contact_force": out / "step_max_contact_force.npy",
+        "hand_state_sim": out / "hand_state_sim.npy",
+        "object_position_sim": out / "object_position_sim.npy",
+        "object_quaternion_sim": out / "object_quaternion_sim.npy",
+    }
+    np.save(arrays["actions_raw_pred_normalized"], raw_norm_all)
+    np.save(arrays["actions_raw_pred_physical"], raw_phys_all)
+    np.save(arrays["actions_commanded_physical"], np.asarray(commanded_steps, dtype=np.float32))
+    np.save(arrays["preclip_absolute_targets"], np.asarray(preclip_targets, dtype=np.float32))
+    np.save(arrays["servo_position_targets"], np.asarray(servo_targets, dtype=np.float32))
+    np.save(
+        arrays["servo_target_clipping_correction"],
+        np.asarray(clipping_corrections, dtype=np.float32),
+    )
+    np.save(arrays["actions_applied_physical"], applied_all)
+    np.save(arrays["rollout_observation_state"], np.asarray(observation_states, dtype=np.float32))
+    np.save(
+        arrays["rollout_observation_contacts"],
+        np.asarray(observation_contacts, dtype=np.float32),
+    )
+    np.save(arrays["rollout_observation_lift"], np.asarray(observation_lift, dtype=np.float32))
+    np.save(arrays["physics_contact_flags"], np.asarray(physics_contact_flags, dtype=np.bool_))
+    np.save(
+        arrays["step_max_contact_force"],
+        np.asarray(step_max_contact_forces, dtype=np.float32),
+    )
+    np.save(arrays["hand_state_sim"], np.asarray(hand_states, dtype=np.float32))
+    np.save(arrays["object_position_sim"], np.asarray(object_positions, dtype=np.float32))
+    np.save(arrays["object_quaternion_sim"], np.asarray(object_quaternions, dtype=np.float32))
     total_request_seconds = float(sum(float(t["wall_seconds"]) for t in query_timings))
     result = {
         "mode": "mode4",
@@ -690,12 +748,7 @@ def run_variant(
         "head_video": str(head_path),
         "wrist_video": str(wrist_path),
         "dataset_replay_video": str(dataset_path),
-        "arrays": {
-            "servo_position_targets": str(out / "servo_position_targets.npy"),
-            "hand_state_sim": str(out / "hand_state_sim.npy"),
-            "object_position_sim": str(out / "object_position_sim.npy"),
-            "object_quaternion_sim": str(out / "object_quaternion_sim.npy"),
-        },
+        "arrays": {name: str(path) for name, path in arrays.items()},
     }
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
