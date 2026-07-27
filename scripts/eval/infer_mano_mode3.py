@@ -259,30 +259,70 @@ def render_reference_state(*, model, data, renderer, object_addr: int, hand_addr
 
 
 def _result_metadata(args, *, row_index: int, object_name: str, window, source_frames: int,
-                     query_timings: list[dict], out: Path, head_path: Path, wrist_path: Path) -> dict:
+                     query_timings: list[dict], out: Path, head_path: Path, wrist_path: Path,
+                     row: dict | None = None) -> dict:
+    row = row or {}
+    index = row.get("index") or {}
+    total_request_seconds = float(
+        sum(float(timing.get("wall_seconds", 0.0)) for timing in query_timings)
+    )
     return {
-        "mode": "historical_kinematic_mode3_sim_no_smooth", "physics_dynamics": False,
-        "state_observation_source": "sim", "image_observation_source": "sim",
-        "object_pose_source": "reference_trajectory", "action_source": URDF_TARGET_ABSOLUTE,
-        "rollout_dynamics": "B_query_anchored_absolute_target_kinematic", "temporal_ensemble": False,
-        "chunk_horizon": HORIZON, "query_stride": HORIZON, "act_mode": "batch",
-        "act_batch_size": args.act_batch_size, "action_padding_contract": "physical_action[26:32]=0; never_executed",
+        "mode": "historical_kinematic_mode3_sim_no_smooth",
+        "physics_dynamics": False,
+        "mujoco_update": "mj_forward_only; mj_step_never_called",
+        "closed_loop": True,
+        "observation_feedback": True,
+        "state_observation_source": "sim",
+        "image_observation_source": "sim",
+        "video_presentation": "side_by_side_sim_vs_dataset_same_source_frame",
+        "object_pose_source": "reference_trajectory",
+        "action_source": URDF_TARGET_ABSOLUTE,
+        "rollout_dynamics": "B_query_anchored_absolute_target_kinematic",
+        "temporal_ensemble": False,
+        "chunk_horizon": HORIZON,
+        "query_stride": HORIZON,
+        "act_mode": "batch",
+        "act_batch_size": args.act_batch_size,
+        "action_padding_contract": "physical_action[26:32]=0; never_executed",
+        "extended_state": True,
         "state_contract": STATE_CONTRACT_ID,
-        "contact_semantics": CONTACT_SEMANTICS, "contact_rule": CONTACT_RULE,
-        "norm_sha_expected": args.norm_sha_expected, "norm_sha_actual": args.norm_sha_actual,
-        "row_index": row_index, "object_name": object_name, "source_frame_count": source_frames,
-        "trajectory_frame_count": window.frame_count, "frame_window": window.as_dict(),
-        "query_count": len(query_timings), "query_timings": query_timings,
-        "head_video": str(head_path), "wrist_video": str(wrist_path),
-        "arrays": {"actions_raw_pred_normalized": str(out / "actions_raw_pred_normalized.npy"),
-                   "actions_raw_pred_physical": str(out / "actions_raw_pred_physical.npy"),
-                   "actions_commanded_physical": str(out / "actions_commanded_physical.npy"),
-                   "actions_applied_physical": str(out / "actions_applied_physical.npy"),
-                   "actions_gt_normalized": str(out / "actions_gt_normalized.npy"),
-                   "actions_gt_physical": str(out / "actions_gt_physical.npy"),
-                   "hand_state_sim": str(out / "hand_state_sim.npy")},
-        "client_commit": args.client_commit, "backend_commit": args.backend_commit,
-        "model_commit": args.model_commit, "language_conditioning": args.language_conditioning,
+        "contact_semantics": CONTACT_SEMANTICS,
+        "contact_rule": CONTACT_RULE,
+        "norm_stats_dir": str(args.norm_stats_dir),
+        "norm_sha_expected": args.norm_sha_expected,
+        "norm_sha_actual": args.norm_sha_actual,
+        "model_path": args.model_path,
+        "model": args.model,
+        "row_index": row_index,
+        "row_uuid": index.get("uuid"),
+        "seed_uuid": index.get("seed_uuid"),
+        "prompt": row.get("prompt"),
+        "object_name": object_name,
+        "source_frame_count": source_frames,
+        "trajectory_frame_count": window.frame_count,
+        "frame_window": window.as_dict(),
+        "query_count": len(query_timings),
+        "total_request_seconds": total_request_seconds,
+        "mean_request_seconds": (
+            total_request_seconds / len(query_timings) if query_timings else 0.0
+        ),
+        "query_timings": query_timings,
+        "head_video": str(head_path),
+        "wrist_video": str(wrist_path),
+        "arrays": {
+            "state_observation_32d": str(out / "state_observation_32d.npy"),
+            "actions_raw_pred_normalized": str(out / "actions_raw_pred_normalized.npy"),
+            "actions_raw_pred_physical": str(out / "actions_raw_pred_physical.npy"),
+            "actions_commanded_physical": str(out / "actions_commanded_physical.npy"),
+            "actions_applied_physical": str(out / "actions_applied_physical.npy"),
+            "actions_gt_normalized": str(out / "actions_gt_normalized.npy"),
+            "actions_gt_physical": str(out / "actions_gt_physical.npy"),
+            "hand_state_sim": str(out / "hand_state_sim.npy"),
+        },
+        "client_commit": args.client_commit,
+        "backend_commit": args.backend_commit,
+        "model_commit": args.model_commit,
+        "language_conditioning": args.language_conditioning,
     }
 
 
@@ -310,7 +350,8 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
     object_pos = np.asarray(row["objects"][0]["pos"], dtype=np.float64)
     object_rot = np.asarray(row["objects"][0]["rot_aa"], dtype=np.float64)
     object_z0 = float(object_pos[0, 2])
-    raw_norm, raw_phys, gt_norm_steps, commanded, applied, sim_hands = [], [], [], [], [], [hand.copy()]
+    raw_norm, raw_phys, gt_norm_steps, commanded, applied = [], [], [], [], []
+    sim_hands, state_observations = [hand.copy()], []
     query_timings: list[dict] = []
     candidates: dict[int, dict] = {}
     query_frames = set(mode3_query_frames(window.start_frame, window.end_frame))
@@ -327,6 +368,7 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                 state = build_extended_sim_state(hand_qpos=hand, model=model, data=data, object_name=object_name,
                     keypoint_geom_ids=kp_ids, object_geom_ids=object_ids, geom_id_to_finger=geom_to_finger,
                     reference_object_z=float(object_pos[frame, 2]), source_object_z0=object_z0)
+                state_observations.append(state.copy())
                 if frame in query_frames:
                     datum = build_datum(row, frame=frame, state_input=state, head_image=head, wrist_image=wrist,
                                         data_config=data_config, base_model=args.model, window_end=window.end_frame)
@@ -375,10 +417,12 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                          ("actions_commanded_physical", commanded), ("actions_applied_physical", applied),
                          ("actions_gt_normalized", gt_norm_steps),
                          ("actions_gt_physical", np.asarray(row["actions"])[window.start_frame:window.end_frame + 1]),
-                         ("hand_state_sim", sim_hands)):
+                         ("hand_state_sim", sim_hands),
+                         ("state_observation_32d", state_observations)):
         np.save(out / f"{name}.npy", np.asarray(values, dtype=np.float32))
     result = _result_metadata(args, row_index=row_index, object_name=object_name, window=window,
-        source_frames=source_frames, query_timings=query_timings, out=out, head_path=head_path, wrist_path=wrist_path)
+        source_frames=source_frames, query_timings=query_timings, out=out, head_path=head_path,
+        wrist_path=wrist_path, row=row)
     result["joint_limit_clipping"] = clipping
     result["pred_has_nan_inf"] = bool(not np.isfinite(np.asarray(raw_norm)).all())
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")

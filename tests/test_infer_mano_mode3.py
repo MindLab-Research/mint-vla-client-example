@@ -95,6 +95,8 @@ def test_ordered_rows_are_unique_and_preserve_first_occurrence():
 def test_metadata_identifies_kinematic_contract(tmp_path):
     args = SimpleNamespace(
         act_batch_size=4, norm_sha_expected="expected", norm_sha_actual="actual",
+        norm_stats_dir=tmp_path / "norm", model_path="mint://checkpoint",
+        model="openpi/pi05-action-lora-r16-finetune",
         client_commit="client", backend_commit="backend", model_commit="model",
         language_conditioning="gesture",
     )
@@ -112,3 +114,5 @@ def test_metadata_identifies_kinematic_contract(tmp_path):
     assert metadata["contact_rule"] == mode3.CONTACT_RULE
     assert metadata["norm_sha_expected"] == "expected"
     assert metadata["client_commit"] == "client"
+    assert metadata["mujoco_update"] == "mj_forward_only; mj_step_never_called"
+    assert "state_observation_32d" in metadata["arrays"]
