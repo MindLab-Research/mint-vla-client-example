@@ -30,7 +30,12 @@ import requests
 import mano_action_support as action_support
 import mano_physics_core as physics
 from mano_joint_limits import clip_hand_state, new_clipping_diagnostics, record_clipping
-from mano_servo_lag import CONTRACT_ID as SERVO_LAG_CONTRACT_ID, load_gain_file, servo_lag_step
+from mano_servo_lag import (
+    CONTRACT_ID as SERVO_LAG_CONTRACT_ID,
+    load_gain_file,
+    servo_lag_step,
+    wrap_euler_target_near_current,
+)
 from mode4_support import acquire_action_session, action_session_payload, parse_ordered_unique_csv
 from scripts import contact_windows
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
@@ -438,7 +443,7 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                 if args.hand_transition == "calibrated_servo_lag":
                     # Euler predictions are absolute and may choose an equivalent 2pi branch.
                     # Put the setpoint on the branch nearest current qpos before clipping/lag.
-                    target = physics.wrap_euler_targets_near_current(target, hand)
+                    target = wrap_euler_target_near_current(target, hand)
                 bounded_target, clip_event = clip_hand_state(target, limits)
                 if args.hand_transition == "calibrated_servo_lag":
                     next_hand = servo_lag_step(hand, bounded_target, args.servo_gains)

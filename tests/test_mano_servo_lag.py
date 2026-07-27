@@ -20,6 +20,16 @@ def test_fit_first_order_gains_recovers_known_response():
     assert count == 29
 
 
+def test_wrap_euler_target_near_current_preserves_non_euler_coordinates():
+    q = np.arange(lag.HAND_DIM, dtype=np.float64) / 10
+    target = q + 1
+    target[3] = q[3] + 2 * np.pi - 0.2
+    wrapped = lag.wrap_euler_target_near_current(target, q)
+    assert wrapped[3] == pytest.approx(q[3] - 0.2)
+    np.testing.assert_allclose(wrapped[:3], target[:3])
+    np.testing.assert_allclose(wrapped[6:], target[6:])
+
+
 def test_servo_lag_step_uses_shortest_euler_branch():
     q = np.zeros(lag.HAND_DIM); target = np.ones(lag.HAND_DIM); gains = np.full(lag.HAND_DIM, 0.1)
     q[3] = np.pi - 0.01; target[3] = -np.pi + 0.01

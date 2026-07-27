@@ -64,6 +64,21 @@ def fit_first_order_gains(trajectories: Iterable[tuple[np.ndarray, np.ndarray]],
     return gains.astype(np.float64), raw.astype(np.float64), int(error.shape[0])
 
 
+def wrap_euler_target_near_current(target: np.ndarray, qpos: np.ndarray) -> np.ndarray:
+    """Return an equivalent target whose Euler coordinates use the nearest branch."""
+    t = np.asarray(target, dtype=np.float64)
+    q = np.asarray(qpos, dtype=np.float64)
+    if t.shape != (HAND_DIM,) or q.shape != (HAND_DIM,):
+        raise ValueError(f"target and qpos must have shape ({HAND_DIM},)")
+    if not np.isfinite(t).all() or not np.isfinite(q).all():
+        raise ValueError("target and qpos must be finite")
+    result = t.copy()
+    result[EULER_SLICE] = q[EULER_SLICE] + wrap_angle_error(
+        t[EULER_SLICE] - q[EULER_SLICE]
+    )
+    return result
+
+
 def servo_lag_step(qpos: np.ndarray, target: np.ndarray, gains: np.ndarray) -> np.ndarray:
     """Advance one source interval toward a setpoint using calibrated gains."""
     q = np.asarray(qpos, dtype=np.float64)
