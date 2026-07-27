@@ -12,6 +12,7 @@ MANIFEST=${DATA}.contact_windows.json
 GESTURE=$CLIENT/config/datasets/new_all_generated_mano.index.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
 OUTPUT_ROOT=${MODE3_OUTPUT_ROOT:-/vePFS-Mindverse/user/intern/wenxi/results/training/mode3_latest_b_alora_clean_aug_20260727}
+QUERY_STRIDE=${MODE3_QUERY_STRIDE:-10}
 ROWS=924,960,914,943,939
 NORM_ROWS=$(python3 -c "print(','.join(str(i) for i in range(810,995)))")
 OWNER_ID=000000000000000000000001
@@ -28,6 +29,9 @@ FAILED=$OUTPUT_ROOT/delivery.failed
 log(){ printf '%s %s\n' "$(date -Is)" "$*"; }
 fail(){ mkdir -p "$OUTPUT_ROOT"; log "FAILED: $*" | tee "$FAILED" >&2; exit 1; }
 
+[[ "$QUERY_STRIDE" == 1 || "$QUERY_STRIDE" == 10 ]] || {
+  echo "MODE3_QUERY_STRIDE must be 1 or 10, got $QUERY_STRIDE" >&2; exit 2;
+}
 [[ ! -e "$OUTPUT_ROOT" ]] || { echo "output already exists: $OUTPUT_ROOT" >&2; exit 2; }
 mkdir -p "$OUTPUT_ROOT"
 trap 'rc=$?; if ((rc != 0)) && [[ ! -f "$FAILED" ]]; then echo "$(date -Is) top-level rc=$rc" > "$FAILED"; fi' EXIT
@@ -143,13 +147,14 @@ run_arm(){ (
     --lance-dataset "$DATA" --language-conditioning gesture --gesture-index "$GESTURE"
     --normalization-row-indices "$NORM_ROWS" --contact-window-manifest "$MANIFEST"
     --missing-contact-policy error --extended-state --norm-stats-dir "$NORM"
-    --act-batch-size 4 --max-warm-request-seconds 2
+    --act-batch-size 4 --query-stride "$QUERY_STRIDE" --max-warm-request-seconds 2
     --client-commit "$CLIENT_COMMIT" --backend-commit "$MINT_COMMIT" --model-commit "$OPENPI_COMMIT"
   )
 
-  # Two requests exercise model load/JIT, live 32D state, batch sharding, and warm latency.
+  # At least two requests exercise model load/JIT, live 32D state, sharding, and warm latency.
+  smoke_frames=$((QUERY_STRIDE + 1))
   "$PYTHON" -u "$CLIENT/scripts/eval/infer_mano_mode3.py" "${common[@]}" \
-    --row-index 924 --max-frames 11 --output-dir "$arm_out/smoke" \
+    --row-index 924 --max-frames "$smoke_frames" --output-dir "$arm_out/smoke" \
     >"$arm_out/smoke/eval.log" 2>&1
   [[ -s "$arm_out/smoke/mode3/result.json" ]] || { echo "$arm smoke missing result" > "$arm_out/arm.failed"; exit 1; }
   log "$arm smoke passed"
@@ -171,12 +176,17 @@ set -e
 
 log "validating Mode3 artifacts"
 export PYTHONPATH=$SITE:$EXTRA
-"$PYTHON" - "$OUTPUT_ROOT" "$ROWS" "$CLIENT_COMMIT" "$MINT_COMMIT" "$OPENPI_COMMIT" "$EXPECTED_NORM_SHA" <<'PY'
+"$PYTHON" - "$OUTPUT_ROOT" "$ROWS" "$CLIENT_COMMIT" "$MINT_COMMIT" "$OPENPI_COMMIT" "$EXPECTED_NORM_SHA" "$QUERY_STRIDE" <<'PY'
 import hashlib, json, math, sys
 from pathlib import Path
 import numpy as np
 root=Path(sys.argv[1]); rows=[int(x) for x in sys.argv[2].split(',')]
 client,mint,openpi,norm=sys.argv[3:7]
+query_stride=int(sys.argv[7])
+mode=("historical_kinematic_mode3_sim_no_smooth" if query_stride == 10
+      else "kinematic_mode3_replan1_first_action")
+action_execution=("consume_full_nonoverlap_chunk" if query_stride == 10
+                  else "replan_each_frame_execute_action_0")
 entries=[]
 for arm in ('clean','stateaug005'):
     for row in rows:
@@ -185,14 +195,15 @@ for arm in ('clean','stateaug005'):
         if not p.is_file(): raise SystemExit(f'missing {p}')
         r=json.loads(p.read_text())
         expected={
-            'mode':'historical_kinematic_mode3_sim_no_smooth',
+            'mode':mode,
             'physics_dynamics':False,
             'mujoco_update':'mj_forward_only; mj_step_never_called',
             'state_observation_source':'sim',
             'image_observation_source':'sim',
             'object_pose_source':'reference_trajectory',
             'temporal_ensemble':False,
-            'query_stride':10,
+            'query_stride':query_stride,
+            'action_execution':action_execution,
             'act_batch_size':4,
             'client_commit':client,
             'backend_commit':mint,
@@ -203,10 +214,10 @@ for arm in ('clean','stateaug005'):
         }
         for key,value in expected.items():
             if r.get(key) != value: raise SystemExit(f'{p}: {key}={r.get(key)!r}, expected {value!r}')
-        n=int(r['trajectory_frame_count']); q=math.ceil(n/10)
+        n=int(r['trajectory_frame_count']); q=math.ceil(n/query_stride)
         if r['query_count'] != q: raise SystemExit(f'{p}: query_count {r["query_count"]} != {q}')
         frames=[x['source_frame'] for x in r['query_timings']]
-        if frames != list(range(r['frame_window']['start_frame'], r['frame_window']['end_frame']+1, 10)):
+        if frames != list(range(r['frame_window']['start_frame'], r['frame_window']['end_frame']+1, query_stride)):
             raise SystemExit(f'{p}: query frame drift')
         state=np.load(d/'state_observation_32d.npy')
         raw=np.load(d/'actions_raw_pred_physical.npy')
@@ -236,7 +247,8 @@ for arm in ('clean','stateaug005'):
             'head_sha256':hashlib.sha256(Path(videos[0]).read_bytes()).hexdigest(),
         })
 manifest={
-    'status':'validated','mode':'historical_kinematic_mode3_sim_no_smooth',
+    'status':'validated','mode':mode,'query_stride':query_stride,
+    'action_execution':action_execution,
     'rows':rows,'client_commit':client,'mint_commit':mint,'openpi_commit':openpi,
     'norm_sha256':norm,'entries':entries,
 }

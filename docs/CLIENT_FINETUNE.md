@@ -172,6 +172,13 @@ sim-owned object motion and native position-servo dynamics.
   --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/mode3
 ```
 
+The default `--query-stride 10` preserves historical Mode3 by consuming a full
+non-overlapping action chunk. `--query-stride 1` keeps the checkpoint/model
+horizon at 10, queries every source frame, executes only `action[0]`, and then
+replans. This receding-horizon option addresses chunk-boundary discontinuity;
+it does not retrain or change the model's output shape and still uses no
+temporal ensemble.
+
 The required extended state is `[predicted_hand_qpos(26), contact(index,thumb,
 ring,middle,pinky), reference_object_z[t]-reference_object_z[0]]`. Contacts are
 target-object × MANO-keypoint pair presence after the frame's forward pass;

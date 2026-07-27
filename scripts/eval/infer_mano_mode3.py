@@ -64,11 +64,13 @@ def reconstruct_absolute_target_chunk(query_q: np.ndarray, pred_phys: np.ndarray
     return target
 
 
-def mode3_query_frames(start: int, end: int) -> list[int]:
-    """Disjoint historical sim_no_smooth chunks cover exactly ten frames."""
+def mode3_query_frames(start: int, end: int, query_stride: int = HORIZON) -> list[int]:
+    """Return query frames for historical chunk-10 or receding-horizon replan-1."""
+    if query_stride not in (1, HORIZON):
+        raise ValueError(f"Mode3 query stride must be 1 or {HORIZON}, got {query_stride}")
     if end < start:
         return []
-    return list(range(start, end + 1, HORIZON))
+    return list(range(start, end + 1, query_stride))
 
 
 def mode3_row_frame_count(row: dict) -> int:
@@ -163,6 +165,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-frames", type=int, default=0)
     p.add_argument("--act-batch-size", type=int, default=4,
                    help="must remain 4 for the deployed B checkpoint serving contract")
+    p.add_argument(
+        "--query-stride", type=int, choices=(1, HORIZON), default=HORIZON,
+        help="10 preserves historical Mode3; 1 replans every frame and executes only action[0]",
+    )
     p.add_argument("--max-warm-request-seconds", type=float, default=2.0)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--fps", type=float, default=10.0)
@@ -267,7 +273,11 @@ def _result_metadata(args, *, row_index: int, object_name: str, window, source_f
         sum(float(timing.get("wall_seconds", 0.0)) for timing in query_timings)
     )
     return {
-        "mode": "historical_kinematic_mode3_sim_no_smooth",
+        "mode": (
+            "historical_kinematic_mode3_sim_no_smooth"
+            if args.query_stride == HORIZON
+            else "kinematic_mode3_replan1_first_action"
+        ),
         "physics_dynamics": False,
         "mujoco_update": "mj_forward_only; mj_step_never_called",
         "closed_loop": True,
@@ -280,7 +290,12 @@ def _result_metadata(args, *, row_index: int, object_name: str, window, source_f
         "rollout_dynamics": "B_query_anchored_absolute_target_kinematic",
         "temporal_ensemble": False,
         "chunk_horizon": HORIZON,
-        "query_stride": HORIZON,
+        "query_stride": args.query_stride,
+        "action_execution": (
+            "consume_full_nonoverlap_chunk"
+            if args.query_stride == HORIZON
+            else "replan_each_frame_execute_action_0"
+        ),
         "act_mode": "batch",
         "act_batch_size": args.act_batch_size,
         "action_padding_contract": "physical_action[26:32]=0; never_executed",
@@ -354,7 +369,9 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
     sim_hands, state_observations = [hand.copy()], []
     query_timings: list[dict] = []
     candidates: dict[int, dict] = {}
-    query_frames = set(mode3_query_frames(window.start_frame, window.end_frame))
+    query_frames = set(
+        mode3_query_frames(window.start_frame, window.end_frame, args.query_stride)
+    )
     active_session, owns_session = session_id or "", False
     head_path, wrist_path = out / "mode3_kinematic_head.mp4", out / "mode3_kinematic_wrist.mp4"
     try:
