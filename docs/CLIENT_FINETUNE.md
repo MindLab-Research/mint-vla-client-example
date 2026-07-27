@@ -172,12 +172,18 @@ sim-owned object motion and native position-servo dynamics.
   --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/mode3
 ```
 
-The default `--query-stride 10` preserves historical Mode3 by consuming a full
-non-overlapping action chunk. `--query-stride 1` keeps the checkpoint/model
-horizon at 10, queries every source frame, executes only `action[0]`, and then
-replans. This receding-horizon option addresses chunk-boundary discontinuity;
-it does not retrain or change the model's output shape and still uses no
-temporal ensemble.
+The default `--query-stride 10 --hand-transition instant_setpoint` preserves
+historical Mode3 by consuming a full non-overlapping action chunk and writing
+each target directly as qpos. That historical transition visualizes predicted
+setpoints; it is not a calibrated hand-speed model.
+
+`--query-stride 1 --hand-transition calibrated_servo_lag --servo-gain-file ...`
+keeps the checkpoint/model horizon at 10, queries every source frame, executes
+only `action[0]`, and advances qpos by one recorded 0.005-second response step
+toward that setpoint. The gain file is fitted from aligned
+`urdf_dof_target[t] -> urdf_dof[t+1]` trajectories with wrapped Euler errors.
+This mode fixes the target-as-achieved-state category error without enabling
+MuJoCo dynamics or temporal ensembling.
 
 The required extended state is `[predicted_hand_qpos(26), contact(index,thumb,
 ring,middle,pinky), reference_object_z[t]-reference_object_z[0]]`. Contacts are

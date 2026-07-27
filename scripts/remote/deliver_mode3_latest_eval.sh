@@ -13,6 +13,8 @@ GESTURE=$CLIENT/config/datasets/new_all_generated_mano.index.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
 OUTPUT_ROOT=${MODE3_OUTPUT_ROOT:-/vePFS-Mindverse/user/intern/wenxi/results/training/mode3_latest_b_alora_clean_aug_20260727}
 QUERY_STRIDE=${MODE3_QUERY_STRIDE:-10}
+HAND_TRANSITION=${MODE3_HAND_TRANSITION:-instant_setpoint}
+SERVO_GAIN_FILE=${MODE3_SERVO_GAIN_FILE:-}
 RUN_SMOKE=${MODE3_RUN_SMOKE:-1}
 ROWS=924,960,914,943,939
 NORM_ROWS=$(python3 -c "print(','.join(str(i) for i in range(810,995)))")
@@ -36,6 +38,13 @@ fail(){ mkdir -p "$OUTPUT_ROOT"; log "FAILED: $*" | tee "$FAILED" >&2; exit 1; }
 [[ "$RUN_SMOKE" == 0 || "$RUN_SMOKE" == 1 ]] || {
   echo "MODE3_RUN_SMOKE must be 0 or 1, got $RUN_SMOKE" >&2; exit 2;
 }
+[[ "$HAND_TRANSITION" == instant_setpoint || "$HAND_TRANSITION" == calibrated_servo_lag ]] || {
+  echo "unsupported MODE3_HAND_TRANSITION: $HAND_TRANSITION" >&2; exit 2;
+}
+if [[ "$HAND_TRANSITION" == calibrated_servo_lag ]]; then
+  [[ "$QUERY_STRIDE" == 1 ]] || { echo "calibrated_servo_lag requires stride1" >&2; exit 2; }
+  [[ -s "$SERVO_GAIN_FILE" ]] || { echo "missing MODE3_SERVO_GAIN_FILE" >&2; exit 2; }
+fi
 [[ ! -e "$OUTPUT_ROOT" ]] || { echo "output already exists: $OUTPUT_ROOT" >&2; exit 2; }
 mkdir -p "$OUTPUT_ROOT"
 trap 'rc=$?; if ((rc != 0)) && [[ ! -f "$FAILED" ]]; then echo "$(date -Is) top-level rc=$rc" > "$FAILED"; fi' EXIT
@@ -151,9 +160,13 @@ run_arm(){ (
     --lance-dataset "$DATA" --language-conditioning gesture --gesture-index "$GESTURE"
     --normalization-row-indices "$NORM_ROWS" --contact-window-manifest "$MANIFEST"
     --missing-contact-policy error --extended-state --norm-stats-dir "$NORM"
-    --act-batch-size 4 --query-stride "$QUERY_STRIDE" --max-warm-request-seconds 2
+    --act-batch-size 4 --query-stride "$QUERY_STRIDE" --hand-transition "$HAND_TRANSITION"
+    --max-warm-request-seconds 2
     --client-commit "$CLIENT_COMMIT" --backend-commit "$MINT_COMMIT" --model-commit "$OPENPI_COMMIT"
   )
+  if [[ "$HAND_TRANSITION" == calibrated_servo_lag ]]; then
+    common+=(--servo-gain-file "$SERVO_GAIN_FILE")
+  fi
 
   if [[ "$RUN_SMOKE" == 1 ]]; then
     # At least two requests exercise model load/JIT, live state, sharding, and warm latency.
@@ -184,15 +197,16 @@ set -e
 
 log "validating Mode3 artifacts"
 export PYTHONPATH=$SITE:$EXTRA
-"$PYTHON" - "$OUTPUT_ROOT" "$ROWS" "$CLIENT_COMMIT" "$MINT_COMMIT" "$OPENPI_COMMIT" "$EXPECTED_NORM_SHA" "$QUERY_STRIDE" <<'PY'
+"$PYTHON" - "$OUTPUT_ROOT" "$ROWS" "$CLIENT_COMMIT" "$MINT_COMMIT" "$OPENPI_COMMIT" "$EXPECTED_NORM_SHA" "$QUERY_STRIDE" "$HAND_TRANSITION" <<'PY'
 import hashlib, json, math, sys
 from pathlib import Path
 import numpy as np
 root=Path(sys.argv[1]); rows=[int(x) for x in sys.argv[2].split(',')]
 client,mint,openpi,norm=sys.argv[3:7]
-query_stride=int(sys.argv[7])
-mode=("historical_kinematic_mode3_sim_no_smooth" if query_stride == 10
-      else "kinematic_mode3_replan1_first_action")
+query_stride=int(sys.argv[7]); hand_transition=sys.argv[8]
+mode=("kinematic_mode3_servo_lag_replan1" if hand_transition == "calibrated_servo_lag"
+      else ("historical_kinematic_mode3_sim_no_smooth" if query_stride == 10
+            else "kinematic_mode3_replan1_first_action"))
 action_execution=("consume_full_nonoverlap_chunk" if query_stride == 10
                   else "replan_each_frame_execute_action_0")
 entries=[]
@@ -212,6 +226,7 @@ for arm in ('clean','stateaug005'):
             'temporal_ensemble':False,
             'query_stride':query_stride,
             'action_execution':action_execution,
+            'hand_transition':hand_transition,
             'act_batch_size':4,
             'client_commit':client,
             'backend_commit':mint,
@@ -232,9 +247,10 @@ for arm in ('clean','stateaug005'):
         commanded=np.load(d/'actions_commanded_physical.npy')
         applied=np.load(d/'actions_applied_physical.npy')
         hands=np.load(d/'hand_state_sim.npy')
-        if state.shape != (n,32) or raw.shape != (n,32) or commanded.shape != (n,32) or applied.shape != (n,32) or hands.shape != (n+1,26):
+        setpoints=np.load(d/'setpoint_targets_physical.npy')
+        if state.shape != (n,32) or raw.shape != (n,32) or commanded.shape != (n,32) or applied.shape != (n,32) or hands.shape != (n+1,26) or setpoints.shape != (n,26):
             raise SystemExit(f'{p}: array shape mismatch')
-        if not all(np.isfinite(x).all() for x in (state,raw,commanded,applied,hands)):
+        if not all(np.isfinite(x).all() for x in (state,raw,commanded,applied,hands,setpoints)):
             raise SystemExit(f'{p}: non-finite array')
         if not np.array_equal(raw[:,26:],np.zeros((n,6),np.float32)):
             raise SystemExit(f'{p}: raw action tail not exact zero')
@@ -249,6 +265,7 @@ for arm in ('clean','stateaug005'):
         entries.append({
             'arm':arm,'row':row,'seed_uuid':r.get('seed_uuid'),'prompt':r.get('prompt'),
             'frame_window':r['frame_window'],'query_count':q,
+            'hand_transition':hand_transition,'servo_lag':r.get('servo_lag'),
             'contact_positive_frames':state[:,26:31].sum(axis=0).astype(int).tolist(),
             'reference_lift_min':float(state[:,31].min()),'reference_lift_max':float(state[:,31].max()),
             'head_video':videos[0],'wrist_video':videos[1],'result_json':str(p),
@@ -256,7 +273,7 @@ for arm in ('clean','stateaug005'):
         })
 manifest={
     'status':'validated','mode':mode,'query_stride':query_stride,
-    'action_execution':action_execution,
+    'action_execution':action_execution,'hand_transition':hand_transition,
     'rows':rows,'client_commit':client,'mint_commit':mint,'openpi_commit':openpi,
     'norm_sha256':norm,'entries':entries,
 }

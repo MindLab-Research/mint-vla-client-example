@@ -95,8 +95,8 @@ implement the following validated path:
   sim-owned object motion, and fixed-shape `act_batch` requests;
 - Mode3 kinematic diagnostic for B-exact v1 checkpoints: predicted MANO qpos
   and sim cameras are evaluated against the reference object trajectory with
-  `mj_forward` only; historical chunk-10 and receding-horizon replan-1 execution
-  are explicit inference options;
+  `mj_forward` only; historical direct-setpoint and calibrated one-step servo-lag
+  transitions are explicit inference options;
 - five-finger Mode4 contact from object-keypoint pair presence, with no
   `mj_contactForce` or `0.01 N` filter;
 - focused training, inference, contract, migration, and production-path tests.

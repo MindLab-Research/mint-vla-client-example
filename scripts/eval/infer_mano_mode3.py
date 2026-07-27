@@ -30,6 +30,7 @@ import requests
 import mano_action_support as action_support
 import mano_physics_core as physics
 from mano_joint_limits import clip_hand_state, new_clipping_diagnostics, record_clipping
+from mano_servo_lag import CONTRACT_ID as SERVO_LAG_CONTRACT_ID, load_gain_file, servo_lag_step
 from mode4_support import acquire_action_session, action_session_payload, parse_ordered_unique_csv
 from scripts import contact_windows
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
@@ -169,6 +170,13 @@ def parse_args() -> argparse.Namespace:
         "--query-stride", type=int, choices=(1, HORIZON), default=HORIZON,
         help="10 preserves historical Mode3; 1 replans every frame and executes only action[0]",
     )
+    p.add_argument(
+        "--hand-transition", choices=("instant_setpoint", "calibrated_servo_lag"),
+        default="instant_setpoint",
+        help="historical direct target write or calibrated one-source-step setpoint response",
+    )
+    p.add_argument("--servo-gain-file", type=Path,
+                   help="required by calibrated_servo_lag; fitted 0.005-second per-DoF gains")
     p.add_argument("--max-warm-request-seconds", type=float, default=2.0)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--fps", type=float, default=10.0)
@@ -274,9 +282,13 @@ def _result_metadata(args, *, row_index: int, object_name: str, window, source_f
     )
     return {
         "mode": (
-            "historical_kinematic_mode3_sim_no_smooth"
-            if args.query_stride == HORIZON
-            else "kinematic_mode3_replan1_first_action"
+            "kinematic_mode3_servo_lag_replan1"
+            if args.hand_transition == "calibrated_servo_lag"
+            else (
+                "historical_kinematic_mode3_sim_no_smooth"
+                if args.query_stride == HORIZON
+                else "kinematic_mode3_replan1_first_action"
+            )
         ),
         "physics_dynamics": False,
         "mujoco_update": "mj_forward_only; mj_step_never_called",
@@ -295,6 +307,20 @@ def _result_metadata(args, *, row_index: int, object_name: str, window, source_f
             "consume_full_nonoverlap_chunk"
             if args.query_stride == HORIZON
             else "replan_each_frame_execute_action_0"
+        ),
+        "hand_transition": args.hand_transition,
+        "servo_lag": (
+            {
+                "contract_id": SERVO_LAG_CONTRACT_ID,
+                "gain_file": str(args.servo_gain_file),
+                "gain_file_sha256": args.servo_gain_sha256,
+                "source_interval_seconds": args.servo_gain_payload["source_interval_seconds"],
+                "fit_row_count": args.servo_gain_payload["row_count"],
+                "fit_transition_count": args.servo_gain_payload["transition_count"],
+                "gains": args.servo_gains.tolist(),
+            }
+            if args.hand_transition == "calibrated_servo_lag"
+            else None
         ),
         "act_mode": "batch",
         "act_batch_size": args.act_batch_size,
@@ -333,6 +359,7 @@ def _result_metadata(args, *, row_index: int, object_name: str, window, source_f
             "actions_gt_normalized": str(out / "actions_gt_normalized.npy"),
             "actions_gt_physical": str(out / "actions_gt_physical.npy"),
             "hand_state_sim": str(out / "hand_state_sim.npy"),
+            "setpoint_targets_physical": str(out / "setpoint_targets_physical.npy"),
         },
         "client_commit": args.client_commit,
         "backend_commit": args.backend_commit,
@@ -365,7 +392,7 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
     object_pos = np.asarray(row["objects"][0]["pos"], dtype=np.float64)
     object_rot = np.asarray(row["objects"][0]["rot_aa"], dtype=np.float64)
     object_z0 = float(object_pos[0, 2])
-    raw_norm, raw_phys, gt_norm_steps, commanded, applied = [], [], [], [], []
+    raw_norm, raw_phys, gt_norm_steps, commanded, applied, setpoint_targets = [], [], [], [], [], []
     sim_hands, state_observations = [hand.copy()], []
     query_timings: list[dict] = []
     candidates: dict[int, dict] = {}
@@ -408,7 +435,18 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                 if offset >= HORIZON:
                     raise RuntimeError(f"no non-overlapping Mode3 chunk at frame {frame}")
                 target = candidate["targets"][offset]
-                next_hand, clip_event = clip_hand_state(target, limits)
+                if args.hand_transition == "calibrated_servo_lag":
+                    # Euler predictions are absolute and may choose an equivalent 2pi branch.
+                    # Put the setpoint on the branch nearest current qpos before clipping/lag.
+                    target = physics.wrap_euler_targets_near_current(target, hand)
+                bounded_target, clip_event = clip_hand_state(target, limits)
+                if args.hand_transition == "calibrated_servo_lag":
+                    next_hand = servo_lag_step(hand, bounded_target, args.servo_gains)
+                    next_hand, applied_clip = clip_hand_state(next_hand, limits)
+                    if applied_clip["clipped_values"]:
+                        raise RuntimeError("calibrated convex servo step unexpectedly left joint limits")
+                else:
+                    next_hand = bounded_target
                 command = np.zeros(ACTION_DIM, dtype=np.float32)
                 command[:HAND_DIM] = next_hand - hand
                 # Physical B padding is fixed-zero and is never executed.
@@ -416,6 +454,7 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                 hand = next_hand
                 record_clipping(clipping, clip_event)
                 raw_norm.append(candidate["pred_norm"][offset]); raw_phys.append(candidate["pred_phys"][offset])
+                setpoint_targets.append(bounded_target.copy())
                 gt_norm_steps.append(candidate["gt_norm"][offset])
                 commanded.append(command); applied.append(applied_step); sim_hands.append(hand.copy())
                 dataset_head = resize_for_video(decode_jpeg(row["image"][frame]), args.width, args.height)
@@ -435,6 +474,7 @@ def run_mode3(*, args, row, data_config, headers, object_name, row_index, manife
                          ("actions_gt_normalized", gt_norm_steps),
                          ("actions_gt_physical", np.asarray(row["actions"])[window.start_frame:window.end_frame + 1]),
                          ("hand_state_sim", sim_hands),
+                         ("setpoint_targets_physical", setpoint_targets),
                          ("state_observation_32d", state_observations)):
         np.save(out / f"{name}.npy", np.asarray(values, dtype=np.float32))
     result = _result_metadata(args, row_index=row_index, object_name=object_name, window=window,
@@ -458,6 +498,18 @@ def main() -> int:
     args.client_commit = args.client_commit or _client_commit()
     if args.act_batch_size != 4:
         raise ValueError("Mode3 requires --act-batch-size 4")
+    if args.hand_transition == "calibrated_servo_lag":
+        if args.query_stride != 1:
+            raise ValueError("calibrated_servo_lag currently requires --query-stride 1")
+        if args.servo_gain_file is None:
+            raise ValueError("calibrated_servo_lag requires --servo-gain-file")
+        args.servo_gains, args.servo_gain_payload, args.servo_gain_sha256 = load_gain_file(
+            args.servo_gain_file
+        )
+    else:
+        if args.servo_gain_file is not None:
+            raise ValueError("--servo-gain-file requires calibrated_servo_lag")
+        args.servo_gains = None; args.servo_gain_payload = None; args.servo_gain_sha256 = None
     if args.contact_context_frames < 0:
         raise ValueError("--contact-context-frames must be non-negative")
     _, args.norm_sha_actual = verify_locked_norm_stats(args.norm_stats_dir)

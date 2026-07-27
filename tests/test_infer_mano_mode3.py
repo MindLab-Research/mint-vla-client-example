@@ -87,7 +87,8 @@ def test_extended_state_uses_pair_presence_and_reference_lift():
 def test_norm_failure_fails_before_norm_stats_load(monkeypatch, tmp_path):
     args = SimpleNamespace(
         base_url="x", act_batch_size=4, contact_context_frames=0,
-        norm_stats_dir=tmp_path, client_commit=None,
+        norm_stats_dir=tmp_path, client_commit=None, query_stride=10,
+        hand_transition="instant_setpoint", servo_gain_file=None,
     )
     monkeypatch.setattr(mode3, "parse_args", lambda: args)
     with mock.patch.object(mode3, "verify_locked_norm_stats", side_effect=ValueError("bad sha")), \
@@ -106,6 +107,8 @@ def test_metadata_identifies_kinematic_contract(tmp_path):
         act_batch_size=4, norm_sha_expected="expected", norm_sha_actual="actual",
         norm_stats_dir=tmp_path / "norm", model_path="mint://checkpoint",
         model="openpi/pi05-action-lora-r16-finetune", query_stride=10,
+        hand_transition="instant_setpoint", servo_gain_file=None,
+        servo_gain_sha256=None, servo_gain_payload=None, servo_gains=None,
         client_commit="client", backend_commit="backend", model_commit="model",
         language_conditioning="gesture",
     )
@@ -131,6 +134,8 @@ def test_metadata_identifies_kinematic_contract(tmp_path):
 def test_metadata_identifies_replan_one_execution(tmp_path):
     args = SimpleNamespace(
         act_batch_size=4, query_stride=1,
+        hand_transition="instant_setpoint", servo_gain_file=None,
+        servo_gain_sha256=None, servo_gain_payload=None, servo_gains=None,
         norm_sha_expected="expected", norm_sha_actual="actual",
         norm_stats_dir=tmp_path / "norm", model_path="mint://checkpoint",
         model="openpi/pi05-action-lora-r16-finetune",
@@ -149,3 +154,32 @@ def test_metadata_identifies_replan_one_execution(tmp_path):
     assert metadata["mode"] == "kinematic_mode3_replan1_first_action"
     assert metadata["query_stride"] == 1
     assert metadata["action_execution"] == "replan_each_frame_execute_action_0"
+
+
+def test_metadata_identifies_calibrated_servo_lag(tmp_path):
+    gains = np.linspace(0.01, 0.05, 26)
+    args = SimpleNamespace(
+        act_batch_size=4, query_stride=1, hand_transition="calibrated_servo_lag",
+        servo_gain_file=tmp_path / "servo.json", servo_gain_sha256="gain-sha",
+        servo_gain_payload={"source_interval_seconds": 0.005, "row_count": 185,
+                            "transition_count": 161862}, servo_gains=gains,
+        norm_sha_expected="expected", norm_sha_actual="actual",
+        norm_stats_dir=tmp_path / "norm", model_path="mint://checkpoint",
+        model="openpi/pi05-action-lora-r16-finetune",
+        client_commit="client", backend_commit="backend", model_commit="model",
+        language_conditioning="gesture",
+    )
+    window = SimpleNamespace(
+        frame_count=3,
+        as_dict=lambda: {"start_frame": 4, "end_frame": 6, "frame_count": 3},
+    )
+    metadata = mode3._result_metadata(
+        args, row_index=12, object_name="cube1", window=window, source_frames=20,
+        query_timings=[], out=tmp_path, head_path=tmp_path / "head.mp4",
+        wrist_path=tmp_path / "wrist.mp4",
+    )
+    assert metadata["mode"] == "kinematic_mode3_servo_lag_replan1"
+    assert metadata["hand_transition"] == "calibrated_servo_lag"
+    assert metadata["servo_lag"]["contract_id"] == mode3.SERVO_LAG_CONTRACT_ID
+    assert metadata["servo_lag"]["gain_file_sha256"] == "gain-sha"
+    np.testing.assert_allclose(metadata["servo_lag"]["gains"], gains)
