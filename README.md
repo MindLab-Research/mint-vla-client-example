@@ -246,22 +246,36 @@ nvidia-smi
 ss -ltnp | grep 30540 || echo "port free"
 ```
 
-### Training command (A-LoRA, cube2 rows)
+### Training command (A-LoRA, all cube1 trajectories)
 
-Dry-run first, then drop `--dry-run` for a real run:
+The locked cube1 population is 1,102 contiguous Lance rows (`507..1608`),
+selected by `config/datasets/cube1_all_rows_507_1608.csv`. Its exact 32D norm
+has SHA256 `4d7ee78f34c293c4a6023a8980a0c8a614eae6f0c63b889984a5f9a45ce0a747`.
+Dry-run first; remove `--dry-run` only after the 200-step smoke converges.
 
 ```bash
 cd /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/mint-vla-client-example
+DATA=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
+MANIFEST=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json
+NORM=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/training/cube1_all_32d_extended_norm_v1_20260728
+ROWS=$(tr -d '\n' < config/datasets/cube1_all_rows_507_1608.csv)
+RUN=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/client_runs/cube1_all_alora_50k
+
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
   --model openpi/pi05-action-lora-r16-finetune \
-  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
-  --row-indices 1609,1610,1611,1612,1838,1839,1840,1841 \
-  --frame-window full --missing-contact-policy full \
-  --extended-state --action-source urdf_target_absolute \
-  --steps 30000 --batch-size 4 --seed 42 \
-  --save-path rongenz_cube2_alora_30k \
-  --output-json /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/rongenz_cube2_alora_30k.json \
-  --dry-run
+  --lance-dataset "$DATA" --target-lance-dataset "$DATA" \
+  --row-indices "$ROWS" --contact-window-manifest "$MANIFEST" \
+  --missing-contact-policy error --action-source urdf_target_absolute \
+  --extended-state --language-conditioning gesture \
+  --gesture-index config/datasets/new_all_generated_mano.index.json \
+  --norm-stats-dir "$NORM" --sampling-strategy coverage \
+  --coverage-anchors-per-row 8 --steps 50000 --batch-size 4 --seed 42 \
+  --learning-rate 1e-4 --checkpoint-every 5000 \
+  --checkpoint-save-path-template 'cube1_all_alora_50k_step{step}' \
+  --checkpoint-step 25000 --checkpoint-save-path cube1_all_alora_50k_mid \
+  --checkpoint-state-path cube1_all_alora_50k_mid_state \
+  --save-path cube1_all_alora_50k --metrics-jsonl "$RUN/metrics.jsonl" \
+  --output-json "$RUN/result.json" --dry-run
 ```
 
 Minimal validation order: worktrees clean -> launcher prints correct roots ->

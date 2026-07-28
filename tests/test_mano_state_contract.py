@@ -18,6 +18,7 @@ from scripts.mano_state_contract import (
     STATE_DIM,
     aggregate_finger_contacts,
     build_extended_state,
+    verify_locked_norm_stats,
 )
 
 
@@ -131,3 +132,32 @@ class TestContactNormalization:
         for raw, expected in [(0.0, CONTACT_NEGATIVE), (1.0, CONTACT_POSITIVE)]:
             norm = (raw - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
             assert norm == pytest.approx(expected, abs=1e-3)
+
+
+class TestPopulationNormContract:
+    def _write(self, root, contract=True):
+        import hashlib, json
+        norm = root / "norm_stats.json"
+        norm.write_text('{"norm_stats": {}}')
+        digest = hashlib.sha256(norm.read_bytes()).hexdigest()
+        if contract:
+            (root / "data_contract.json").write_text(json.dumps({
+                "norm_stats_sha256": digest,
+                "state_contract": STATE_CONTRACT_ID,
+                "extended_state": True,
+                "action_source": "urdf_target_absolute",
+            }))
+        return digest
+
+    def test_accepts_allowlisted_population_norm_with_contract(self, tmp_path, monkeypatch):
+        digest = self._write(tmp_path)
+        monkeypatch.setattr("scripts.mano_state_contract.CUBE1_ALL_NORM_SHA256", digest)
+        path, actual = verify_locked_norm_stats(tmp_path)
+        assert path == tmp_path / "norm_stats.json"
+        assert actual == digest
+
+    def test_rejects_population_norm_without_contract(self, tmp_path, monkeypatch):
+        digest = self._write(tmp_path, contract=False)
+        monkeypatch.setattr("scripts.mano_state_contract.CUBE1_ALL_NORM_SHA256", digest)
+        with pytest.raises(ValueError, match="data_contract.json"):
+            verify_locked_norm_stats(tmp_path)

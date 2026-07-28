@@ -1,0 +1,22 @@
+{
+  "selection_id": "cube1_all_rows_v1",
+  "source_gesture_index": "config/datasets/new_all_generated_mano.index.json",
+  "source_gesture_index_sha256": "ec847b5dc3fa5f59e03849bec71e1eb5d2d8557ad0addfa2b52feba15ba0580f",
+  "object_type": "cube1",
+  "row_count": 1102,
+  "row_min": 507,
+  "row_max": 1608,
+  "rows_contiguous": true,
+  "row_indices_sha256": "c5cbe33d1134f300f836c171ef4b8b0203fcf5ee6d9b2403b632b8285acaf588",
+  "total_frames": 927283,
+  "gesture_counts": {
+    "01": 149,
+    "02": 154,
+    "03": 185,
+    "04": 160,
+    "09": 148,
+    "10": 204,
+    "18": 102
+  },
+  "rows_csv": "config/datasets/cube1_all_rows_507_1608.csv"
+}

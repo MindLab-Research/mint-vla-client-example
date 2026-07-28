@@ -36,7 +36,6 @@ from scripts.gesture_language import (
 from scripts.mano_state_contract import (
     CONTACT_RULE,
     CONTACT_SEMANTICS,
-    EXPECTED_NORM_SHA256,
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
@@ -1586,7 +1585,7 @@ def main() -> int:
             CONTACT_RULE if args.extended_state else None
         ),
         "norm_sha_expected": (
-            EXPECTED_NORM_SHA256 if args.extended_state else None
+            norm_stats_provenance.get("sha256") if args.extended_state else None
         ),
         "norm_sha_actual": norm_stats_provenance.get("sha256"),
         "gesture_index": (
@@ -1866,7 +1865,7 @@ def main() -> int:
                 CONTACT_RULE if args.extended_state else None
             ),
             "norm_sha_expected": (
-                EXPECTED_NORM_SHA256 if args.extended_state else None
+                norm_stats_provenance.get("sha256") if args.extended_state else None
             ),
             "norm_sha_actual": norm_stats_provenance.get("sha256"),
             "gesture_index": (

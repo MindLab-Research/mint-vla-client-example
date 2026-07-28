@@ -43,7 +43,6 @@ from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
 from scripts.mano_state_contract import (
     CONTACT_RULE,
     CONTACT_SEMANTICS,
-    EXPECTED_NORM_SHA256,
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
@@ -797,7 +796,7 @@ def main() -> int:
     if args.extended_state:
         # Authenticate the exact v1 normalization bytes before loading them.
         _, actual_sha = verify_locked_norm_stats(args.norm_stats_dir)
-        args.norm_sha_expected = EXPECTED_NORM_SHA256
+        args.norm_sha_expected = actual_sha
         args.norm_sha_actual = actual_sha
     norm_stats = L.normalize.load(args.norm_stats_dir)
     if args.extended_state:

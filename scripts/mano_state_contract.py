@@ -18,14 +18,16 @@ Contact semantics (v1, user final decision):
 Contact normalization: raw 0/1 → -1/+1 via fixed q01=0/q99=1 mapping
 (NOT quantile normalization, which would fail for sparse fingers like pinky).
 
-EXPECTED_NORM_SHA256: SHA256 of the locked 185-row gesture03 32D norm stats.
-Mode 4 extended-state MUST verify norm_stats.json matches this SHA before
-loading or first query.
+EXPECTED_NORM_SHA256: SHA256 of the legacy locked 185-row gesture03 norm.
+CUBE1_ALL_NORM_SHA256: SHA256 of the locked 1102-row cube1-all norm.
+Mode 4 extended-state MUST verify norm_stats.json is allowlisted and any new
+population norm has a matching data_contract.json before loading or first query.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +35,7 @@ import numpy as np
 
 STATE_CONTRACT_ID = "mano_five_finger_contact_lift_v1"
 EXPECTED_NORM_SHA256 = "507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d"
+CUBE1_ALL_NORM_SHA256 = "4d7ee78f34c293c4a6023a8980a0c8a614eae6f0c63b889984a5f9a45ce0a747"
 CONTACT_SEMANTICS = "record_or_keypoint_pair_presence_v1"
 CONTACT_RULE = (
     "Training: target-object contact record exists in Lance contact[]. "
@@ -48,11 +51,31 @@ def verify_locked_norm_stats(norm_stats_dir: Path) -> tuple[Path, str]:
     if not path.is_file():
         raise ValueError(f"v1 extended-state requires norm_stats.json at {path}")
     actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual_sha != EXPECTED_NORM_SHA256:
+    supported = {EXPECTED_NORM_SHA256, CUBE1_ALL_NORM_SHA256}
+    if actual_sha not in supported:
         raise ValueError(
             "v1 extended-state norm SHA mismatch: "
-            f"expected {EXPECTED_NORM_SHA256}, got {actual_sha}: {path}"
+            f"expected one of {sorted(supported)}, got {actual_sha}: {path}"
         )
+    # The legacy gesture03 cache predates data_contract.json enforcement. New
+    # population-specific norms must authenticate both their bytes and contract.
+    if actual_sha != EXPECTED_NORM_SHA256:
+        contract_path = Path(norm_stats_dir) / "data_contract.json"
+        if not contract_path.is_file():
+            raise ValueError(f"population norm requires data_contract.json at {contract_path}")
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        expected_fields = {
+            "norm_stats_sha256": actual_sha,
+            "state_contract": STATE_CONTRACT_ID,
+            "extended_state": True,
+            "action_source": "urdf_target_absolute",
+        }
+        for key, expected in expected_fields.items():
+            if contract.get(key) != expected:
+                raise ValueError(
+                    f"population norm contract {key!r} mismatch: "
+                    f"expected {expected!r}, got {contract.get(key)!r}: {contract_path}"
+                )
     return path, actual_sha
 
 
