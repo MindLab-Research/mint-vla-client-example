@@ -260,6 +260,7 @@ MANIFEST=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano
 NORM=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/training/cube1_all_32d_extended_norm_v1_20260728
 ROWS=$(tr -d '\n' < config/datasets/cube1_all_rows_507_1608.csv)
 RUN=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/client_runs/cube1_all_alora_50k
+mkdir -p "$RUN"
 
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
   --model openpi/pi05-action-lora-r16-finetune \
@@ -272,11 +273,14 @@ RUN=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/client_runs/cube1
   --coverage-anchors-per-row 8 --steps 50000 --batch-size 4 --seed 42 \
   --learning-rate 1e-4 --checkpoint-every 5000 \
   --checkpoint-save-path-template 'cube1_all_alora_50k_step{step}' \
-  --checkpoint-step 25000 --checkpoint-save-path cube1_all_alora_50k_mid \
-  --checkpoint-state-path cube1_all_alora_50k_mid_state \
   --save-path cube1_all_alora_50k --metrics-jsonl "$RUN/metrics.jsonl" \
   --output-json "$RUN/result.json" --dry-run
 ```
+
+The current no-Ray direct runtime can save sampler checkpoints but returns 503
+for `/api/v1/save_state`; optimizer state is therefore not resumable. Run the
+50k job continuously, preserve 5k sampler checkpoints for evaluation/rollback,
+and do not pass `--checkpoint-state-path` until the direct runtime implements it.
 
 Minimal validation order: worktrees clean -> launcher prints correct roots ->
 GPU/port free -> server up -> `/openapi.json` 200 -> client dry-run -> few-step
