@@ -41,6 +41,7 @@ from mode4_support import (
     action_session_payload,
     parse_ordered_unique_csv,
 )
+from scripts import contact_windows
 from scripts.eval.result_paths import default_inference_output_dir
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
 from scripts.mano_state_contract import (
@@ -66,6 +67,13 @@ HAND_DIM = 26
 # Fixed timing exported for audit/tests.
 MANORL_PHYSICS_TIMESTEP = physics.DT
 MANORL_PHYSICS_SUBSTEPS = physics.NATIVE_SUBSTEPS
+
+
+def inferred_contact_manifest_path(dataset: Path) -> Path:
+    """Return the locked ctx100 manifest colocated with the canonical Lance dataset."""
+    value = str(dataset)
+    stem = value[:-6] if value.endswith(".lance") else value
+    return Path(f"{stem}.contact_ctx100_error_v1.json")
 
 
 def reconstruct_absolute_target_chunk(query_q: np.ndarray, pred_phys: np.ndarray) -> np.ndarray:
@@ -174,6 +182,28 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=default_inference_output_dir("mode4"),
         help="result root (default: client-local results/inference/mode4_<UTC>_<pid>)",
+    )
+    parser.add_argument(
+        "--frame-window",
+        choices=("contact", "full"),
+        default="contact",
+        help="contact initializes and evaluates only the manifest window; full is an explicit stress test",
+    )
+    parser.add_argument(
+        "--contact-window-manifest",
+        type=Path,
+        default=None,
+        help="contact-window JSON; defaults to <dataset-without-.lance>.contact_ctx100_error_v1.json",
+    )
+    parser.add_argument(
+        "--contact-context-frames",
+        type=int,
+        default=contact_windows.DEFAULT_CONTACT_CONTEXT_FRAMES,
+    )
+    parser.add_argument(
+        "--missing-contact-policy",
+        choices=("full", "skip", "error"),
+        default="error",
     )
     parser.add_argument(
         "--action-session-id",
@@ -398,20 +428,24 @@ def run_variant(
         raise ValueError(f"invalid source timestamps: {timestamps.shape}")
     if not np.allclose(np.diff(timestamps), 0.005, rtol=0, atol=1e-10):
         raise ValueError("Mode4 requires exact monotonic 200 Hz source timestamps")
+    frame_window = getattr(args, "frame_window", "full")
+    contact_context_frames = int(getattr(args, "contact_context_frames", 0))
+    missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
     window = full.resolve_row_window(
         row,
         row_index=selected_row_index,
-        frame_window="full",
-        contact_context_frames=0,
-        missing_contact_policy="error",
-        manifest_entry=None,
+        frame_window=frame_window,
+        contact_context_frames=contact_context_frames,
+        missing_contact_policy=missing_contact_policy,
+        manifest_entry=manifest_entry,
     )
-    if window is None or window.start_frame != 0:
-        raise ValueError("Mode4 must initialize once at source frame 0")
-    window_end = window.end_frame
+    if window is None:
+        raise ValueError(f"Mode4 row {selected_row_index} was skipped by the window contract")
+    window_start = int(window.start_frame)
+    window_end = int(window.end_frame)
     if args.max_frames > 0:
-        window_end = min(window_end, args.max_frames - 1)
-    frame_count = window_end + 1
+        window_end = min(window_end, window_start + args.max_frames - 1)
+    frame_count = window_end - window_start + 1
     if frame_count < 2:
         raise ValueError("Mode4 needs at least two frames")
     # Canonical MANO metadata says 100 Hz, but the validated quality-replay
@@ -432,7 +466,12 @@ def run_variant(
         "render_and_video": 0.0,
         "array_finalize": 0.0,
     }
-    phase_counts = {"queries": 0, "frames": frame_count, "video_frames_written": 0}
+    phase_counts = {
+        "queries": 0,
+        "frames": frame_count,
+        "comparison_video_frames_written": 0,
+        "dataset_reference_frames_written": 0,
+    }
     scene_started = time.perf_counter()
     tmp, model, data, renderer, object_addr, _, hand_addrs, _, limits = physics.make_scene(
         object_name,
@@ -448,15 +487,15 @@ def run_variant(
         if args.extended_state else (None, None, None)
     )
     state = np.zeros(32, dtype=np.float32)
-    state[:HAND_DIM] = np.asarray(row["state"][0], dtype=np.float32)[:HAND_DIM]
+    state[:HAND_DIM] = np.asarray(row["state"][window_start], dtype=np.float32)[:HAND_DIM]
     clipping = new_clipping_diagnostics(limits)
     data.qvel[:] = 0.0
     full.set_scene_state(
         model,
         data,
         state=state[:HAND_DIM],
-        object_pos=row["objects"][0]["pos"][0],
-        object_rot_aa=row["objects"][0]["rot_aa"][0],
+        object_pos=row["objects"][0]["pos"][window_start],
+        object_rot_aa=row["objects"][0]["rot_aa"][window_start],
         object_addr=object_addr,
         hand_addrs=hand_addrs,
     )
@@ -526,16 +565,29 @@ def run_variant(
                     )
                 )
                 video_started = time.perf_counter()
+                # Preserve the complete demonstration as context, independently
+                # from the window used to initialize and evaluate the policy.
+                for source_frame in range(source_frames):
+                    dataset_reference = resize_for_video(
+                        decode_jpeg(row["image"][source_frame]), args.width, args.height
+                    )
+                    dataset_writer.append_data(
+                        label(dataset_reference, f"DATASET reference source frame {source_frame}")
+                    )
+                phase_counts["dataset_reference_frames_written"] = source_frames
+
                 sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
-                dataset_head = resize_for_video(decode_jpeg(row["image"][0]), args.width, args.height)
+                dataset_head = resize_for_video(
+                    decode_jpeg(row["image"][window_start]), args.width, args.height
+                )
                 dataset_wrist = resize_for_video(
-                    decode_jpeg(row["wrist_image"][0]), args.width, args.height
+                    decode_jpeg(row["wrist_image"][window_start]), args.width, args.height
                 )
                 head_writer.append_data(
                     np.concatenate(
                         [
-                            label(sim_head, "MODE4 PHYSICS frame 0"),
-                            label(dataset_head, "DATASET frame 0"),
+                            label(sim_head, f"MODE4 PHYSICS source frame {window_start}"),
+                            label(dataset_head, f"DATASET source frame {window_start}"),
                         ],
                         axis=1,
                     )
@@ -543,17 +595,16 @@ def run_variant(
                 wrist_writer.append_data(
                     np.concatenate(
                         [
-                            label(sim_wrist, "MODE4 PHYSICS wrist 0"),
-                            label(dataset_wrist, "DATASET wrist 0"),
+                            label(sim_wrist, f"MODE4 PHYSICS wrist source frame {window_start}"),
+                            label(dataset_wrist, f"DATASET wrist source frame {window_start}"),
                         ],
                         axis=1,
                     )
                 )
-                dataset_writer.append_data(label(dataset_head, "DATASET reference frame 0"))
                 phase_seconds["render_and_video"] += time.perf_counter() - video_started
-                phase_counts["video_frames_written"] += 1
+                phase_counts["comparison_video_frames_written"] += 1
 
-            for frame in range(window_end):
+            for frame in range(window_start, window_end):
                 current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
                 state[:HAND_DIM] = current_q.astype(np.float32)
                 if args.extended_state:
@@ -574,7 +625,7 @@ def run_variant(
                 observation_states.append(state.copy())
                 observation_contacts.append(state[26:31].copy())
                 observation_lift.append(state[31])
-                if frame % args.chunk_stride == 0:
+                if (frame - window_start) % args.chunk_stride == 0:
                     query_prepare_started = time.perf_counter()
                     head_image, wrist_image = physics.render_current_state(model, data, renderer)
                     datum = build_datum(
@@ -713,8 +764,8 @@ def run_variant(
                     head_writer.append_data(
                         np.concatenate(
                             [
-                                label(sim_head, f"MODE4 PHYSICS frame {next_frame}"),
-                                label(dataset_head, f"DATASET frame {next_frame}"),
+                                label(sim_head, f"MODE4 PHYSICS source frame {next_frame}"),
+                                label(dataset_head, f"DATASET source frame {next_frame}"),
                             ],
                             axis=1,
                         )
@@ -722,17 +773,14 @@ def run_variant(
                     wrist_writer.append_data(
                         np.concatenate(
                             [
-                                label(sim_wrist, f"MODE4 PHYSICS wrist {next_frame}"),
-                                label(dataset_wrist, f"DATASET wrist {next_frame}"),
+                                label(sim_wrist, f"MODE4 PHYSICS wrist source frame {next_frame}"),
+                                label(dataset_wrist, f"DATASET wrist source frame {next_frame}"),
                             ],
                             axis=1,
                         )
                     )
-                    dataset_writer.append_data(
-                        label(dataset_head, f"DATASET reference frame {next_frame}")
-                    )
                     phase_seconds["render_and_video"] += time.perf_counter() - video_started
-                    phase_counts["video_frames_written"] += 1
+                    phase_counts["comparison_video_frames_written"] += 1
     finally:
         if owns_session and active_session_id:
             delete_session(args, headers, active_session_id)
@@ -803,7 +851,7 @@ def run_variant(
         "observation_feedback": True,
         "state_observation_source": "integrated_mujoco_qpos",
         "image_observation_source": "integrated_mujoco_renderer",
-        "object_pose_source": "sim_owned_after_frame0",
+        "object_pose_source": f"sim_owned_after_source_frame_{window_start}",
         "action_source": args.action_source,
         "extended_state": bool(args.extended_state),
         "state_contract": (
@@ -826,7 +874,35 @@ def run_variant(
         "object_name": object_name,
         "source_frame_count": source_frames,
         "trajectory_frame_count": frame_count,
-        "frame_window": {"start_frame": 0, "end_frame": window_end, "frame_count": frame_count},
+        "frame_window": {
+            "type": frame_window,
+            "status": getattr(window, "status", frame_window),
+            "start_frame": window_start,
+            "end_frame": window_end,
+            "frame_count": frame_count,
+            "first_contact_frame": getattr(window, "first_contact_frame", None),
+            "last_contact_frame": getattr(window, "last_contact_frame", None),
+            "context_frames": getattr(window, "context_frames", contact_context_frames),
+            "manifest": (
+                str(args.contact_window_manifest)
+                if getattr(args, "contact_window_manifest", None) is not None
+                else None
+            ),
+        },
+        "video_windows": {
+            "dataset_reference": {
+                "type": "full",
+                "start_frame": 0,
+                "end_frame": source_frames - 1,
+                "frame_count": source_frames,
+            },
+            "physics_comparison": {
+                "type": frame_window,
+                "start_frame": window_start,
+                "end_frame": window_end,
+                "frame_count": frame_count,
+            },
+        },
         "physics": {
             "engine": "MuJoCo",
             "controller": "manorl_native_position_servo",
@@ -904,8 +980,22 @@ def build_row_summary(
         ),
         "norm_sha_expected": getattr(args, "norm_sha_expected", None),
         "norm_sha_actual": getattr(args, "norm_sha_actual", None),
-        "frame_window": "full_from_frame0",
-        "object_pose_source": "sim_owned_after_frame0",
+        "frame_window": (
+            results[0].get("frame_window", getattr(args, "frame_window", "full"))
+            if results
+            else getattr(args, "frame_window", "full")
+        ),
+        "video_windows": results[0].get("video_windows") if results else None,
+        "object_pose_source": (
+            results[0].get("object_pose_source", "sim_owned_after_window_start")
+            if results
+            else "sim_owned_after_window_start"
+        ),
+        "contact_window_manifest": (
+            str(args.contact_window_manifest)
+            if getattr(args, "contact_window_manifest", None) is not None
+            else None
+        ),
         "act_mode": args.act_mode,
         "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
         "max_warm_request_seconds": args.max_warm_request_seconds,
@@ -916,6 +1006,12 @@ def build_row_summary(
 def main() -> int:
     args = parse_args()
     args.base_url = args.base_url.rstrip("/")
+    # Tests and legacy direct callers may construct a minimal Namespace; the
+    # formal CLI defaults new evaluations to contact-window initialization.
+    args.frame_window = getattr(args, "frame_window", "full")
+    args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
+    args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
+    args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
     args._gesture_index = (
         GestureIndex.load(args.gesture_index)
         if args.language_conditioning == GESTURE_LANGUAGE
@@ -927,6 +1023,8 @@ def main() -> int:
         raise ValueError("--temporal-decay must be in (0, 1]")
     if args.act_batch_size <= 0:
         raise ValueError("--act-batch-size must be positive")
+    if args.contact_context_frames < 0:
+        raise ValueError("--contact-context-frames must be non-negative")
     if args.action_session_id and args.keep_action_session:
         raise ValueError("--action-session-id and --keep-action-session are mutually exclusive")
 
@@ -946,6 +1044,37 @@ def main() -> int:
     args.rollout_action_gains = np.ones(HAND_DIM, dtype=np.float32)
     if any(not 0 <= index < row_count for index in eval_rows):
         raise IndexError(f"row index out of range: {eval_rows}")
+
+    contact_manifest_entries: dict[int, dict] = {}
+    if args.frame_window == "contact":
+        manifest_path = args.contact_window_manifest or inferred_contact_manifest_path(
+            args.lance_dataset
+        )
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"contact-window inference requires a manifest: {manifest_path}"
+            )
+        manifest_raw, contact_manifest_entries = contact_windows.load_manifest(manifest_path)
+        manifest_dataset = manifest_raw.get("dataset")
+        if manifest_dataset not in (None, str(args.lance_dataset)):
+            raise ValueError(
+                f"contact-window manifest dataset mismatch: {manifest_dataset!r} != "
+                f"{str(args.lance_dataset)!r}"
+            )
+        manifest_context = int(
+            manifest_raw.get("context_frames", args.contact_context_frames)
+        )
+        if manifest_context != args.contact_context_frames:
+            raise ValueError(
+                f"contact-window context mismatch: {manifest_context} != "
+                f"{args.contact_context_frames}"
+            )
+        missing = [row for row in eval_rows if row not in contact_manifest_entries]
+        if missing:
+            raise ValueError(f"contact-window manifest is missing rows: {missing}")
+        args.contact_window_manifest = manifest_path
+    else:
+        args.contact_window_manifest = None
     normalization_rows = (
         list(range(row_count))
         if args.normalization_row_indices.strip().lower() == "all"
@@ -1047,6 +1176,7 @@ def main() -> int:
                     mode="mode4",
                     headers=headers,
                     object_name=object_name,
+                    manifest_entry=contact_manifest_entries.get(row_index),
                     session_id=shared_session_id,
                 )
             ]
@@ -1071,6 +1201,7 @@ def main() -> int:
                         mode="mode4",
                         headers=headers,
                         object_name=object_name,
+                        manifest_entry=contact_manifest_entries.get(row_index),
                         session_id=shared_session_id,
                         row_index=row_index,
                         output_dir=row_output_dir,
@@ -1111,8 +1242,13 @@ def main() -> int:
                 "contact_rule": CONTACT_RULE if args.extended_state else None,
                 "norm_sha_expected": getattr(args, "norm_sha_expected", None),
                 "norm_sha_actual": getattr(args, "norm_sha_actual", None),
-                "frame_window": "full_from_frame0",
-                "object_pose_source": "sim_owned_after_frame0",
+                "frame_window": args.frame_window,
+                "contact_window_manifest": (
+                    str(args.contact_window_manifest)
+                    if args.contact_window_manifest is not None
+                    else None
+                ),
+                "object_pose_source": "sim_owned_after_window_start",
                 "act_mode": args.act_mode,
                 "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
                 "video_mode": getattr(args, "video_mode", "full"),

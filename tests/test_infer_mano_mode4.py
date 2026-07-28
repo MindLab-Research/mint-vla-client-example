@@ -203,25 +203,39 @@ class Mode4SessionLifecycleTests(unittest.TestCase):
 
 
 class Mode4LoopTests(unittest.TestCase):
-    def test_one_interval_steps_twice_and_never_rewrites_object(self):
+    def test_contact_window_initializes_at_absolute_start_and_keeps_full_reference(self):
         frame = np.full((24, 32, 3), 127, dtype=np.uint8)
         buf = BytesIO()
         Image.fromarray(frame).save(buf, format="JPEG")
         blob = buf.getvalue()
-        source_state = np.zeros((2, 32), np.float32)
+        source_state = np.zeros((3, 32), np.float32)
         source_state[0, 0] = 0.123
+        source_state[1, 0] = 0.456
         row = {
             "state": source_state,
-            "actions": np.zeros((2, 32), np.float32),
-            "image": [blob, blob],
-            "wrist_image": [blob, blob],
-            "objects": [{"pos": [[0.3, 0, 0.1]] * 2, "rot_aa": [[0, 0, 0]] * 2}],
-            "timestamp": np.asarray([0.0, 0.005], dtype=np.float64),
+            "actions": np.zeros((3, 32), np.float32),
+            "image": [blob, blob, blob],
+            "wrist_image": [blob, blob, blob],
+            "objects": [
+                {
+                    "pos": [[0.3, 0, 0.1], [0.4, 0, 0.1], [0.4, 0, 0.1]],
+                    "rot_aa": [[0, 0, 0]] * 3,
+                }
+            ],
+            "timestamp": np.asarray([0.0, 0.005, 0.01], dtype=np.float64),
             "prompt": "pick up cube1",
             "trajectory_metadata": {"data_fps": 100},
             "episode_metadata": {"fps": 100},
         }
-        window = types.SimpleNamespace(start_frame=0, end_frame=1, frame_count=2)
+        window = types.SimpleNamespace(
+            start_frame=1,
+            end_frame=2,
+            frame_count=2,
+            status="contact_window",
+            first_contact_frame=2,
+            last_contact_frame=2,
+            context_frames=100,
+        )
         data = types.SimpleNamespace(qpos=np.zeros(33), qvel=np.zeros(32), time=0.0)
         data.qpos[3] = 1
         renderer = types.SimpleNamespace(close=lambda: None)
@@ -241,6 +255,10 @@ class Mode4LoopTests(unittest.TestCase):
             language_conditioning="gesture",
             max_warm_request_seconds=0,
             temporal_decay=0.4,
+            frame_window="contact",
+            contact_context_frames=100,
+            missing_contact_policy="error",
+            contact_window_manifest=Path("/contact.json"),
             base_url="x",
             model_path="p",
             client_commit="client-sha",
@@ -274,7 +292,7 @@ class Mode4LoopTests(unittest.TestCase):
         observation_contacts = np.asarray([0.1, 0.2, 0.3, 0.4, 0.5], dtype=np.float32)
 
         with tempfile.TemporaryDirectory() as out, mock.patch.object(
-            mode4.full, "row_frame_count", return_value=2
+            mode4.full, "row_frame_count", return_value=3
         ), mock.patch.object(
             mode4.full, "resolve_row_window", return_value=window
         ), mock.patch.object(
@@ -339,10 +357,17 @@ class Mode4LoopTests(unittest.TestCase):
                 output_dir=Path(out),
             )
             self.assertEqual(len(set_calls), 1)
-            self.assertAlmostEqual(float(set_calls[0]["state"][0]), 0.123, places=6)
+            self.assertAlmostEqual(float(set_calls[0]["state"][0]), 0.456, places=6)
+            self.assertAlmostEqual(float(set_calls[0]["object_pos"][0]), 0.4, places=6)
             self.assertEqual(result["physics"]["mj_step_calls"], 2)
             self.assertEqual(result["physics"]["intervals"], 1)
-            self.assertEqual(result["object_pose_source"], "sim_owned_after_frame0")
+            self.assertEqual(result["object_pose_source"], "sim_owned_after_source_frame_1")
+            self.assertEqual(result["frame_window"]["type"], "contact")
+            self.assertEqual(result["frame_window"]["start_frame"], 1)
+            self.assertEqual(result["frame_window"]["end_frame"], 2)
+            self.assertEqual(result["video_windows"]["dataset_reference"]["frame_count"], 3)
+            self.assertEqual(result["video_windows"]["physics_comparison"]["frame_count"], 2)
+            self.assertEqual(result["query_timings"][0]["source_frame"], 1)
             self.assertEqual(result["client_commit"], "client-sha")
             self.assertEqual(result["backend_commit"], "mint-sha")
             self.assertEqual(result["model_commit"], "openpi-sha")
@@ -350,7 +375,7 @@ class Mode4LoopTests(unittest.TestCase):
             self.assertFalse(result["action_session_owned_by_variant"])
             output = Path(out) / "mode4"
             self.assertAlmostEqual(
-                np.load(output / "object_position_sim.npy")[-1, 0], 0.32, places=6
+                np.load(output / "object_position_sim.npy")[-1, 0], 0.42, places=6
             )
             expected_arrays = {
                 "actions_raw_pred_normalized",

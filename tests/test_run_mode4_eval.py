@@ -46,6 +46,22 @@ def base_fixture(root: Path) -> tuple[Path, Path, str, str, Path, Path, Path]:
     openpi_commit = init_git_checkout(openpi)
     dataset = root / "dataset.lance"
     dataset.mkdir()
+    (root / "dataset.contact_ctx100_error_v1.json").write_text(
+        json.dumps(
+            {
+                "manifest_version": 1,
+                "dataset": str(dataset),
+                "context_frames": 100,
+                "missing_policy": "error",
+                "windows": {
+                    "2": {"row_index": 2, "start_frame": 1, "end_frame": 3},
+                    "7": {"row_index": 7, "start_frame": 2, "end_frame": 4},
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     norm = root / "norm"
     norm.mkdir()
     norm_stats = norm / "norm_stats.json"
@@ -129,6 +145,13 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
             self.assertEqual(payload["evaluation"]["normalization_row_indices"], [7, 2])
             self.assertEqual(payload["evaluation"]["video_mode"], "full")
+            self.assertEqual(payload["evaluation"]["frame_window"], "contact")
+            self.assertEqual(
+                payload["evaluation"]["contact_window_manifest"],
+                str(root / "dataset.contact_ctx100_error_v1.json"),
+            )
+            self.assertEqual(payload["evaluation"]["dataset_reference_video_window"], "full")
+            self.assertEqual(payload["evaluation"]["physics_comparison_video_window"], "contact")
             self.assertEqual(payload["provenance"]["backend_commit"], "0123456789abcdef0123456789abcdef01234567")
             self.assertEqual(payload["provenance"]["model_commit"], "abcdef0123456789abcdef0123456789abcdef01")
             self.assertIsNone(payload["provenance"]["backend_dirty"])
@@ -176,6 +199,30 @@ class RunMode4EvalContractTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 64)
             self.assertIn("--output-dir and --run-name are mutually exclusive", completed.stderr)
+
+    def test_explicit_full_window_does_not_require_contact_manifest(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            (root / "dataset.contact_ctx100_error_v1.json").unlink()
+            output = root / "full-stress-output"
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    output,
+                    "--frame-window",
+                    "full",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["evaluation"]["frame_window"], "full")
+            self.assertIsNone(payload["evaluation"]["contact_window_manifest"])
+            self.assertEqual(payload["evaluation"]["dataset_reference_video_window"], "full")
+            self.assertEqual(payload["evaluation"]["physics_comparison_video_window"], "full")
 
     def test_print_config_accepts_video_none_without_creating_output(self):
         with tempfile.TemporaryDirectory() as temp:

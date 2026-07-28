@@ -162,7 +162,11 @@ endpoint or own a dedicated server and records the effective stride, ensemble,
 server, source provenance, and per-phase timing in the output root. Generated
 inference defaults to this checkout's ignored `results/inference/` directory;
 use `--run-name NAME` for a stable client-local directory or `--output-dir PATH`
-only when an explicit override is required:
+only when an explicit override is required. Mode4 defaults to contact-window
+initialization using the canonical ctx100 manifest. `dataset_reference.mp4`
+keeps the full demonstration, while head/wrist physics-comparison videos and
+all rollout arrays cover only the synchronized contact window. Use
+`--frame-window full` only for an explicitly named full-trajectory stress test:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help

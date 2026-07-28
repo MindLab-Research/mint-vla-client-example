@@ -142,6 +142,16 @@ Without an output option it creates a unique run below the formal checkout's
 `--output-dir PATH` remains an explicit override and cannot be combined with
 `--run-name`.
 
+The canonical Mode4 frame contract is `--frame-window contact`. The launcher
+loads `<dataset-without-.lance>.contact_ctx100_error_v1.json` unless an explicit
+manifest is supplied, initializes hand/object physics at the absolute window
+start, and resets lift there. `dataset_reference.mp4` always preserves the full
+source demonstration. `mode4_physics_vs_dataset_head.mp4`, the wrist comparison,
+rollout arrays, and physical metrics cover only the synchronized contact window
+and retain absolute source-frame labels. `--frame-window full` is a separate
+out-of-support stress test; do not obtain a contact result by trimming a full
+closed-loop video after the fact.
+
 When using an existing endpoint, declare the backend/model commits reported by
 the server owner. The launcher records them as operator-declared provenance; a
 client cannot prove the source of a process it did not start:

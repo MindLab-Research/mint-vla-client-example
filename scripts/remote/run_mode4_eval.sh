@@ -55,6 +55,10 @@ FPS=10
 WIDTH=640
 HEIGHT=360
 VIDEO_MODE=full
+FRAME_WINDOW=contact
+CONTACT_WINDOW_MANIFEST=
+CONTACT_CONTEXT_FRAMES=100
+MISSING_CONTACT_POLICY=error
 LANGUAGE_CONDITIONING=gesture
 GESTURE_INDEX="${REPO_ROOT}/config/datasets/new_all_generated_mano.index.json"
 OVERWRITE_OUTPUT=0
@@ -98,6 +102,12 @@ Evaluation options:
   --fps FLOAT                 output video FPS (default: 10)
   --width N --height N        per-panel render size (default: 640x360)
   --video-mode full|none      full writes videos; none keeps observation rendering but skips output-video encoding
+  --frame-window contact|full contact initializes physics at the manifest window (default);
+                              full is an explicit full-trajectory stress test
+  --contact-window-manifest PATH
+                              default: <dataset-without-.lance>.contact_ctx100_error_v1.json
+  --contact-context-frames N  must match the manifest (default: 100)
+  --missing-contact-policy full|skip|error (default: error)
   --language-conditioning gesture|motion_variant|object_only
   --gesture-index PATH        canonical gesture index; required for gesture
   --api-key KEY               MINT API key (default: MINT_API_KEY)
@@ -165,6 +175,10 @@ while (($#)); do
     --width) WIDTH=${2:?}; shift 2 ;;
     --height) HEIGHT=${2:?}; shift 2 ;;
     --video-mode) VIDEO_MODE=${2:?}; shift 2 ;;
+    --frame-window) FRAME_WINDOW=${2:?}; shift 2 ;;
+    --contact-window-manifest) CONTACT_WINDOW_MANIFEST=${2:?}; shift 2 ;;
+    --contact-context-frames) CONTACT_CONTEXT_FRAMES=${2:?}; shift 2 ;;
+    --missing-contact-policy) MISSING_CONTACT_POLICY=${2:?}; shift 2 ;;
     --language-conditioning) LANGUAGE_CONDITIONING=${2:?}; shift 2 ;;
     --gesture-index) GESTURE_INDEX=${2:?}; shift 2 ;;
     --api-key) MINT_API_KEY=${2:?}; shift 2 ;;
@@ -292,6 +306,25 @@ if [[ -z "$OUTPUT_DIR" ]]; then
   require_absolute VLA_CLIENT_INFERENCE_ROOT "$VLA_CLIENT_INFERENCE_ROOT"
   RUN_NAME=${RUN_NAME:-"mode4_$(date -u +%Y%m%dT%H%M%SZ)_$$"}
   OUTPUT_DIR="${VLA_CLIENT_INFERENCE_ROOT%/}/${RUN_NAME}"
+fi
+case "$FRAME_WINDOW" in
+  contact|full) ;;
+  *) fail "--frame-window must be contact or full: $FRAME_WINDOW" ;;
+esac
+case "$MISSING_CONTACT_POLICY" in
+  full|skip|error) ;;
+  *) fail "--missing-contact-policy must be full, skip, or error: $MISSING_CONTACT_POLICY" ;;
+esac
+require_nonnegative_int --contact-context-frames "$CONTACT_CONTEXT_FRAMES"
+if [[ "$FRAME_WINDOW" == contact ]]; then
+  if [[ -z "$CONTACT_WINDOW_MANIFEST" ]]; then
+    CONTACT_WINDOW_MANIFEST="${DATASET%.lance}.contact_ctx100_error_v1.json"
+  fi
+  require_absolute --contact-window-manifest "$CONTACT_WINDOW_MANIFEST"
+  [[ -f "$CONTACT_WINDOW_MANIFEST" ]] || \
+    fail "contact-window manifest does not exist: $CONTACT_WINDOW_MANIFEST"
+else
+  CONTACT_WINDOW_MANIFEST=
 fi
 require_absolute --dataset "$DATASET"
 require_absolute --norm-stats-dir "$NORM_STATS_DIR"
@@ -438,7 +471,8 @@ from datetime import datetime, timezone
     openpi_dirty, norm_sha, verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, max_warm, max_frames, fps, width,
-    height, video_mode, language, gesture_index, server_port, server_gpus, runtime_root,
+    height, video_mode, frame_window, contact_manifest, contact_context,
+    missing_contact_policy, language, gesture_index, server_port, server_gpus, runtime_root,
     cache_dir, persistent_cache, keep_server, reuse_server_info, action_session_id,
 ) = sys.argv[1:]
 row_ids=list(dict.fromkeys(int(x) for x in rows.split(',')))
@@ -473,6 +507,12 @@ payload={
         'width': int(width),
         'height': int(height),
         'video_mode': video_mode,
+        'frame_window': frame_window,
+        'contact_window_manifest': contact_manifest or None,
+        'contact_context_frames': int(contact_context),
+        'missing_contact_policy': missing_contact_policy,
+        'dataset_reference_video_window': 'full',
+        'physics_comparison_video_window': frame_window,
         'language_conditioning': language,
         'gesture_index': gesture_index if language == 'gesture' else None,
         'extended_state': True,
@@ -512,8 +552,10 @@ CONFIG_ARGS=(
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$MAX_WARM_REQUEST_SECONDS"
-  "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX"
-  "$SERVER_PORT" "$SERVER_GPUS" "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
+  "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$FRAME_WINDOW"
+  "$CONTACT_WINDOW_MANIFEST" "$CONTACT_CONTEXT_FRAMES" "$MISSING_CONTACT_POLICY"
+  "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX" "$SERVER_PORT" "$SERVER_GPUS"
+  "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
   "$ENABLE_JAX_PERSISTENT_CACHE" "$KEEP_SERVER" "$REUSE_SERVER_INFO" "$ACTION_SESSION_ID"
 )
 if ((PRINT_CONFIG)); then
@@ -642,6 +684,8 @@ EVAL_ARGS=(
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
   --max-warm-request-seconds "$MAX_WARM_REQUEST_SECONDS" --max-frames "$MAX_FRAMES"
   --fps "$FPS" --width "$WIDTH" --height "$HEIGHT" --video-mode "$VIDEO_MODE"
+  --frame-window "$FRAME_WINDOW" --contact-context-frames "$CONTACT_CONTEXT_FRAMES"
+  --missing-contact-policy "$MISSING_CONTACT_POLICY"
   --client-commit "$CLIENT_COMMIT" --backend-commit "$BACKEND_COMMIT"
   --model-commit "$OPENPI_COMMIT"
 )
@@ -649,6 +693,9 @@ if ((KEEP_SERVER)); then
   EVAL_ARGS+=(--keep-action-session)
 elif [[ -n "$ACTION_SESSION_ID" ]]; then
   EVAL_ARGS+=(--action-session-id "$ACTION_SESSION_ID")
+fi
+if [[ "$FRAME_WINDOW" == contact ]]; then
+  EVAL_ARGS+=(--contact-window-manifest "$CONTACT_WINDOW_MANIFEST")
 fi
 if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
