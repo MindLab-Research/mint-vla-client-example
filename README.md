@@ -197,3 +197,73 @@ Do not commit:
 The MINT and OpenPI repositories are read-only dependencies for client work.
 Server changes require their own reviewed commits in their respective
 `action-lora-r16` branches.
+
+
+## Ronggan personal deployment
+
+Personal three-layer setup on the GPU host (2026-07-27). The upstream launchers
+default to the shared `*-action-lora-r16` worktrees, so every personal run must
+override `MINT_CODE_ROOT` / `MINT_OPENPI_ROOT` to the personal worktrees below.
+
+Layer map:
+
+| Layer | Path | Branch | Notes |
+| --- | --- | --- | --- |
+| Client (this clone) | `/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/mint-vla-client-example` | `rongenz/dev` | personal clone; tracks `origin/rongenz/dev` |
+| MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-ronggan_action-lora-r16` | `ronggan_action-lora-r16` | worktree of `mint/.git`, HEAD `32f53162` |
+| OpenPI model | `/vePFS-Mindverse/user/intern/wenxi/openpi-ronggan_action-lora-r16` | `ronggan_action-lora-r16` | worktree of openpi `.git`, HEAD `dac1605` |
+
+Record both commits per run; a MINT commit does not imply an OpenPI version.
+
+### config/remote.env overrides
+
+`config/remote.env` is gitignored. Point the client at the personal roots:
+
+```bash
+MINT_BASE_URL=http://127.0.0.1:30540
+MINT_CODE_ROOT=/vePFS-Mindverse/user/intern/wenxi/mint-ronggan_action-lora-r16
+MINT_OPENPI_ROOT=/vePFS-Mindverse/user/intern/wenxi/openpi-ronggan_action-lora-r16
+MINT_LANCE_DATASET=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
+```
+
+### Start the personal MINT server
+
+The personal server launcher lives outside this clone and already binds the
+personal worktrees, port `30540` on `127.0.0.1`, personal checkpoint root, and
+prints both roots + commits at startup:
+
+```bash
+bash /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/tools/start_personal_server.sh <gpus>
+# readiness:
+curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:30540/openapi.json   # expect 200
+```
+
+Before starting, confirm GPU and port are free (worktree isolation is not
+runtime isolation):
+
+```bash
+nvidia-smi
+ss -ltnp | grep 30540 || echo "port free"
+```
+
+### Training command (A-LoRA, cube2 rows)
+
+Dry-run first, then drop `--dry-run` for a real run:
+
+```bash
+cd /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/mint-vla-client-example
+./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
+  --model openpi/pi05-action-lora-r16-finetune \
+  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
+  --row-indices 1609,1610,1611,1612,1838,1839,1840,1841 \
+  --frame-window full --missing-contact-policy full \
+  --extended-state --action-source urdf_target_absolute \
+  --steps 30000 --batch-size 4 --seed 42 \
+  --save-path rongenz_cube2_alora_30k \
+  --output-json /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/rongenz_cube2_alora_30k.json \
+  --dry-run
+```
+
+Minimal validation order: worktrees clean -> launcher prints correct roots ->
+GPU/port free -> server up -> `/openapi.json` 200 -> client dry-run -> few-step
+smoke -> checkpoint save/reload -> full training.
