@@ -303,3 +303,38 @@ class TestMode4ContactProduction:
             )
         resolver.assert_not_called()
         assert result[0] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# Row-cache safety: action horizons must own their arrays because DeltaActions
+# mutates actions in place and neighboring windows overlap.
+# ---------------------------------------------------------------------------
+
+@_needs_physics
+class TestActionWindowOwnership:
+    def test_overlapping_action_windows_do_not_share_row_cache_memory(self, monkeypatch):
+        from types import SimpleNamespace
+        from scripts.train import openpi_vla_smoke_lance_base as base
+
+        dataset = base.LanceViewpi05Dataset.__new__(base.LanceViewpi05Dataset)
+        dataset._index = [(0, 0), (0, 1)]
+        dataset._row_windows = {0: SimpleNamespace(start_frame=0, end_frame=3)}
+        dataset._action_horizon = 3
+        dataset._extended_state = False
+        row_actions = np.arange(4 * 32, dtype=np.float32).reshape(4, 32)
+        row = {
+            "actions": row_actions,
+            "state": np.zeros((4, 32), dtype=np.float32),
+            "image": [b"jpeg"] * 4,
+            "wrist_image": [b"jpeg"] * 4,
+            "prompt": "test",
+        }
+        dataset._get_row = lambda _row_index: row
+        monkeypatch.setattr(base, "_decode_jpeg", lambda _blob: np.zeros((2, 2, 3), dtype=np.uint8))
+
+        first = dataset[0]
+        assert not np.shares_memory(first["actions"], row_actions)
+        first["actions"] -= 1000.0  # mimic in-place DeltaActions
+
+        second = dataset[1]
+        np.testing.assert_array_equal(second["actions"], row_actions[1:4])

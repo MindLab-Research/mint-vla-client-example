@@ -473,7 +473,10 @@ class LanceViewpi05Dataset:
         window = self._row_windows[row_index]
         row = self._get_row(row_index)
         end = min(frame + self._action_horizon, window.end_frame + 1)
-        actions = np.asarray(row["actions"][frame:end], dtype=np.float32)
+        # DeltaActions mutates actions in place. A slice of the row-cache array is a view,
+        # so transform it only after taking an owned copy; otherwise overlapping horizon
+        # windows repeatedly subtract state and corrupt later samples.
+        actions = np.array(row["actions"][frame:end], dtype=np.float32, copy=True)
         if actions.shape[0] < self._action_horizon:
             pad = np.repeat(actions[-1:], self._action_horizon - actions.shape[0], axis=0)
             actions = np.concatenate([actions, pad], axis=0)
