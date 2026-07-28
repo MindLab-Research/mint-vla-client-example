@@ -32,6 +32,7 @@ import mano_physics_core as physics
 from mano_joint_limits import clip_hand_state, new_clipping_diagnostics, record_clipping
 from mode4_support import acquire_action_session, action_session_payload, parse_ordered_unique_csv
 from scripts import contact_windows
+from scripts.eval.result_paths import default_inference_output_dir
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
 from scripts.mano_state_contract import (
     CONTACT_RULE, CONTACT_SEMANTICS, EXPECTED_NORM_SHA256, STATE_CONTRACT_ID,
@@ -164,7 +165,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--act-batch-size", type=int, default=4,
                    help="must remain 4 for the deployed B checkpoint serving contract")
     p.add_argument("--max-warm-request-seconds", type=float, default=2.0)
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument(
+        "--output-dir",
+        type=Path,
+        default=default_inference_output_dir("mode3"),
+        help="result root (default: client-local results/inference/mode3_<UTC>_<pid>)",
+    )
     p.add_argument("--fps", type=float, default=10.0)
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=360)

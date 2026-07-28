@@ -41,6 +41,7 @@ from mode4_support import (
     action_session_payload,
     parse_ordered_unique_csv,
 )
+from scripts.eval.result_paths import default_inference_output_dir
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
 from scripts.mano_state_contract import (
     CONTACT_RULE,
@@ -168,7 +169,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="locked training norm_stats directory; required for B target recovery",
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=default_inference_output_dir("mode4"),
+        help="result root (default: client-local results/inference/mode4_<UTC>_<pid>)",
+    )
     parser.add_argument(
         "--action-session-id",
         default=None,

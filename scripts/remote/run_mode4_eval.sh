@@ -18,6 +18,8 @@ fi
 : "${MINT_PYTHON_BIN:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}"
 : "${MINT_API_KEY:=tml-dummy}"
 : "${MINT_LANCE_DATASET:=}"
+: "${VLA_CLIENT_RESULTS_ROOT:=${REPO_ROOT}/results}"
+: "${VLA_CLIENT_INFERENCE_ROOT:=${VLA_CLIENT_RESULTS_ROOT}/inference}"
 
 MODEL=openpi/pi05-action-lora-r16-finetune
 MODEL_PATH=
@@ -26,6 +28,7 @@ ROWS=
 NORMALIZATION_ROWS=
 NORM_STATS_DIR=
 OUTPUT_DIR=
+RUN_NAME=
 OWNER_ID=
 BASE_URL=
 ENDPOINT_LABEL=
@@ -61,7 +64,7 @@ PRINT_CONFIG=0
 usage() {
   cat <<'EOF'
 usage: run_mode4_eval.sh --model-path PATH --rows CSV \
-  --normalization-rows CSV|all --norm-stats-dir PATH --output-dir PATH --owner ID \
+  --normalization-rows CSV|all --norm-stats-dir PATH --owner ID \
   (--base-url URL --backend-commit SHA --model-commit SHA | \
    --reuse-server-info PATH | --own-server --server-runtime-root PATH) [options]
 
@@ -72,7 +75,6 @@ Required evaluation options:
   --rows, --row-indices CSV   ordered evaluation row IDs
   --normalization-rows, --normalization-row-indices CSV|all
   --norm-stats-dir PATH       checkpoint's locked normalization directory
-  --output-dir PATH           new result root; existing roots are refused
   --owner, --owner-id ID      MINT action-session owner ID; supplied by --reuse-server-info
 
 Endpoint selection (choose exactly one):
@@ -112,6 +114,9 @@ Dedicated-server options:
                               opt in to multi-GB executable serialization
 
 Output/source controls:
+  --output-dir PATH           explicit result root; existing roots are refused
+  --run-name NAME             client-local results/inference/NAME; cannot combine with --output-dir
+                              default: mode4_<UTC>_<pid> under VLA_CLIENT_INFERENCE_ROOT
   --overwrite-output          delete and recreate an existing output root
   --allow-dirty-sources       permit dirty client/owned-server worktrees and record it
   --print-config              validate and print effective JSON; do not start/run
@@ -132,6 +137,7 @@ while (($#)); do
     --normalization-rows|--normalization-row-indices) NORMALIZATION_ROWS=${2:?}; shift 2 ;;
     --norm-stats-dir) NORM_STATS_DIR=${2:?}; shift 2 ;;
     --output-dir) OUTPUT_DIR=${2:?}; shift 2 ;;
+    --run-name) RUN_NAME=${2:?}; shift 2 ;;
     --owner|--owner-id) OWNER_ID=${2:?}; shift 2 ;;
     --base-url) BASE_URL=${2:?}; shift 2 ;;
     --endpoint-label) ENDPOINT_LABEL=${2:?}; shift 2 ;;
@@ -275,8 +281,18 @@ require_nonempty --dataset "$DATASET"
 require_nonempty --rows "$ROWS"
 require_nonempty --normalization-rows "$NORMALIZATION_ROWS"
 require_nonempty --norm-stats-dir "$NORM_STATS_DIR"
-require_nonempty --output-dir "$OUTPUT_DIR"
 require_nonempty --owner "$OWNER_ID"
+if [[ -n "$OUTPUT_DIR" && -n "$RUN_NAME" ]]; then
+  fail "--output-dir and --run-name are mutually exclusive"
+fi
+if [[ -n "$RUN_NAME" && ! "$RUN_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  fail "--run-name must be a single portable path component: $RUN_NAME"
+fi
+if [[ -z "$OUTPUT_DIR" ]]; then
+  require_absolute VLA_CLIENT_INFERENCE_ROOT "$VLA_CLIENT_INFERENCE_ROOT"
+  RUN_NAME=${RUN_NAME:-"mode4_$(date -u +%Y%m%dT%H%M%SZ)_$$"}
+  OUTPUT_DIR="${VLA_CLIENT_INFERENCE_ROOT%/}/${RUN_NAME}"
+fi
 require_absolute --dataset "$DATASET"
 require_absolute --norm-stats-dir "$NORM_STATS_DIR"
 require_absolute --output-dir "$OUTPUT_DIR"

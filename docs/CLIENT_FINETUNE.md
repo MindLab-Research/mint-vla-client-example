@@ -33,7 +33,9 @@ OpenPI code:  /vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16
 Environment:  /vePFS-Mindverse/user/intern/wenxi/mint_env
 Assets/code:  /vePFS-Mindverse/user/intern/wenxi/pi-finetune
 Dataset:      /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
-Run outputs:  /vePFS-Mindverse/user/intern/wenxi/results/client_runs/<run-name>
+Run outputs:  /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/<run-name>
+Inference:    /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/inference/<run-name>
+Baselines:    /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/baselines/<baseline-name>
 ```
 
 The committed defaults are in `config/remote.env.example`. Each coworker may
@@ -135,6 +137,10 @@ This is the single operational interface; do not copy `deliver_mode4_eval.sh`.
 It refuses an existing output directory unless `--overwrite-output` is supplied,
 creates a clean replacement when that flag is explicit, writes
 `effective_config.json`, and writes `run.completed.json` or `run.failed.json`.
+Without an output option it creates a unique run below the formal checkout's
+`results/inference/`. Prefer `--run-name NAME` for named comparisons;
+`--output-dir PATH` remains an explicit override and cannot be combined with
+`--run-name`.
 
 When using an existing endpoint, declare the backend/model commits reported by
 the server owner. The launcher records them as operator-declared provenance; a
@@ -148,7 +154,7 @@ NORM_ROWS=$(seq -s, 810 994)
   --dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
   --rows "${ROWS}" --normalization-rows "${NORM_ROWS}" \
   --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/<run>/norm \
-  --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/<run>-mode4 \
+  --run-name <run>-mode4 \
   --owner-id <owner> --chunk-stride 5 --temporal-decay 0.4 \
   --act-mode batch --act-batch-size 4 --video-mode full \
   --base-url http://127.0.0.1:30532 \
@@ -161,7 +167,7 @@ For a dedicated server, replace `--base-url` and the two declared commits with:
 ./scripts/remote/run_mode4_eval.sh \
   --model-path <checkpoint> --dataset <dataset> --rows 924,960 \
   --normalization-rows "$(seq -s, 810 994)" --norm-stats-dir <norm> \
-  --output-dir <new-output-root> --owner-id <owner> \
+  --run-name <run>-mode4 --owner-id <owner> \
   --own-server --server-runtime-root <checkpoint-bearing-server-root> \
   --server-port 30532 --server-gpus 4,5,6,7
 ```
@@ -237,7 +243,7 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
   --seed 42 \
   --state-noise-std 0 \
   --save-path coworker_cube1_dry_run \
-  --output-json /vePFS-Mindverse/user/intern/wenxi/results/client_runs/coworker_cube1_dry_run/result.json \
+  --output-json /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/coworker_cube1_dry_run/result.json \
   --dry-run
 ```
 
@@ -262,8 +268,7 @@ sim-owned object motion and native position-servo dynamics.
   --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
   --row-indices 810,811 --normalization-row-indices 810,811 \
   --contact-window-manifest "${MANIFEST}" --missing-contact-policy error \
-  --extended-state --norm-stats-dir "${NORM}" \
-  --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/mode3
+  --extended-state --norm-stats-dir "${NORM}"
 ```
 
 The required extended state is `[predicted_hand_qpos(26), contact(index,thumb,
@@ -316,7 +321,7 @@ MINT_BASE_URL=http://127.0.0.1:30532 \
   --steps 30000 --batch-size 8 --seed 42 --augmentation-seed 43 \
   --state-noise-std "${STATE_NOISE}" \
   --save-path "${RUN_NAME}" \
-  --output-json "/vePFS-Mindverse/user/intern/wenxi/results/client_runs/${RUN_NAME}/result.json"
+  --output-json "/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/${RUN_NAME}/result.json"
 ```
 
 For the A-LoRA discrete-state profile, state augmentation is injected **after
@@ -357,7 +362,7 @@ For a basic full-dataset smoke run, use the generic client:
   --steps 4 \
   --batch-size 4 \
   --seed 42 \
-  --output-json /vePFS-Mindverse/user/intern/wenxi/results/client_runs/my_smoke/result.json
+  --output-json /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/my_smoke/result.json
 ```
 
 For a real experiment, add a dedicated entry point under `scripts/train/` that
@@ -377,10 +382,14 @@ Every run should preserve:
 - `save_weights_for_sampler` response, especially the `mint://...` URI;
 - later evaluation metrics and video paths.
 
-`results/` is ignored locally because videos, arrays, and logs are generated
-artifacts. Store durable remote artifacts below a unique directory in
-`/vePFS-Mindverse/user/intern/wenxi/results/client_runs`, then selectively sync
-them into local `results/` for inspection.
+`results/` is ignored by Git because videos, arrays, and logs are generated
+artifacts, but it is the canonical filesystem home for this client's outputs.
+Mode3/Mode4 default to `results/inference/<mode>_<UTC>_<pid>`; use
+`run_mode4_eval.sh --run-name NAME` for a readable stable name. Training and
+smoke metadata should use `results/training/`. User-selected behavioral
+references belong in `results/baselines/<baseline-name>` with a manifest that
+records source checkpoint, inference protocol, hashes, and interpretation
+boundary. Explicit `--output-dir` remains available for intentional overrides.
 
 ## 9. Troubleshooting boundaries
 

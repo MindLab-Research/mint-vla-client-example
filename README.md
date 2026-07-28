@@ -153,13 +153,16 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
   --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726 \
   --dry-run \
   --save-path client_preflight \
-  --output-json /vePFS-Mindverse/user/intern/wenxi/results/client_runs/client_preflight/result.json
+  --output-json /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/client_preflight/result.json
 ```
 
 For every new Mode4 checkpoint/row evaluation, use the single parameterized
 launcher rather than copying an experiment script. It can attach to an existing
 endpoint or own a dedicated server and records the effective stride, ensemble,
-server, source provenance, and per-phase timing in the output root:
+server, source provenance, and per-phase timing in the output root. Generated
+inference defaults to this checkout's ignored `results/inference/` directory;
+use `--run-name NAME` for a stable client-local directory or `--output-dir PATH`
+only when an explicit override is required:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help

@@ -23,7 +23,8 @@ fi
 : "${OPENPI_DATA_HOME:=/vePFS-Mindverse/share/models/openpi}"
 : "${HF_HOME:=/vePFS-Mindverse/share/huggingface}"
 : "${MINT_LANCE_DATASET:=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance}"
-: "${VLA_CLIENT_RESULTS_ROOT:=/vePFS-Mindverse/user/intern/wenxi/results/client_runs}"
+: "${VLA_CLIENT_RESULTS_ROOT:=${REPO_ROOT}/results}"
+: "${VLA_CLIENT_INFERENCE_ROOT:=${VLA_CLIENT_RESULTS_ROOT}/inference}"
 : "${MINT_GLVND_SHIM:=/vePFS-Mindverse/share/zhouch-caches/.cache/openvla_full_a800/glvnd_shim}"
 
 # The host exposes NVIDIA's vendor EGL library but not the vendor-neutral
@@ -85,7 +86,7 @@ if [[ -n "${MINT_OPENPI_ROOT}" && ! -f "${MINT_OPENPI_ROOT}/src/openpi/models/ge
 fi
 
 export MINT_BASE_URL MINT_API_KEY MINT_OPENPI_ROOT OPENPI_DATA_HOME HF_HOME MINT_LANCE_DATASET
-export VLA_CLIENT_RESULTS_ROOT
+export VLA_CLIENT_RESULTS_ROOT VLA_CLIENT_INFERENCE_ROOT
 export JAX_PLATFORMS=cpu
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/scripts/train:${MINT_PI_FINETUNE_ROOT}/case/01_export_video:${MINT_OPENPI_ROOT:+${MINT_OPENPI_ROOT}/src:${MINT_OPENPI_ROOT}/packages/openpi-client/src:}${MINT_CODE_ROOT}:${MINT_EXTRA_PYDEPS}:${MINT_GRB_ROOT}/site-packages:${MINT_CPU_ROOT}/site-packages:${MINT_GRB_ROOT}/src/openpi/src:${MINT_GRB_ROOT}/src/openpi/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -98,7 +99,7 @@ else
 fi
 export VLA_CLIENT_GIT_COMMIT
 
-mkdir -p "${VLA_CLIENT_RESULTS_ROOT}"
+mkdir -p "${VLA_CLIENT_RESULTS_ROOT}" "${VLA_CLIENT_INFERENCE_ROOT}"
 
 NEEDS_SERVER=1
 for argument in "$@"; do
@@ -123,4 +124,5 @@ echo "client_git_commit=${VLA_CLIENT_GIT_COMMIT}"
 echo "mint_base_url=${MINT_BASE_URL}"
 echo "default_dataset=${MINT_LANCE_DATASET}"
 echo "results_root=${VLA_CLIENT_RESULTS_ROOT}"
+echo "inference_root=${VLA_CLIENT_INFERENCE_ROOT}"
 exec "${PYTHON_BIN}" -u "${CLIENT_SCRIPT}" "$@"

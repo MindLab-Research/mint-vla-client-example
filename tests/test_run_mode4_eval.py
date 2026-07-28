@@ -52,7 +52,10 @@ def base_fixture(root: Path) -> tuple[Path, Path, str, str, Path, Path, Path]:
     norm_stats.write_text('{"fixture": true}\n', encoding="utf-8")
     config = root / "remote.env"
     config.write_text(
-        f"MINT_CODE_ROOT={mint}\nMINT_OPENPI_ROOT={openpi}\n",
+        f"MINT_CODE_ROOT={mint}\n"
+        f"MINT_OPENPI_ROOT={openpi}\n"
+        f"VLA_CLIENT_RESULTS_ROOT={root / 'client-results'}\n"
+        f"VLA_CLIENT_INFERENCE_ROOT={root / 'client-results' / 'inference'}\n",
         encoding="utf-8",
     )
     gesture = root / "gesture.index.json"
@@ -135,6 +138,44 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 payload["provenance"]["norm_stats_sha256"],
                 hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest(),
             )
+
+    def test_default_output_uses_client_inference_root_and_run_name(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            args = self.common_args(dataset, norm, root / "unused-explicit-output")
+            output_index = args.index("--output-dir")
+            del args[output_index : output_index + 2]
+            completed = self.run_launcher(
+                root,
+                *args,
+                "--run-name",
+                "stateaug-row943-939",
+                "--print-config",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            expected = root / "client-results" / "inference" / "stateaug-row943-939"
+            self.assertEqual(payload["evaluation"]["output_dir"], str(expected))
+            self.assertFalse(expected.exists(), "--print-config must not create default output")
+
+    def test_run_name_and_output_dir_are_mutually_exclusive(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "explicit-output",
+                    "--run-name",
+                    "also-named",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("--output-dir and --run-name are mutually exclusive", completed.stderr)
 
     def test_print_config_accepts_video_none_without_creating_output(self):
         with tempfile.TemporaryDirectory() as temp:
