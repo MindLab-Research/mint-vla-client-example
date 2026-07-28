@@ -442,7 +442,10 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
 
 
 def load_or_compute_norm_stats(
-    dataset: SelectedLanceDataset, norm_stats_dir: Path | None
+    dataset: SelectedLanceDataset,
+    norm_stats_dir: Path | None,
+    *,
+    expected_norm_sha256: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extended_state = bool(getattr(dataset, "_extended_state", False))
     if norm_stats_dir is None:
@@ -458,7 +461,9 @@ def load_or_compute_norm_stats(
         }
     path = norm_stats_dir / "norm_stats.json"
     if extended_state:
-        path, actual_sha = verify_locked_norm_stats(norm_stats_dir)
+        path, actual_sha = verify_locked_norm_stats(
+            norm_stats_dir, expected_sha256=expected_norm_sha256
+        )
     else:
         if not path.is_file():
             raise ValueError(f"normalization cache is missing norm_stats.json: {path}")
@@ -1294,6 +1299,11 @@ def parse_args() -> argparse.Namespace:
         help="optional directory containing a locked norm_stats.json for this exact population",
     )
     parser.add_argument(
+        "--norm-sha-expected",
+        default=os.environ.get("MINT_NORM_SHA_EXPECTED", EXPECTED_NORM_SHA256),
+        help="expected SHA256 of norm_stats.json; extended-state runs authenticate before loading",
+    )
+    parser.add_argument(
         "--missing-contact-policy", choices=("full", "skip", "error"), default="full",
     )
     parser.add_argument("--steps", type=int, default=30000)
@@ -1450,6 +1460,13 @@ from scripts.deadline import parse_stop_at
 def main() -> int:
     args = parse_args()
     validate_state_noise(args.model, args.state_noise_std)
+    if args.extended_state:
+        expected_norm_sha = str(args.norm_sha_expected).lower()
+        if len(expected_norm_sha) != 64 or any(
+            char not in "0123456789abcdef" for char in expected_norm_sha
+        ):
+            raise ValueError("--norm-sha-expected must be 64 hexadecimal characters")
+        args.norm_sha_expected = expected_norm_sha
     if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
         raise ValueError("--learning-rate must be a finite positive value")
     if not math.isfinite(args.target_noise_std) or args.target_noise_std < 0:
@@ -1525,7 +1542,11 @@ def main() -> int:
     model_config = L._build_model_config(
         args.action_horizon, action_dim=action_dim, base_model=args.model
     )
-    norm_stats, norm_stats_provenance = load_or_compute_norm_stats(dataset, args.norm_stats_dir)
+    norm_stats, norm_stats_provenance = load_or_compute_norm_stats(
+        dataset,
+        args.norm_stats_dir,
+        expected_norm_sha256=args.norm_sha_expected if args.extended_state else None,
+    )
     data_config = L._make_data_config(
         model_config, norm_stats, action_source=dataset._action_source
     )
@@ -1586,7 +1607,7 @@ def main() -> int:
             CONTACT_RULE if args.extended_state else None
         ),
         "norm_sha_expected": (
-            EXPECTED_NORM_SHA256 if args.extended_state else None
+            args.norm_sha_expected if args.extended_state else None
         ),
         "norm_sha_actual": norm_stats_provenance.get("sha256"),
         "gesture_index": (
@@ -1866,7 +1887,7 @@ def main() -> int:
                 CONTACT_RULE if args.extended_state else None
             ),
             "norm_sha_expected": (
-                EXPECTED_NORM_SHA256 if args.extended_state else None
+                args.norm_sha_expected if args.extended_state else None
             ),
             "norm_sha_actual": norm_stats_provenance.get("sha256"),
             "gesture_index": (

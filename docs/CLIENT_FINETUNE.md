@@ -327,6 +327,7 @@ RUN_NAME="gesture03_32d_${ARM}_30k"
 ROWS=$(seq -s, 810 994)
 MANIFEST=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
+NORM_SHA=$(sha256sum "${NORM}/norm_stats.json" | awk '{print $1}')
 
 MINT_BASE_URL=http://127.0.0.1:30532 \
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
@@ -338,7 +339,7 @@ MINT_BASE_URL=http://127.0.0.1:30532 \
   --missing-contact-policy error \
   --action-source urdf_target_absolute \
   --language-conditioning gesture \
-  --extended-state --norm-stats-dir "${NORM}" \
+  --extended-state --norm-stats-dir "${NORM}" --norm-sha-expected "${NORM_SHA}" \
   --sampling-strategy coverage --slate-size 16 --coverage-anchors-per-row 8 \
   --steps 30000 --batch-size 8 --seed 42 --augmentation-seed 43 \
   --state-noise-std "${STATE_NOISE}" \
@@ -349,7 +350,9 @@ MINT_BASE_URL=http://127.0.0.1:30532 \
 For the A-LoRA discrete-state profile, state augmentation is injected **after
 normalization and before prompt tokenization**, so the state tokens the model
 receives are actually augmented. The v1 extended-state path refuses computed or
-wrong-hash norm fallback.
+wrong-hash norm fallback. Every new row/window population needs a freshly
+computed norm plus an explicit `--norm-sha-expected`; the gesture03 norm must
+not be reused for a broader object/action population.
 
 The augmentation changes only normalized state and its derived encoded prompt;
 images, action labels, task text, and normalization statistics remain clean.

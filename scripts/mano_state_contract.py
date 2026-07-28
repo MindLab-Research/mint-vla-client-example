@@ -18,9 +18,9 @@ Contact semantics (v1, user final decision):
 Contact normalization: raw 0/1 → -1/+1 via fixed q01=0/q99=1 mapping
 (NOT quantile normalization, which would fail for sparse fingers like pinky).
 
-EXPECTED_NORM_SHA256: SHA256 of the locked 185-row gesture03 32D norm stats.
-Mode 4 extended-state MUST verify norm_stats.json matches this SHA before
-loading or first query.
+EXPECTED_NORM_SHA256: default SHA256 of the locked 185-row gesture03 32D norm.
+Other populations must supply their own explicit expected SHA; every
+extended-state consumer verifies norm_stats.json before loading or first query.
 """
 
 from __future__ import annotations
@@ -42,16 +42,22 @@ CONTACT_RULE = (
 )
 
 
-def verify_locked_norm_stats(norm_stats_dir: Path) -> tuple[Path, str]:
-    """Return the locked norm path and SHA, or fail before it is consumed."""
+def verify_locked_norm_stats(
+    norm_stats_dir: Path, *, expected_sha256: str | None = None
+) -> tuple[Path, str]:
+    """Return the authenticated norm path and SHA, or fail before consumption."""
+    expected = EXPECTED_NORM_SHA256 if expected_sha256 is None else str(expected_sha256)
+    if len(expected) != 64 or any(char not in "0123456789abcdef" for char in expected.lower()):
+        raise ValueError(f"expected norm SHA256 must be 64 hexadecimal characters, got {expected!r}")
+    expected = expected.lower()
     path = Path(norm_stats_dir) / "norm_stats.json"
     if not path.is_file():
         raise ValueError(f"v1 extended-state requires norm_stats.json at {path}")
     actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    if actual_sha != EXPECTED_NORM_SHA256:
+    if actual_sha != expected:
         raise ValueError(
             "v1 extended-state norm SHA mismatch: "
-            f"expected {EXPECTED_NORM_SHA256}, got {actual_sha}: {path}"
+            f"expected {expected}, got {actual_sha}: {path}"
         )
     return path, actual_sha
 

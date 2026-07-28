@@ -151,6 +151,7 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
   --action-source urdf_target_absolute \
   --extended-state \
   --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726 \
+  --norm-sha-expected 507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d \
   --dry-run \
   --save-path client_preflight \
   --output-json /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/client_preflight/result.json

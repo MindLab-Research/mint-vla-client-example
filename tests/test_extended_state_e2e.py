@@ -75,13 +75,13 @@ class TestNormCacheProduction:
     def _load_with_file_sha(self, td, *, extended_state=True):
         import hashlib
         from types import SimpleNamespace
-        from unittest.mock import patch
         from scripts.train.train_cube1_01_compare import load_or_compute_norm_stats
 
         expected = hashlib.sha256((td / "norm_stats.json").read_bytes()).hexdigest()
         dataset = SimpleNamespace(_extended_state=extended_state)
-        with patch("scripts.mano_state_contract.EXPECTED_NORM_SHA256", expected):
-            return load_or_compute_norm_stats(dataset, td)
+        return load_or_compute_norm_stats(
+            dataset, td, expected_norm_sha256=expected
+        )
 
     def test_extended_state_rejects_computed_fallback(self):
         from types import SimpleNamespace

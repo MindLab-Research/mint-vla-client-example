@@ -18,6 +18,7 @@ from scripts.mano_state_contract import (
     STATE_DIM,
     aggregate_finger_contacts,
     build_extended_state,
+    verify_locked_norm_stats,
 )
 
 
@@ -28,6 +29,30 @@ class TestContractIdentity:
         assert EXPECTED_NORM_SHA256 == (
             "507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d"
         )
+
+
+class TestNormAuthentication:
+    def test_explicit_population_sha_is_accepted(self, tmp_path):
+        import hashlib
+
+        path = tmp_path / "norm_stats.json"
+        path.write_bytes(b"population-specific-norm")
+        expected = hashlib.sha256(path.read_bytes()).hexdigest()
+        resolved, actual = verify_locked_norm_stats(
+            tmp_path, expected_sha256=expected
+        )
+        assert resolved == path
+        assert actual == expected
+
+    def test_explicit_wrong_sha_is_rejected(self, tmp_path):
+        path = tmp_path / "norm_stats.json"
+        path.write_bytes(b"population-specific-norm")
+        with pytest.raises(ValueError, match="norm SHA mismatch"):
+            verify_locked_norm_stats(tmp_path, expected_sha256="0" * 64)
+
+    def test_malformed_expected_sha_is_rejected(self, tmp_path):
+        with pytest.raises(ValueError, match="64 hexadecimal"):
+            verify_locked_norm_stats(tmp_path, expected_sha256="not-a-sha")
 
 
 class TestAggregateFingerContacts:
