@@ -39,6 +39,32 @@ class Mode4ContractTests(unittest.TestCase):
         chunk[:] = -1
         np.testing.assert_array_equal(actions, original)
 
+    def test_row_summary_records_all_source_commits(self):
+        args = types.SimpleNamespace(
+            model_path="mint://checkpoint",
+            model="openpi/pi05-action-lora-r16-finetune",
+            client_commit="client-sha",
+            backend_commit="mint-sha",
+            model_commit="openpi-sha",
+            action_source="urdf_target_absolute",
+            language_conditioning="gesture",
+            _gesture_index=None,
+            lance_dataset=Path("/dataset.lance"),
+            norm_stats_dir=Path("/norm"),
+            extended_state=False,
+            norm_sha_expected=None,
+            norm_sha_actual=None,
+            act_mode="batch",
+            act_batch_size=4,
+            max_warm_request_seconds=2.0,
+        )
+        summary = mode4.build_row_summary(
+            args=args, row_index=3, normalization_rows=[1, 2], results=[]
+        )
+        self.assertEqual(summary["client_commit"], "client-sha")
+        self.assertEqual(summary["backend_commit"], "mint-sha")
+        self.assertEqual(summary["model_commit"], "openpi-sha")
+
     def test_native_servo_and_collision_scene(self):
         kp, dampratio, effort = physics.servo_parameters()
         np.testing.assert_allclose(kp[:6], 100)
@@ -104,6 +130,9 @@ class Mode4LoopTests(unittest.TestCase):
             temporal_decay=0.4,
             base_url="x",
             model_path="p",
+            client_commit="client-sha",
+            backend_commit="mint-sha",
+            model_commit="openpi-sha",
         )
         pred = np.zeros((10, 32), np.float32)
         pred[:, :26] = 0.01
@@ -201,6 +230,9 @@ class Mode4LoopTests(unittest.TestCase):
             self.assertEqual(result["physics"]["mj_step_calls"], 2)
             self.assertEqual(result["physics"]["intervals"], 1)
             self.assertEqual(result["object_pose_source"], "sim_owned_after_frame0")
+            self.assertEqual(result["client_commit"], "client-sha")
+            self.assertEqual(result["backend_commit"], "mint-sha")
+            self.assertEqual(result["model_commit"], "openpi-sha")
             output = Path(out) / "mode4"
             self.assertAlmostEqual(
                 np.load(output / "object_position_sim.npy")[-1, 0], 0.32, places=6

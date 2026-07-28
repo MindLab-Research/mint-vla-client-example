@@ -1,0 +1,258 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LAUNCHER = REPO_ROOT / "scripts/remote/run_mode4_eval.sh"
+SERVER_LAUNCHER = REPO_ROOT / "scripts/remote/run_action_lora_server.sh"
+
+
+def init_git_checkout(path: Path) -> str:
+    path.mkdir()
+    (path / "source.txt").write_text(path.name, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
+    subprocess.run(["git", "-C", str(path), "add", "source.txt"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "fixture",
+        ],
+        check=True,
+    )
+    return subprocess.check_output(
+        ["git", "-C", str(path), "rev-parse", "HEAD"], text=True
+    ).strip()
+
+
+def base_fixture(root: Path) -> tuple[Path, Path, str, str, Path, Path, Path]:
+    mint = root / "mint"
+    openpi = root / "openpi"
+    mint_commit = init_git_checkout(mint)
+    openpi_commit = init_git_checkout(openpi)
+    dataset = root / "dataset.lance"
+    dataset.mkdir()
+    norm = root / "norm"
+    norm.mkdir()
+    norm_stats = norm / "norm_stats.json"
+    norm_stats.write_text('{"fixture": true}\n', encoding="utf-8")
+    config = root / "remote.env"
+    config.write_text(
+        f"MINT_CODE_ROOT={mint}\nMINT_OPENPI_ROOT={openpi}\n",
+        encoding="utf-8",
+    )
+    gesture = root / "gesture.index.json"
+    gesture.write_text("{}\n", encoding="utf-8")
+    return mint, openpi, mint_commit, openpi_commit, dataset, norm, config
+
+
+class RunMode4EvalContractTests(unittest.TestCase):
+    def run_launcher(self, root: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(LAUNCHER), *extra],
+            cwd=REPO_ROOT,
+            env={"PATH": "/usr/bin:/bin", "VLA_CLIENT_CONFIG": str(root / "remote.env")},
+            text=True,
+            capture_output=True,
+        )
+
+    def common_args(
+        self,
+        dataset: Path,
+        norm: Path,
+        output: Path,
+        *extra: str,
+    ) -> list[str]:
+        return [
+            "--model-path",
+            "mint://fixture/checkpoint",
+            "--dataset",
+            str(dataset),
+            "--rows",
+            "2,7,2",
+            "--normalization-rows",
+            "7,2,7",
+            "--norm-stats-dir",
+            str(norm),
+            "--output-dir",
+            str(output),
+            "--owner-id",
+            "owner-1",
+            "--base-url",
+            "http://127.0.0.1:30532",
+            "--backend-commit",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--model-commit",
+            "abcdef0123456789abcdef0123456789abcdef01",
+            "--allow-dirty-sources",
+            *extra,
+        ]
+
+    def test_print_config_records_existing_endpoint_provenance_and_lists(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, mint_commit, openpi_commit, dataset, norm, config = base_fixture(root)
+            output = root / "fresh-output"
+            completed = self.run_launcher(
+                root,
+                *self.common_args(dataset, norm, output, "--print-config"),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(
+                payload["endpoint"],
+                {
+                    "mode": "existing",
+                    "label": None,
+                    "base_url": "http://127.0.0.1:30532",
+                    "source_verification": "operator_declared",
+                },
+            )
+            self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
+            self.assertEqual(payload["evaluation"]["normalization_row_indices"], [7, 2])
+            self.assertEqual(payload["provenance"]["backend_commit"], "0123456789abcdef0123456789abcdef01234567")
+            self.assertEqual(payload["provenance"]["model_commit"], "abcdef0123456789abcdef0123456789abcdef01")
+            self.assertIsNone(payload["provenance"]["backend_dirty"])
+            self.assertIsNone(payload["dedicated_server"])
+            self.assertFalse(output.exists(), "--print-config must not create output")
+            self.assertEqual(
+                payload["provenance"]["norm_stats_sha256"],
+                hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest(),
+            )
+
+    def test_owned_server_uses_worktree_commits_and_disables_cache_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, mint_commit, openpi_commit, dataset, norm, _ = base_fixture(root)
+            output = root / "owned-output"
+            completed = self.run_launcher(
+                root,
+                *[
+                    "--model-path",
+                    "mint://fixture/checkpoint",
+                    "--dataset",
+                    str(dataset),
+                    "--rows",
+                    "2",
+                    "--normalization-rows",
+                    "2",
+                    "--norm-stats-dir",
+                    str(norm),
+                    "--output-dir",
+                    str(output),
+                    "--owner-id",
+                    "owner-1",
+                    "--own-server",
+                    "--server-runtime-root",
+                    str(root / "runtime"),
+                    "--server-port",
+                    "30533",
+                    "--server-gpus",
+                    "0",
+                    "--mint-root",
+                    str(root / "mint"),
+                    "--openpi-root",
+                    str(root / "openpi"),
+                    "--python-bin",
+                    "/bin/true",
+                    "--allow-dirty-sources",
+                    "--print-config",
+                ],
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["endpoint"]["mode"], "dedicated")
+            self.assertEqual(
+                payload["endpoint"]["source_verification"],
+                "launcher_verified_worktrees",
+            )
+            self.assertEqual(payload["provenance"]["backend_commit"], mint_commit)
+            self.assertEqual(payload["provenance"]["model_commit"], openpi_commit)
+            self.assertFalse(
+                payload["dedicated_server"]["jax_persistent_executable_cache"]
+            )
+            self.assertEqual(payload["dedicated_server"]["gpus"], [0])
+            self.assertFalse(output.exists())
+
+    def test_existing_endpoint_requires_declared_backend_and_model_commits(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            args = self.common_args(dataset, norm, root / "out")
+            args[args.index("--backend-commit") : args.index("--backend-commit") + 2] = []
+            completed = self.run_launcher(root, *args)
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("--backend-commit is required", completed.stderr)
+
+    def test_existing_endpoint_rejects_dedicated_server_options(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(dataset, norm, root / "out", "--server-gpus", "0"),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("dedicated-server options require --own-server", completed.stderr)
+
+    def test_existing_output_is_rejected_without_explicit_override(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            output = root / "existing-output"
+            output.mkdir()
+            completed = self.run_launcher(
+                root,
+                *self.common_args(dataset, norm, output, "--print-config"),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("output already exists", completed.stderr)
+
+    def test_dedicated_server_launcher_disables_persistent_cache_by_default(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "mint").mkdir()
+            (root / "openpi").mkdir()
+            completed = subprocess.run(
+                [
+                    "bash",
+                    str(SERVER_LAUNCHER),
+                    "--runtime-root",
+                    str(root / "runtime"),
+                    "--port",
+                    "30539",
+                    "--gpus",
+                    "0",
+                    "--mint-root",
+                    str(root / "mint"),
+                    "--openpi-root",
+                    str(root / "openpi"),
+                    "--python-bin",
+                    "/bin/true",
+                    "--print-config",
+                ],
+                cwd=REPO_ROOT,
+                env={"PATH": "/usr/bin:/bin"},
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("jax_persistent_executable_cache=0", completed.stderr)
+            self.assertIn("jax_compilation_cache=disabled", completed.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

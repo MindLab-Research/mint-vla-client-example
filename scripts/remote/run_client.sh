@@ -49,7 +49,7 @@ if [[ ! -f "${CLIENT_SCRIPT}" ]]; then
   exit 2
 fi
 
-PYTHON_BIN="${MINT_GRB_ROOT}/host-venv/bin/python"
+PYTHON_BIN=${MINT_PYTHON_BIN:-${MINT_GRB_ROOT}/host-venv/bin/python}
 if [[ ! -x "${PYTHON_BIN}" ]]; then
   echo "remote OpenPI interpreter is missing: ${PYTHON_BIN}" >&2
   exit 2

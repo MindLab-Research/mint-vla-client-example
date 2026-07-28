@@ -5,6 +5,10 @@ PORT=30532
 GPU_IDS=0,1,2,3,4,5,6,7
 RUNTIME_ROOT=
 CACHE_DIR=
+MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16}
+OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16}
+PYTHON_BIN=${MINT_PYTHON_BIN:-/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}
+ENABLE_JAX_PERSISTENT_CACHE=0
 PRINT_CONFIG=0
 while (($#)); do
   case "$1" in
@@ -12,6 +16,10 @@ while (($#)); do
     --gpus) GPU_IDS=${2:?}; shift 2 ;;
     --runtime-root) RUNTIME_ROOT=${2:?}; shift 2 ;;
     --cache-dir) CACHE_DIR=${2:?}; shift 2 ;;
+    --mint-root) MINT_ROOT=${2:?}; shift 2 ;;
+    --openpi-root) OPENPI_ROOT=${2:?}; shift 2 ;;
+    --python-bin) PYTHON_BIN=${2:?}; shift 2 ;;
+    --enable-jax-persistent-cache) ENABLE_JAX_PERSISTENT_CACHE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help)
       cat <<'EOF'
@@ -20,7 +28,12 @@ usage: run_action_lora_server.sh --runtime-root PATH [options]
 Options:
   --port PORT          MINT listen port (default: 30532)
   --gpus CSV           visible GPU IDs (default: 0,1,2,3,4,5,6,7)
-  --cache-dir PATH     durable JAX cache; defaults by visible GPU count
+  --cache-dir PATH     durable JAX cache when persistent caching is enabled
+  --mint-root PATH     MINT checkout (default: MINT_CODE_ROOT or project path)
+  --openpi-root PATH   paired OpenPI checkout (default: MINT_OPENPI_ROOT or project path)
+  --python-bin PATH    GPU runtime Python (default: MINT_PYTHON_BIN or project path)
+  --enable-jax-persistent-cache
+                     opt in to JAX persistent executable serialization
   --print-config       validate and print configuration without starting
 EOF
       exit 0
@@ -44,22 +57,26 @@ if [[ -z "$CACHE_DIR" ]]; then
 fi
 [[ "$CACHE_DIR" = /* ]] || { echo "--cache-dir must be absolute" >&2; exit 64; }
 
-MINT_ROOT=/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16
-OPENPI_ROOT=/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16
-PYTHON_BIN=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python
+[[ "$MINT_ROOT" = /* && "$OPENPI_ROOT" = /* && "$PYTHON_BIN" = /* ]] || {
+  echo "--mint-root, --openpi-root, and --python-bin must be absolute" >&2; exit 64;
+}
 MODEL=openpi/pi05-action-lora-r16-finetune
-for path in "$MINT_ROOT" "$OPENPI_ROOT" "$PYTHON_BIN"; do
+for path in "$MINT_ROOT" "$OPENPI_ROOT"; do
   [[ -e "$path" ]] || { echo "required path missing: $path" >&2; exit 2; }
 done
+[[ -x "$PYTHON_BIN" ]] || { echo "runtime Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 mkdir -p "$RUNTIME_ROOT"/{openpi_checkpoint_base,runtime_checkpoints,tmp,action_state}
-mkdir -p "$CACHE_DIR"
+if ((ENABLE_JAX_PERSISTENT_CACHE)); then
+  mkdir -p "$CACHE_DIR"
+fi
 
 cat >&2 <<EOF
 mint_action_lora_server:
   mint_root=$MINT_ROOT
   openpi_root=$OPENPI_ROOT
   runtime_root=$RUNTIME_ROOT
-  jax_compilation_cache=$CACHE_DIR
+  jax_persistent_executable_cache=$ENABLE_JAX_PERSISTENT_CACHE
+  jax_compilation_cache=$([[ "$ENABLE_JAX_PERSISTENT_CACHE" == 1 ]] && printf '%s' "$CACHE_DIR" || printf 'disabled')
   visible_gpus=$GPU_IDS
   port=$PORT
 EOF
@@ -80,15 +97,23 @@ export MINT_PERSISTENT_CHECKPOINT_DIR="$RUNTIME_ROOT/runtime_checkpoints/persist
 export MINT_TMP_ROOT="$RUNTIME_ROOT/tmp"
 export MINT_OPENPI_FAST_ACTION_SESSION_STATE_ROOT_BASE="$RUNTIME_ROOT/action_state"
 
-# The worker applies the MINT alias explicitly before constructing any JIT.
-# Standard JAX variables are also set so XLA autotune artifacts share the cache.
-export MINT_OPENPI_JAX_COMPILATION_CACHE_DIR="$CACHE_DIR"
-export JAX_ENABLE_COMPILATION_CACHE=true
-export JAX_COMPILATION_CACHE_DIR="$CACHE_DIR"
-export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
-export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
-export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES=xla_gpu_per_fusion_autotune_cache_dir
-export JAX_RAISE_PERSISTENT_CACHE_ERRORS=true
+# pi0.5's multi-GB executable cannot be serialized reliably on this runtime.
+# Compile/JIT normally by default; opt in only when the runtime has been proven
+# to serialize the executable successfully.
+if ((ENABLE_JAX_PERSISTENT_CACHE)); then
+  export MINT_OPENPI_JAX_COMPILATION_CACHE_DIR="$CACHE_DIR"
+  export JAX_ENABLE_COMPILATION_CACHE=true
+  export JAX_COMPILATION_CACHE_DIR="$CACHE_DIR"
+  export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0
+  export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
+  export JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES=xla_gpu_per_fusion_autotune_cache_dir
+  export JAX_RAISE_PERSISTENT_CACHE_ERRORS=true
+else
+  unset MINT_OPENPI_JAX_COMPILATION_CACHE_DIR JAX_ENABLE_COMPILATION_CACHE
+  unset JAX_COMPILATION_CACHE_DIR JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS
+  unset JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES JAX_PERSISTENT_CACHE_ENABLE_XLA_CACHES
+  unset JAX_RAISE_PERSISTENT_CACHE_ERRORS
+fi
 
 export OPENPI_DATA_HOME=/vePFS-Mindverse/share/models/openpi
 export HF_HOME=/vePFS-Mindverse/share/huggingface

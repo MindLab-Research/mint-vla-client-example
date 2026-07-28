@@ -125,6 +125,54 @@ contact-pair presence. Mode4 does not query solved contact force or apply a
 `0.01 N` threshold. Extended-state training and Mode4 both require the locked
 norm SHA declared in `scripts/mano_state_contract.py`.
 
+Use `scripts/remote/run_mode4_eval.sh` for every new checkpoint and row set.
+This is the single operational interface; do not copy `deliver_mode4_eval.sh`.
+It refuses an existing output directory unless `--overwrite-output` is supplied,
+creates a clean replacement when that flag is explicit, writes
+`effective_config.json`, and writes `run.completed.json` or `run.failed.json`.
+
+When using an existing endpoint, declare the backend/model commits reported by
+the server owner. The launcher records them as operator-declared provenance; a
+client cannot prove the source of a process it did not start:
+
+```bash
+ROWS=924,960
+NORM_ROWS=$(seq -s, 810 994)
+./scripts/remote/run_mode4_eval.sh \
+  --model-path <checkpoint> \
+  --dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
+  --rows "${ROWS}" --normalization-rows "${NORM_ROWS}" \
+  --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/<run>/norm \
+  --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/<run>-mode4 \
+  --owner-id <owner> --chunk-stride 5 --temporal-decay 0.4 \
+  --act-mode batch --act-batch-size 4 \
+  --base-url http://127.0.0.1:30532 \
+  --backend-commit <mint-commit> --model-commit <openpi-commit>
+```
+
+For a dedicated server, replace `--base-url` and the two declared commits with:
+
+```bash
+./scripts/remote/run_mode4_eval.sh \
+  --model-path <checkpoint> --dataset <dataset> --rows 924,960 \
+  --normalization-rows "$(seq -s, 810 994)" --norm-stats-dir <norm> \
+  --output-dir <new-output-root> --owner-id <owner> \
+  --own-server --server-runtime-root <unique-runtime-root> \
+  --server-port 30532 --server-gpus 4,5,6,7
+```
+
+Run either command once with `--print-config` before allocating the server or
+creating outputs. Source worktrees must be clean by default;
+`--allow-dirty-sources` is an explicit diagnostic override and the dirty state
+is retained in `effective_config.json`.
+
+Dedicated mode starts and stops exactly one server and reads the MINT/OpenPI
+commits from the worktrees it launches. Persistent JAX executable
+serialization is disabled by default because this pi0.5 runtime cannot
+serialize the multi-GB executable; `--enable-jax-persistent-cache` is an
+intentional opt-in after validation. The historical `deliver_mode4_eval.sh`
+remains a delivery-specific record, not a template for new evaluations.
+
 Connect to the GPU host and run:
 
 ```bash

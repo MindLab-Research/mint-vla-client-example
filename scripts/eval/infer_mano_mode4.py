@@ -186,6 +186,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
+    parser.add_argument(
+        "--client-commit",
+        default=os.environ.get("VLA_CLIENT_GIT_COMMIT"),
+        help="optional client source SHA (launcher supplies this when available)",
+    )
+    parser.add_argument(
+        "--backend-commit", default=None, help="optional paired MINT backend source SHA"
+    )
+    parser.add_argument(
+        "--model-commit", default=None, help="optional paired OpenPI model source SHA"
+    )
     return parser.parse_args()
 
 
@@ -693,6 +704,11 @@ def run_variant(
     total_request_seconds = float(sum(float(t["wall_seconds"]) for t in query_timings))
     result = {
         "mode": "mode4",
+        "model_path": args.model_path,
+        "model": args.model,
+        "client_commit": getattr(args, "client_commit", None),
+        "backend_commit": getattr(args, "backend_commit", None),
+        "model_commit": getattr(args, "model_commit", None),
         "physics_dynamics": True,
         "closed_loop": True,
         "observation_feedback": True,
@@ -765,6 +781,9 @@ def build_row_summary(
         "mode": "mode4_policy_target_dof_mujoco_physics",
         "model_path": args.model_path,
         "model": args.model,
+        "client_commit": args.client_commit,
+        "backend_commit": args.backend_commit,
+        "model_commit": args.model_commit,
         "action_source": args.action_source,
         "language_conditioning": args.language_conditioning,
         "gesture_index": (
@@ -961,6 +980,9 @@ def main() -> int:
         "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
         "model_path": args.model_path,
         "row_indices": eval_rows,
+        "client_commit": args.client_commit,
+        "backend_commit": args.backend_commit,
+        "model_commit": args.model_commit,
         "action_source": args.action_source,
         "language_conditioning": args.language_conditioning,
         "gesture_index": (

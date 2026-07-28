@@ -156,8 +156,17 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
   --output-json /vePFS-Mindverse/user/intern/wenxi/results/client_runs/client_preflight/result.json
 ```
 
-For a dedicated rank-16 server, use the reviewed operator helper only after GPU
-ownership is confirmed:
+For every new Mode4 checkpoint/row evaluation, use the single parameterized
+launcher rather than copying an experiment script. It can attach to an existing
+endpoint or own a dedicated server and records the effective stride, ensemble,
+server, and source provenance in the output root:
+
+```bash
+./scripts/remote/run_mode4_eval.sh --help
+```
+
+For standalone dedicated-server inspection outside the unified Mode4 launcher,
+use the reviewed operator helper only after GPU ownership is confirmed:
 
 ```bash
 ./scripts/remote/run_action_lora_server.sh \
@@ -183,8 +192,12 @@ Remove `--print-config` only when the printed allocation is correct.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
   and norm SHA verifier.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.
+- `scripts/remote/run_mode4_eval.sh`: parameterized Mode4 evaluation launcher
+  for an existing MINT endpoint or an explicitly owned dedicated server; it
+  records effective configuration and source/normalization provenance.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server
-  launcher; not a shared-server lifecycle command.
+  launcher; not a shared-server lifecycle command. Persistent JAX executable
+  serialization is disabled unless explicitly enabled.
 - `docs/ARCHITECTURE.md`: client/MINT/OpenPI ownership and local-context policy.
 - `docs/CLIENT_FINETUNE.md`: detailed client workflow.
 - `Tutorial.md`: historical MINT no-Ray protocol reference.

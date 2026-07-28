@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# HISTORICAL DELIVERY WRAPPER. Use run_mode4_eval.sh for new evaluations.
+# This file is retained to reproduce the 2026-07-27 two-arm delivery.
 # 08:00 post-deadline: wait for training completion, Mode 4 eval 5 rows × 2 arms,
 # generate + validate 10/10 videos, write delivery.ready for local rsync+send.
 # NO lark-cli on remote; sending happens on local machine.
