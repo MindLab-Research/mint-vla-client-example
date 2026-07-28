@@ -1,4 +1,5 @@
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 import json
 import unittest
@@ -200,6 +201,49 @@ class Mode4SessionLifecycleTests(unittest.TestCase):
             summary = json.loads((Path(temp) / "summary.json").read_text())
             self.assertEqual(summary["action_session"]["source"], "external")
             self.assertEqual(summary["action_session"]["cleanup_owner"], "external")
+
+
+class LockstepBatcherTests(unittest.TestCase):
+    def test_batches_real_rows_and_retires_shorter_trajectory(self):
+        dispatched = []
+
+        def dispatch(datums):
+            dispatched.append(list(datums))
+            real = len(datums)
+            return [
+                (datum, datum, datum, {"padding_count": 4 - real})
+                for datum in datums
+            ]
+
+        batcher = mode4.LockstepActionBatcher([0, 1], dispatch)
+
+        def row_zero():
+            try:
+                return [batcher.query(0, "row0-step0"), batcher.query(0, "row0-step1")]
+            finally:
+                batcher.retire(0)
+
+        def row_one():
+            try:
+                return [batcher.query(1, "row1-step0")]
+            finally:
+                batcher.retire(1)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            zero_future = pool.submit(row_zero)
+            one_future = pool.submit(row_one)
+            zero = zero_future.result(timeout=5)
+            one = one_future.result(timeout=5)
+        stats = batcher.close()
+
+        self.assertEqual(dispatched[0], ["row0-step0", "row1-step0"])
+        self.assertEqual(dispatched[1], ["row0-step1"])
+        self.assertEqual(zero[0][0], "row0-step0")
+        self.assertEqual(one[0][0], "row1-step0")
+        self.assertEqual(
+            stats,
+            {"batch_requests": 2, "real_observations": 3, "padding_observations": 5},
+        )
 
 
 class Mode4LoopTests(unittest.TestCase):

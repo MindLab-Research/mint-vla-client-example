@@ -49,6 +49,8 @@ CHUNK_STRIDE=5
 TEMPORAL_DECAY=0.4
 ACT_MODE=batch
 ACT_BATCH_SIZE=4
+ROW_EXECUTION=lockstep
+ROW_BATCH_SIZE=4
 MAX_WARM_REQUEST_SECONDS=2
 MAX_FRAMES=0
 FPS=10
@@ -96,7 +98,10 @@ Evaluation options:
   --chunk-stride N            query stride, 1..9 (default: 5)
   --temporal-decay FLOAT      ensemble decay in (0, 1] (default: 0.4)
   --act-mode batch|single     action endpoint mode (default: batch)
-  --act-batch-size N          fixed batch size for batch mode (default: 4)
+  --act-batch-size N          fixed model batch shape (default: 4)
+  --row-execution lockstep|sequential
+                              lockstep batches real observations from independent rows (default)
+  --row-batch-size N          concurrent rows per lockstep group, <= act-batch-size (default: 4)
   --max-warm-request-seconds FLOAT (default: 2; 0 disables)
   --max-frames N              optional bounded smoke rollout; 0 means full
   --fps FLOAT                 output video FPS (default: 10)
@@ -169,6 +174,8 @@ while (($#)); do
     --temporal-decay) TEMPORAL_DECAY=${2:?}; shift 2 ;;
     --act-mode) ACT_MODE=${2:?}; shift 2 ;;
     --act-batch-size) ACT_BATCH_SIZE=${2:?}; shift 2 ;;
+    --row-execution) ROW_EXECUTION=${2:?}; shift 2 ;;
+    --row-batch-size) ROW_BATCH_SIZE=${2:?}; shift 2 ;;
     --max-warm-request-seconds) MAX_WARM_REQUEST_SECONDS=${2:?}; shift 2 ;;
     --max-frames) MAX_FRAMES=${2:?}; shift 2 ;;
     --fps) FPS=${2:?}; shift 2 ;;
@@ -362,8 +369,15 @@ fi
 [[ "$CHUNK_STRIDE" =~ ^[0-9]+$ ]] && ((10#$CHUNK_STRIDE >= 1 && 10#$CHUNK_STRIDE < 10)) || \
   fail "--chunk-stride must be between 1 and 9"
 [[ "$ACT_MODE" == batch || "$ACT_MODE" == single ]] || fail "--act-mode must be batch or single"
+[[ "$ROW_EXECUTION" == lockstep || "$ROW_EXECUTION" == sequential ]] || \
+  fail "--row-execution must be lockstep or sequential"
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
+require_positive_int --row-batch-size "$ROW_BATCH_SIZE"
+((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
+  fail "--row-batch-size must be <= --act-batch-size"
+[[ "$ROW_EXECUTION" != lockstep || "$ACT_MODE" == batch ]] || \
+  fail "--row-execution lockstep requires --act-mode batch"
 require_nonnegative_int --max-frames "$MAX_FRAMES"
 ((10#$MAX_FRAMES == 0 || 10#$MAX_FRAMES >= 2)) || fail "--max-frames must be 0 or at least 2"
 require_positive_int --width "$WIDTH"
@@ -470,8 +484,9 @@ from datetime import datetime, timezone
     client_commit, client_dirty, backend_commit, model_commit, mint_dirty,
     openpi_dirty, norm_sha, verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
-    owner, stride, decay, act_mode, batch_size, max_warm, max_frames, fps, width,
-    height, video_mode, frame_window, contact_manifest, contact_context,
+    owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
+    max_warm, max_frames, fps, width, height, video_mode, frame_window,
+    contact_manifest, contact_context,
     missing_contact_policy, language, gesture_index, server_port, server_gpus, runtime_root,
     cache_dir, persistent_cache, keep_server, reuse_server_info, action_session_id,
 ) = sys.argv[1:]
@@ -501,6 +516,8 @@ payload={
         'temporal_decay': float(decay),
         'act_mode': act_mode,
         'act_batch_size': 1 if act_mode == 'single' else int(batch_size),
+        'row_execution': row_execution,
+        'row_batch_size': int(row_batch_size),
         'max_warm_request_seconds': float(max_warm),
         'max_frames': int(max_frames),
         'fps': float(fps),
@@ -551,8 +568,8 @@ CONFIG_ARGS=(
   "$OPENPI_DIRTY" "$NORM_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
-  "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$MAX_WARM_REQUEST_SECONDS"
-  "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$FRAME_WINDOW"
+  "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$ROW_EXECUTION" "$ROW_BATCH_SIZE"
+  "$MAX_WARM_REQUEST_SECONDS" "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$FRAME_WINDOW"
   "$CONTACT_WINDOW_MANIFEST" "$CONTACT_CONTEXT_FRAMES" "$MISSING_CONTACT_POLICY"
   "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX" "$SERVER_PORT" "$SERVER_GPUS"
   "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
@@ -682,6 +699,7 @@ EVAL_ARGS=(
   --norm-stats-dir "$NORM_STATS_DIR" --output-dir "$OUTPUT_DIR/artifacts"
   --chunk-stride "$CHUNK_STRIDE" --temporal-decay "$TEMPORAL_DECAY"
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
+  --row-execution "$ROW_EXECUTION" --row-batch-size "$ROW_BATCH_SIZE"
   --max-warm-request-seconds "$MAX_WARM_REQUEST_SECONDS" --max-frames "$MAX_FRAMES"
   --fps "$FPS" --width "$WIDTH" --height "$HEIGHT" --video-mode "$VIDEO_MODE"
   --frame-window "$FRAME_WINDOW" --contact-context-frames "$CONTACT_CONTEXT_FRAMES"

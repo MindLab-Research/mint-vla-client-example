@@ -152,6 +152,18 @@ and retain absolute source-frame labels. `--frame-window full` is a separate
 out-of-support stress test; do not obtain a contact result by trimming a full
 closed-loop video after the fact.
 
+For multi-row evaluation, the default `--row-execution lockstep
+--row-batch-size 4 --act-batch-size 4` runs four independent MuJoCo scenes in
+one client process. Each local source step forms one action request from the
+currently active rows, preserving stable row-to-slot ordering inside that
+request. Full groups therefore send four real observations and zero padding;
+when a shorter contact window finishes, subsequent tail requests use the
+remaining live rows and pad only the unused model slots. Groups larger than
+four run sequentially while reusing the same retained action session and
+compiled executable. The summary records each group's batch-request, real
+observation, and padding counts. Use `--row-execution sequential` only for a
+single-row diagnostic or compatibility comparison.
+
 When using an existing endpoint, declare the backend/model commits reported by
 the server owner. The launcher records them as operator-declared provenance; a
 client cannot prove the source of a process it did not start:

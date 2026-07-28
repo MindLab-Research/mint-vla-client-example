@@ -9,12 +9,14 @@ executed by the same 200 Hz native position-servo contract as quality replay.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from io import BytesIO
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import uuid
 
@@ -225,6 +227,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--act-batch-size", type=int, default=4)
     parser.add_argument(
+        "--row-execution",
+        choices=("lockstep", "sequential"),
+        default="lockstep",
+        help="lockstep fills act_batch with real observations from multiple independent rows",
+    )
+    parser.add_argument(
+        "--row-batch-size",
+        type=int,
+        default=4,
+        help="maximum concurrent MuJoCo rows per lockstep group (must be <= act-batch-size)",
+    )
+    parser.add_argument(
         "--max-warm-request-seconds",
         type=float,
         default=2.0,
@@ -355,6 +369,56 @@ def write_retained_session_marker(args: argparse.Namespace, session_id: str) -> 
     return marker
 
 
+def _decode_action_result(
+    datum: dict, payload: dict, timing: dict
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    pred_norm = np.asarray(payload["data"], dtype=np.float32).reshape(payload["shape"])
+    pred_phys = np.asarray(
+        OBS._unnormalize_actions(pred_norm, datum["data_config"]), dtype=np.float32
+    )
+    gt_payload = datum["supervision"]["actions"]
+    gt_norm = np.asarray(gt_payload["data"], dtype=np.float32).reshape(gt_payload["shape"])
+    return pred_norm, pred_phys, gt_norm, timing
+
+
+def query_action_group(
+    *,
+    args: argparse.Namespace,
+    headers: dict[str, str],
+    session_id: str,
+    datums: list[dict],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, dict]]:
+    """Issue one fixed-shape act_batch containing N real row observations."""
+    if args.act_mode != "batch":
+        raise ValueError("lockstep row execution requires --act-mode batch")
+    if not datums or len(datums) > args.act_batch_size:
+        raise ValueError(
+            f"real observation count must be in [1,{args.act_batch_size}], got {len(datums)}"
+        )
+    payloads, shared_timing = L._request_action_batch(
+        args.base_url,
+        headers,
+        session_id,
+        [datum["observation"] for datum in datums],
+        fixed_batch_size=args.act_batch_size,
+    )
+    if len(payloads) < len(datums):
+        raise RuntimeError(
+            f"act_batch returned {len(payloads)} actions for {len(datums)} real observations"
+        )
+    results = []
+    for slot, (datum, payload) in enumerate(zip(datums, payloads, strict=False)):
+        if slot >= len(datums):
+            break
+        timing = {
+            **shared_timing,
+            "batch_slot": slot,
+            "lockstep_real_observations": len(datums),
+        }
+        results.append(_decode_action_result(datum, payload, timing))
+    return results
+
+
 def query_action(
     *,
     args: argparse.Namespace,
@@ -363,43 +427,127 @@ def query_action(
     datum: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if args.act_mode == "batch":
-        payloads, timing = L._request_action_batch(
+        return query_action_group(
+            args=args,
+            headers=headers,
+            session_id=session_id,
+            datums=[datum],
+        )[0]
+    started = time.monotonic()
+    result = L._await_result(
+        args.base_url,
+        headers,
+        L._post_json(
             args.base_url,
+            f"/api/v1/mint/action_sessions/{session_id}/act",
             headers,
-            session_id,
-            [datum["observation"]],
-            fixed_batch_size=args.act_batch_size,
-        )
-        payload = payloads[0]
-    else:
-        started = time.monotonic()
-        result = L._await_result(
-            args.base_url,
-            headers,
-            L._post_json(
-                args.base_url,
-                f"/api/v1/mint/action_sessions/{session_id}/act",
-                headers,
-                {"observation": datum["observation"]},
-            ),
-        )
-        timing = {
-            "wall_seconds": time.monotonic() - started,
-            "actual_observation_count": 1,
-            "request_batch_size": 1,
-            "padding_count": 0,
-            "server_elapsed_ms": None,
-            "used_data_sharding": False,
-            "response_batch_size": 1,
-        }
-        payload = result["actions"]
-    pred_norm = np.asarray(payload["data"], dtype=np.float32).reshape(payload["shape"])
-    pred_phys = np.asarray(
-        OBS._unnormalize_actions(pred_norm, datum["data_config"]), dtype=np.float32
+            {"observation": datum["observation"]},
+        ),
     )
-    gt_payload = datum["supervision"]["actions"]
-    gt_norm = np.asarray(gt_payload["data"], dtype=np.float32).reshape(gt_payload["shape"])
-    return pred_norm, pred_phys, gt_norm, timing
+    timing = {
+        "wall_seconds": time.monotonic() - started,
+        "actual_observation_count": 1,
+        "request_batch_size": 1,
+        "padding_count": 0,
+        "server_elapsed_ms": None,
+        "used_data_sharding": False,
+        "response_batch_size": 1,
+        "batch_slot": 0,
+        "lockstep_real_observations": 1,
+    }
+    return _decode_action_result(datum, result["actions"], timing)
+
+
+class LockstepActionBatcher:
+    """Barrier-style coordinator that maps one live query per row into one act_batch."""
+
+    def __init__(self, participant_slots: list[int], dispatch):
+        slots = list(dict.fromkeys(int(slot) for slot in participant_slots))
+        if not slots:
+            raise ValueError("lockstep batcher requires at least one participant")
+        self._active = set(slots)
+        self._pending: dict[int, dict] = {}
+        self._condition = threading.Condition()
+        self._failure: BaseException | None = None
+        self._dispatch = dispatch
+        self._batch_count = 0
+        self._real_observation_count = 0
+        self._padded_observation_count = 0
+        self._thread = threading.Thread(target=self._run, name="mode4-lockstep-batcher", daemon=True)
+        self._thread.start()
+
+    def query(self, slot: int, datum: dict):
+        request = {"datum": datum, "event": threading.Event(), "result": None, "error": None}
+        with self._condition:
+            if self._failure is not None:
+                raise RuntimeError("lockstep batcher has failed") from self._failure
+            if slot not in self._active:
+                raise RuntimeError(f"inactive lockstep slot submitted a query: {slot}")
+            if slot in self._pending:
+                raise RuntimeError(f"lockstep slot already has a pending query: {slot}")
+            self._pending[slot] = request
+            self._condition.notify_all()
+        request["event"].wait()
+        if request["error"] is not None:
+            raise RuntimeError("lockstep action batch failed") from request["error"]
+        return request["result"]
+
+    def retire(self, slot: int) -> None:
+        with self._condition:
+            self._active.discard(int(slot))
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._failure is not None
+                    or (self._pending and set(self._pending) == self._active)
+                    or (not self._active and not self._pending)
+                )
+                if self._failure is not None:
+                    return
+                if not self._active and not self._pending:
+                    return
+                slots = sorted(self._pending)
+                requests_batch = [self._pending.pop(slot) for slot in slots]
+            try:
+                results = self._dispatch([request["datum"] for request in requests_batch])
+                if len(results) != len(requests_batch):
+                    raise RuntimeError(
+                        f"dispatch returned {len(results)} results for {len(requests_batch)} rows"
+                    )
+                self._batch_count += 1
+                self._real_observation_count += len(requests_batch)
+                if results:
+                    timing = results[0][3]
+                    self._padded_observation_count += int(timing.get("padding_count", 0))
+                for request, result in zip(requests_batch, results, strict=True):
+                    request["result"] = result
+            except BaseException as exc:
+                with self._condition:
+                    self._failure = exc
+                for request in requests_batch:
+                    request["error"] = exc
+            finally:
+                for request in requests_batch:
+                    request["event"].set()
+
+    def close(self) -> dict[str, int]:
+        with self._condition:
+            if self._active:
+                raise RuntimeError(f"lockstep participants still active: {sorted(self._active)}")
+            self._condition.notify_all()
+        self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            raise RuntimeError("lockstep batcher did not terminate")
+        if self._failure is not None:
+            raise RuntimeError("lockstep batcher failed") from self._failure
+        return {
+            "batch_requests": self._batch_count,
+            "real_observations": self._real_observation_count,
+            "padding_observations": self._padded_observation_count,
+        }
 
 
 def run_variant(
@@ -414,6 +562,7 @@ def run_variant(
     session_id=None,
     row_index=None,
     output_dir=None,
+    action_query=None,
 ):
     """The sole Mode4: policy-in-the-loop, target-DOF, real MuJoCo dynamics."""
     if mode != "mode4":
@@ -421,6 +570,7 @@ def run_variant(
     if args.action_source != URDF_TARGET_ABSOLUTE:
         raise ValueError("Mode4 requires urdf_target_absolute checkpoint semantics")
     video_mode = getattr(args, "video_mode", "full")
+    query_impl = action_query or query_action
     selected_row_index = args.row_index if row_index is None else row_index
     source_frames = full.row_frame_count(row)
     timestamps = np.asarray(row["timestamp"], dtype=np.float64)
@@ -640,7 +790,7 @@ def run_variant(
                     )
                     datum["data_config"] = data_config
                     phase_seconds["query_preparation"] += time.perf_counter() - query_prepare_started
-                    pred_norm, pred_phys, gt_norm, timing = query_action(
+                    pred_norm, pred_phys, gt_norm, timing = query_impl(
                         args=args,
                         headers=headers,
                         session_id=active_session_id,
@@ -998,6 +1148,8 @@ def build_row_summary(
         ),
         "act_mode": args.act_mode,
         "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+        "row_execution": getattr(args, "row_execution", "sequential"),
+        "row_batch_size": getattr(args, "row_batch_size", 1),
         "max_warm_request_seconds": args.max_warm_request_seconds,
         "results": results,
     }
@@ -1012,6 +1164,8 @@ def main() -> int:
     args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
     args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
     args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
+    args.row_execution = str(getattr(args, "row_execution", "sequential"))
+    args.row_batch_size = int(getattr(args, "row_batch_size", 1))
     args._gesture_index = (
         GestureIndex.load(args.gesture_index)
         if args.language_conditioning == GESTURE_LANGUAGE
@@ -1023,6 +1177,10 @@ def main() -> int:
         raise ValueError("--temporal-decay must be in (0, 1]")
     if args.act_batch_size <= 0:
         raise ValueError("--act-batch-size must be positive")
+    if args.row_batch_size <= 0 or args.row_batch_size > args.act_batch_size:
+        raise ValueError("--row-batch-size must be positive and <= --act-batch-size")
+    if args.row_execution == "lockstep" and args.act_mode != "batch":
+        raise ValueError("--row-execution lockstep requires --act-mode batch")
     if args.contact_context_frames < 0:
         raise ValueError("--contact-context-frames must be non-negative")
     if args.action_session_id and args.keep_action_session:
@@ -1188,11 +1346,16 @@ def main() -> int:
             )
         else:
             row_summaries: list[dict] = []
-            for row_index in eval_rows:
+            lockstep_groups: list[dict] = []
+
+            def evaluate_loaded_row(
+                row_index: int,
+                row: dict,
+                *,
+                action_query=None,
+            ) -> dict:
                 row_output_dir = args.output_dir / f"row{row_index}"
                 row_output_dir.mkdir(parents=True, exist_ok=True)
-                row = load_eval_row(row_index)
-                object_name = full.safe_object_name(row)
                 results = [
                     run_variant(
                         args=args,
@@ -1200,11 +1363,12 @@ def main() -> int:
                         data_config=data_config,
                         mode="mode4",
                         headers=headers,
-                        object_name=object_name,
+                        object_name=full.safe_object_name(row),
                         manifest_entry=contact_manifest_entries.get(row_index),
                         session_id=shared_session_id,
                         row_index=row_index,
                         output_dir=row_output_dir,
+                        action_query=action_query,
                     )
                 ]
                 row_summary = build_row_summary(
@@ -1216,7 +1380,57 @@ def main() -> int:
                 (row_output_dir / "summary.json").write_text(
                     json.dumps(row_summary, indent=2), encoding="utf-8"
                 )
-                row_summaries.append(row_summary)
+                return row_summary
+
+            if args.row_execution == "sequential" or args.row_batch_size == 1:
+                for row_index in eval_rows:
+                    row_summaries.append(evaluate_loaded_row(row_index, load_eval_row(row_index)))
+            else:
+                for group_start in range(0, len(eval_rows), args.row_batch_size):
+                    group_indices = eval_rows[group_start : group_start + args.row_batch_size]
+                    loaded_rows = [load_eval_row(row_index) for row_index in group_indices]
+
+                    def dispatch(datums: list[dict]):
+                        return query_action_group(
+                            args=args,
+                            headers=headers,
+                            session_id=shared_session_id,
+                            datums=datums,
+                        )
+
+                    batcher = LockstepActionBatcher(list(range(len(group_indices))), dispatch)
+
+                    def evaluate_slot(slot: int) -> dict:
+                        def lockstep_query(*, args, headers, session_id, datum):
+                            del args, headers, session_id
+                            return batcher.query(slot, datum)
+
+                        try:
+                            return evaluate_loaded_row(
+                                group_indices[slot],
+                                loaded_rows[slot],
+                                action_query=lockstep_query,
+                            )
+                        finally:
+                            batcher.retire(slot)
+
+                    with ThreadPoolExecutor(
+                        max_workers=len(group_indices),
+                        thread_name_prefix="mode4-row",
+                    ) as executor:
+                        futures = [
+                            executor.submit(evaluate_slot, slot)
+                            for slot in range(len(group_indices))
+                        ]
+                        group_summaries = [future.result() for future in futures]
+                    batch_stats = batcher.close()
+                    lockstep_groups.append(
+                        {
+                            "row_indices": group_indices,
+                            **batch_stats,
+                        }
+                    )
+                    row_summaries.extend(group_summaries)
 
             summary = {
                 "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
@@ -1251,6 +1465,9 @@ def main() -> int:
                 "object_pose_source": "sim_owned_after_window_start",
                 "act_mode": args.act_mode,
                 "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+                "row_execution": args.row_execution,
+                "row_batch_size": args.row_batch_size,
+                "lockstep_groups": lockstep_groups,
                 "video_mode": getattr(args, "video_mode", "full"),
                 "max_warm_request_seconds": args.max_warm_request_seconds,
                 "rows": row_summaries,

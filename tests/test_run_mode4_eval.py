@@ -145,6 +145,8 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
             self.assertEqual(payload["evaluation"]["normalization_row_indices"], [7, 2])
             self.assertEqual(payload["evaluation"]["video_mode"], "full")
+            self.assertEqual(payload["evaluation"]["row_execution"], "lockstep")
+            self.assertEqual(payload["evaluation"]["row_batch_size"], 4)
             self.assertEqual(payload["evaluation"]["frame_window"], "contact")
             self.assertEqual(
                 payload["evaluation"]["contact_window_manifest"],

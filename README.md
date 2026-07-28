@@ -166,7 +166,11 @@ only when an explicit override is required. Mode4 defaults to contact-window
 initialization using the canonical ctx100 manifest. `dataset_reference.mp4`
 keeps the full demonstration, while head/wrist physics-comparison videos and
 all rollout arrays cover only the synchronized contact window. Use
-`--frame-window full` only for an explicitly named full-trajectory stress test:
+`--frame-window full` only for an explicitly named full-trajectory stress test.
+Multi-row Mode4 defaults to `--row-execution lockstep --row-batch-size 4`:
+four independent MuJoCo trajectories contribute four real observations to each
+fixed-shape `act_batch`, while only the final partial group/window tail is
+padded:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help
