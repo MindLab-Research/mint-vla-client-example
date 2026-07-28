@@ -196,9 +196,9 @@ Remove `--print-config` only when the printed allocation is correct.
   for an existing MINT endpoint or an explicitly owned dedicated server; it
   records effective configuration, source/normalization provenance, phase
   timings, and supports explicit `--video-mode none` diagnostic sweeps and
-  `--keep-server` reuse.
-- `scripts/remote/stop_owned_mode4_server.sh`: ownership-checked graceful stop
-  for a server handed off with `--keep-server`.
+  retained action-session reuse through `--keep-server` / `--reuse-server-info`.
+- `scripts/remote/stop_owned_mode4_server.sh`: ownership-checked retained-session
+  cleanup and graceful stop for a server handed off with `--keep-server`.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server
   launcher; not a shared-server lifecycle command. Persistent JAX executable
   serialization is disabled unless explicitly enabled.

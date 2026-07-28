@@ -1,4 +1,6 @@
 from __future__ import annotations
+from contextlib import ExitStack
+import json
 import unittest
 from unittest import mock
 from io import BytesIO
@@ -65,6 +67,22 @@ class Mode4ContractTests(unittest.TestCase):
         self.assertEqual(summary["backend_commit"], "mint-sha")
         self.assertEqual(summary["model_commit"], "openpi-sha")
 
+    def test_retained_session_marker_records_identity(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = types.SimpleNamespace(
+                output_dir=Path(temp),
+                base_url="http://127.0.0.1:30536",
+                model="openpi/pi05-action-lora-r16-finetune",
+                model_path="mint://owner/checkpoint",
+                owner_id="owner-1",
+            )
+            marker = mode4.write_retained_session_marker(args, "session-123")
+            payload = json.loads(marker.read_text())
+            self.assertEqual(payload["status"], "retained")
+            self.assertEqual(payload["action_session_id"], "session-123")
+            self.assertEqual(payload["model_path"], "mint://owner/checkpoint")
+            self.assertEqual(payload["owner_id"], "owner-1")
+
     def test_native_servo_and_collision_scene(self):
         kp, dampratio, effort = physics.servo_parameters()
         np.testing.assert_allclose(kp[:6], 100)
@@ -87,6 +105,101 @@ class Mode4ContractTests(unittest.TestCase):
             self.assertAlmostEqual(data.time, 0.005)
         finally:
             tmp.cleanup()
+
+
+class Mode4SessionLifecycleTests(unittest.TestCase):
+    def make_args(self, output_dir: Path, *, action_session_id=None, keep_action_session=False):
+        return types.SimpleNamespace(
+            base_url="http://127.0.0.1:30536",
+            api_key="tml-dummy",
+            model_path="mint://owner/checkpoint",
+            model="openpi/pi05-action-lora-r16-finetune",
+            owner_id="owner-1",
+            lance_dataset=Path("/dataset.lance"),
+            row_index=None,
+            row_indices="0",
+            action_source="urdf_target_absolute",
+            extended_state=False,
+            language_conditioning="object_only",
+            gesture_index=Path("/gesture.index.json"),
+            normalization_row_indices="0",
+            norm_stats_dir=Path("/norm"),
+            output_dir=output_dir,
+            action_session_id=action_session_id,
+            keep_action_session=keep_action_session,
+            chunk_stride=5,
+            max_frames=2,
+            act_mode="batch",
+            act_batch_size=4,
+            max_warm_request_seconds=2.0,
+            temporal_decay=0.4,
+            fps=10.0,
+            width=32,
+            height=24,
+            video_mode="none",
+            client_commit="client-sha",
+            backend_commit="mint-sha",
+            model_commit="openpi-sha",
+        )
+
+    def run_main_with_session(self, args):
+        row = {"index": {"uuid": "u"}, "state": np.zeros((2, 32), np.float32)}
+        target = {
+            "index": {"uuid": "u"},
+            "hands": [{"urdf_dof": np.zeros((2, 26), np.float32)}],
+        }
+
+        def take(_indices, columns):
+            return types.SimpleNamespace(
+                to_pylist=lambda: [target if columns == ["hands", "index"] else row]
+            )
+
+        source = types.SimpleNamespace(count_rows=lambda: 1, take=take)
+        patches = (
+            mock.patch.object(mode4, "parse_args", return_value=args),
+            mock.patch.object(mode4.lance, "dataset", return_value=source),
+            mock.patch.object(mode4.L.normalize, "load", return_value={}),
+            mock.patch.object(mode4.full, "build_model_config", return_value=object()),
+            mock.patch.object(mode4.L, "_make_data_config", return_value=object()),
+            mock.patch.object(mode4, "project_row_actions", side_effect=lambda value, _: value),
+            mock.patch.object(mode4, "condition_row_language", side_effect=lambda value, *_a, **_k: value),
+            mock.patch.object(mode4.full, "safe_object_name", return_value="cube1"),
+            mock.patch.object(mode4, "run_variant", return_value={"ok": True}),
+            mock.patch.object(mode4, "build_row_summary", return_value={"mode": "test"}),
+            mock.patch.object(mode4, "create_session", return_value="created-session"),
+            mock.patch.object(mode4, "delete_session"),
+        )
+        with ExitStack() as stack:
+            entered = [stack.enter_context(patch) for patch in patches]
+            self.assertEqual(mode4.main(), 0)
+            run_mock = entered[8]
+            create_mock = entered[10]
+            delete_mock = entered[11]
+        return run_mock, create_mock, delete_mock
+
+    def test_keep_action_session_retains_created_session_and_writes_marker(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = self.make_args(Path(temp), keep_action_session=True)
+            run_mock, create_mock, delete_mock = self.run_main_with_session(args)
+            create_mock.assert_called_once()
+            delete_mock.assert_not_called()
+            self.assertEqual(run_mock.call_args.kwargs["session_id"], "created-session")
+            marker = json.loads((Path(temp) / "action_session.retained.json").read_text())
+            self.assertEqual(marker["action_session_id"], "created-session")
+            summary = json.loads((Path(temp) / "summary.json").read_text())
+            self.assertTrue(summary["action_session"]["retained"])
+            self.assertEqual(summary["action_session"]["cleanup_owner"], "caller")
+
+    def test_external_action_session_is_neither_created_nor_deleted(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = self.make_args(Path(temp), action_session_id="external-session")
+            run_mock, create_mock, delete_mock = self.run_main_with_session(args)
+            create_mock.assert_not_called()
+            delete_mock.assert_not_called()
+            self.assertEqual(run_mock.call_args.kwargs["session_id"], "external-session")
+            summary = json.loads((Path(temp) / "summary.json").read_text())
+            self.assertEqual(summary["action_session"]["source"], "external")
+            self.assertEqual(summary["action_session"]["cleanup_owner"], "external")
 
 
 class Mode4LoopTests(unittest.TestCase):
@@ -233,6 +346,8 @@ class Mode4LoopTests(unittest.TestCase):
             self.assertEqual(result["client_commit"], "client-sha")
             self.assertEqual(result["backend_commit"], "mint-sha")
             self.assertEqual(result["model_commit"], "openpi-sha")
+            self.assertEqual(result["action_session_id"], "s")
+            self.assertFalse(result["action_session_owned_by_variant"])
             output = Path(out) / "mode4"
             self.assertAlmostEqual(
                 np.load(output / "object_position_sim.npy")[-1, 0], 0.32, places=6

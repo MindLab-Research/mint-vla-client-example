@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -119,6 +120,7 @@ class RunMode4EvalContractTests(unittest.TestCase):
                     "label": None,
                     "base_url": "http://127.0.0.1:30532",
                     "source_verification": "operator_declared",
+                    "reuse_server_info": None,
                 },
             )
             self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
@@ -202,6 +204,111 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertFalse(payload["dedicated_server"]["keep_server"])
             self.assertEqual(payload["dedicated_server"]["gpus"], [0])
             self.assertFalse(output.exists())
+
+    def test_reuse_server_info_supplies_endpoint_commits_owner_and_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            fake_server = subprocess.Popen(["bash", "-c", "exec -a uvicorn sleep 60"])
+            try:
+                marker = root / "server.keepalive.json"
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "status": "owned_running",
+                            "pid": fake_server.pid,
+                            "base_url": "http://127.0.0.1:30536",
+                            "owner_id": "owner-from-marker",
+                            "backend_commit": "0123456789abcdef0123456789abcdef01234567",
+                            "model_commit": "abcdef0123456789abcdef0123456789abcdef01",
+                            "action_session_id": "retained-session-123",
+                            "model": "openpi/pi05-action-lora-r16-finetune",
+                            "model_path": "mint://fixture/checkpoint",
+                            "act_mode": "batch",
+                            "act_batch_size": 4,
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+                output = root / "reused-output"
+                completed = self.run_launcher(
+                    root,
+                    "--model-path",
+                    "mint://fixture/checkpoint",
+                    "--dataset",
+                    str(dataset),
+                    "--rows",
+                    "2,7",
+                    "--normalization-rows",
+                    "7,2",
+                    "--norm-stats-dir",
+                    str(norm),
+                    "--output-dir",
+                    str(output),
+                    "--reuse-server-info",
+                    str(marker),
+                    "--allow-dirty-sources",
+                    "--print-config",
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                payload = json.loads(completed.stdout)
+                self.assertEqual(payload["endpoint"]["mode"], "retained")
+                self.assertEqual(
+                    payload["endpoint"]["source_verification"],
+                    "retained_action_session_marker",
+                )
+                self.assertEqual(payload["endpoint"]["reuse_server_info"], str(marker))
+                self.assertEqual(payload["evaluation"]["owner_id"], "owner-from-marker")
+                self.assertEqual(
+                    payload["evaluation"]["action_session_id"], "retained-session-123"
+                )
+                self.assertIsNone(payload["dedicated_server"])
+                self.assertFalse(output.exists())
+            finally:
+                fake_server.terminate()
+                fake_server.wait(timeout=5)
+
+    def test_reuse_server_info_requires_retained_action_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            marker = root / "server.keepalive.json"
+            marker.write_text(
+                json.dumps(
+                    {
+                        "status": "owned_running",
+                        "pid": os.getpid(),
+                        "base_url": "http://127.0.0.1:30536",
+                        "owner_id": "owner-from-marker",
+                        "backend_commit": "0123456789abcdef0123456789abcdef01234567",
+                        "model_commit": "abcdef0123456789abcdef0123456789abcdef01",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            completed = self.run_launcher(
+                root,
+                "--model-path",
+                "mint://fixture/checkpoint",
+                "--dataset",
+                str(dataset),
+                "--rows",
+                "2",
+                "--normalization-rows",
+                "2",
+                "--norm-stats-dir",
+                str(norm),
+                "--output-dir",
+                str(root / "out"),
+                "--reuse-server-info",
+                str(marker),
+                "--allow-dirty-sources",
+                "--print-config",
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("invalid reuse server marker", completed.stderr)
 
     def test_keep_server_requires_owned_server(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -31,6 +31,8 @@ BASE_URL=
 ENDPOINT_LABEL=
 BACKEND_COMMIT=
 OPENPI_COMMIT=
+REUSE_SERVER_INFO=
+ACTION_SESSION_ID=
 OWN_SERVER=0
 KEEP_SERVER=0
 SERVER_PORT=30532
@@ -61,7 +63,7 @@ usage() {
 usage: run_mode4_eval.sh --model-path PATH --rows CSV \
   --normalization-rows CSV|all --norm-stats-dir PATH --output-dir PATH --owner ID \
   (--base-url URL --backend-commit SHA --model-commit SHA | \
-   --own-server --server-runtime-root PATH) [options]
+   --reuse-server-info PATH | --own-server --server-runtime-root PATH) [options]
 
 Required evaluation options:
   --model-path PATH           checkpoint identifier accepted by MINT
@@ -71,13 +73,15 @@ Required evaluation options:
   --normalization-rows, --normalization-row-indices CSV|all
   --norm-stats-dir PATH       checkpoint's locked normalization directory
   --output-dir PATH           new result root; existing roots are refused
-  --owner, --owner-id ID      MINT action-session owner ID
+  --owner, --owner-id ID      MINT action-session owner ID; supplied by --reuse-server-info
 
 Endpoint selection (choose exactly one):
   --base-url URL              existing endpoint; this launcher never stops it
   --backend-commit SHA        operator-declared MINT source for existing endpoint
   --model-commit SHA          operator-declared OpenPI source for existing endpoint
   --endpoint-label TEXT       optional allocation/deployment identifier
+  --action-session-id ID      reuse an externally owned action session on --base-url
+  --reuse-server-info PATH    attach through a prior keep-server marker and reuse its action session
   --own-server                start and stop a dedicated server for this run
   --server-runtime-root PATH  required with --own-server
 
@@ -103,7 +107,7 @@ Dedicated-server options:
   --openpi-root PATH          paired OpenPI checkout
   --python-bin PATH           GPU runtime Python
   --server-cache-dir PATH     cache path used only with explicit cache opt-in
-  --keep-server               leave an owned server running after success and write server.keepalive.json
+  --keep-server               retain the owned server and compiled action session after success
   --enable-jax-persistent-cache
                               opt in to multi-GB executable serialization
 
@@ -133,6 +137,8 @@ while (($#)); do
     --endpoint-label) ENDPOINT_LABEL=${2:?}; shift 2 ;;
     --backend-commit) BACKEND_COMMIT=${2:?}; shift 2 ;;
     --model-commit) OPENPI_COMMIT=${2:?}; shift 2 ;;
+    --action-session-id) ACTION_SESSION_ID=${2:?}; shift 2 ;;
+    --reuse-server-info) REUSE_SERVER_INFO=${2:?}; shift 2 ;;
     --own-server) OWN_SERVER=1; shift ;;
     --keep-server) KEEP_SERVER=1; shift ;;
     --server-port) SERVER_PORT=${2:?}; SERVER_PORT_SET=1; shift 2 ;;
@@ -198,6 +204,70 @@ git_dirty() {
 validate_sha() {
   [[ "$2" =~ ^[0-9a-fA-F]{7,40}$ ]] || fail "$1 must be a 7-40 character hexadecimal Git SHA"
 }
+
+REUSE_MARKER_VERIFIED=0
+if [[ -n "$REUSE_SERVER_INFO" ]]; then
+  ((OWN_SERVER == 0)) || fail "--reuse-server-info and --own-server are mutually exclusive"
+  [[ -z "$BASE_URL" ]] || fail "--reuse-server-info and --base-url are mutually exclusive"
+  [[ -z "$ACTION_SESSION_ID" ]] || fail "--reuse-server-info and --action-session-id are mutually exclusive"
+  require_absolute --reuse-server-info "$REUSE_SERVER_INFO"
+  [[ -f "$REUSE_SERVER_INFO" ]] || fail "reuse server marker does not exist: $REUSE_SERVER_INFO"
+  REUSE_DATA=$(python3 - "$REUSE_SERVER_INFO" <<'PY'
+import json, sys
+from pathlib import Path
+marker=json.loads(Path(sys.argv[1]).read_text())
+if marker.get('status') != 'owned_running':
+    raise SystemExit(f"marker status must be owned_running, got {marker.get('status')!r}")
+for key in (
+    'pid','base_url','owner_id','backend_commit','model_commit','action_session_id',
+    'model','model_path','act_mode','act_batch_size',
+):
+    if not marker.get(key):
+        raise SystemExit(f"reuse marker missing {key}")
+print(marker['pid'])
+print(marker['base_url'])
+print(marker['owner_id'])
+print(marker['backend_commit'])
+print(marker['model_commit'])
+print(marker['action_session_id'])
+print(marker['model'])
+print(marker['model_path'])
+print(marker['act_mode'])
+print(marker['act_batch_size'])
+PY
+  ) || fail "invalid reuse server marker: $REUSE_SERVER_INFO"
+  mapfile -t REUSE_FIELDS <<< "$REUSE_DATA"
+  ((${#REUSE_FIELDS[@]} == 10)) || fail "invalid reuse server marker fields"
+  REUSE_SERVER_PID=${REUSE_FIELDS[0]}
+  [[ "$REUSE_SERVER_PID" =~ ^[0-9]+$ ]] || fail "reuse server marker contains an invalid PID"
+  kill -0 "$REUSE_SERVER_PID" 2>/dev/null || fail "retained server PID is not running: $REUSE_SERVER_PID"
+  REUSE_CMDLINE=$(tr '\0' ' ' < "/proc/$REUSE_SERVER_PID/cmdline" 2>/dev/null || true)
+  [[ "$REUSE_CMDLINE" == *mint_server* || "$REUSE_CMDLINE" == *uvicorn* ]] || \
+    fail "retained server PID is not recognizably MINT/uvicorn: $REUSE_SERVER_PID"
+  BASE_URL=${REUSE_FIELDS[1]}
+  if [[ -n "$OWNER_ID" && "$OWNER_ID" != "${REUSE_FIELDS[2]}" ]]; then
+    fail "--owner-id does not match reuse server marker"
+  fi
+  if [[ -n "$BACKEND_COMMIT" && "$BACKEND_COMMIT" != "${REUSE_FIELDS[3]}" ]]; then
+    fail "--backend-commit does not match reuse server marker"
+  fi
+  if [[ -n "$OPENPI_COMMIT" && "$OPENPI_COMMIT" != "${REUSE_FIELDS[4]}" ]]; then
+    fail "--model-commit does not match reuse server marker"
+  fi
+  OWNER_ID=${REUSE_FIELDS[2]}
+  BACKEND_COMMIT=${REUSE_FIELDS[3]}
+  OPENPI_COMMIT=${REUSE_FIELDS[4]}
+  ACTION_SESSION_ID=${REUSE_FIELDS[5]}
+  [[ "$MODEL" == "${REUSE_FIELDS[6]}" ]] || fail "--model does not match retained action session"
+  [[ "$MODEL_PATH" == "${REUSE_FIELDS[7]}" ]] || fail "--model-path does not match retained action session"
+  [[ "$ACT_MODE" == "${REUSE_FIELDS[8]}" ]] || fail "--act-mode does not match retained action session"
+  EXPECTED_REUSE_BATCH_SIZE=$ACT_BATCH_SIZE
+  [[ "$ACT_MODE" == batch ]] || EXPECTED_REUSE_BATCH_SIZE=1
+  [[ "$EXPECTED_REUSE_BATCH_SIZE" == "${REUSE_FIELDS[9]}" ]] || \
+    fail "--act-batch-size does not match retained action session"
+  ENDPOINT_LABEL=${ENDPOINT_LABEL:-retained-action-session}
+  REUSE_MARKER_VERIFIED=1
+fi
 
 require_nonempty --model "$MODEL"
 require_nonempty --model-path "$MODEL_PATH"
@@ -267,6 +337,8 @@ if ((KEEP_SERVER && !OWN_SERVER)); then
 fi
 if ((OWN_SERVER)); then
   [[ -z "$BASE_URL" ]] || fail "--own-server and --base-url are mutually exclusive"
+  [[ -z "$REUSE_SERVER_INFO" ]] || fail "--own-server and --reuse-server-info are mutually exclusive"
+  [[ -z "$ACTION_SESSION_ID" ]] || fail "--action-session-id requires an existing or retained endpoint"
   ((SERVER_PORT_SET == 1)) || fail "--server-port is required with --own-server"
   ((SERVER_GPUS_SET == 1)) || fail "--server-gpus is required with --own-server"
   require_nonempty --server-runtime-root "$SERVER_RUNTIME_ROOT"
@@ -304,6 +376,9 @@ else
   require_nonempty --model-commit "$OPENPI_COMMIT"
   validate_sha --backend-commit "$BACKEND_COMMIT"
   validate_sha --model-commit "$OPENPI_COMMIT"
+  if ((REUSE_MARKER_VERIFIED)); then
+    PROVENANCE_VERIFICATION=retained_action_session_marker
+  fi
 fi
 BASE_URL=${BASE_URL%/}
 [[ "$BASE_URL" =~ ^https?://[^/]+$ ]] || fail "--base-url must be an http(s) endpoint without a path"
@@ -348,7 +423,7 @@ from datetime import datetime, timezone
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, max_warm, max_frames, fps, width,
     height, video_mode, language, gesture_index, server_port, server_gpus, runtime_root,
-    cache_dir, persistent_cache, keep_server,
+    cache_dir, persistent_cache, keep_server, reuse_server_info, action_session_id,
 ) = sys.argv[1:]
 row_ids=list(dict.fromkeys(int(x) for x in rows.split(',')))
 normalization='all' if norm_rows == 'all' else list(dict.fromkeys(int(x) for x in norm_rows.split(',')))
@@ -360,6 +435,7 @@ payload={
         'label': endpoint_label or None,
         'base_url': base_url,
         'source_verification': verification,
+        'reuse_server_info': reuse_server_info or None,
     },
     'evaluation': {
         'model': model,
@@ -370,6 +446,7 @@ payload={
         'norm_stats_dir': norm_dir,
         'output_dir': output_dir,
         'owner_id': owner,
+        'action_session_id': action_session_id or None,
         'chunk_stride': int(stride),
         'temporal_decay': float(decay),
         'act_mode': act_mode,
@@ -384,14 +461,14 @@ payload={
         'gesture_index': gesture_index if language == 'gesture' else None,
         'extended_state': True,
     },
-    'dedicated_server': None if endpoint_mode == 'existing' else {
+    'dedicated_server': {
         'port': int(server_port),
         'gpus': [int(x) for x in server_gpus.split(',')],
         'runtime_root': runtime_root,
         'cache_dir': cache_dir or None,
         'jax_persistent_executable_cache': persistent_cache == '1',
         'keep_server': keep_server == '1',
-    },
+    } if endpoint_mode == 'dedicated' else None,
     'provenance': {
         'client_commit': client_commit,
         'client_dirty': client_dirty == 'true',
@@ -406,7 +483,13 @@ print(json.dumps(payload, indent=2, sort_keys=True))
 PY
 }
 
-ENDPOINT_MODE=$([[ "$OWN_SERVER" == 1 ]] && printf dedicated || printf existing)
+if ((OWN_SERVER)); then
+  ENDPOINT_MODE=dedicated
+elif ((REUSE_MARKER_VERIFIED)); then
+  ENDPOINT_MODE=retained
+else
+  ENDPOINT_MODE=existing
+fi
 CONFIG_ARGS=(
   "$CLIENT_COMMIT" "$CLIENT_DIRTY" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$MINT_DIRTY"
   "$OPENPI_DIRTY" "$NORM_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
@@ -415,7 +498,7 @@ CONFIG_ARGS=(
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$MAX_WARM_REQUEST_SECONDS"
   "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX"
   "$SERVER_PORT" "$SERVER_GPUS" "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
-  "$ENABLE_JAX_PERSISTENT_CACHE" "$KEEP_SERVER"
+  "$ENABLE_JAX_PERSISTENT_CACHE" "$KEEP_SERVER" "$REUSE_SERVER_INFO" "$ACTION_SESSION_ID"
 )
 if ((PRINT_CONFIG)); then
   write_config "${CONFIG_ARGS[@]}"
@@ -455,13 +538,15 @@ write_keepalive_marker() {
   kill -0 "$server_pid" 2>/dev/null || fail "dedicated server exited before keepalive handoff"
   python3 - "$OUTPUT_DIR/server.keepalive.json" "$server_pid" "$BASE_URL" \
     "$SERVER_PORT" "$SERVER_GPUS" "$SERVER_RUNTIME_ROOT" "$OWNER_ID" \
-    "$CLIENT_COMMIT" "$BACKEND_COMMIT" "$OPENPI_COMMIT" <<'PY'
+    "$CLIENT_COMMIT" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$ACTION_SESSION_ID" \
+    "$ACTION_SESSION_MARKER" "$MODEL" "$MODEL_PATH" "$ACT_MODE" "$ACT_BATCH_SIZE" <<'PY'
 import json, sys
 from datetime import datetime, timezone
 from pathlib import Path
 (
     path, pid, base_url, port, gpus, runtime_root, owner_id,
-    client_commit, backend_commit, model_commit,
+    client_commit, backend_commit, model_commit, action_session_id,
+    action_session_marker, model, model_path, act_mode, act_batch_size,
 ) = sys.argv[1:]
 Path(path).write_text(json.dumps({
     'status': 'owned_running',
@@ -475,6 +560,12 @@ Path(path).write_text(json.dumps({
     'client_commit': client_commit,
     'backend_commit': backend_commit,
     'model_commit': model_commit,
+    'action_session_id': action_session_id,
+    'action_session_marker': action_session_marker,
+    'model': model,
+    'model_path': model_path,
+    'act_mode': act_mode,
+    'act_batch_size': 1 if act_mode == 'single' else int(act_batch_size),
     'source_output': str(Path(path).parent),
 }, indent=2) + '\n')
 PY
@@ -538,6 +629,11 @@ EVAL_ARGS=(
   --client-commit "$CLIENT_COMMIT" --backend-commit "$BACKEND_COMMIT"
   --model-commit "$OPENPI_COMMIT"
 )
+if ((KEEP_SERVER)); then
+  EVAL_ARGS+=(--keep-action-session)
+elif [[ -n "$ACTION_SESSION_ID" ]]; then
+  EVAL_ARGS+=(--action-session-id "$ACTION_SESSION_ID")
+fi
 if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
 fi
@@ -552,8 +648,26 @@ MINT_API_KEY="$MINT_API_KEY" \
 SUMMARY_PATH="$OUTPUT_DIR/artifacts/summary.json"
 [[ -s "$SUMMARY_PATH" ]] || fail "Mode4 completed without summary: $SUMMARY_PATH"
 if ((KEEP_SERVER)); then
+  ACTION_SESSION_MARKER="$OUTPUT_DIR/artifacts/action_session.retained.json"
+  [[ -s "$ACTION_SESSION_MARKER" ]] || fail "Mode4 did not retain its action session: $ACTION_SESSION_MARKER"
+  ACTION_SESSION_ID=$(python3 - "$ACTION_SESSION_MARKER" "$BASE_URL" "$MODEL_PATH" "$OWNER_ID" <<'PY'
+import json, sys
+from pathlib import Path
+marker=json.loads(Path(sys.argv[1]).read_text())
+if marker.get('status') != 'retained': raise SystemExit('action session marker is not retained')
+if marker.get('base_url') != sys.argv[2]: raise SystemExit('action session base_url mismatch')
+if marker.get('model_path') != sys.argv[3]: raise SystemExit('action session model_path mismatch')
+if marker.get('owner_id') != sys.argv[4]: raise SystemExit('action session owner mismatch')
+session_id=marker.get('action_session_id')
+if not session_id: raise SystemExit('action session marker is missing its ID')
+print(session_id)
+PY
+  ) || fail "invalid retained action-session marker"
+  CONFIG_ARGS[$((${#CONFIG_ARGS[@]} - 1))]=$ACTION_SESSION_ID
+  write_config "${CONFIG_ARGS[@]}" > "$OUTPUT_DIR/effective_config.json.tmp"
+  mv "$OUTPUT_DIR/effective_config.json.tmp" "$OUTPUT_DIR/effective_config.json"
   write_keepalive_marker
-  # on_exit must not clean a server explicitly handed off to the operator.
+  # on_exit must not clean a server and session explicitly handed off to the operator.
   server_pid=
 fi
 python3 - "$OUTPUT_DIR/run.completed.json" "$SUMMARY_PATH" <<'PY'

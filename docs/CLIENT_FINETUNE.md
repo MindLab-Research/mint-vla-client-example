@@ -175,17 +175,24 @@ first successful evaluation:
   --server-runtime-root <checkpoint-bearing-server-root> \
   --server-port 30532 --server-gpus 4,5,6,7 --keep-server
 
-# Later evaluations: attach to the explicitly owned endpoint.
-./scripts/remote/run_mode4_eval.sh ... --base-url http://127.0.0.1:30532 \
-  --backend-commit <mint-commit> --model-commit <openpi-commit>
+# Later evaluations: reuse the same server and compiled action session.
+./scripts/remote/run_mode4_eval.sh ... \
+  --reuse-server-info <first-output>/server.keepalive.json
 
 # End the lifecycle using the marker from the first output root.
 ./scripts/remote/stop_owned_mode4_server.sh <first-output>/server.keepalive.json
 ```
 
-This reuses the in-process compiled executable. It is appropriate only for a
-server whose ownership is explicit; an existing endpoint is never stopped by
-the launcher.
+The JIT executable is owned by the action-session policy instance. Keeping only
+the uvicorn process alive is insufficient: deleting the session and creating a
+new one recompiles the identical `jit(sample_fn)` when persistent serialization
+is disabled. `--keep-server` therefore retains both the owned server and the
+successful evaluator's action session. `--reuse-server-info` verifies the live
+PID and marker, supplies the endpoint, source commits, owner, checkpoint/model,
+batch shape, and retained session ID, and leaves lifecycle ownership with the
+first run. The retained policy RNG stream continues across evaluations; these
+runs avoid compilation but are not independently reseeded or deterministic
+sample pairs. An unrelated existing endpoint is never stopped by the launcher.
 
 Run either command once with `--print-config` before allocating the server or
 creating outputs. Source worktrees must be clean by default;
@@ -194,17 +201,19 @@ is retained in `effective_config.json`.
 
 Dedicated mode starts and stops exactly one server and reads the MINT/OpenPI
 commits from the worktrees it launches. For a parameter sweep on the same
-checkpoint, `--keep-server` can hand the owned server to the operator after a
-successful run; the launcher writes `server.keepalive.json` and uses `nohup`
-so subsequent existing-endpoint evaluations can reuse the in-process compiled
-`sample_fn`. Stop only that explicitly owned process with:
+checkpoint, `--keep-server` hands the owned server and compiled action session
+to the operator after a successful run; the launcher writes
+`server.keepalive.json` and uses `nohup`. Subsequent runs must use
+`--reuse-server-info` so they submit to that retained session rather than
+creating a new one. Stop only that explicitly owned lifecycle with:
 
 ```bash
 ./scripts/remote/stop_owned_mode4_server.sh <output>/server.keepalive.json
 ```
 
-The stop helper verifies the marker, PID command line, and endpoint before
-sending a graceful signal. Persistent JAX executable serialization is disabled
+The stop helper verifies the marker, PID command line, and endpoint, deletes
+the retained action session, and then sends a graceful server signal. Persistent
+JAX executable serialization is disabled
 by default because this pi0.5 runtime cannot serialize the multi-GB executable;
 `--enable-jax-persistent-cache` is an intentional opt-in after validation. The
 historical `deliver_mode4_eval.sh` remains a delivery-specific record, not a

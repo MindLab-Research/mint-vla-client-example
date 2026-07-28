@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import ExitStack
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 import os
@@ -168,6 +169,16 @@ def parse_args() -> argparse.Namespace:
         help="locked training norm_stats directory; required for B target recovery",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--action-session-id",
+        default=None,
+        help="reuse an externally owned action session; this evaluator will not delete it",
+    )
+    parser.add_argument(
+        "--keep-action-session",
+        action="store_true",
+        help="retain the action session created by this evaluator after successful completion",
+    )
     parser.add_argument("--chunk-stride", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument(
@@ -289,6 +300,23 @@ def delete_session(args: argparse.Namespace, headers: dict[str, str], session_id
         )
     except Exception:
         pass
+
+
+def write_retained_session_marker(args: argparse.Namespace, session_id: str) -> Path:
+    marker = args.output_dir / "action_session.retained.json"
+    payload = {
+        "status": "retained",
+        "retained_at": datetime.now(timezone.utc).isoformat(),
+        "action_session_id": session_id,
+        "base_url": args.base_url,
+        "model": args.model,
+        "model_path": args.model_path,
+        "owner_id": args.owner_id,
+    }
+    temporary = marker.with_suffix(marker.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(marker)
+    return marker
 
 
 def query_action(
@@ -812,6 +840,8 @@ def run_variant(
         },
         "joint_limit_clipping": clipping,
         "query_count": len(query_timings),
+        "action_session_id": active_session_id,
+        "action_session_owned_by_variant": owns_session,
         "video_mode": video_mode,
         "timing": {
             "phase_seconds": {name: float(value) for name, value in phase_seconds.items()},
@@ -891,6 +921,8 @@ def main() -> int:
         raise ValueError("--temporal-decay must be in (0, 1]")
     if args.act_batch_size <= 0:
         raise ValueError("--act-batch-size must be positive")
+    if args.action_session_id and args.keep_action_session:
+        raise ValueError("--action-session-id and --keep-action-session are mutually exclusive")
 
     multi_row = args.row_indices is not None
     eval_rows = (
@@ -977,38 +1009,28 @@ def main() -> int:
             gesture_index=args._gesture_index,
         )
 
-    if not multi_row:
-        row_index = eval_rows[0]
-        row = load_eval_row(row_index)
-        object_name = full.safe_object_name(row)
-        results = [
-            run_variant(
-                args=args,
-                row=row,
-                data_config=data_config,
-                mode="mode4",
-                headers=headers,
-                object_name=object_name,
-            )
-        ]
-        summary = build_row_summary(
-            args=args,
-            row_index=row_index,
-            normalization_rows=normalization_rows,
-            results=results,
-        )
-        (args.output_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
-        print(json.dumps(summary, indent=2), flush=True)
-        return 0
+    shared_session_id = args.action_session_id
+    created_session = False
+    needs_shared_session = multi_row or bool(args.action_session_id) or args.keep_action_session
+    if needs_shared_session and not shared_session_id:
+        shared_session_id = create_session(args, headers)
+        created_session = True
 
-    shared_session_id = create_session(args, headers)
-    row_summaries: list[dict] = []
+    if args.action_session_id:
+        session_source = "external"
+        session_cleanup_owner = "external"
+    elif created_session:
+        session_source = "created"
+        session_cleanup_owner = "caller" if args.keep_action_session else "evaluator"
+    else:
+        session_source = "variant_ephemeral"
+        session_cleanup_owner = "variant"
+
+    evaluation_succeeded = False
+    retained_marker: Path | None = None
     try:
-        for row_index in eval_rows:
-            row_output_dir = args.output_dir / f"row{row_index}"
-            row_output_dir.mkdir(parents=True, exist_ok=True)
+        if not multi_row:
+            row_index = eval_rows[0]
             row = load_eval_row(row_index)
             object_name = full.safe_object_name(row)
             results = [
@@ -1020,62 +1042,100 @@ def main() -> int:
                     headers=headers,
                     object_name=object_name,
                     session_id=shared_session_id,
-                    row_index=row_index,
-                    output_dir=row_output_dir,
                 )
             ]
-            row_summary = build_row_summary(
+            summary = build_row_summary(
                 args=args,
                 row_index=row_index,
                 normalization_rows=normalization_rows,
                 results=results,
             )
-            (row_output_dir / "summary.json").write_text(
-                json.dumps(row_summary, indent=2), encoding="utf-8"
-            )
-            row_summaries.append(row_summary)
-    finally:
-        delete_session(args, headers, shared_session_id)
+        else:
+            row_summaries: list[dict] = []
+            for row_index in eval_rows:
+                row_output_dir = args.output_dir / f"row{row_index}"
+                row_output_dir.mkdir(parents=True, exist_ok=True)
+                row = load_eval_row(row_index)
+                object_name = full.safe_object_name(row)
+                results = [
+                    run_variant(
+                        args=args,
+                        row=row,
+                        data_config=data_config,
+                        mode="mode4",
+                        headers=headers,
+                        object_name=object_name,
+                        session_id=shared_session_id,
+                        row_index=row_index,
+                        output_dir=row_output_dir,
+                    )
+                ]
+                row_summary = build_row_summary(
+                    args=args,
+                    row_index=row_index,
+                    normalization_rows=normalization_rows,
+                    results=results,
+                )
+                (row_output_dir / "summary.json").write_text(
+                    json.dumps(row_summary, indent=2), encoding="utf-8"
+                )
+                row_summaries.append(row_summary)
 
-    summary = {
-        "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
-        "model_path": args.model_path,
-        "row_indices": eval_rows,
-        "client_commit": args.client_commit,
-        "backend_commit": args.backend_commit,
-        "model_commit": args.model_commit,
-        "action_source": args.action_source,
-        "language_conditioning": args.language_conditioning,
-        "gesture_index": (
-            str(args._gesture_index.path) if args._gesture_index is not None else None
-        ),
-        "gesture_index_sha256": (
-            args._gesture_index.sha256 if args._gesture_index is not None else None
-        ),
-        "lance_dataset": str(args.lance_dataset),
-        "shared_session": True,
-        "normalization_row_indices": normalization_rows,
-        "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
-        "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
-        ),
-        "contact_semantics": (
-            CONTACT_SEMANTICS if args.extended_state else None
-        ),
-        "contact_rule": (
-            CONTACT_RULE if args.extended_state else None
-        ),
-        "norm_sha_expected": getattr(args, "norm_sha_expected", None),
-        "norm_sha_actual": getattr(args, "norm_sha_actual", None),
-        "frame_window": "full_from_frame0",
-        "object_pose_source": "sim_owned_after_frame0",
-        "act_mode": args.act_mode,
-        "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
-        "video_mode": getattr(args, "video_mode", "full"),
-        "max_warm_request_seconds": args.max_warm_request_seconds,
-        "rows": row_summaries,
-    }
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            summary = {
+                "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
+                "model_path": args.model_path,
+                "row_indices": eval_rows,
+                "client_commit": args.client_commit,
+                "backend_commit": args.backend_commit,
+                "model_commit": args.model_commit,
+                "action_source": args.action_source,
+                "language_conditioning": args.language_conditioning,
+                "gesture_index": (
+                    str(args._gesture_index.path) if args._gesture_index is not None else None
+                ),
+                "gesture_index_sha256": (
+                    args._gesture_index.sha256 if args._gesture_index is not None else None
+                ),
+                "lance_dataset": str(args.lance_dataset),
+                "shared_session": True,
+                "normalization_row_indices": normalization_rows,
+                "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
+                "state_contract": STATE_CONTRACT_ID if args.extended_state else None,
+                "contact_semantics": CONTACT_SEMANTICS if args.extended_state else None,
+                "contact_rule": CONTACT_RULE if args.extended_state else None,
+                "norm_sha_expected": getattr(args, "norm_sha_expected", None),
+                "norm_sha_actual": getattr(args, "norm_sha_actual", None),
+                "frame_window": "full_from_frame0",
+                "object_pose_source": "sim_owned_after_frame0",
+                "act_mode": args.act_mode,
+                "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+                "video_mode": getattr(args, "video_mode", "full"),
+                "max_warm_request_seconds": args.max_warm_request_seconds,
+                "rows": row_summaries,
+            }
+
+        session_metadata = {
+            "id": shared_session_id,
+            "source": session_source,
+            "cleanup_owner": session_cleanup_owner,
+            "retained": bool(args.action_session_id or args.keep_action_session),
+        }
+        if args.keep_action_session:
+            if not shared_session_id or not created_session:
+                raise RuntimeError("retained action session must be created by this evaluator")
+            retained_marker = write_retained_session_marker(args, shared_session_id)
+            session_metadata["marker"] = str(retained_marker)
+        summary["action_session"] = session_metadata
+        (args.output_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        evaluation_succeeded = True
+    finally:
+        if created_session and (not args.keep_action_session or not evaluation_succeeded):
+            delete_session(args, headers, shared_session_id)
+            if retained_marker is not None and not evaluation_succeeded:
+                retained_marker.unlink(missing_ok=True)
+
     print(json.dumps(summary, indent=2), flush=True)
     return 0
 
