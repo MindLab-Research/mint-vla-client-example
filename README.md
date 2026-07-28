@@ -159,7 +159,7 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
 For every new Mode4 checkpoint/row evaluation, use the single parameterized
 launcher rather than copying an experiment script. It can attach to an existing
 endpoint or own a dedicated server and records the effective stride, ensemble,
-server, and source provenance in the output root:
+server, source provenance, and per-phase timing in the output root:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help
@@ -194,7 +194,11 @@ Remove `--print-config` only when the printed allocation is correct.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.
 - `scripts/remote/run_mode4_eval.sh`: parameterized Mode4 evaluation launcher
   for an existing MINT endpoint or an explicitly owned dedicated server; it
-  records effective configuration and source/normalization provenance.
+  records effective configuration, source/normalization provenance, phase
+  timings, and supports explicit `--video-mode none` diagnostic sweeps and
+  `--keep-server` reuse.
+- `scripts/remote/stop_owned_mode4_server.sh`: ownership-checked graceful stop
+  for a server handed off with `--keep-server`.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server
   launcher; not a shared-server lifecycle command. Persistent JAX executable
   serialization is disabled unless explicitly enabled.

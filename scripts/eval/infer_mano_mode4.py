@@ -9,6 +9,7 @@ executed by the same 200 Hz native position-servo contract as quality replay.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from io import BytesIO
 import json
 import os
@@ -187,6 +188,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
     parser.add_argument(
+        "--video-mode",
+        choices=("full", "none"),
+        default="full",
+        help="full writes the three canonical videos; none keeps policy observation rendering but skips output-video rendering/encoding",
+    )
+    parser.add_argument(
         "--client-commit",
         default=os.environ.get("VLA_CLIENT_GIT_COMMIT"),
         help="optional client source SHA (launcher supplies this when available)",
@@ -349,6 +356,7 @@ def run_variant(
         raise ValueError(f"only mode4 exists, got {mode!r}")
     if args.action_source != URDF_TARGET_ABSOLUTE:
         raise ValueError("Mode4 requires urdf_target_absolute checkpoint semantics")
+    video_mode = getattr(args, "video_mode", "full")
     selected_row_index = args.row_index if row_index is None else row_index
     source_frames = full.row_frame_count(row)
     timestamps = np.asarray(row["timestamp"], dtype=np.float64)
@@ -379,6 +387,19 @@ def run_variant(
 
     out = (args.output_dir if output_dir is None else output_dir) / "mode4"
     out.mkdir(parents=True, exist_ok=True)
+    rollout_started = time.perf_counter()
+    phase_seconds = {
+        "scene_setup": 0.0,
+        "session_setup": 0.0,
+        "query_preparation": 0.0,
+        "action_request": 0.0,
+        "target_processing": 0.0,
+        "physics_step": 0.0,
+        "render_and_video": 0.0,
+        "array_finalize": 0.0,
+    }
+    phase_counts = {"queries": 0, "frames": frame_count, "video_frames_written": 0}
+    scene_started = time.perf_counter()
     tmp, model, data, renderer, object_addr, _, hand_addrs, _, limits = physics.make_scene(
         object_name,
         args.width,
@@ -407,6 +428,7 @@ def run_variant(
     )
     import mujoco as _mujoco
     _mujoco.mj_forward(model, data)
+    phase_seconds["scene_setup"] += time.perf_counter() - scene_started
     # Record lift baseline from Mode 4's actual initialized sim state.
     object_z_initial = (
         float(data.qpos[object_addr + 2]) if args.extended_state else 0.0
@@ -446,40 +468,56 @@ def run_variant(
     owns_session = False
     headers = dict(headers)
     try:
+        session_started = time.perf_counter()
         active_session_id, owns_session = acquire_action_session(
             session_id, lambda: create_session(args, headers)
         )
-        with imageio.get_writer(
-            str(head_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as head_writer, imageio.get_writer(
-            str(wrist_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as wrist_writer, imageio.get_writer(
-            str(dataset_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as dataset_writer:
-            sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
-            dataset_head = resize_for_video(decode_jpeg(row["image"][0]), args.width, args.height)
-            dataset_wrist = resize_for_video(
-                decode_jpeg(row["wrist_image"][0]), args.width, args.height
-            )
-            head_writer.append_data(
-                np.concatenate(
-                    [
-                        label(sim_head, "MODE4 PHYSICS frame 0"),
-                        label(dataset_head, "DATASET frame 0"),
-                    ],
-                    axis=1,
+        phase_seconds["session_setup"] += time.perf_counter() - session_started
+        with ExitStack() as video_stack:
+            head_writer = wrist_writer = dataset_writer = None
+            if video_mode == "full":
+                head_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(head_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
                 )
-            )
-            wrist_writer.append_data(
-                np.concatenate(
-                    [
-                        label(sim_wrist, "MODE4 PHYSICS wrist 0"),
-                        label(dataset_wrist, "DATASET wrist 0"),
-                    ],
-                    axis=1,
+                wrist_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(wrist_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
                 )
-            )
-            dataset_writer.append_data(label(dataset_head, "DATASET reference frame 0"))
+                dataset_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(dataset_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
+                )
+                video_started = time.perf_counter()
+                sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
+                dataset_head = resize_for_video(decode_jpeg(row["image"][0]), args.width, args.height)
+                dataset_wrist = resize_for_video(
+                    decode_jpeg(row["wrist_image"][0]), args.width, args.height
+                )
+                head_writer.append_data(
+                    np.concatenate(
+                        [
+                            label(sim_head, "MODE4 PHYSICS frame 0"),
+                            label(dataset_head, "DATASET frame 0"),
+                        ],
+                        axis=1,
+                    )
+                )
+                wrist_writer.append_data(
+                    np.concatenate(
+                        [
+                            label(sim_wrist, "MODE4 PHYSICS wrist 0"),
+                            label(dataset_wrist, "DATASET wrist 0"),
+                        ],
+                        axis=1,
+                    )
+                )
+                dataset_writer.append_data(label(dataset_head, "DATASET reference frame 0"))
+                phase_seconds["render_and_video"] += time.perf_counter() - video_started
+                phase_counts["video_frames_written"] += 1
 
             for frame in range(window_end):
                 current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
@@ -503,6 +541,7 @@ def run_variant(
                 observation_contacts.append(state[26:31].copy())
                 observation_lift.append(state[31])
                 if frame % args.chunk_stride == 0:
+                    query_prepare_started = time.perf_counter()
                     head_image, wrist_image = physics.render_current_state(model, data, renderer)
                     datum = build_datum(
                         row,
@@ -515,6 +554,7 @@ def run_variant(
                         window_end=window_end,
                     )
                     datum["data_config"] = data_config
+                    phase_seconds["query_preparation"] += time.perf_counter() - query_prepare_started
                     pred_norm, pred_phys, gt_norm, timing = query_action(
                         args=args,
                         headers=headers,
@@ -524,6 +564,8 @@ def run_variant(
                     query_index = len(query_timings)
                     timing = {"query_index": query_index, "source_frame": frame, **timing}
                     query_timings.append(timing)
+                    phase_seconds["action_request"] += float(timing["wall_seconds"])
+                    phase_counts["queries"] += 1
                     if args.act_mode == "batch" and timing.get("used_data_sharding") is not True:
                         raise RuntimeError("act_batch did not use data sharding")
                     if (
@@ -535,6 +577,7 @@ def run_variant(
                         raise RuntimeError(
                             f"warm latency {timing['wall_seconds']:.3f}s exceeds limit"
                         )
+                    target_processing_started = time.perf_counter()
                     rollout_phys = np.asarray(pred_phys, dtype=np.float32).copy()
                     query_q = state[:HAND_DIM].copy()
                     target_hand = reconstruct_absolute_target_chunk(query_q, rollout_phys[:HORIZON])
@@ -548,6 +591,8 @@ def run_variant(
                         }
                     )
                     candidates = [c for c in candidates if frame < c["start"] + HORIZON]
+                    phase_seconds["target_processing"] += time.perf_counter() - target_processing_started
+                target_processing_started = time.perf_counter()
                 active = [c for c in candidates if c["start"] <= frame < c["start"] + HORIZON]
                 if not active:
                     raise RuntimeError(f"no action candidate at frame {frame}")
@@ -572,6 +617,8 @@ def run_variant(
                 record_clipping(clipping, clip_event)
                 preclip_target = np.asarray(absolute_target, dtype=np.float32)
                 servo_target = np.asarray(target, dtype=np.float32)
+                phase_seconds["target_processing"] += time.perf_counter() - target_processing_started
+                physics_started = time.perf_counter()
                 before = current_q.copy()
                 diagnostics = physics.step_servo(
                     model=model,
@@ -618,35 +665,40 @@ def run_variant(
                         data.qpos[object_addr + 3 : object_addr + 7], dtype=np.float32
                     ).copy()
                 )
-                next_frame = frame + 1
-                sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
-                dataset_head = resize_for_video(
-                    decode_jpeg(row["image"][next_frame]), args.width, args.height
-                )
-                dataset_wrist = resize_for_video(
-                    decode_jpeg(row["wrist_image"][next_frame]), args.width, args.height
-                )
-                head_writer.append_data(
-                    np.concatenate(
-                        [
-                            label(sim_head, f"MODE4 PHYSICS frame {next_frame}"),
-                            label(dataset_head, f"DATASET frame {next_frame}"),
-                        ],
-                        axis=1,
+                phase_seconds["physics_step"] += time.perf_counter() - physics_started
+                if video_mode == "full":
+                    video_started = time.perf_counter()
+                    next_frame = frame + 1
+                    sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
+                    dataset_head = resize_for_video(
+                        decode_jpeg(row["image"][next_frame]), args.width, args.height
                     )
-                )
-                wrist_writer.append_data(
-                    np.concatenate(
-                        [
-                            label(sim_wrist, f"MODE4 PHYSICS wrist {next_frame}"),
-                            label(dataset_wrist, f"DATASET wrist {next_frame}"),
-                        ],
-                        axis=1,
+                    dataset_wrist = resize_for_video(
+                        decode_jpeg(row["wrist_image"][next_frame]), args.width, args.height
                     )
-                )
-                dataset_writer.append_data(
-                    label(dataset_head, f"DATASET reference frame {next_frame}")
-                )
+                    head_writer.append_data(
+                        np.concatenate(
+                            [
+                                label(sim_head, f"MODE4 PHYSICS frame {next_frame}"),
+                                label(dataset_head, f"DATASET frame {next_frame}"),
+                            ],
+                            axis=1,
+                        )
+                    )
+                    wrist_writer.append_data(
+                        np.concatenate(
+                            [
+                                label(sim_wrist, f"MODE4 PHYSICS wrist {next_frame}"),
+                                label(dataset_wrist, f"DATASET wrist {next_frame}"),
+                            ],
+                            axis=1,
+                        )
+                    )
+                    dataset_writer.append_data(
+                        label(dataset_head, f"DATASET reference frame {next_frame}")
+                    )
+                    phase_seconds["render_and_video"] += time.perf_counter() - video_started
+                    phase_counts["video_frames_written"] += 1
     finally:
         if owns_session and active_session_id:
             delete_session(args, headers, active_session_id)
@@ -677,6 +729,7 @@ def run_variant(
         "object_position_sim": out / "object_position_sim.npy",
         "object_quaternion_sim": out / "object_quaternion_sim.npy",
     }
+    array_finalize_started = time.perf_counter()
     np.save(arrays["actions_raw_pred_normalized"], raw_norm_all)
     np.save(arrays["actions_raw_pred_physical"], raw_phys_all)
     np.save(arrays["actions_commanded_physical"], np.asarray(commanded_steps, dtype=np.float32))
@@ -701,6 +754,8 @@ def run_variant(
     np.save(arrays["hand_state_sim"], np.asarray(hand_states, dtype=np.float32))
     np.save(arrays["object_position_sim"], np.asarray(object_positions, dtype=np.float32))
     np.save(arrays["object_quaternion_sim"], np.asarray(object_quaternions, dtype=np.float32))
+    phase_seconds["array_finalize"] += time.perf_counter() - array_finalize_started
+    phase_seconds["rollout_wall"] = time.perf_counter() - rollout_started
     total_request_seconds = float(sum(float(t["wall_seconds"]) for t in query_timings))
     result = {
         "mode": "mode4",
@@ -757,13 +812,18 @@ def run_variant(
         },
         "joint_limit_clipping": clipping,
         "query_count": len(query_timings),
+        "video_mode": video_mode,
+        "timing": {
+            "phase_seconds": {name: float(value) for name, value in phase_seconds.items()},
+            "phase_counts": phase_counts,
+        },
         "total_request_seconds": total_request_seconds,
         "mean_request_seconds": total_request_seconds / max(len(query_timings), 1),
         "query_timings": query_timings,
         "pred_has_nan_inf": bool(not np.isfinite(raw_norm_all).all()),
-        "head_video": str(head_path),
-        "wrist_video": str(wrist_path),
-        "dataset_replay_video": str(dataset_path),
+        "head_video": str(head_path) if video_mode == "full" else None,
+        "wrist_video": str(wrist_path) if video_mode == "full" else None,
+        "dataset_replay_video": str(dataset_path) if video_mode == "full" else None,
         "arrays": {name: str(path) for name, path in arrays.items()},
     }
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
@@ -796,6 +856,7 @@ def build_row_summary(
         "row_index": row_index,
         "normalization_row_indices": normalization_rows,
         "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
+        "video_mode": getattr(args, "video_mode", "full"),
         "state_contract": (
             STATE_CONTRACT_ID if args.extended_state else None
         ),
@@ -1010,6 +1071,7 @@ def main() -> int:
         "object_pose_source": "sim_owned_after_frame0",
         "act_mode": args.act_mode,
         "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+        "video_mode": getattr(args, "video_mode", "full"),
         "max_warm_request_seconds": args.max_warm_request_seconds,
         "rows": row_summaries,
     }

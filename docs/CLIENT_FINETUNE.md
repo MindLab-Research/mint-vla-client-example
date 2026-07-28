@@ -118,6 +118,11 @@ remains sequential; repeated observations only fill the server's fixed sharded
 batch, and the evaluator consumes the first returned action. Timings include
 HTTP completion and result materialization. The server must expose the matching
 `act_batch` contract; failures are surfaced rather than silently falling back.
+Each row result now records `timing.phase_seconds`, separating action requests,
+query preparation, target processing, MuJoCo stepping, rendering/video, and
+array finalization. `video_mode=full` is the canonical delivery setting;
+`--video-mode none` preserves policy-observation rendering but skips the three
+output video encoders for faster diagnostic sweeps.
 
 For `mano_five_finger_contact_lift_v1`, training uses target-object Lance
 contact-record presence and Mode4 uses target-object × MANO-keypoint MuJoCo
@@ -145,7 +150,7 @@ NORM_ROWS=$(seq -s, 810 994)
   --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/<run>/norm \
   --output-dir /vePFS-Mindverse/user/intern/wenxi/results/client_runs/<run>-mode4 \
   --owner-id <owner> --chunk-stride 5 --temporal-decay 0.4 \
-  --act-mode batch --act-batch-size 4 \
+  --act-mode batch --act-batch-size 4 --video-mode full \
   --base-url http://127.0.0.1:30532 \
   --backend-commit <mint-commit> --model-commit <openpi-commit>
 ```
@@ -157,9 +162,30 @@ For a dedicated server, replace `--base-url` and the two declared commits with:
   --model-path <checkpoint> --dataset <dataset> --rows 924,960 \
   --normalization-rows "$(seq -s, 810 994)" --norm-stats-dir <norm> \
   --output-dir <new-output-root> --owner-id <owner> \
-  --own-server --server-runtime-root <unique-runtime-root> \
+  --own-server --server-runtime-root <checkpoint-bearing-server-root> \
   --server-port 30532 --server-gpus 4,5,6,7
 ```
+
+For a same-checkpoint parameter sweep, keep the owned server alive after the
+first successful evaluation:
+
+```bash
+# First evaluation: compile and hand the server off.
+./scripts/remote/run_mode4_eval.sh ... --own-server \
+  --server-runtime-root <checkpoint-bearing-server-root> \
+  --server-port 30532 --server-gpus 4,5,6,7 --keep-server
+
+# Later evaluations: attach to the explicitly owned endpoint.
+./scripts/remote/run_mode4_eval.sh ... --base-url http://127.0.0.1:30532 \
+  --backend-commit <mint-commit> --model-commit <openpi-commit>
+
+# End the lifecycle using the marker from the first output root.
+./scripts/remote/stop_owned_mode4_server.sh <first-output>/server.keepalive.json
+```
+
+This reuses the in-process compiled executable. It is appropriate only for a
+server whose ownership is explicit; an existing endpoint is never stopped by
+the launcher.
 
 Run either command once with `--print-config` before allocating the server or
 creating outputs. Source worktrees must be clean by default;
@@ -167,11 +193,22 @@ creating outputs. Source worktrees must be clean by default;
 is retained in `effective_config.json`.
 
 Dedicated mode starts and stops exactly one server and reads the MINT/OpenPI
-commits from the worktrees it launches. Persistent JAX executable
-serialization is disabled by default because this pi0.5 runtime cannot
-serialize the multi-GB executable; `--enable-jax-persistent-cache` is an
-intentional opt-in after validation. The historical `deliver_mode4_eval.sh`
-remains a delivery-specific record, not a template for new evaluations.
+commits from the worktrees it launches. For a parameter sweep on the same
+checkpoint, `--keep-server` can hand the owned server to the operator after a
+successful run; the launcher writes `server.keepalive.json` and uses `nohup`
+so subsequent existing-endpoint evaluations can reuse the in-process compiled
+`sample_fn`. Stop only that explicitly owned process with:
+
+```bash
+./scripts/remote/stop_owned_mode4_server.sh <output>/server.keepalive.json
+```
+
+The stop helper verifies the marker, PID command line, and endpoint before
+sending a graceful signal. Persistent JAX executable serialization is disabled
+by default because this pi0.5 runtime cannot serialize the multi-GB executable;
+`--enable-jax-persistent-cache` is an intentional opt-in after validation. The
+historical `deliver_mode4_eval.sh` remains a delivery-specific record, not a
+template for new evaluations.
 
 Connect to the GPU host and run:
 

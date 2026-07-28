@@ -123,6 +123,7 @@ class RunMode4EvalContractTests(unittest.TestCase):
             )
             self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
             self.assertEqual(payload["evaluation"]["normalization_row_indices"], [7, 2])
+            self.assertEqual(payload["evaluation"]["video_mode"], "full")
             self.assertEqual(payload["provenance"]["backend_commit"], "0123456789abcdef0123456789abcdef01234567")
             self.assertEqual(payload["provenance"]["model_commit"], "abcdef0123456789abcdef0123456789abcdef01")
             self.assertIsNone(payload["provenance"]["backend_dirty"])
@@ -132,6 +133,20 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 payload["provenance"]["norm_stats_sha256"],
                 hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest(),
             )
+
+    def test_print_config_accepts_video_none_without_creating_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            output = root / "no-video-output"
+            completed = self.run_launcher(
+                root,
+                *self.common_args(dataset, norm, output, "--video-mode", "none", "--print-config"),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["evaluation"]["video_mode"], "none")
+            self.assertFalse(output.exists())
 
     def test_owned_server_uses_worktree_commits_and_disables_cache_by_default(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -184,8 +199,20 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertFalse(
                 payload["dedicated_server"]["jax_persistent_executable_cache"]
             )
+            self.assertFalse(payload["dedicated_server"]["keep_server"])
             self.assertEqual(payload["dedicated_server"]["gpus"], [0])
             self.assertFalse(output.exists())
+
+    def test_keep_server_requires_owned_server(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(dataset, norm, root / "out", "--keep-server"),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("--keep-server requires --own-server", completed.stderr)
 
     def test_existing_endpoint_requires_declared_backend_and_model_commits(self):
         with tempfile.TemporaryDirectory() as temp:

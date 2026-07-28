@@ -32,6 +32,7 @@ ENDPOINT_LABEL=
 BACKEND_COMMIT=
 OPENPI_COMMIT=
 OWN_SERVER=0
+KEEP_SERVER=0
 SERVER_PORT=30532
 SERVER_PORT_SET=0
 SERVER_GPUS=
@@ -48,6 +49,7 @@ MAX_FRAMES=0
 FPS=10
 WIDTH=640
 HEIGHT=360
+VIDEO_MODE=full
 LANGUAGE_CONDITIONING=gesture
 GESTURE_INDEX="${REPO_ROOT}/config/datasets/new_all_generated_mano.index.json"
 OVERWRITE_OUTPUT=0
@@ -89,6 +91,7 @@ Evaluation options:
   --max-frames N              optional bounded smoke rollout; 0 means full
   --fps FLOAT                 output video FPS (default: 10)
   --width N --height N        per-panel render size (default: 640x360)
+  --video-mode full|none      full writes videos; none keeps observation rendering but skips output-video encoding
   --language-conditioning gesture|motion_variant|object_only
   --gesture-index PATH        canonical gesture index; required for gesture
   --api-key KEY               MINT API key (default: MINT_API_KEY)
@@ -100,6 +103,7 @@ Dedicated-server options:
   --openpi-root PATH          paired OpenPI checkout
   --python-bin PATH           GPU runtime Python
   --server-cache-dir PATH     cache path used only with explicit cache opt-in
+  --keep-server               leave an owned server running after success and write server.keepalive.json
   --enable-jax-persistent-cache
                               opt in to multi-GB executable serialization
 
@@ -130,6 +134,7 @@ while (($#)); do
     --backend-commit) BACKEND_COMMIT=${2:?}; shift 2 ;;
     --model-commit) OPENPI_COMMIT=${2:?}; shift 2 ;;
     --own-server) OWN_SERVER=1; shift ;;
+    --keep-server) KEEP_SERVER=1; shift ;;
     --server-port) SERVER_PORT=${2:?}; SERVER_PORT_SET=1; shift 2 ;;
     --server-gpus) SERVER_GPUS=${2:?}; SERVER_GPUS_SET=1; shift 2 ;;
     --server-runtime-root) SERVER_RUNTIME_ROOT=${2:?}; shift 2 ;;
@@ -147,6 +152,7 @@ while (($#)); do
     --fps) FPS=${2:?}; shift 2 ;;
     --width) WIDTH=${2:?}; shift 2 ;;
     --height) HEIGHT=${2:?}; shift 2 ;;
+    --video-mode) VIDEO_MODE=${2:?}; shift 2 ;;
     --language-conditioning) LANGUAGE_CONDITIONING=${2:?}; shift 2 ;;
     --gesture-index) GESTURE_INDEX=${2:?}; shift 2 ;;
     --api-key) MINT_API_KEY=${2:?}; shift 2 ;;
@@ -237,6 +243,7 @@ fi
 [[ "$CHUNK_STRIDE" =~ ^[0-9]+$ ]] && ((10#$CHUNK_STRIDE >= 1 && 10#$CHUNK_STRIDE < 10)) || \
   fail "--chunk-stride must be between 1 and 9"
 [[ "$ACT_MODE" == batch || "$ACT_MODE" == single ]] || fail "--act-mode must be batch or single"
+[[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
 require_nonnegative_int --max-frames "$MAX_FRAMES"
 ((10#$MAX_FRAMES == 0 || 10#$MAX_FRAMES >= 2)) || fail "--max-frames must be 0 or at least 2"
@@ -255,6 +262,9 @@ CLIENT_DIRTY=$(git_dirty "$REPO_ROOT")
 PROVENANCE_VERIFICATION=operator_declared
 MINT_DIRTY=null
 OPENPI_DIRTY=null
+if ((KEEP_SERVER && !OWN_SERVER)); then
+  fail "--keep-server requires --own-server"
+fi
 if ((OWN_SERVER)); then
   [[ -z "$BASE_URL" ]] || fail "--own-server and --base-url are mutually exclusive"
   ((SERVER_PORT_SET == 1)) || fail "--server-port is required with --own-server"
@@ -337,8 +347,8 @@ from datetime import datetime, timezone
     openpi_dirty, norm_sha, verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, max_warm, max_frames, fps, width,
-    height, language, gesture_index, server_port, server_gpus, runtime_root,
-    cache_dir, persistent_cache,
+    height, video_mode, language, gesture_index, server_port, server_gpus, runtime_root,
+    cache_dir, persistent_cache, keep_server,
 ) = sys.argv[1:]
 row_ids=list(dict.fromkeys(int(x) for x in rows.split(',')))
 normalization='all' if norm_rows == 'all' else list(dict.fromkeys(int(x) for x in norm_rows.split(',')))
@@ -369,6 +379,7 @@ payload={
         'fps': float(fps),
         'width': int(width),
         'height': int(height),
+        'video_mode': video_mode,
         'language_conditioning': language,
         'gesture_index': gesture_index if language == 'gesture' else None,
         'extended_state': True,
@@ -379,6 +390,7 @@ payload={
         'runtime_root': runtime_root,
         'cache_dir': cache_dir or None,
         'jax_persistent_executable_cache': persistent_cache == '1',
+        'keep_server': keep_server == '1',
     },
     'provenance': {
         'client_commit': client_commit,
@@ -401,9 +413,9 @@ CONFIG_ARGS=(
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$MAX_WARM_REQUEST_SECONDS"
-  "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX"
+  "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX"
   "$SERVER_PORT" "$SERVER_GPUS" "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
-  "$ENABLE_JAX_PERSISTENT_CACHE"
+  "$ENABLE_JAX_PERSISTENT_CACHE" "$KEEP_SERVER"
 )
 if ((PRINT_CONFIG)); then
   write_config "${CONFIG_ARGS[@]}"
@@ -438,6 +450,35 @@ Path(sys.argv[1]).write_text(json.dumps({
 }, indent=2) + '\n')
 PY
 }
+write_keepalive_marker() {
+  [[ -n "$server_pid" ]] || fail "cannot keep server alive without a server PID"
+  kill -0 "$server_pid" 2>/dev/null || fail "dedicated server exited before keepalive handoff"
+  python3 - "$OUTPUT_DIR/server.keepalive.json" "$server_pid" "$BASE_URL" \
+    "$SERVER_PORT" "$SERVER_GPUS" "$SERVER_RUNTIME_ROOT" "$OWNER_ID" \
+    "$CLIENT_COMMIT" "$BACKEND_COMMIT" "$OPENPI_COMMIT" <<'PY'
+import json, sys
+from datetime import datetime, timezone
+from pathlib import Path
+(
+    path, pid, base_url, port, gpus, runtime_root, owner_id,
+    client_commit, backend_commit, model_commit,
+) = sys.argv[1:]
+Path(path).write_text(json.dumps({
+    'status': 'owned_running',
+    'timestamp': datetime.now(timezone.utc).isoformat(),
+    'pid': int(pid),
+    'base_url': base_url,
+    'port': int(port),
+    'gpus': [int(x) for x in gpus.split(',')],
+    'runtime_root': runtime_root,
+    'owner_id': owner_id,
+    'client_commit': client_commit,
+    'backend_commit': backend_commit,
+    'model_commit': model_commit,
+    'source_output': str(Path(path).parent),
+}, indent=2) + '\n')
+PY
+}
 on_exit() {
   local rc=$?
   trap - EXIT
@@ -459,7 +500,11 @@ if ((OWN_SERVER)); then
     SERVER_CMD+=(--enable-jax-persistent-cache)
     [[ -z "$SERVER_CACHE_DIR" ]] || SERVER_CMD+=(--cache-dir "$SERVER_CACHE_DIR")
   fi
-  "${SERVER_CMD[@]}" > "$OUTPUT_DIR/server.log" 2>&1 &
+  if ((KEEP_SERVER)); then
+    nohup "${SERVER_CMD[@]}" > "$OUTPUT_DIR/server.log" 2>&1 &
+  else
+    "${SERVER_CMD[@]}" > "$OUTPUT_DIR/server.log" 2>&1 &
+  fi
   server_pid=$!
   printf '%s\n' "$server_pid" > "$OUTPUT_DIR/server.pid"
   ready=000
@@ -489,7 +534,7 @@ EVAL_ARGS=(
   --chunk-stride "$CHUNK_STRIDE" --temporal-decay "$TEMPORAL_DECAY"
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
   --max-warm-request-seconds "$MAX_WARM_REQUEST_SECONDS" --max-frames "$MAX_FRAMES"
-  --fps "$FPS" --width "$WIDTH" --height "$HEIGHT"
+  --fps "$FPS" --width "$WIDTH" --height "$HEIGHT" --video-mode "$VIDEO_MODE"
   --client-commit "$CLIENT_COMMIT" --backend-commit "$BACKEND_COMMIT"
   --model-commit "$OPENPI_COMMIT"
 )
@@ -506,6 +551,11 @@ MINT_API_KEY="$MINT_API_KEY" \
 
 SUMMARY_PATH="$OUTPUT_DIR/artifacts/summary.json"
 [[ -s "$SUMMARY_PATH" ]] || fail "Mode4 completed without summary: $SUMMARY_PATH"
+if ((KEEP_SERVER)); then
+  write_keepalive_marker
+  # on_exit must not clean a server explicitly handed off to the operator.
+  server_pid=
+fi
 python3 - "$OUTPUT_DIR/run.completed.json" "$SUMMARY_PATH" <<'PY'
 import json, sys
 from datetime import datetime, timezone
