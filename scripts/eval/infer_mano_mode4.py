@@ -178,6 +178,11 @@ def parse_args() -> argparse.Namespace:
         help="locked training norm_stats directory; required for B target recovery",
     )
     parser.add_argument(
+        "--norm-sha-expected",
+        default=EXPECTED_NORM_SHA256,
+        help="population-specific expected SHA256 of norm_stats.json",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=default_inference_output_dir("mode4"),
@@ -1252,8 +1257,10 @@ def main() -> int:
     ]
     if args.extended_state:
         # Authenticate the exact v1 normalization bytes before loading them.
-        _, actual_sha = verify_locked_norm_stats(args.norm_stats_dir)
-        args.norm_sha_expected = EXPECTED_NORM_SHA256
+        _, actual_sha = verify_locked_norm_stats(
+            args.norm_stats_dir,
+            expected_sha256=args.norm_sha_expected,
+        )
         args.norm_sha_actual = actual_sha
     norm_stats = L.normalize.load(args.norm_stats_dir)
     if args.extended_state:

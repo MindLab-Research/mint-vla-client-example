@@ -37,6 +37,7 @@ DATASET=${MINT_LANCE_DATASET}
 ROWS=
 NORMALIZATION_ROWS=
 NORM_STATS_DIR=
+NORM_SHA_EXPECTED=
 OUTPUT_DIR=
 RUN_NAME=
 OWNER_ID=
@@ -91,6 +92,7 @@ Required evaluation options:
   --rows, --row-indices CSV   ordered evaluation row IDs
   --normalization-rows, --normalization-row-indices CSV|all
   --norm-stats-dir PATH       checkpoint's locked normalization directory
+  --norm-sha-expected SHA     population-specific expected norm_stats.json SHA256
   --owner, --owner-id ID      MINT action-session owner ID; supplied by --reuse-server-info
 
 Endpoint selection (choose exactly one):
@@ -162,6 +164,7 @@ while (($#)); do
     --rows|--row-indices) ROWS=${2:?}; shift 2 ;;
     --normalization-rows|--normalization-row-indices) NORMALIZATION_ROWS=${2:?}; shift 2 ;;
     --norm-stats-dir) NORM_STATS_DIR=${2:?}; shift 2 ;;
+    --norm-sha-expected) NORM_SHA_EXPECTED=${2:?}; shift 2 ;;
     --output-dir) OUTPUT_DIR=${2:?}; shift 2 ;;
     --run-name) RUN_NAME=${2:?}; shift 2 ;;
     --owner|--owner-id) OWNER_ID=${2:?}; shift 2 ;;
@@ -490,6 +493,12 @@ if [[ -e "$OUTPUT_DIR" && "$OVERWRITE_OUTPUT" == 0 ]]; then
   fail "output already exists: $OUTPUT_DIR"
 fi
 NORM_SHA256=$(sha256sum "$NORM_STATS_DIR/norm_stats.json" | awk '{print $1}')
+if [[ -n "$NORM_SHA_EXPECTED" ]]; then
+  [[ "$NORM_SHA_EXPECTED" =~ ^[0-9a-fA-F]{64}$ ]] || fail "--norm-sha-expected must be 64 hexadecimal characters"
+  [[ "${NORM_SHA_EXPECTED,,}" == "$NORM_SHA256" ]] || \
+    fail "norm SHA mismatch: expected ${NORM_SHA_EXPECTED,,}, got $NORM_SHA256"
+  NORM_SHA_EXPECTED=${NORM_SHA_EXPECTED,,}
+fi
 
 write_config() {
   python3 - "$@" <<'PY'
@@ -497,7 +506,7 @@ import json, sys
 from datetime import datetime, timezone
 (
     client_commit, client_dirty, backend_commit, model_commit, mint_dirty,
-    openpi_dirty, norm_sha, release_id, release_manifest, release_sha,
+    openpi_dirty, norm_sha, norm_sha_expected, release_id, release_manifest, release_sha,
     verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
@@ -569,6 +578,7 @@ payload={
         'dataset_release_manifest': release_manifest,
         'dataset_release_manifest_sha256': release_sha,
         'norm_stats_sha256': norm_sha,
+        'norm_stats_sha256_expected': norm_sha_expected or None,
     },
 }
 print(json.dumps(payload, indent=2, sort_keys=True))
@@ -584,7 +594,7 @@ else
 fi
 CONFIG_ARGS=(
   "$CLIENT_COMMIT" "$CLIENT_DIRTY" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$MINT_DIRTY"
-  "$OPENPI_DIRTY" "$NORM_SHA256" "$MANO_RELEASE_ID" "$MANO_DATASET_RELEASE"
+  "$OPENPI_DIRTY" "$NORM_SHA256" "$NORM_SHA_EXPECTED" "$MANO_RELEASE_ID" "$MANO_DATASET_RELEASE"
   "$MANO_RELEASE_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
@@ -727,6 +737,9 @@ EVAL_ARGS=(
   --client-commit "$CLIENT_COMMIT" --backend-commit "$BACKEND_COMMIT"
   --model-commit "$OPENPI_COMMIT"
 )
+if [[ -n "$NORM_SHA_EXPECTED" ]]; then
+  EVAL_ARGS+=(--norm-sha-expected "$NORM_SHA_EXPECTED")
+fi
 if ((KEEP_SERVER)); then
   EVAL_ARGS+=(--keep-action-session)
 elif [[ -n "$ACTION_SESSION_ID" ]]; then

@@ -126,9 +126,17 @@ class RunMode4EvalContractTests(unittest.TestCase):
             root = Path(temp)
             _, _, mint_commit, openpi_commit, dataset, norm, config = base_fixture(root)
             output = root / "fresh-output"
+            expected_norm_sha = hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest()
             completed = self.run_launcher(
                 root,
-                *self.common_args(dataset, norm, output, "--print-config"),
+                *self.common_args(
+                    dataset,
+                    norm,
+                    output,
+                    "--norm-sha-expected",
+                    expected_norm_sha,
+                    "--print-config",
+                ),
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             payload = json.loads(completed.stdout)
@@ -159,9 +167,10 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertIsNone(payload["provenance"]["backend_dirty"])
             self.assertIsNone(payload["dedicated_server"])
             self.assertFalse(output.exists(), "--print-config must not create output")
+            self.assertEqual(payload["provenance"]["norm_stats_sha256"], expected_norm_sha)
             self.assertEqual(
-                payload["provenance"]["norm_stats_sha256"],
-                hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest(),
+                payload["provenance"]["norm_stats_sha256_expected"],
+                expected_norm_sha,
             )
             release_manifest = REPO_ROOT / "config/datasets/mano_dataset_release.json"
             release_payload = json.loads(release_manifest.read_text())
@@ -173,6 +182,24 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 payload["provenance"]["dataset_release_manifest_sha256"],
                 hashlib.sha256(release_manifest.read_bytes()).hexdigest(),
             )
+
+    def test_rejects_population_norm_sha_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "output",
+                    "--norm-sha-expected",
+                    "0" * 64,
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("norm SHA mismatch", completed.stderr)
 
     def test_default_output_uses_client_inference_root_and_run_name(self):
         with tempfile.TemporaryDirectory() as temp:
