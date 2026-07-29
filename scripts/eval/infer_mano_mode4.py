@@ -72,10 +72,8 @@ MANORL_PHYSICS_SUBSTEPS = physics.NATIVE_SUBSTEPS
 
 
 def inferred_contact_manifest_path(dataset: Path) -> Path:
-    """Return the locked ctx100 manifest colocated with the canonical Lance dataset."""
-    value = str(dataset)
-    stem = value[:-6] if value.endswith(".lance") else value
-    return Path(f"{stem}.contact_ctx100_error_v1.json")
+    """Resolve the release-owned sidecar or a deterministic non-release fallback."""
+    return contact_windows.default_manifest_path(dataset)
 
 
 def reconstruct_absolute_target_chunk(query_q: np.ndarray, pred_phys: np.ndarray) -> np.ndarray:
@@ -195,7 +193,7 @@ def parse_args() -> argparse.Namespace:
         "--contact-window-manifest",
         type=Path,
         default=None,
-        help="contact-window JSON; defaults to <dataset-without-.lance>.contact_ctx100_error_v1.json",
+        help="contact-window JSON; canonical data resolves release role contact_windows",
     )
     parser.add_argument(
         "--contact-context-frames",

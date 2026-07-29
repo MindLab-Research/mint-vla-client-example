@@ -17,7 +17,17 @@ fi
 : "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16}"
 : "${MINT_PYTHON_BIN:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}"
 : "${MINT_API_KEY:=tml-dummy}"
-: "${MINT_LANCE_DATASET:=}"
+: "${MANO_DATASET_RELEASE:=${REPO_ROOT}/config/datasets/mano_dataset_release.json}"
+CANONICAL_DATASET=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+  --manifest "${MANO_DATASET_RELEASE}" resolve training_dataset)
+CANONICAL_CONTACT_MANIFEST=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+  --manifest "${MANO_DATASET_RELEASE}" resolve contact_windows)
+CANONICAL_GESTURE_INDEX=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+  --manifest "${MANO_DATASET_RELEASE}" resolve language_index)
+MANO_RELEASE_ID=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+  --manifest "${MANO_DATASET_RELEASE}" release-id)
+MANO_RELEASE_SHA256=$(sha256sum "${MANO_DATASET_RELEASE}" | awk '{print $1}')
+: "${MINT_LANCE_DATASET:=${CANONICAL_DATASET}}"
 : "${VLA_CLIENT_RESULTS_ROOT:=${REPO_ROOT}/results}"
 : "${VLA_CLIENT_INFERENCE_ROOT:=${VLA_CLIENT_RESULTS_ROOT}/inference}"
 
@@ -62,7 +72,7 @@ CONTACT_WINDOW_MANIFEST=
 CONTACT_CONTEXT_FRAMES=100
 MISSING_CONTACT_POLICY=error
 LANGUAGE_CONDITIONING=gesture
-GESTURE_INDEX="${REPO_ROOT}/config/datasets/new_all_generated_mano.index.json"
+GESTURE_INDEX=${CANONICAL_GESTURE_INDEX}
 OVERWRITE_OUTPUT=0
 ALLOW_DIRTY_SOURCES=0
 PRINT_CONFIG=0
@@ -77,7 +87,7 @@ usage: run_mode4_eval.sh --model-path PATH --rows CSV \
 Required evaluation options:
   --model-path PATH           checkpoint identifier accepted by MINT
   --dataset, --lance-dataset PATH
-                              Lance dataset; defaults to MINT_LANCE_DATASET
+                              Lance dataset; defaults to release role training_dataset
   --rows, --row-indices CSV   ordered evaluation row IDs
   --normalization-rows, --normalization-row-indices CSV|all
   --norm-stats-dir PATH       checkpoint's locked normalization directory
@@ -110,7 +120,8 @@ Evaluation options:
   --frame-window contact|full contact initializes physics at the manifest window (default);
                               full is an explicit full-trajectory stress test
   --contact-window-manifest PATH
-                              default: <dataset-without-.lance>.contact_ctx100_error_v1.json
+                              canonical dataset uses release role contact_windows;
+                              non-release datasets derive <dataset-without-.lance>.contact_ctx100_error_v1.json
   --contact-context-frames N  must match the manifest (default: 100)
   --missing-contact-policy full|skip|error (default: error)
   --language-conditioning gesture|motion_variant|object_only
@@ -325,7 +336,11 @@ esac
 require_nonnegative_int --contact-context-frames "$CONTACT_CONTEXT_FRAMES"
 if [[ "$FRAME_WINDOW" == contact ]]; then
   if [[ -z "$CONTACT_WINDOW_MANIFEST" ]]; then
-    CONTACT_WINDOW_MANIFEST="${DATASET%.lance}.contact_ctx100_error_v1.json"
+    if [[ "$(readlink -f "$DATASET")" == "$(readlink -f "$CANONICAL_DATASET")" ]]; then
+      CONTACT_WINDOW_MANIFEST=${CANONICAL_CONTACT_MANIFEST}
+    else
+      CONTACT_WINDOW_MANIFEST="${DATASET%.lance}.contact_ctx100_error_v1.json"
+    fi
   fi
   require_absolute --contact-window-manifest "$CONTACT_WINDOW_MANIFEST"
   [[ -f "$CONTACT_WINDOW_MANIFEST" ]] || \
@@ -482,7 +497,8 @@ import json, sys
 from datetime import datetime, timezone
 (
     client_commit, client_dirty, backend_commit, model_commit, mint_dirty,
-    openpi_dirty, norm_sha, verification, endpoint_mode, endpoint_label,
+    openpi_dirty, norm_sha, release_id, release_manifest, release_sha,
+    verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
     max_warm, max_frames, fps, width, height, video_mode, frame_window,
@@ -549,6 +565,9 @@ payload={
         'backend_dirty': None if mint_dirty == 'null' else mint_dirty == 'true',
         'model_commit': model_commit,
         'model_dirty': None if openpi_dirty == 'null' else openpi_dirty == 'true',
+        'dataset_release_id': release_id,
+        'dataset_release_manifest': release_manifest,
+        'dataset_release_manifest_sha256': release_sha,
         'norm_stats_sha256': norm_sha,
     },
 }
@@ -565,7 +584,8 @@ else
 fi
 CONFIG_ARGS=(
   "$CLIENT_COMMIT" "$CLIENT_DIRTY" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$MINT_DIRTY"
-  "$OPENPI_DIRTY" "$NORM_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
+  "$OPENPI_DIRTY" "$NORM_SHA256" "$MANO_RELEASE_ID" "$MANO_DATASET_RELEASE"
+  "$MANO_RELEASE_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$ROW_EXECUTION" "$ROW_BATCH_SIZE"

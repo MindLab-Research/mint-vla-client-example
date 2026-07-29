@@ -22,7 +22,18 @@ fi
 : "${MINT_PI_FINETUNE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/pi-finetune}"
 : "${OPENPI_DATA_HOME:=/vePFS-Mindverse/share/models/openpi}"
 : "${HF_HOME:=/vePFS-Mindverse/share/huggingface}"
-: "${MINT_LANCE_DATASET:=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance}"
+: "${MANO_DATASET_RELEASE:=${REPO_ROOT}/config/datasets/mano_dataset_release.json}"
+if [[ -z "${MINT_LANCE_DATASET:-}" ]]; then
+  MINT_LANCE_DATASET=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+    --manifest "${MANO_DATASET_RELEASE}" resolve training_dataset)
+fi
+if [[ -z "${MINT_CONTACT_WINDOW_MANIFEST:-}" ]]; then
+  MINT_CONTACT_WINDOW_MANIFEST=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+    --manifest "${MANO_DATASET_RELEASE}" resolve contact_windows)
+fi
+MANO_RELEASE_ID=$(python3 "${REPO_ROOT}/scripts/mano_dataset_release.py" \
+  --manifest "${MANO_DATASET_RELEASE}" release-id)
+MANO_RELEASE_SHA256=$(sha256sum "${MANO_DATASET_RELEASE}" | awk '{print $1}')
 : "${VLA_CLIENT_RESULTS_ROOT:=${REPO_ROOT}/results}"
 : "${VLA_CLIENT_INFERENCE_ROOT:=${VLA_CLIENT_RESULTS_ROOT}/inference}"
 : "${MINT_GLVND_SHIM:=/vePFS-Mindverse/share/zhouch-caches/.cache/openvla_full_a800/glvnd_shim}"
@@ -85,10 +96,12 @@ if [[ -n "${MINT_OPENPI_ROOT}" && ! -f "${MINT_OPENPI_ROOT}/src/openpi/models/ge
   exit 2
 fi
 
-export MINT_BASE_URL MINT_API_KEY MINT_OPENPI_ROOT OPENPI_DATA_HOME HF_HOME MINT_LANCE_DATASET
+export MINT_BASE_URL MINT_API_KEY MINT_OPENPI_ROOT OPENPI_DATA_HOME HF_HOME
+export MANO_DATASET_RELEASE MANO_RELEASE_ID MANO_RELEASE_SHA256
+export MINT_LANCE_DATASET MINT_CONTACT_WINDOW_MANIFEST
 export VLA_CLIENT_RESULTS_ROOT VLA_CLIENT_INFERENCE_ROOT
 export JAX_PLATFORMS=cpu
-export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/scripts/train:${MINT_PI_FINETUNE_ROOT}/case/01_export_video:${MINT_OPENPI_ROOT:+${MINT_OPENPI_ROOT}/src:${MINT_OPENPI_ROOT}/packages/openpi-client/src:}${MINT_CODE_ROOT}:${MINT_EXTRA_PYDEPS}:${MINT_GRB_ROOT}/site-packages:${MINT_CPU_ROOT}/site-packages:${MINT_GRB_ROOT}/src/openpi/src:${MINT_GRB_ROOT}/src/openpi/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/scripts/train:${REPO_ROOT}/scripts/eval:${MINT_PI_FINETUNE_ROOT}/case/01_export_video:${MINT_OPENPI_ROOT:+${MINT_OPENPI_ROOT}/src:${MINT_OPENPI_ROOT}/packages/openpi-client/src:}${MINT_CODE_ROOT}:${MINT_EXTRA_PYDEPS}:${MINT_GRB_ROOT}/site-packages:${MINT_CPU_ROOT}/site-packages:${MINT_GRB_ROOT}/src/openpi/src:${MINT_GRB_ROOT}/src/openpi/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 if git -C "${REPO_ROOT}" rev-parse HEAD >/dev/null 2>&1; then
   VLA_CLIENT_GIT_COMMIT=$(git -C "${REPO_ROOT}" rev-parse HEAD)
@@ -122,6 +135,8 @@ fi
 echo "client_repo=${REPO_ROOT}"
 echo "client_git_commit=${VLA_CLIENT_GIT_COMMIT}"
 echo "mint_base_url=${MINT_BASE_URL}"
+echo "dataset_release=${MANO_RELEASE_ID}"
+echo "dataset_release_sha256=${MANO_RELEASE_SHA256}"
 echo "default_dataset=${MINT_LANCE_DATASET}"
 echo "results_root=${VLA_CLIENT_RESULTS_ROOT}"
 echo "inference_root=${VLA_CLIENT_INFERENCE_ROOT}"

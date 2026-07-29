@@ -62,6 +62,7 @@ import openpi.transforms as transforms
 
 from mint_server.backend.core.model_registry import MODEL_CONFIGS
 from scripts import contact_windows as contact_windows_lib
+from scripts import mano_dataset_release
 from scripts.openpi_profiles import (
     ACTION_LORA_R16_MODEL,
     LEGACY_L_LORA_MODEL,
@@ -724,7 +725,7 @@ def _build_batch(dataset: LanceViewpi05Dataset, data_config: openpi_config.DataC
 
 
 def main() -> int:
-    default_ds = "/vePFS-Mindverse/user/intern/wenxi/pi-finetune/data_source/lance/pi_video_streams_lance_smoke.lance"
+    default_ds = str(mano_dataset_release.resolve_role("training_dataset"))
     parser = argparse.ArgumentParser(description="pi0.5 VLA smoke driver over a real Lance dataset")
     parser.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL", "http://localhost:8000"))
     parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY", "dummy"))
@@ -745,7 +746,7 @@ def main() -> int:
     parser.add_argument(
         "--contact-window-manifest",
         default=os.environ.get("MINT_CONTACT_WINDOW_MANIFEST", ""),
-        help="JSON sidecar; defaults to DATASET.lance.contact_windows.json",
+        help="JSON sidecar; canonical data resolves release role contact_windows",
     )
     parser.add_argument(
         "--missing-contact-policy", choices=("full", "skip", "error"), default="full",

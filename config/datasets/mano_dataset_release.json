@@ -1,0 +1,445 @@
+{
+  "schema_version": 1,
+  "release_id": "mano_dataset_b_images_target_v20_20260729",
+  "status": "canonical",
+  "authority": {
+    "manifest": "client://config/datasets/mano_dataset_release.json",
+    "rule": "This manifest is the sole machine-readable resolver for MANO dataset paths, versions, hashes, owners, and canonical roles. Documentation and run configs may explain or override a role for one experiment but cannot redefine the release.",
+    "immutable_evidence_rule": "Historical result-root code and traces remain immutable provenance; they are not current production entrypoints.",
+    "no_copy_rule": "External raw data, 809GiB canonical data, assets, and pinned producer code retain one owner and are referenced rather than copied into the client."
+  },
+  "owners": {
+    "formal_client": {
+      "kind": "git_repository",
+      "path": "client://",
+      "responsibility": "release manifest, validation, target migration, runtime projection, training, Mode4"
+    },
+    "pi_finetune": {
+      "kind": "git_repository",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/pi-finetune",
+      "commit": "e18bb9eca6718e56cec2ec363f273a1cc72cb43c",
+      "responsibility": "kinematic image rendering, camera/scene construction, hand assets"
+    },
+    "ylang_shared": {
+      "kind": "shared_immutable_storage",
+      "path": "/vePFS-Mindverse/share/ylang",
+      "responsibility": "raw Dataset_B and object assets"
+    },
+    "wenxi_results": {
+      "kind": "project_storage",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results",
+      "responsibility": "canonical derived Lance, immutable logs, physics evidence"
+    }
+  },
+  "roles": {
+    "raw_dataset": "raw_lance",
+    "training_dataset": "canonical_lance",
+    "target_dataset": "canonical_lance",
+    "language_index": "gesture_index",
+    "contact_windows": "contact_manifest",
+    "assets": "mano_asset_bundle",
+    "physics_quality": "physics_evidence",
+    "physics_quality_generator": "physics_generator_code",
+    "physics_statistics": "physics_stats_summary",
+    "cube1_cube2_norm": "cube1_cube2_norm_stats"
+  },
+  "artifacts": {
+    "raw_lance": {
+      "kind": "lance_dataset",
+      "owner": "ylang_shared",
+      "path": "/vePFS-Mindverse/share/ylang/datasets/Dataset_B/new_all_generated_mano.lance",
+      "immutable": true,
+      "metadata_fingerprint_sha256": "07dd4df7c4be83d446c6c26ee93c4542d3c5381252002f0059d872f6b7b4a969",
+      "contract": {
+        "version": 236,
+        "row_count": 7539,
+        "frame_count": 6866627,
+        "frame_count_field": "trajectory_metadata.total_frames",
+        "top_level_fields": [
+          "index",
+          "trajectory_metadata",
+          "timestamp",
+          "hands",
+          "objects",
+          "contact"
+        ],
+        "hands_fields": [
+          "mano_global_pos",
+          "mano_global_rot_aa",
+          "mano_hand_pose",
+          "mano_joint_pos",
+          "urdf_dof"
+        ],
+        "tags": {}
+      }
+    },
+    "canonical_lance": {
+      "kind": "lance_dataset",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance",
+      "immutable_release": true,
+      "metadata_fingerprint_sha256": "605ccf8a3a8587d413f931354a6d18ca37fc2ccd0a2375967e56748ea3fc68a0",
+      "contract": {
+        "version": 20,
+        "row_count": 7539,
+        "frame_count": 6866627,
+        "frame_count_field": "episode_metadata.total_frames",
+        "top_level_fields": [
+          "index",
+          "trajectory_metadata",
+          "timestamp",
+          "objects",
+          "contact",
+          "image",
+          "wrist_image",
+          "state",
+          "actions",
+          "prompt",
+          "episode_metadata",
+          "hands"
+        ],
+        "hands_fields": [
+          "mano_global_pos",
+          "mano_global_rot_aa",
+          "mano_hand_pose",
+          "mano_joint_pos",
+          "urdf_dof",
+          "urdf_dof_target"
+        ],
+        "tags": {
+          "pre_mano_target": 17
+        }
+      }
+    },
+    "gesture_index": {
+      "kind": "gesture_index",
+      "owner": "formal_client",
+      "path": "client://config/datasets/new_all_generated_mano.index.json",
+      "sha256": "ec847b5dc3fa5f59e03849bec71e1eb5d2d8557ad0addfa2b52feba15ba0580f",
+      "contract": {
+        "version": "1.0",
+        "dataset_name": "new_all_generated_mano.lance",
+        "row_count": 7539,
+        "object_count": 17,
+        "gesture_count": 15,
+        "stratum_count": 91
+      }
+    },
+    "contact_manifest": {
+      "kind": "contact_manifest",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json",
+      "sha256": "49b6f843dc8a56132f915b145d5b2edb8d31bd8568c5b652d8e21ffa948b3731",
+      "contract": {
+        "manifest_version": 1,
+        "dataset": "/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance",
+        "row_count": 7539,
+        "context_frames": 100,
+        "missing_policy": "error"
+      }
+    },
+    "contact_manifest_compatibility_alias": {
+      "kind": "symlink",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance.contact_windows.json",
+      "target": "/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json",
+      "deprecated": true
+    },
+    "image_producer_repo": {
+      "kind": "git_repo",
+      "owner": "pi_finetune",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/pi-finetune",
+      "commit": "e18bb9eca6718e56cec2ec363f273a1cc72cb43c",
+      "file_sha256": {
+        "case/01_export_video/render_dataset_b_images.py": "f7244d920ea4ca46b01467acdfddb97f2d5c876acfc25f67334f44b1795641c7",
+        "case/01_export_video/export_mano_sim_video.py": "56e2feddb436e7dc8f38c52ff73bf89f880e320eac28c1dc9c2a8e8a8f44bc2c",
+        "case/01_export_video/add_training_fields_dataset_b.py": "1d8bf97a0d305a7260efc0a873ae5048a17f3b0624c095cfae56ff3b765d458c"
+      }
+    },
+    "render_merge_log": {
+      "kind": "file",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/logs/dataset_b_render/merge.log",
+      "sha256": "cbbcd88db938f8e9d36f65d6c0e0e49c133fe9331ea05f79847f82c42c521a64"
+    },
+    "training_fields_log": {
+      "kind": "file",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/logs/dataset_b_render/add_training_fields.log",
+      "sha256": "a720131d26aface88449cc813f2a1435bcabca514ea8942081b0670d75dfcc2a"
+    },
+    "target_migration_report": {
+      "kind": "json_contract",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/logs/dataset_b_target_migration/apply_v17.json",
+      "sha256": "43be464fe3a011a55e58ff99eba8a60914e4e69bd3de2fbf84b31fd549fb4165",
+      "top_level_equals": {
+        "status": "applied",
+        "final_version": 20,
+        "rollback_version": 17,
+        "promoted_version": 19,
+        "staged_version": 18
+      }
+    },
+    "target_migration_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/tools/migrate_mano_target_column.py",
+      "sha256": "19e667a6b096374581fde22ac2fe64663a8713111780b85f021ca313b7f1765d"
+    },
+    "gesture_contract_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/gesture_language.py",
+      "sha256": "4b90c311f9a6dfa7b70fcf18ae9e8ab5d26d2b5e7d60c28e9a77ce954193d484"
+    },
+    "contact_contract_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/contact_windows.py",
+      "sha256": "3c5ae68dc8bcaa6e87cbfca9798209a427659997651c8eeaa8d9a1f29d1a5cfe"
+    },
+    "state_contract_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/mano_state_contract.py",
+      "sha256": "089f19e7958f9f1839ffc53490369b842584a66dfc178d8d19e320f521375930"
+    },
+    "action_contract_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/target_actions.py",
+      "sha256": "0a6c669ade9ce6f2db165ff756b3f70f838752433ed021f21d9428e50e963667"
+    },
+    "wire_projection_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/train/openpi_vla_smoke_lance_base.py",
+      "sha256": "9ca4f66176ae20a3bc048092ec5de030313e477645021efa1ae4e3037ea56bff"
+    },
+    "training_loader_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/train/train_cube1_01_compare.py",
+      "sha256": "7e1b5b1bfd49d7bd7ce36e89fcc5f1bb0677fb11fc0572ac5d2d3e8b7e4c7c4a"
+    },
+    "scene_camera_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/eval/mano_action_support.py",
+      "sha256": "818632263988e335d439226bca164d31835d2c8ecae3378fa01d2b8f16dcd3c8"
+    },
+    "physics_contract_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/eval/mano_physics_core.py",
+      "sha256": "322fac2efc00f2eac186ff06929f1c218bda31391d4e84c4496a3833e241e4de"
+    },
+    "mano_asset_bundle": {
+      "kind": "asset_bundle",
+      "owner": "pi_finetune",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/pi-finetune/3rd-party/all_assets/Assets/HAND/s02/mano/Z_upNew/mano_hand.urdf",
+      "sha256": "d04056f11630405e3939efebde311e7d482a5cde628f0da279bf3646d949e9c4",
+      "contract": {
+        "hand_urdf": "/vePFS-Mindverse/user/intern/wenxi/pi-finetune/3rd-party/all_assets/Assets/HAND/s02/mano/Z_upNew/mano_hand.urdf",
+        "object_urdf_root": "/vePFS-Mindverse/share/ylang/all_assets/Assets/sim/mano_objects_urdf",
+        "object_names": [
+          "banana",
+          "bowl",
+          "cube1",
+          "cube2",
+          "cuboid2",
+          "cylinder1",
+          "cylinder2",
+          "cylinder3",
+          "cylinder4",
+          "cylinder5",
+          "cylinder6",
+          "mayonnaisebottle",
+          "powerdrill",
+          "scissor",
+          "sphere1",
+          "sphere2",
+          "sphere3"
+        ],
+        "fingerprint_algorithm": "sha256(sorted(logical_path + NUL + sha256(file_bytes) + LF))",
+        "file_count": 84
+      }
+    },
+    "physics_generator_code": {
+      "kind": "code_file",
+      "owner": "formal_client",
+      "path": "client://scripts/eval/replay_mano_target_physics.py",
+      "sha256": "e2946da67545a521c181b6e185a465911c7e446661ee7f4d05994ed46950e935"
+    },
+    "physics_generator_equivalence": {
+      "kind": "json_contract",
+      "owner": "formal_client",
+      "path": "client://results/dataset_release/mano_dataset_b_images_target_v20_20260729/physics_generator_equivalence.json",
+      "sha256": "c4e7e62aa8476efdf7765d60e13f38c4600489a88e7e3130d6a005bb56307356",
+      "top_level_equals": {
+        "accepted": true,
+        "row_index": 850,
+        "object": "cube1",
+        "grade_equal": true,
+        "metrics_exactly_equal": true
+      }
+    },
+    "physics_generator_archive": {
+      "kind": "code_file",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/physics_quality/mano_target_physics_200hz_v1_20260725/code/mano_physics_quality.py",
+      "sha256": "7632569f886c6e63e61078d4a847ba9ae4a8fb3c9b9172062874027cb9cb3a67",
+      "historical_only": true
+    },
+    "physics_compat_archive": {
+      "kind": "code_file",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/physics_quality/mano_target_physics_200hz_v1_20260725/code/mano_physics_compat.py",
+      "sha256": "d778df0f1f3c5b390ca2999a6c94cbea56a3b60f7b28e9c66438d76975c37b13",
+      "historical_only": true
+    },
+    "physics_evidence": {
+      "kind": "physics_evidence",
+      "owner": "wenxi_results",
+      "path": "/vePFS-Mindverse/user/intern/wenxi/results/physics_quality/mano_target_physics_200hz_v1_20260725",
+      "completion_marker": "all_physics_objects.completed",
+      "completion_marker_sha256": "902ff0505372efa7fbdbc2794f811cbc2d9193bfe1bf219a094df5334238adb7",
+      "contract": {
+        "id": "mano_target_physics_200hz_v1",
+        "object_count": 17,
+        "row_count": 7539,
+        "invalid_count": 0,
+        "grade_counts": {
+          "A": 187,
+          "B": 1167,
+          "C": 6185
+        },
+        "source_dt": 0.005,
+        "mujoco_dt": 0.0025,
+        "steps_per_interval": 2,
+        "target_offset": 0
+      }
+    },
+    "physics_stats_summary": {
+      "kind": "json_contract",
+      "owner": "formal_client",
+      "path": "client://results/training/mano_target_dof_physics_replay_stats_20260729/summary.json",
+      "sha256": "d8d5fb1388abc874d42e8b9e8773346bb4a44f4859e0374d4ae24f809f5b1acb"
+    },
+    "cube1_cube2_norm_stats": {
+      "kind": "file",
+      "owner": "formal_client",
+      "path": "client://results/training/cube1_cube2_all_32d_extended_norm_v1_20260728/norm_stats.json",
+      "sha256": "4f91eca8ee91d53426ea07faf28873ab98c3761ecb84d6374f4c0c439d51069a"
+    },
+    "cube1_cube2_norm_contract": {
+      "kind": "json_contract",
+      "owner": "formal_client",
+      "path": "client://results/training/cube1_cube2_all_32d_extended_norm_v1_20260728/data_contract.json",
+      "sha256": "fd10d2bd69343def95fd08bb75793cd60620e12ba8008e317d43ab85542ca102"
+    }
+  },
+  "pipeline": [
+    {
+      "stage": "kinematic_image_render",
+      "inputs": ["raw_lance", "mano_asset_bundle"],
+      "producer": "image_producer_repo",
+      "evidence": ["render_merge_log"],
+      "output": "canonical_lance",
+      "semantics": "Per-frame hand/object qpos assignment plus mj_forward and camera rendering; no mj_step."
+    },
+    {
+      "stage": "base_training_fields",
+      "inputs": ["canonical_lance"],
+      "producer": "image_producer_repo",
+      "evidence": ["training_fields_log"],
+      "output": "canonical_lance",
+      "semantics": "Persisted state is qpos padded to32; persisted actions are measured next-state delta, not B labels; persisted prompt is object-only."
+    },
+    {
+      "stage": "target_column_promotion",
+      "inputs": ["canonical_lance"],
+      "producer": "target_migration_code",
+      "evidence": ["target_migration_report"],
+      "output": "canonical_lance",
+      "semantics": "Promote hands[].urdf_dof_target without rewriting image fragments; rollback tag pre_mano_target remains at v17."
+    },
+    {
+      "stage": "runtime_training_projection",
+      "inputs": ["canonical_lance", "gesture_index", "contact_manifest", "cube1_cube2_norm_stats"],
+      "producer": [
+        "gesture_contract_code",
+        "contact_contract_code",
+        "state_contract_code",
+        "action_contract_code",
+        "wire_projection_code",
+        "training_loader_code"
+      ],
+      "output": "MINT_batch",
+      "semantics": "Build gesture prompt, contact/lift 32D state, B-schema horizon10 actions, population norm, and optional transient StateAug."
+    },
+    {
+      "stage": "recorded_target_physics_quality",
+      "inputs": ["canonical_lance", "gesture_index", "mano_asset_bundle"],
+      "historical_producer": ["physics_generator_archive", "physics_compat_archive"],
+      "current_producer": "physics_generator_code",
+      "current_scene_contract": ["scene_camera_code", "physics_contract_code"],
+      "acceptance_evidence": "physics_generator_equivalence",
+      "output": "physics_evidence",
+      "semantics": "Frame0 initialization; recorded target execution through MuJoCo dynamics; object is simulation-owned. The maintained generator reproduced historical row850 arrays and metrics bit-for-bit."
+    }
+  ],
+  "runtime_contracts": {
+    "state": {
+      "id": "mano_five_finger_contact_lift_v1",
+      "layout": "qpos[0:26], contact[index,thumb,ring,middle,pinky][26:31], lift[31]"
+    },
+    "action": {
+      "id": "urdf_target_absolute_B_v1",
+      "layout": "xyz3 relative, Euler3 absolute, finger20 relative, padding6 zero",
+      "horizon": 10,
+      "delta_mask": "11100011111111111111111111000000"
+    },
+    "contact_window": {
+      "context_frames": 100,
+      "missing_policy": "error"
+    },
+    "state_augmentation": {
+      "persisted": false,
+      "space": "quantile-normalized state[0:26]",
+      "label_invariant": "absolute PD target"
+    }
+  },
+  "retired_or_missing": {
+    "target_staging": {
+      "former_path": "/vePFS-Mindverse/user/intern/wenxi/results/datas/staging/new_all_generated_mano_with_target.lance",
+      "status": "deleted_after_promotion",
+      "authority": "target_migration_report"
+    },
+    "raw_npy_and_index_producer": {
+      "status": "not_present_on_current_host",
+      "evidence": "gesture_index source_path/source_sha256 fields"
+    },
+    "physics_result_root_code": {
+      "status": "immutable_historical_provenance",
+      "current_generator": "physics_generator_code",
+      "current_contract": "physics_contract_code"
+    }
+  },
+  "cleanup_policy": {
+    "delete_without_additional_approval": [
+      "empty directories",
+      "Python bytecode/cache",
+      "byte-identical derived duplicates after replacement by a compatibility symlink"
+    ],
+    "never_delete_as_cleanup": [
+      "raw_lance",
+      "canonical_lance or any retained Lance version/tag",
+      "physics_evidence traces/aggregates",
+      "training checkpoints",
+      "uncommitted checkout contents",
+      "artifacts with unresolved process/path references"
+    ]
+  }
+}

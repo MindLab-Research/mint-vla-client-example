@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from pathlib import Path
 import sys
@@ -38,6 +39,18 @@ def _load_compare_module() -> types.ModuleType:
     ):
         spec.loader.exec_module(module)
     return module
+
+
+class CompareTrainingReleaseTests(unittest.TestCase):
+    def test_release_provenance_hashes_the_canonical_manifest(self):
+        module = _load_compare_module()
+        provenance = module.dataset_release_provenance()
+        manifest = Path(provenance["manifest"])
+        self.assertEqual(provenance["release_id"], "mano_dataset_b_images_target_v20_20260729")
+        self.assertEqual(
+            provenance["manifest_sha256"],
+            hashlib.sha256(manifest.read_bytes()).hexdigest(),
+        )
 
 
 class _SamplingDataset:
@@ -128,6 +141,17 @@ class CompareTrainingCliTests(unittest.TestCase):
             )
             self.assertEqual(args.checkpoint_every, 0)
             self.assertEqual(args.checkpoint_save_path_template, "")
+
+    def test_b_schema_defaults_both_datasets_from_release(self) -> None:
+        compare = _load_compare_module()
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--action-source", "urdf_target_absolute",
+            "--save-path", "save", "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        expected = compare.mano_dataset_release.resolve_role("training_dataset")
+        self.assertEqual(args.lance_dataset, expected)
+        self.assertEqual(args.target_lance_dataset, expected)
 
     def test_parallel_worker_option_propagates_from_cli(self) -> None:
         compare = _load_compare_module()

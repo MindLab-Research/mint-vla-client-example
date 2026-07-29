@@ -30,6 +30,7 @@ physics state are computed here, before the request reaches MINT.
 
 ### Source-of-truth rule
 
+- `config/datasets/mano_dataset_release.json` is the sole machine-readable source of truth for MANO data, language/contact sidecars, producer commits, assets, runtime contracts, norms, and physics evidence. Launchers resolve canonical roles through `scripts/mano_dataset_release.py`; docs and local env files cannot redefine the release.
 - This Git repository is the source of truth for client code.
 - The checkout at `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`
   is both a real Git checkout and the supported execution directory.
@@ -73,7 +74,8 @@ The locked gesture03 v1 norm SHA256 is:
 | MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16`, `action-lora-r16` |
 | OpenPI model worktree | `/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16`, `action-lora-r16` |
 | Runtime | `/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl` |
-| Lance dataset | `/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance` |
+| MANO release resolver | `config/datasets/mano_dataset_release.json` |
+| Lance dataset (`training_dataset` role) | `/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance` |
 | Gesture03 v1 norm | `/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726` |
 
 Ports and GPUs are allocated per run. A different port does not imply a
@@ -143,10 +145,7 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
 
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
   --model openpi/pi05-action-lora-r16-finetune \
-  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
-  --target-lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
   --row-indices 810,811 \
-  --contact-window-manifest /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json \
   --missing-contact-policy error \
   --action-source urdf_target_absolute \
   --extended-state \
@@ -190,6 +189,8 @@ Remove `--print-config` only when the printed allocation is correct.
 
 ## Maintained entrypoints
 
+- `scripts/mano_dataset_release.py`: the only resolver for canonical MANO release roles.
+- `scripts/tools/validate_mano_dataset_release.py`: fail-closed fast/deep release validation for paths, hashes, Lance population/schema, producer commits, assets, and physics evidence.
 - `scripts/train/train_cube1_01_compare.py`: selected-row clean/StateAug
   training client, checkpointing, deadline handling, and locked norm metadata.
 - `scripts/train/openpi_vla_smoke_lance_base.py`: Lance projection and MINT wire
@@ -201,6 +202,7 @@ Remove `--print-config` only when the printed allocation is correct.
   numbered-mode multiplexer.
 - `scripts/eval/mano_physics_core.py`: MuJoCo scene, collision, five-finger
   pair-presence contact, servo, and timing.
+- `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target physics-quality producer; historical result-root code is immutable provenance only.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
   and norm SHA verifier.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.

@@ -28,6 +28,7 @@ import lance
 import numpy as np
 
 import openpi_vla_smoke_lance_base as L
+from scripts import mano_dataset_release
 from scripts.gesture_language import (
     DEFAULT_GESTURE_INDEX_PATH,
     GestureIndex,
@@ -68,6 +69,20 @@ LANGUAGE_CONDITIONING_CHOICES = (
     OBJECT_ONLY_LANGUAGE,
     MOTION_VARIANT_LANGUAGE,
 )
+
+
+def dataset_release_provenance() -> dict[str, str]:
+    manifest = Path(
+        os.environ.get(
+            "MANO_DATASET_RELEASE", str(mano_dataset_release.DEFAULT_RELEASE_MANIFEST)
+        )
+    ).expanduser().resolve()
+    payload = mano_dataset_release.load_release(manifest)
+    return {
+        "release_id": str(payload["release_id"]),
+        "manifest": str(manifest),
+        "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+    }
 
 
 def motion_variant_identifier(trajectory_metadata: dict[str, Any]) -> str:
@@ -1250,12 +1265,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default=os.environ.get("MINT_BASE_URL", "http://127.0.0.1:30531"))
     parser.add_argument("--api-key", default=os.environ.get("MINT_API_KEY", "tml-dummy"))
     parser.add_argument("--model", default=L.PI05_MODEL, choices=L.MODEL_CHOICES)
-    parser.add_argument("--lance-dataset", type=Path, required=True)
+    parser.add_argument(
+        "--lance-dataset",
+        type=Path,
+        default=mano_dataset_release.resolve_role("training_dataset"),
+        help="defaults to release role training_dataset",
+    )
     parser.add_argument(
         "--target-lance-dataset",
         type=Path,
         default=None,
-        help="row-aligned raw Lance source for hands[].urdf_dof_target",
+        help="row-aligned source for hands[].urdf_dof_target; B/P defaults to release role target_dataset",
     )
     parser.add_argument("--row-indices", default=",".join(map(str, DEFAULT_ROW_INDICES)), help="comma-separated source rows or 'all'")
     parser.add_argument(
@@ -1432,7 +1452,10 @@ def parse_args() -> argparse.Namespace:
         help="with --dry-run, build at least this many samples and report augmentation population metrics",
     )
     parser.add_argument("--dry-run", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.action_source != MEASURED_DELTA and args.target_lance_dataset is None:
+        args.target_lance_dataset = mano_dataset_release.resolve_role("target_dataset")
+    return args
 
 
 def periodic_checkpoint_path(
@@ -1587,7 +1610,9 @@ def main() -> int:
             target_noise_std=args.target_noise_std,
         )
 
+    release_provenance = dataset_release_provenance()
     print(json.dumps({
+        "dataset_release": release_provenance,
         "dataset": str(args.lance_dataset),
         "target_lance_dataset": (
             str(args.target_lance_dataset) if args.target_lance_dataset else None
@@ -1871,6 +1896,7 @@ def main() -> int:
                             else f"selected_rows_{len(row_indices)}_clean"))
             ),
             "client_git_commit": os.environ.get("VLA_CLIENT_GIT_COMMIT", "unknown"),
+            "dataset_release": release_provenance,
             "base_url": base_url,
             "model": args.model,
             "model_id": model_id,

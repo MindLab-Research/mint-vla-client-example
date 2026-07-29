@@ -20,6 +20,8 @@ from pathlib import Path
 import tempfile
 from typing import Any, Iterable, Mapping, Sequence
 
+from scripts import mano_dataset_release
+
 DEFAULT_CONTACT_CONTEXT_FRAMES = 100
 MANIFEST_VERSION = 1
 CONTACT_COLUMNS = ("contact", "trajectory_metadata", "episode_metadata")
@@ -303,7 +305,21 @@ def clamp_window(window: ContactWindow, total_frames: int) -> ContactWindow:
 
 
 def default_manifest_path(dataset_path: str | Path) -> Path:
-    return Path(f"{dataset_path}.contact_windows.json")
+    """Resolve the release sidecar for the canonical dataset.
+
+    Non-release datasets retain a deterministic colocated filename, but the
+    canonical dataset must never derive a second contact-manifest authority.
+    """
+    dataset = Path(dataset_path).expanduser().resolve()
+    release = mano_dataset_release.load_release()
+    canonical_dataset = mano_dataset_release.resolve_role(
+        "training_dataset", release=release
+    )
+    if dataset == canonical_dataset:
+        return mano_dataset_release.resolve_role(
+            "contact_windows", release=release
+        )
+    return Path(f"{dataset}.contact_windows.json")
 
 
 def _manifest_entries(raw: Mapping[str, Any]) -> dict[int, dict[str, Any]]:

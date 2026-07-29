@@ -163,6 +163,16 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 payload["provenance"]["norm_stats_sha256"],
                 hashlib.sha256((norm / "norm_stats.json").read_bytes()).hexdigest(),
             )
+            release_manifest = REPO_ROOT / "config/datasets/mano_dataset_release.json"
+            release_payload = json.loads(release_manifest.read_text())
+            self.assertEqual(
+                payload["provenance"]["dataset_release_id"],
+                release_payload["release_id"],
+            )
+            self.assertEqual(
+                payload["provenance"]["dataset_release_manifest_sha256"],
+                hashlib.sha256(release_manifest.read_bytes()).hexdigest(),
+            )
 
     def test_default_output_uses_client_inference_root_and_run_name(self):
         with tempfile.TemporaryDirectory() as temp:
