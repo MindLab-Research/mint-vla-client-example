@@ -164,6 +164,17 @@ class CompareTrainingCliTests(unittest.TestCase):
             args = compare.parse_args()
             self.assertEqual(args.batch_build_workers, 8)
             self.assertEqual(args.language_conditioning, "motion_variant")
+            self.assertFalse(args.skip_final_save)
+
+    def test_performance_probe_can_skip_final_sampler_save(self) -> None:
+        compare = _load_compare_module()
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--skip-final-save",
+            "--lance-dataset", "dataset.lance", "--save-path", "unused",
+            "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertTrue(args.skip_final_save)
 
     def test_learning_rate_propagates_to_explicit_adam_contract(self) -> None:
         compare = _load_compare_module()
