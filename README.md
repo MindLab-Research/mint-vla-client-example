@@ -217,7 +217,7 @@ Remove `--print-config` only when the printed allocation is correct.
   launcher; not a shared-server lifecycle command. Persistent JAX executable
   serialization is disabled unless explicitly enabled.
 - `docs/ARCHITECTURE.md`: client/MINT/OpenPI ownership and local-context policy.
-- `docs/MANO_DATA_PIPELINE.md`: canonical map of raw/derived MANO data, language labels, kinematic image rendering, target-DOF physics replay, assets, sidecars, and remaining provenance gaps.
+- `docs/MANO_DATA_PIPELINE.md`: canonical map of raw/derived MANO data, language labels, kinematic image rendering, target-DOF physics replay, assets, sidecars, and the current LoRA task boundary.
 - `docs/CLIENT_FINETUNE.md`: detailed client workflow.
 - `Tutorial.md`: historical MINT no-Ray protocol reference.
 

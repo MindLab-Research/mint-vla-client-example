@@ -267,19 +267,23 @@ mano_target_physics_200hz_v1_20260725/code/
 
 Release manifest对17个对象闭包内的hand URDF/mesh和object URDF/mesh共84个文件做统一content-addressed fingerprint；当前asset bundle SHA256为`d04056f11630405e3939efebde311e7d482a5cde628f0da279bf3646d949e9c4`。Camera/scene/physics contract由manifest中固定的producer commit和client code SHA共同认证。
 
-## 9. 当前仍缺的东西
+## 9. 当前LoRA任务边界
 
-已经解决：唯一release manifest、fail-closed validator、asset closure hash、canonical contact sidecar、formal-client physics-quality generator和历史trace等价性验收。
+当前工作是基于已认证canonical v20数据做LoRA训练和闭环评估。只要release manifest、Lance、gesture/contact sidecar、norm、assets和checkpoint可验证，synthetic NPY → raw Lance producer、target staging上游和image release orchestration都不属于当前任务，也不构成训练阻塞。它们只作为release provenance boundary记录，不进入当前worklist。
 
-### P0：阻碍从最原始源重建
+### Replay A/B/C的准确含义
 
-1. **原始synthetic NPY → raw Lance/index的producer没有归档到formal client或另一个已固定commit的owner。** Gesture index记录了source path、source SHA和匹配方法，但原root当前未挂载。
-2. **recorded target staging的上游生成源已清理。** Canonical v20、version17 rollback和迁移报告足够当前训练/replay，但不能从上游重新生成`urdf_dof_target`。
+A/B/C是**recorded target DOF在当前MuJoCo scene/controller下对参考物体轨迹的可复现性分层**。它使用整条full trajectory的最大物体平移误差：
 
-### P1：阻碍自动质量分层
+| Grade | `max_t ||p_replay[t] - p_reference[t]||₂` | 含义 |
+|---|---:|---|
+| A | `< 3 cm` | recorded target在当前物理配置下高度复现参考物体轨迹 |
+| B | `3–8 cm` | 有偏差但仍在既定qualified阈值内 |
+| C | `>= 8 cm` | recorded target本身已与参考物体轨迹明显分叉 |
 
-3. **Replay grade尚未形成一个canonical全局row-aligned sidecar供sampler/evaluator直接加载。** 现有17个per-object shards和统计完全可验证，但自动A/B/C分层还需要组装和接入，不应把grade直接写回809GiB主Lance。
-4. **Image release没有单命令orchestrator。** 生产脚本和commit已经固定，16-shard合并证据完整，但从raw Lance到完整image release仍由多个显式步骤组成。
+A/B合称`qualified`只表示target replay的轨迹误差小于8cm。它不是gesture类别、LoRA训练标签、loss等级，也不是抓取成功/失败等级；它只测物体平移误差，不直接测朝向、多指闭合、持续lift或稳定抓取。C行上的policy失败混合了policy误差和reference/scene/controller不一致，因此不能全部归因于模型；A/B行更适合隔离policy本身的闭环能力。
+
+当前LoRA训练不需要按A/B/C过滤，也不需要为此立即构建全局sidecar。只有在后续评估要自动报告“全部rows、A/B physics-feasible子集、C诊断子集”时，才值得把现有per-object grade组装成row-aligned evaluation sidecar；它属于可选评估工具，不是剩余缺口。
 
 ### 有意动态生成，不应误认为缺列
 
