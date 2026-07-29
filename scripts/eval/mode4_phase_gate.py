@@ -1,8 +1,8 @@
 """Event-driven grasp probe gate for diagnostic Mode4 rollouts.
 
 The gate is deliberately external to the policy.  It leaves approach/closure
-commands untouched until a persistent multi-finger contact candidate is
-observed, then holds the policy's contemporaneous finger target while applying
+commands untouched until persistent multi-finger contact is observed while
+object-floor support is clear, then holds the policy's contemporaneous finger target while applying
 a small root-Z probe followed by a larger retention lift.  Physical object
 motion, floor support, and persistent contacts decide whether each phase passes.
 """
@@ -152,7 +152,14 @@ class GraspProbePhaseGate:
         contact_count = int(np.count_nonzero(contacts > 0.5))
 
         if self.phase == GraspGatePhase.WAITING:
-            self.contact_run = self.contact_run + 1 if contact_count >= self.config.min_contact_count else 0
+            candidate_now = (
+                contact_count >= self.config.min_contact_count
+                and (
+                    not self.config.require_floor_clear
+                    or not bool(object_floor_contact)
+                )
+            )
+            self.contact_run = self.contact_run + 1 if candidate_now else 0
             if self.contact_run < self.config.contact_persistence_frames:
                 return GraspGateStep(proposed.copy(), self.phase, False, contact_count)
             self.phase = GraspGatePhase.PROBE

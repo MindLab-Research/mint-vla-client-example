@@ -59,8 +59,8 @@ def test_waiting_is_exact_passthrough() -> None:
 def test_probe_latches_achieved_root_and_policy_finger_target() -> None:
     gate = GraspProbePhaseGate(small_config())
     current, proposed, contacts, obj = inputs()
-    run_step(gate, 0, current, proposed, contacts, obj)
-    result = run_step(gate, 1, current, proposed, contacts, obj)
+    run_step(gate, 0, current, proposed, contacts, obj, floor=False)
+    result = run_step(gate, 1, current, proposed, contacts, obj, floor=False)
     assert result.phase is GraspGatePhase.PROBE
     assert result.override is True
     np.testing.assert_allclose(result.target[:2], current[:2])
@@ -73,9 +73,9 @@ def test_probe_latches_achieved_root_and_policy_finger_target() -> None:
 def test_physical_probe_and_retention_pass() -> None:
     gate = GraspProbePhaseGate(small_config())
     current, proposed, contacts, obj = inputs()
-    run_step(gate, 0, current, proposed, contacts, obj)
-    run_step(gate, 1, current, proposed, contacts, obj)
-    run_step(gate, 2, current, proposed, contacts, obj)
+    run_step(gate, 0, current, proposed, contacts, obj, floor=False)
+    run_step(gate, 1, current, proposed, contacts, obj, floor=False)
+    run_step(gate, 2, current, proposed, contacts, obj, floor=False)
 
     probe_observation = obj.copy(); probe_observation[2] += 0.004
     result = run_step(
@@ -99,9 +99,9 @@ def test_physical_probe_and_retention_pass() -> None:
 def test_probe_failure_returns_policy_control() -> None:
     gate = GraspProbePhaseGate(small_config())
     current, proposed, contacts, obj = inputs()
-    run_step(gate, 0, current, proposed, contacts, obj)
-    run_step(gate, 1, current, proposed, contacts, obj)
-    run_step(gate, 2, current, proposed, contacts, obj)
+    run_step(gate, 0, current, proposed, contacts, obj, floor=False)
+    run_step(gate, 1, current, proposed, contacts, obj, floor=False)
+    run_step(gate, 2, current, proposed, contacts, obj, floor=False)
     result = run_step(gate, 3, current, proposed, contacts, obj, floor=True)
     assert result.phase is GraspGatePhase.FAILED
     assert result.override is False
