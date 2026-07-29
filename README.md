@@ -170,8 +170,10 @@ Remove `--print-config` only when the printed allocation is correct.
   training client, checkpointing, deadline handling, and locked norm metadata.
 - `scripts/train/openpi_vla_smoke_lance_base.py`: Lance projection and MINT wire
   format.
-- `scripts/eval/infer_mano_mode4.py`: sole MANO closed-loop inference
+- `scripts/eval/infer_mano_mode4.py`: sole MANO closed-loop policy inference
   entrypoint.
+- `scripts/eval/replay_mano_gt_mode4.py`: policy-free GT absolute-target replay
+  through the same MuJoCo/controller for calibration.
 - `scripts/eval/mano_physics_core.py`: MuJoCo scene, collision, five-finger
   pair-presence contact, servo, and timing.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
