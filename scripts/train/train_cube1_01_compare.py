@@ -1360,6 +1360,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--save-path", required=True)
     parser.add_argument(
+        "--skip-final-save",
+        action="store_true",
+        help="skip save_weights_for_sampler after training; intended for bounded performance probes",
+    )
+    parser.add_argument(
         "--checkpoint-step",
         type=int,
         default=0,
@@ -1686,6 +1691,7 @@ def main() -> int:
     prefetcher: BatchPrefetcher | None = None
     metrics_stream = None
     batch_build_seconds = 0.0
+    batch_ready_wait_seconds = 0.0
     request_seconds = 0.0
     started_at = time.time()
     stop_reason = None
@@ -1702,6 +1708,7 @@ def main() -> int:
                 args.prefetch_batches, build_next_batch, max_batches=args.steps
             )
         for step in range(1, args.steps + 1):
+            step_started_at = time.perf_counter()
             global_step = args.global_step_offset + step
             # Cooperative deadline: check before entering the next step.
             if stop_at_ts is not None and time.time() >= stop_at_ts:
@@ -1710,12 +1717,15 @@ def main() -> int:
                 print(json.dumps({"stop_reason": stop_reason, "deadline": args.stop_at,
                                   "completed_step": completed_step}), flush=True)
                 break
+            batch_wait_started_at = time.perf_counter()
             if prefetcher is not None:
                 batch = prefetcher.next_batch()
             else:
                 batch_started_at = time.perf_counter()
                 batch = build_next_batch()
                 batch_build_seconds += time.perf_counter() - batch_started_at
+            batch_ready_wait = time.perf_counter() - batch_wait_started_at
+            batch_ready_wait_seconds += batch_ready_wait
             request_started_at = time.perf_counter()
             result = L._await_result(base_url, headers, L._post_json(
                 base_url,
@@ -1727,13 +1737,19 @@ def main() -> int:
                     learning_rate=args.learning_rate,
                 ),
             ))
-            request_seconds += time.perf_counter() - request_started_at
+            train_request_seconds = time.perf_counter() - request_started_at
+            request_seconds += train_request_seconds
             metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
             entry = {
                 "step": global_step,
                 "phase_step": step,
                 "loss": metrics.get("loss:mean"),
                 "metrics": metrics,
+                "timing_seconds": {
+                    "batch_ready_wait": batch_ready_wait,
+                    "train_request": train_request_seconds,
+                    "step_total": time.perf_counter() - step_started_at,
+                },
             }
             steps_log.append(entry)
             if metrics_stream is not None:
@@ -1836,10 +1852,13 @@ def main() -> int:
             batch_build_seconds = prefetcher.build_seconds
             prefetcher.close()
 
-        save_result = L._await_result(base_url, headers, L._post_json(
-            base_url, "/api/v1/save_weights_for_sampler", headers,
-            {"model_id": model_id, "path": args.save_path},
-        ))
+        if args.skip_final_save:
+            save_result = {"skipped": True, "reason": "--skip-final-save"}
+        else:
+            save_result = L._await_result(base_url, headers, L._post_json(
+                base_url, "/api/v1/save_weights_for_sampler", headers,
+                {"model_id": model_id, "path": args.save_path},
+            ))
         payload = {
             "experiment": (
                 f"all_rows_{len(row_indices)}_state_aug"
@@ -1906,6 +1925,7 @@ def main() -> int:
             "sampling": coverage_sampler.summary() if coverage_sampler else {"strategy": "legacy"},
             "batch_size": args.batch_size,
             "learning_rate": args.learning_rate,
+            "skip_final_save": bool(args.skip_final_save),
             "seed": args.seed,
             "sample_seed": args.seed,
             "augmentation_seed": augmentation_seed,
@@ -1914,6 +1934,7 @@ def main() -> int:
             "batch_build_workers": args.batch_build_workers,
             "timing_seconds": {
                 "batch_build_total": batch_build_seconds,
+                "batch_ready_wait_total": batch_ready_wait_seconds,
                 "train_request_total": request_seconds,
                 "train_requests": args.steps,
             },
