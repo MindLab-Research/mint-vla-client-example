@@ -60,10 +60,12 @@ client setup and cold compilation, rose from about 8.8% at batch 8 to 24.6% at
 the batch-128 point. It is therefore accurate to claim a 2.59× supply/throughput
 improvement, not continuous 100% GPU occupancy.
 
-Artifacts are under
-`results/benchmarks/action_lora_gpu_saturation_20260729/runs/` in the integration
-worktree. Key runs are `baseline_bs8_w4_p2`, `final_bs32_p4_w16_p4`,
-`bs64_p2_w16_p2`, and `bs128_p1_w16_p1`.
+Artifacts are under the formal client root at
+`results/benchmarks/action_lora_gpu_saturation_20260729/`. Key development runs
+are `baseline_bs8_w4_p2`, `final_bs32_p4_w16_p4`, `bs64_p2_w16_p2`, and
+`bs128_p1_w16_p1`. The authoritative post-merge reproduction is
+`postmerge_bs64_p2_w16_p2_20_retry1`; `summary.json` preserves the provenance
+boundary between its committed source and the earlier tuning worktrees.
 
 ## Implemented mechanism
 
