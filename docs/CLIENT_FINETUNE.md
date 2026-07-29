@@ -32,15 +32,18 @@ MINT code:    /vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16
 OpenPI code:  /vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16
 Environment:  /vePFS-Mindverse/user/intern/wenxi/mint_env
 Assets/code:  /vePFS-Mindverse/user/intern/wenxi/pi-finetune
-Dataset:      /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
+Release SSOT: config/datasets/mano_dataset_release.json
+Dataset role: training_dataset (currently /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance)
 Run outputs:  /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/<run-name>
 Inference:    /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/inference/<run-name>
 Baselines:    /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/baselines/<baseline-name>
 ```
 
-The committed defaults are in `config/remote.env.example`. Each coworker may
-create an ignored `config/remote.env` for a different port, user, dataset, or
-result root. Do not commit passwords, private keys, or production API keys.
+The committed machine defaults are in `config/remote.env.example`. Each coworker may
+create an ignored `config/remote.env` for a different port, user, or result root.
+The canonical MANO dataset and sidecars come from the release manifest; set a
+dataset env override only for an explicitly named non-release experiment. Do not
+commit passwords, private keys, or production API keys.
 
 ## 3. Prepare and synchronize the client
 
@@ -92,18 +95,17 @@ end   = min(total_frames - 1, last target-object contact frame + 100)
 ```
 
 Contact comes from the Lance `contact` column, not
-`trajectory_metadata.trajectory_info.object_move`. Build the cache once for a
-new dataset:
+`trajectory_metadata.trajectory_info.object_move`. The canonical release already
+owns a complete contact sidecar; resolve it rather than deriving another filename:
 
 ```bash
-./scripts/remote/run_client.sh scripts/tools/build_contact_windows.py \
-  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
+python3 scripts/mano_dataset_release.py resolve contact_windows
 ```
 
-The client automatically uses `<dataset>.contact_windows.json` afterward. The
-resolved evidence and fallback status are written per row. Use
-`--missing-contact-policy error` when a training run must reject unannotated
-episodes.
+For a genuinely new non-release dataset, use `build_contact_windows.py` with an
+explicit `--output` path. The resolved evidence and fallback status are written
+per row. Use `--missing-contact-policy error` when a training run must reject
+unannotated episodes.
 
 ### Mode4 physics inference
 
@@ -133,7 +135,8 @@ contact-pair presence. Mode4 does not query solved contact force or apply a
 norm SHA declared in `scripts/mano_state_contract.py`.
 
 Use `scripts/remote/run_mode4_eval.sh` for every new checkpoint and row set.
-This is the single operational interface; do not copy `deliver_mode4_eval.sh`.
+This is the single operational interface; the former hard-coded delivery wrapper
+has been removed from current source and remains available only through Git history.
 It refuses an existing output directory unless `--overwrite-output` is supplied,
 creates a clean replacement when that flag is explicit, writes
 `effective_config.json`, and writes `run.completed.json` or `run.failed.json`.
@@ -142,9 +145,9 @@ Without an output option it creates a unique run below the formal checkout's
 `--output-dir PATH` remains an explicit override and cannot be combined with
 `--run-name`.
 
-The canonical Mode4 frame contract is `--frame-window contact`. The launcher
-loads `<dataset-without-.lance>.contact_ctx100_error_v1.json` unless an explicit
-manifest is supplied, initializes hand/object physics at the absolute window
+The canonical Mode4 frame contract is `--frame-window contact`. For the canonical
+dataset the launcher resolves the release role `contact_windows`; a non-release
+dataset requires its own explicit/derived sidecar. It initializes hand/object physics at the absolute window
 start, and resets lift there. `dataset_reference.mp4` always preserves the full
 source demonstration. `mode4_physics_vs_dataset_head.mp4`, the wrist comparison,
 rollout arrays, and physical metrics cover only the synchronized contact window
@@ -173,7 +176,6 @@ ROWS=924,960
 NORM_ROWS=$(seq -s, 810 994)
 ./scripts/remote/run_mode4_eval.sh \
   --model-path <checkpoint> \
-  --dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
   --rows "${ROWS}" --normalization-rows "${NORM_ROWS}" \
   --norm-stats-dir /vePFS-Mindverse/user/intern/wenxi/results/training/<run>/norm \
   --run-name <run>-mode4 \
@@ -244,8 +246,8 @@ the retained action session, and then sends a graceful server signal. Persistent
 JAX executable serialization is disabled
 by default because this pi0.5 runtime cannot serialize the multi-GB executable;
 `--enable-jax-persistent-cache` is an intentional opt-in after validation. The
-historical `deliver_mode4_eval.sh` remains a delivery-specific record, not a
-template for new evaluations.
+historical delivery behavior is preserved by Git commits and result artifacts,
+not by keeping another executable launcher in the current source tree.
 
 Connect to the GPU host and run:
 
@@ -253,10 +255,7 @@ Connect to the GPU host and run:
 cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
 
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
-  --lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
-  --target-lance-dataset /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance \
   --row-indices 810,811 \
-  --contact-window-manifest /vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json \
   --missing-contact-policy error \
   --action-source urdf_target_absolute \
   --extended-state \

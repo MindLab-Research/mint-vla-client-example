@@ -1,6 +1,25 @@
 # MANO数据处理链、资产与Provenance
 
-本文是formal client中关于MANO数据的canonical位置总览。它区分四种容易混淆的东西：原始轨迹、运动学图像渲染、训练时动态投影、真实物理replay。路径状态核对日期为2026-07-29。
+本文解释MANO release，但不单独定义路径真相。唯一机器可读source of truth是：
+
+```text
+config/datasets/mano_dataset_release.json
+```
+
+所有默认launcher通过`scripts/mano_dataset_release.py`解析其中的canonical role；`scripts/tools/validate_mano_dataset_release.py`对路径、版本、SHA、producer commit、Lance schema/population、asset closure和physics evidence fail-closed验证。本文与manifest冲突时以manifest为准。路径状态核对日期为2026-07-29。
+
+```bash
+# 查看唯一release与canonical roles
+python3 scripts/mano_dataset_release.py release-id
+python3 scripts/mano_dataset_release.py resolve training_dataset
+python3 scripts/mano_dataset_release.py resolve contact_windows
+
+# 在部署runtime中做快速/完整验证
+VLA_SKIP_SERVER_CHECK=1 ./scripts/remote/run_client.sh \
+  scripts/tools/validate_mano_dataset_release.py --mode fast
+VLA_SKIP_SERVER_CHECK=1 ./scripts/remote/run_client.sh \
+  scripts/tools/validate_mano_dataset_release.py --mode deep
+```
 
 ## 1. 总图
 
@@ -202,20 +221,38 @@ target offset    = 0
 
 物理场景包含gravity、collision、inertia、friction和26D position servo。它与运动学图像渲染的本质差异是：运动学分支每帧强写object reference pose；物理分支只在起点写一次，之后执行`mj_step`。
 
-生产代码冻结在结果root：
+当前唯一维护的全量physics-quality生产入口在formal client：
+
+```text
+scripts/eval/replay_mano_target_physics.py
+```
+
+它直接复用：
+
+```text
+scripts/eval/mano_physics_core.py
+scripts/eval/mano_action_support.py
+```
+
+示例（必须写到新的结果root，历史evidence root拒绝覆盖）：
+
+```bash
+VLA_SKIP_SERVER_CHECK=1 ./scripts/remote/run_client.sh \
+  scripts/eval/replay_mano_target_physics.py \
+  --output-dir results/physics_quality/<new-release> \
+  --object cube1 --workers 8 --batch-size 8
+```
+
+新入口默认从release manifest解析dataset/index/assets，把release ID、manifest SHA、asset bundle SHA、client commit和physics-core SHA写入每行provenance，并拒绝写入历史evidence root。验收时对cube1 row850重新运行完整715帧；新旧grade、所有metrics、五个NPZ arrays和trace SHA均bitwise相同。
+
+历史生产代码仍冻结在以下结果root，作为生成已有7,539条证据时的immutable provenance，不再作为当前入口：
 
 ```text
 /vePFS-Mindverse/user/intern/wenxi/results/physics_quality/
 mano_target_physics_200hz_v1_20260725/code/
 ```
 
-其中`mano_physics_quality.py`生成逐行JSON/NPZ和per-object aggregate；`render_physics_quality_video.py`生成验证过trace一致性的physics-vs-reference视频。formal client当前维护相同已验证场景/servo机制的核心在：
-
-```text
-scripts/eval/mano_physics_core.py
-```
-
-但全量quality-dataset生成器尚未正式迁入client source。客户端只有统计快照和Mode4共享physics core。
+`render_physics_quality_video.py`仍属于历史可视化证据；新的统计生产统一由formal-client replay入口完成，Mode4可视化继续走`scripts/remote/run_mode4_eval.sh`。
 
 ## 8. 资产
 
@@ -228,31 +265,34 @@ scripts/eval/mano_physics_core.py
 | head/wrist cameras | `render_dataset_b_images.py`和`scripts/eval/mano_action_support.py`中的显式常量 | image generation、Mode3、Mode4 |
 | physics controller/contacts | `scripts/eval/mano_physics_core.py` | target replay、Mode4 |
 
-Hand URDF当前SHA256为`136d32b72ba811f20f7ba3162af5bf7fc00e7c845edcd80b535871492daf5f87`。现有replay manifest记录dataset/index/code identity，但没有对整个hand/object asset bundle和camera constants做统一content-addressed manifest。
+Release manifest对17个对象闭包内的hand URDF/mesh和object URDF/mesh共84个文件做统一content-addressed fingerprint；当前asset bundle SHA256为`d04056f11630405e3939efebde311e7d482a5cde628f0da279bf3646d949e9c4`。Camera/scene/physics contract由manifest中固定的producer commit和client code SHA共同认证。
 
 ## 9. 当前仍缺的东西
 
-### P0：阻碍从零重建
+已经解决：唯一release manifest、fail-closed validator、asset closure hash、canonical contact sidecar、formal-client physics-quality generator和历史trace等价性验收。
 
-1. **原始synthetic NPY → raw Lance/index的producer没有归档到formal client。** Gesture index记录了source path、source SHA和匹配方法，但原root当前未挂载，生成脚本也不在client。
-2. **recorded target staging的生成源已清理。** Canonical v20可直接训练和replay，但从上游重新生成`urdf_dof_target`的路径未闭合。
-3. **全量physics-quality generator仍在结果快照中。** 它应迁入client并直接复用`mano_physics_core.py`，移除对retired checkout的依赖。
+### P0：阻碍从最原始源重建
 
-### P1：阻碍严格可复现/自动筛选
+1. **原始synthetic NPY → raw Lance/index的producer没有归档到formal client或另一个已固定commit的owner。** Gesture index记录了source path、source SHA和匹配方法，但原root当前未挂载。
+2. **recorded target staging的上游生成源已清理。** Canonical v20、version17 rollback和迁移报告足够当前训练/replay，但不能从上游重新生成`urdf_dof_target`。
 
-4. **缺少统一asset/camera manifest。** 应记录hand URDF、所有引用mesh、17个object URDF/mesh、相机常量和physics parameters的SHA256。
-5. **缺少一个端到端dataset release manifest。** 目前provenance分散在gesture index、render logs、Lance version/tag、migration logs、contact manifest和norm目录中。
-6. **Replay grade尚未作为canonical全局sidecar接入sampler/evaluator。** 已有17个per-object shards和客户端统计，但还没有一个row-aligned全局A/B/C sidecar供训练过滤或评估自动分层。
+### P1：阻碍自动质量分层
+
+3. **Replay grade尚未形成一个canonical全局row-aligned sidecar供sampler/evaluator直接加载。** 现有17个per-object shards和统计完全可验证，但自动A/B/C分层还需要组装和接入，不应把grade直接写回809GiB主Lance。
+4. **Image release没有单命令orchestrator。** 生产脚本和commit已经固定，16-shard合并证据完整，但从raw Lance到完整image release仍由多个显式步骤组成。
 
 ### 有意动态生成，不应误认为缺列
 
-7. Gesture-expanded prompt、contact/lift 32D state、B-schema actions、StateAug和population norm本来就应在客户端runtime生成。把它们固化回809GiB Lance会增加多份易漂移的数据真相；正确做法是锁定代码、sidecar、population和SHA。
+Gesture-expanded prompt、contact/lift 32D state、B-schema actions、StateAug和population norm本来就应在客户端runtime生成。把它们固化回809GiB Lance会增加多份易漂移的数据真相；manifest固定输入、代码和population，run结果再记录release SHA。
 
-## 10. 当前责任边界
+## 10. 当前责任边界与清理结果
 
-- `pi-finetune @ e18bb9e...`拥有相机/场景构建和原始image-Lance生产代码。
-- Formal client拥有target迁移、gesture消费、contact windows、state/action投影、norm、StateAug、training和Mode4。
-- PFS `results/datas`拥有canonical大型数据；`results/physics_quality`拥有raw physics-quality evidence。
+- `config/datasets/mano_dataset_release.json`是唯一resolver；默认training、Mode4、gesture和contact路径均从这里读取。
+- `pi-finetune @ e18bb9e...`是相机/场景构建和image-Lance producer的唯一代码owner；formal client不复制它。
+- Formal client拥有release验证、target迁移、gesture消费、contact windows、state/action投影、norm、StateAug、physics-quality生产、training和Mode4。
+- PFS `results/datas`拥有canonical大型数据；`results/physics_quality`拥有immutable raw physics evidence；二者不因物理位置外置而成为另一份逻辑真相。
 - MINT/OpenPI不拥有数据定义；它们消费客户端发送的已投影、已归一化batch。
 
-任何新数据population至少要一起锁定：Lance path/version、ordered row population、gesture-index SHA、contact-manifest SHA、state/action contract、norm SHA、asset/scene identity和source commit。
+已清理的安全冗余：byte-identical contact manifest副本已替换为指向canonical sidecar的兼容symlink；空`results/datas/staging`已删除；hard-coded历史Mode3/Mode4 delivery wrappers已从当前源码删除并保留在Git历史。旧checkouts、legacy replay datasets和active checkpoints仍有独立引用或证据价值，因此没有冒险删除。
+
+任何新数据population至少要一起锁定：release ID/manifest SHA、Lance path/version、ordered row population、gesture-index SHA、contact-manifest SHA、state/action contract、norm SHA、asset/scene identity和source commit。
