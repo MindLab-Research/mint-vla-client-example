@@ -192,7 +192,10 @@ Remove `--print-config` only when the printed allocation is correct.
 - `scripts/mano_dataset_release.py`: the only resolver for canonical MANO release roles.
 - `scripts/tools/validate_mano_dataset_release.py`: fail-closed fast/deep release validation for paths, hashes, Lance population/schema, producer commits, assets, and physics evidence.
 - `scripts/train/train_cube1_01_compare.py`: selected-row clean/StateAug
-  training client, checkpointing, deadline handling, and locked norm metadata.
+  training client, deterministic multi-producer materialization, checkpointing,
+  deadline handling, and locked norm metadata.
+- `docs/ACTION_LORA_GPU_SATURATION.md`: measured four-GPU supply-path settings,
+  sharding evidence, throughput results, and coverage-slate prefetch limits.
 - `scripts/train/openpi_vla_smoke_lance_base.py`: Lance projection and MINT wire
   format.
 - `scripts/eval/infer_mano_mode4.py`: maintained MANO closed-loop real-physics

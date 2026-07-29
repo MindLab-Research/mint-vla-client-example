@@ -221,7 +221,7 @@
       "kind": "code_file",
       "owner": "formal_client",
       "path": "client://scripts/train/train_cube1_01_compare.py",
-      "sha256": "7e1b5b1bfd49d7bd7ce36e89fcc5f1bb0677fb11fc0572ac5d2d3e8b7e4c7c4a"
+      "sha256": "035b7c916db00fa10032835edae252a1ed92b5b7c35d49989c83b3930d81ef1e"
     },
     "scene_camera_code": {
       "kind": "code_file",

@@ -360,22 +360,52 @@ client uses independent sample and augmentation RNG streams: `--seed 42` selects
 samples and `--augmentation-seed 43` generates fresh state noise.
 
 The client training loop also uses a bounded transformed-datum cache and an
-ordered batch prefetch queue by default:
+ordered batch prefetch queue:
 
 - `--datum-cache-size 4096` bounds transformed frame memory; use `0` to disable
-  caching.
-- `--prefetch-batches 2` builds the next two batches while the server executes
-  the current request; use `0` for synchronous debugging.
+  caching. Large performance probes can use `256` to cap host RSS.
+- `--prefetch-batches 2` builds batches while the server executes the current
+  request; use `0` for synchronous debugging.
+- `--batch-producers 1` preserves the historical single-producer path. Values
+  above one enable independently materialized batches.
+- `--batch-build-workers` is the total datum-thread budget. With multiple
+  producers it is divided deterministically across them.
 
-Prefetch owns both RNG streams in one producer, so enabling it preserves the
-sample and augmentation sequence. The output JSON records cache statistics and
-aggregate client build/request timings. For checkpoint workflows, the resume
-barrier remains unbounded by default; set
-`--checkpoint-resume-timeout-seconds` to make a failed orchestrator surface as
-an error instead of waiting forever. The launcher exports `JAX_PLATFORMS=cpu`.
-That is intentional: the client does CPU preprocessing and HTTP I/O, while the
-MINT server owns the assigned GPUs.
+Multi-producer mode has one central planner. It alone advances CoverageSampler,
+sample RNG, StateAug RNG, and batch ordinal. Materializers receive immutable
+plans, may finish out of order, and are consumed in ordinal order. Thus thread
+scheduling cannot change rows, frames, StateAug draws, or optimizer batch order.
+The Lance row cache coalesces duplicate misses per row while allowing distinct
+rows to load concurrently.
 
+Keep concurrent prefetch within one CoverageSampler slate. For the standard
+`--slate-size 16 --coverage-anchors-per-row 8` contract, the bound is 128
+outstanding samples:
+
+```text
+batch_size * prefetch_batches <= slate_size * coverage_anchors_per_row
+```
+
+The trainer rejects cross-slate multi-producer settings because concurrent
+slates evict each other's large row payloads and cause repeated PFS reloads. The
+measured four-GPU operating points are:
+
+- throughput-biased: `--batch-size 128 --batch-producers 1
+  --batch-build-workers 16 --prefetch-batches 1`;
+- balanced latency/throughput: `--batch-size 64 --batch-producers 2
+  --batch-build-workers 16 --prefetch-batches 2`.
+
+Both require a batch divisible by the server device count. MINT metrics expose
+`device_count:sum`, `used_data_sharding:mean`, and
+`per_device_batch_size:mean`; verify sharding rather than inferring it from GPU
+memory. `--skip-final-save` is only for bounded performance probes.
+
+The output JSON records cache statistics, planner/build/wait/request timings,
+and the prefetch-slate contract. For checkpoint workflows, the resume barrier
+remains unbounded by default; set `--checkpoint-resume-timeout-seconds` to make
+a failed orchestrator surface as an error instead of waiting forever. The
+launcher exports `JAX_PLATFORMS=cpu`. The client performs CPU preprocessing and
+HTTP I/O, while the MINT server owns the assigned GPUs.
 ## 7. Use a different dataset
 
 For a basic full-dataset smoke run, use the generic client:
