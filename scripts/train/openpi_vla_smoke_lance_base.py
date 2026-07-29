@@ -60,7 +60,6 @@ import openpi.shared.normalize as normalize
 import openpi.training.config as openpi_config
 import openpi.transforms as transforms
 
-from mint_server.backend.core.model_registry import MODEL_CONFIGS
 from scripts import contact_windows as contact_windows_lib
 from scripts import mano_dataset_release
 from scripts.openpi_profiles import (
@@ -650,7 +649,7 @@ def _pi05_datum_from_transformed(base_model: str, item: dict[str, Any]) -> dict[
       - exactly one pre-tokenized encoded_text prompt chunk,
       - rank-1 state, rank-2 actions [action_horizon, action_dim].
     """
-    model_cfg = MODEL_CONFIGS[base_model]
+    model_cfg = resolve_profile(base_model)
     prompt_mask = np.asarray(item["tokenized_prompt_mask"]).astype(bool)
     prompt_tokens = np.asarray(item["tokenized_prompt"])[prompt_mask].astype(int).tolist()
     actions = np.asarray(item["actions"], dtype=np.float32)
@@ -757,7 +756,7 @@ def main() -> int:
     parser.add_argument("--output-json", default="")
     args = parser.parse_args()
 
-    model_cfg = MODEL_CONFIGS[args.model]
+    model_cfg = resolve_profile(args.model)
     if int(model_cfg.action_horizon or 0) != args.action_horizon:
         print(f"warning: --action-horizon {args.action_horizon} != model action_horizon {model_cfg.action_horizon}; "
               f"the server will reject a mismatch", file=sys.stderr)
