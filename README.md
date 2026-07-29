@@ -248,40 +248,49 @@ nvidia-smi
 ss -ltnp | grep 30540 || echo "port free"
 ```
 
-### Training command (A-LoRA, all cube1 trajectories)
+### Current training command (A-LoRA, cube1 + cube2, StateAug 0.05)
 
-The locked cube1 population is 1,102 contiguous Lance rows (`507..1608`),
-selected by `config/datasets/cube1_all_rows_507_1608.csv`. Its exact 32D norm
-has SHA256 `4d7ee78f34c293c4a6023a8980a0c8a614eae6f0c63b889984a5f9a45ce0a747`.
-Dry-run first; remove `--dry-run` only after the 200-step smoke converges.
+The locked population is 1,997 contiguous Lance rows (`507..2503`): cube1=1,102
+and cube2=895, selected by
+`config/datasets/cube1_cube2_all_rows_507_2503.csv`. Contact windows retain
+1,160,274 active frames. The exact B-schema 32D norm has SHA256
+`4f91eca8ee91d53426ea07faf28873ab98c3761ecb84d6374f4c0c439d51069a`.
+Dry-run first; launch the formal run only after the batch8 200-step StateAug
+smoke confirms realized sigma, token diagnostics, memory, loss, and checkpointing.
 
 ```bash
 cd /vePFS-Mindverse/user/intern/rongenz/pi05-finetune/mint-vla-client-example
+ROOT=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune
 DATA=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance
 MANIFEST=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json
-NORM=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/training/cube1_all_32d_extended_norm_v1_20260728
-ROWS=$(tr -d '\n' < config/datasets/cube1_all_rows_507_1608.csv)
-RUN=/vePFS-Mindverse/user/intern/rongenz/pi05-finetune/results/client_runs/cube1_all_alora_50k
+NORM=$ROOT/results/training/cube1_cube2_32d_extended_norm_v1_20260729
+ROWS=$(tr -d '\n' < config/datasets/cube1_cube2_all_rows_507_2503.csv)
+RUN=$ROOT/results/client_runs/rongenz_cube1_cube2_alora_stateaug005_150k_v1
 mkdir -p "$RUN"
 
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
+  --base-url http://127.0.0.1:30540 \
   --model openpi/pi05-action-lora-r16-finetune \
   --lance-dataset "$DATA" --target-lance-dataset "$DATA" \
-  --row-indices "$ROWS" --contact-window-manifest "$MANIFEST" \
-  --missing-contact-policy error --action-source urdf_target_absolute \
-  --extended-state --language-conditioning gesture \
+  --row-indices "$ROWS" --frame-window contact --contact-context-frames 100 \
+  --contact-window-manifest "$MANIFEST" --missing-contact-policy error \
+  --action-source urdf_target_absolute --extended-state \
+  --language-conditioning gesture \
   --gesture-index config/datasets/new_all_generated_mano.index.json \
   --norm-stats-dir "$NORM" --sampling-strategy coverage \
-  --coverage-anchors-per-row 8 --steps 50000 --batch-size 4 --seed 42 \
-  --learning-rate 1e-4 --checkpoint-every 5000 \
-  --checkpoint-save-path-template 'cube1_all_alora_50k_step{step}' \
-  --save-path cube1_all_alora_50k --metrics-jsonl "$RUN/metrics.jsonl" \
-  --output-json "$RUN/result.json" --dry-run
+  --coverage-anchors-per-row 8 --slate-size 16 --datum-cache-size 4096 \
+  --batch-build-workers 4 --prefetch-batches 2 \
+  --steps 150000 --batch-size 8 --learning-rate 5e-5 \
+  --seed 42 --augmentation-seed 43 --state-noise-std 0.05 \
+  --checkpoint-every 10000 \
+  --checkpoint-save-path-template 'rongenz_cube1_cube2_alora_stateaug005_150k_v1_step{step}' \
+  --save-path rongenz_cube1_cube2_alora_stateaug005_150k_v1 \
+  --metrics-jsonl "$RUN/metrics.jsonl" --output-json "$RUN/result.json"
 ```
 
 The current no-Ray direct runtime can save sampler checkpoints but returns 503
 for `/api/v1/save_state`; optimizer state is therefore not resumable. Run the
-50k job continuously, preserve 5k sampler checkpoints for evaluation/rollback,
+150k job continuously, preserve 10k sampler checkpoints for evaluation/rollback,
 and do not pass `--checkpoint-state-path` until the direct runtime implements it.
 
 Minimal validation order: worktrees clean -> launcher prints correct roots ->

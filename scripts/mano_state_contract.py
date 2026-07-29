@@ -20,6 +20,7 @@ Contact normalization: raw 0/1 → -1/+1 via fixed q01=0/q99=1 mapping
 
 EXPECTED_NORM_SHA256: SHA256 of the legacy locked 185-row gesture03 norm.
 CUBE1_ALL_NORM_SHA256: SHA256 of the locked 1102-row cube1-all norm.
+CUBE1_CUBE2_ALL_NORM_SHA256: SHA256 of the locked 1997-row combined norm.
 Mode 4 extended-state MUST verify norm_stats.json is allowlisted and any new
 population norm has a matching data_contract.json before loading or first query.
 """
@@ -36,6 +37,7 @@ import numpy as np
 STATE_CONTRACT_ID = "mano_five_finger_contact_lift_v1"
 EXPECTED_NORM_SHA256 = "507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d"
 CUBE1_ALL_NORM_SHA256 = "4d7ee78f34c293c4a6023a8980a0c8a614eae6f0c63b889984a5f9a45ce0a747"
+CUBE1_CUBE2_ALL_NORM_SHA256 = "4f91eca8ee91d53426ea07faf28873ab98c3761ecb84d6374f4c0c439d51069a"
 CONTACT_SEMANTICS = "record_or_keypoint_pair_presence_v1"
 CONTACT_RULE = (
     "Training: target-object contact record exists in Lance contact[]. "
@@ -51,7 +53,11 @@ def verify_locked_norm_stats(norm_stats_dir: Path) -> tuple[Path, str]:
     if not path.is_file():
         raise ValueError(f"v1 extended-state requires norm_stats.json at {path}")
     actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
-    supported = {EXPECTED_NORM_SHA256, CUBE1_ALL_NORM_SHA256}
+    supported = {
+        EXPECTED_NORM_SHA256,
+        CUBE1_ALL_NORM_SHA256,
+        CUBE1_CUBE2_ALL_NORM_SHA256,
+    }
     if actual_sha not in supported:
         raise ValueError(
             "v1 extended-state norm SHA mismatch: "

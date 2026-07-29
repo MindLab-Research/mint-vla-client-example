@@ -1,0 +1,32 @@
+{
+  "selection_id": "cube1_cube2_all_rows_v1",
+  "source_gesture_index": "config/datasets/new_all_generated_mano.index.json",
+  "source_gesture_index_sha256": "ec847b5dc3fa5f59e03849bec71e1eb5d2d8557ad0addfa2b52feba15ba0580f",
+  "object_types": [
+    "cube1",
+    "cube2"
+  ],
+  "object_counts": {
+    "cube1": 1102,
+    "cube2": 895
+  },
+  "row_count": 1997,
+  "row_min": 507,
+  "row_max": 2503,
+  "rows_contiguous": true,
+  "row_indices_sha256": "5fd0ed493c18b563d1deb280624f0f8b3c47fd7d4d11fcb8ee17650d3d74a654",
+  "total_frames": 1743849,
+  "active_contact_frames": 1160274,
+  "contact_context_frames": 100,
+  "gesture_counts": {
+    "01": 282,
+    "02": 250,
+    "03": 342,
+    "04": 283,
+    "09": 238,
+    "10": 322,
+    "11": 75,
+    "18": 205
+  },
+  "rows_csv": "config/datasets/cube1_cube2_all_rows_507_2503.csv"
+}

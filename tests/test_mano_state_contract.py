@@ -8,6 +8,7 @@ import pytest
 from scripts.mano_state_contract import (
     CONTACT_NEGATIVE,
     CONTACT_POSITIVE,
+    CUBE1_CUBE2_ALL_NORM_SHA256,
     CONTACT_SEMANTICS,
     EXPECTED_NORM_SHA256,
     FINGER_NAMES,
@@ -28,6 +29,9 @@ class TestContractIdentity:
         assert CONTACT_SEMANTICS == "record_or_keypoint_pair_presence_v1"
         assert EXPECTED_NORM_SHA256 == (
             "507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d"
+        )
+        assert CUBE1_CUBE2_ALL_NORM_SHA256 == (
+            "4f91eca8ee91d53426ea07faf28873ab98c3761ecb84d6374f4c0c439d51069a"
         )
 
 
