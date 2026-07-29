@@ -219,6 +219,7 @@ Remove `--print-config` only when the printed allocation is correct.
 - `docs/ARCHITECTURE.md`: client/MINT/OpenPI ownership and local-context policy.
 - `docs/MANO_DATA_PIPELINE.md`: canonical map of raw/derived MANO data, language labels, kinematic image rendering, target-DOF physics replay, assets, sidecars, and the current LoRA task boundary.
 - `docs/CUBE1_CUBE2_STATEAUG80K_RESULTS.md`: final training and 96-row Mode4 evaluation evidence for the cube1+cube2 StateAug80K experiment.
+- `docs/ROW1207_GRASP_PHASE_GATE_EXPERIMENT.md`: event-driven grasp probe contract and the row1207 causal result.
 - `docs/CLIENT_FINETUNE.md`: detailed client workflow.
 - `Tutorial.md`: historical MINT no-Ray protocol reference.
 
