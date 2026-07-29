@@ -153,6 +153,7 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(payload["evaluation"]["row_indices"], [2, 7])
             self.assertEqual(payload["evaluation"]["normalization_row_indices"], [7, 2])
             self.assertEqual(payload["evaluation"]["video_mode"], "full")
+            self.assertEqual(payload["evaluation"]["phase_gate"], {"mode": "off"})
             self.assertEqual(payload["evaluation"]["row_execution"], "lockstep")
             self.assertEqual(payload["evaluation"]["row_batch_size"], 4)
             self.assertEqual(payload["evaluation"]["frame_window"], "contact")
@@ -182,6 +183,58 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 payload["provenance"]["dataset_release_manifest_sha256"],
                 hashlib.sha256(release_manifest.read_bytes()).hexdigest(),
             )
+
+    def test_print_config_records_grasp_probe_phase_gate(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "output",
+                    "--chunk-stride",
+                    "1",
+                    "--phase-gate",
+                    "grasp-probe",
+                    "--phase-gate-min-contact-count",
+                    "4",
+                    "--phase-gate-contact-persistence-frames",
+                    "20",
+                    "--phase-gate-probe-lift-mm",
+                    "5",
+                    "--phase-gate-retention-lift-mm",
+                    "50",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            gate = json.loads(completed.stdout)["evaluation"]["phase_gate"]
+            self.assertEqual(gate["mode"], "grasp-probe")
+            self.assertEqual(gate["min_contact_count"], 4)
+            self.assertEqual(gate["contact_persistence_frames"], 20)
+            self.assertEqual(gate["probe_lift_mm"], 5.0)
+            self.assertEqual(gate["retention_lift_mm"], 50.0)
+            self.assertTrue(gate["require_floor_clear"])
+
+    def test_grasp_probe_requires_stride_one(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "output",
+                    "--phase-gate",
+                    "grasp-probe",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("requires --chunk-stride 1", completed.stderr)
 
     def test_rejects_population_norm_sha_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:

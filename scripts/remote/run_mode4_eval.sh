@@ -68,6 +68,18 @@ FPS=10
 WIDTH=640
 HEIGHT=360
 VIDEO_MODE=full
+PHASE_GATE=off
+PHASE_GATE_MIN_CONTACT_COUNT=4
+PHASE_GATE_CONTACT_PERSISTENCE_FRAMES=20
+PHASE_GATE_PROBE_LIFT_MM=5
+PHASE_GATE_PROBE_FRAMES=20
+PHASE_GATE_PROBE_FOLLOW_MIN_MM=3
+PHASE_GATE_PROBE_MIN_CONTACT_COUNT=3
+PHASE_GATE_RETENTION_LIFT_MM=50
+PHASE_GATE_RETENTION_FRAMES=100
+PHASE_GATE_RETENTION_FOLLOW_MIN_MM=20
+PHASE_GATE_RETENTION_MIN_CONTACT_COUNT=3
+PHASE_GATE_ALLOW_FLOOR_CONTACT=0
 FRAME_WINDOW=contact
 CONTACT_WINDOW_MANIFEST=
 CONTACT_CONTEXT_FRAMES=100
@@ -119,6 +131,16 @@ Evaluation options:
   --fps FLOAT                 output video FPS (default: 10)
   --width N --height N        per-panel render size (default: 640x360)
   --video-mode full|none      full writes videos; none keeps observation rendering but skips output-video encoding
+  --phase-gate off|grasp-probe
+                              event-driven diagnostic grasp probe (default: off)
+  --phase-gate-min-contact-count N (default: 4)
+  --phase-gate-contact-persistence-frames N (default: 20 = 100ms)
+  --phase-gate-probe-lift-mm FLOAT --phase-gate-probe-frames N
+  --phase-gate-probe-follow-min-mm FLOAT --phase-gate-probe-min-contact-count N
+  --phase-gate-retention-lift-mm FLOAT --phase-gate-retention-frames N
+  --phase-gate-retention-follow-min-mm FLOAT --phase-gate-retention-min-contact-count N
+  --phase-gate-allow-floor-contact
+                              diagnostic override; default requires floor support to clear
   --frame-window contact|full contact initializes physics at the manifest window (default);
                               full is an explicit full-trajectory stress test
   --contact-window-manifest PATH
@@ -196,6 +218,18 @@ while (($#)); do
     --width) WIDTH=${2:?}; shift 2 ;;
     --height) HEIGHT=${2:?}; shift 2 ;;
     --video-mode) VIDEO_MODE=${2:?}; shift 2 ;;
+    --phase-gate) PHASE_GATE=${2:?}; shift 2 ;;
+    --phase-gate-min-contact-count) PHASE_GATE_MIN_CONTACT_COUNT=${2:?}; shift 2 ;;
+    --phase-gate-contact-persistence-frames) PHASE_GATE_CONTACT_PERSISTENCE_FRAMES=${2:?}; shift 2 ;;
+    --phase-gate-probe-lift-mm) PHASE_GATE_PROBE_LIFT_MM=${2:?}; shift 2 ;;
+    --phase-gate-probe-frames) PHASE_GATE_PROBE_FRAMES=${2:?}; shift 2 ;;
+    --phase-gate-probe-follow-min-mm) PHASE_GATE_PROBE_FOLLOW_MIN_MM=${2:?}; shift 2 ;;
+    --phase-gate-probe-min-contact-count) PHASE_GATE_PROBE_MIN_CONTACT_COUNT=${2:?}; shift 2 ;;
+    --phase-gate-retention-lift-mm) PHASE_GATE_RETENTION_LIFT_MM=${2:?}; shift 2 ;;
+    --phase-gate-retention-frames) PHASE_GATE_RETENTION_FRAMES=${2:?}; shift 2 ;;
+    --phase-gate-retention-follow-min-mm) PHASE_GATE_RETENTION_FOLLOW_MIN_MM=${2:?}; shift 2 ;;
+    --phase-gate-retention-min-contact-count) PHASE_GATE_RETENTION_MIN_CONTACT_COUNT=${2:?}; shift 2 ;;
+    --phase-gate-allow-floor-contact) PHASE_GATE_ALLOW_FLOOR_CONTACT=1; shift ;;
     --frame-window) FRAME_WINDOW=${2:?}; shift 2 ;;
     --contact-window-manifest) CONTACT_WINDOW_MANIFEST=${2:?}; shift 2 ;;
     --contact-context-frames) CONTACT_CONTEXT_FRAMES=${2:?}; shift 2 ;;
@@ -390,6 +424,23 @@ fi
 [[ "$ROW_EXECUTION" == lockstep || "$ROW_EXECUTION" == sequential ]] || \
   fail "--row-execution must be lockstep or sequential"
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
+[[ "$PHASE_GATE" == off || "$PHASE_GATE" == grasp-probe ]] || \
+  fail "--phase-gate must be off or grasp-probe"
+require_positive_int --phase-gate-min-contact-count "$PHASE_GATE_MIN_CONTACT_COUNT"
+require_positive_int --phase-gate-contact-persistence-frames "$PHASE_GATE_CONTACT_PERSISTENCE_FRAMES"
+require_positive_int --phase-gate-probe-frames "$PHASE_GATE_PROBE_FRAMES"
+require_positive_int --phase-gate-probe-min-contact-count "$PHASE_GATE_PROBE_MIN_CONTACT_COUNT"
+require_positive_int --phase-gate-retention-frames "$PHASE_GATE_RETENTION_FRAMES"
+require_positive_int --phase-gate-retention-min-contact-count "$PHASE_GATE_RETENTION_MIN_CONTACT_COUNT"
+((10#$PHASE_GATE_MIN_CONTACT_COUNT <= 5 && 10#$PHASE_GATE_PROBE_MIN_CONTACT_COUNT <= 5 \
+  && 10#$PHASE_GATE_RETENTION_MIN_CONTACT_COUNT <= 5)) || \
+  fail "phase-gate contact counts must be <= 5"
+require_positive_float --phase-gate-probe-lift-mm "$PHASE_GATE_PROBE_LIFT_MM"
+require_positive_float --phase-gate-probe-follow-min-mm "$PHASE_GATE_PROBE_FOLLOW_MIN_MM"
+require_positive_float --phase-gate-retention-lift-mm "$PHASE_GATE_RETENTION_LIFT_MM"
+require_positive_float --phase-gate-retention-follow-min-mm "$PHASE_GATE_RETENTION_FOLLOW_MIN_MM"
+[[ "$PHASE_GATE" != grasp-probe || "$CHUNK_STRIDE" == 1 ]] || \
+  fail "--phase-gate grasp-probe requires --chunk-stride 1"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
 require_positive_int --row-batch-size "$ROW_BATCH_SIZE"
 ((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
@@ -510,7 +561,7 @@ from datetime import datetime, timezone
     verification, endpoint_mode, endpoint_label,
     base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
-    max_warm, max_frames, fps, width, height, video_mode, frame_window,
+    max_warm, max_frames, fps, width, height, video_mode, phase_gate_json, frame_window,
     contact_manifest, contact_context,
     missing_contact_policy, language, gesture_index, server_port, server_gpus, runtime_root,
     cache_dir, persistent_cache, keep_server, reuse_server_info, action_session_id,
@@ -549,6 +600,7 @@ payload={
         'width': int(width),
         'height': int(height),
         'video_mode': video_mode,
+        'phase_gate': json.loads(phase_gate_json),
         'frame_window': frame_window,
         'contact_window_manifest': contact_manifest or None,
         'contact_context_frames': int(contact_context),
@@ -585,6 +637,37 @@ print(json.dumps(payload, indent=2, sort_keys=True))
 PY
 }
 
+PHASE_GATE_JSON=$(python3 - "$PHASE_GATE" "$PHASE_GATE_MIN_CONTACT_COUNT" \
+  "$PHASE_GATE_CONTACT_PERSISTENCE_FRAMES" "$PHASE_GATE_PROBE_LIFT_MM" \
+  "$PHASE_GATE_PROBE_FRAMES" "$PHASE_GATE_PROBE_FOLLOW_MIN_MM" \
+  "$PHASE_GATE_PROBE_MIN_CONTACT_COUNT" "$PHASE_GATE_RETENTION_LIFT_MM" \
+  "$PHASE_GATE_RETENTION_FRAMES" "$PHASE_GATE_RETENTION_FOLLOW_MIN_MM" \
+  "$PHASE_GATE_RETENTION_MIN_CONTACT_COUNT" "$PHASE_GATE_ALLOW_FLOOR_CONTACT" <<'PY'
+import json, sys
+(
+    mode, min_contacts, persistence, probe_mm, probe_frames, probe_follow_mm,
+    probe_contacts, retention_mm, retention_frames, retention_follow_mm,
+    retention_contacts, allow_floor,
+) = sys.argv[1:]
+payload = {'mode': mode}
+if mode == 'grasp-probe':
+    payload.update({
+        'min_contact_count': int(min_contacts),
+        'contact_persistence_frames': int(persistence),
+        'probe_lift_mm': float(probe_mm),
+        'probe_frames': int(probe_frames),
+        'probe_follow_min_mm': float(probe_follow_mm),
+        'probe_min_contact_count': int(probe_contacts),
+        'retention_lift_mm': float(retention_mm),
+        'retention_frames': int(retention_frames),
+        'retention_follow_min_mm': float(retention_follow_mm),
+        'retention_min_contact_count': int(retention_contacts),
+        'require_floor_clear': allow_floor != '1',
+    })
+print(json.dumps(payload, sort_keys=True))
+PY
+)
+
 if ((OWN_SERVER)); then
   ENDPOINT_MODE=dedicated
 elif ((REUSE_MARKER_VERIFIED)); then
@@ -599,8 +682,8 @@ CONFIG_ARGS=(
   "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$ROW_EXECUTION" "$ROW_BATCH_SIZE"
-  "$MAX_WARM_REQUEST_SECONDS" "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$FRAME_WINDOW"
-  "$CONTACT_WINDOW_MANIFEST" "$CONTACT_CONTEXT_FRAMES" "$MISSING_CONTACT_POLICY"
+  "$MAX_WARM_REQUEST_SECONDS" "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE"
+  "$PHASE_GATE_JSON" "$FRAME_WINDOW" "$CONTACT_WINDOW_MANIFEST" "$CONTACT_CONTEXT_FRAMES" "$MISSING_CONTACT_POLICY"
   "$LANGUAGE_CONDITIONING" "$GESTURE_INDEX" "$SERVER_PORT" "$SERVER_GPUS"
   "$SERVER_RUNTIME_ROOT" "$SERVER_CACHE_DIR"
   "$ENABLE_JAX_PERSISTENT_CACHE" "$KEEP_SERVER" "$REUSE_SERVER_INFO" "$ACTION_SESSION_ID"
@@ -750,6 +833,22 @@ if [[ "$FRAME_WINDOW" == contact ]]; then
 fi
 if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
+fi
+if [[ "$PHASE_GATE" == grasp-probe ]]; then
+  EVAL_ARGS+=(
+    --phase-gate grasp-probe
+    --phase-gate-min-contact-count "$PHASE_GATE_MIN_CONTACT_COUNT"
+    --phase-gate-contact-persistence-frames "$PHASE_GATE_CONTACT_PERSISTENCE_FRAMES"
+    --phase-gate-probe-lift-mm "$PHASE_GATE_PROBE_LIFT_MM"
+    --phase-gate-probe-frames "$PHASE_GATE_PROBE_FRAMES"
+    --phase-gate-probe-follow-min-mm "$PHASE_GATE_PROBE_FOLLOW_MIN_MM"
+    --phase-gate-probe-min-contact-count "$PHASE_GATE_PROBE_MIN_CONTACT_COUNT"
+    --phase-gate-retention-lift-mm "$PHASE_GATE_RETENTION_LIFT_MM"
+    --phase-gate-retention-frames "$PHASE_GATE_RETENTION_FRAMES"
+    --phase-gate-retention-follow-min-mm "$PHASE_GATE_RETENTION_FOLLOW_MIN_MM"
+    --phase-gate-retention-min-contact-count "$PHASE_GATE_RETENTION_MIN_CONTACT_COUNT"
+  )
+  ((PHASE_GATE_ALLOW_FLOOR_CONTACT == 0)) || EVAL_ARGS+=(--phase-gate-allow-floor-contact)
 fi
 
 VLA_CLIENT_CONFIG=/dev/null MINT_CODE_ROOT="$MINT_CODE_ROOT" \
