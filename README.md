@@ -167,7 +167,10 @@ Remove `--print-config` only when the printed allocation is correct.
 ## Maintained entrypoints
 
 - `scripts/train/train_cube1_01_compare.py`: selected-row clean/StateAug
-  training client, checkpointing, deadline handling, and locked norm metadata.
+  training client, deterministic multi-producer materialization, checkpointing,
+  deadline handling, and locked norm metadata.
+- `docs/ACTION_LORA_GPU_SATURATION.md`: measured four-GPU supply-path settings,
+  sharding evidence, throughput results, and coverage-slate prefetch limits.
 - `scripts/train/openpi_vla_smoke_lance_base.py`: Lance projection and MINT wire
   format.
 - `scripts/eval/infer_mano_mode4.py`: sole MANO closed-loop policy inference

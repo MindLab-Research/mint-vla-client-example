@@ -139,8 +139,20 @@ class CompareTrainingCliTests(unittest.TestCase):
         ]):
             args = compare.parse_args()
             self.assertEqual(args.batch_build_workers, 8)
+            self.assertEqual(args.batch_producers, 1)
             self.assertEqual(args.language_conditioning, "motion_variant")
             self.assertFalse(args.skip_final_save)
+
+    def test_multi_producer_option_propagates_from_cli(self) -> None:
+        compare = _load_compare_module()
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--batch-producers", "4", "--batch-build-workers", "8",
+            "--lance-dataset", "dataset.lance", "--save-path", "save",
+            "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertEqual(args.batch_producers, 4)
+        self.assertEqual(args.batch_build_workers, 8)
 
     def test_performance_probe_can_skip_final_sampler_save(self) -> None:
         compare = _load_compare_module()
@@ -469,6 +481,56 @@ class CompareTrainingCacheAndBatchTests(unittest.TestCase):
         self.assertEqual(second.summary()["current_size"], 1)
         self.assertEqual(created, [1, 2, 3, 10])
 
+    def test_row_cache_loads_distinct_rows_concurrently(self) -> None:
+        compare = _load_compare_module()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._row_cache = compare.OrderedDict()
+        dataset._row_cache_lock = threading.RLock()
+        dataset._row_cache_condition = threading.Condition(dataset._row_cache_lock)
+        dataset._row_cache_loading = set()
+        dataset._slate_size = 16
+        active = 0
+        peak_active = 0
+        lock = threading.Lock()
+
+        def load(row_index):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return {"row": row_index}
+
+        with patch.object(dataset, "_load_row_uncached", side_effect=load), compare.ThreadPoolExecutor(max_workers=2) as executor:
+            rows = list(executor.map(dataset._get_row, [0, 1]))
+        self.assertEqual(rows, [{"row": 0}, {"row": 1}])
+        self.assertEqual(peak_active, 2)
+
+    def test_row_cache_coalesces_duplicate_misses(self) -> None:
+        compare = _load_compare_module()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._row_cache = compare.OrderedDict()
+        dataset._row_cache_lock = threading.RLock()
+        dataset._row_cache_condition = threading.Condition(dataset._row_cache_lock)
+        dataset._row_cache_loading = set()
+        dataset._slate_size = 16
+        calls = 0
+        calls_lock = threading.Lock()
+
+        def load(row_index):
+            nonlocal calls
+            with calls_lock:
+                calls += 1
+            time.sleep(0.03)
+            return {"row": row_index}
+
+        with patch.object(dataset, "_load_row_uncached", side_effect=load), compare.ThreadPoolExecutor(max_workers=4) as executor:
+            rows = list(executor.map(dataset._get_row, [0, 0, 0, 0]))
+        self.assertEqual(calls, 1)
+        self.assertTrue(all(row is rows[0] for row in rows))
+
     def test_concurrent_cache_lookup_coalesces_duplicate_creation(self) -> None:
         compare = _load_compare_module()
         cache = compare.DatumCache(4)
@@ -558,6 +620,41 @@ class CompareTrainingCacheAndBatchTests(unittest.TestCase):
         )
         self.assertNotEqual(first["observation"]["state"]["data"], second["observation"]["state"]["data"])
         self.assertEqual(cache._items[0].prefix["state"].tolist(), [0.0] * 32)
+
+    def test_planned_augmentation_matches_single_producer_rng_bytes(self) -> None:
+        compare = _load_compare_module()
+        indices = [0, 1, 2]
+        dataset = _BatchDataset()
+        planned = compare.plan_augmentation_requests(
+            dataset,
+            indices=indices,
+            state_noise_std=0.05,
+            target_noise_std=0.0,
+            rng=np.random.default_rng(43),
+        )
+
+        def prepare(sample, _, __):
+            return _prepared(compare, sample["index"])
+
+        with patch.object(compare, "_prepare_discrete_datum", side_effect=prepare):
+            serial = compare.build_batch(
+                _BatchDataset(), object(),
+                base_model="openpi/pi05-action-lora-r16-finetune", indices=indices,
+                norm_stats=_norm_stats([1] * 32), state_noise_std=0.05,
+                rng=np.random.default_rng(43), datum_cache=compare.DatumCache(0),
+            )
+        unused_rng = np.random.default_rng(999)
+        expected_unused_draw = np.random.default_rng(999).normal()
+        with patch.object(compare, "_prepare_discrete_datum", side_effect=prepare):
+            materialized = compare.build_batch(
+                _BatchDataset(), object(),
+                base_model="openpi/pi05-action-lora-r16-finetune", indices=indices,
+                norm_stats=_norm_stats([1] * 32), state_noise_std=0.05,
+                rng=unused_rng, planned_requests=planned,
+                datum_cache=compare.DatumCache(0),
+            )
+        self.assertEqual(materialized, serial)
+        self.assertEqual(unused_rng.normal(), expected_unused_draw)
 
     def test_target_augmentation_changes_only_valid_supervision_dimensions(self) -> None:
         compare = _load_compare_module()
@@ -855,6 +952,146 @@ class CompareTrainingPrefetchTests(unittest.TestCase):
         producer.close()
         producer.close()
         self.assertFalse(producer._thread.is_alive())
+
+class CompareTrainingPlannedMultiProducerTests(unittest.TestCase):
+    def test_prefetch_span_rejects_cross_slate_materialization(self) -> None:
+        compare = _load_compare_module()
+        with self.assertRaisesRegex(ValueError, "more than one coverage slate"):
+            compare.validate_multi_producer_prefetch_span(
+                batch_size=64,
+                batch_producers=4,
+                prefetch_batches=4,
+                slate_rows=16,
+                anchors_per_row=8,
+                sampling_strategy="coverage",
+            )
+
+    def test_prefetch_span_accepts_one_slate_and_single_producer(self) -> None:
+        compare = _load_compare_module()
+        accepted = compare.validate_multi_producer_prefetch_span(
+            batch_size=64,
+            batch_producers=2,
+            prefetch_batches=2,
+            slate_rows=16,
+            anchors_per_row=8,
+            sampling_strategy="coverage",
+        )
+        self.assertEqual(accepted, {
+            "status": "ok",
+            "outstanding_samples": 128,
+            "coverage_slate_samples": 128,
+        })
+        single = compare.validate_multi_producer_prefetch_span(
+            batch_size=128,
+            batch_producers=1,
+            prefetch_batches=1,
+            slate_rows=16,
+            anchors_per_row=8,
+            sampling_strategy="coverage",
+        )
+        self.assertEqual(single["status"], "not_applicable")
+
+    def test_parallel_materializers_emit_planner_order(self) -> None:
+        compare = _load_compare_module()
+        planned: list[int] = []
+
+        def plan_next(ordinal: int):
+            planned.append(ordinal)
+            return compare.TrainingBatchPlan(ordinal, (ordinal,), None)
+
+        def materialize(plan):
+            time.sleep((5 - plan.ordinal) * 0.002)
+            return [{"ordinal": plan.ordinal}]
+
+        producer = compare.PlannedMultiProducerPrefetcher(
+            4, plan_next, [materialize, materialize], max_batches=6
+        )
+        try:
+            actual = [producer.next_batch()[0]["ordinal"] for _ in range(6)]
+        finally:
+            producer.close()
+        self.assertEqual(actual, list(range(6)))
+        self.assertEqual(planned, list(range(6)))
+        self.assertEqual(producer.batches_built, 6)
+
+    def test_parallel_planner_preserves_sample_and_noise_sequence(self) -> None:
+        compare = _load_compare_module()
+        dataset = _BatchDataset()
+
+        def sequence(parallel: bool):
+            sample_rng = np.random.default_rng(42)
+            noise_rng = np.random.default_rng(43)
+
+            def plan_next(ordinal: int):
+                indices = sample_rng.integers(0, len(dataset), size=3).tolist()
+                requests = compare.plan_augmentation_requests(
+                    dataset,
+                    indices=indices,
+                    state_noise_std=0.05,
+                    target_noise_std=0.0,
+                    rng=noise_rng,
+                )
+                return compare.TrainingBatchPlan(
+                    ordinal, tuple(indices), tuple(requests or ()),
+                )
+
+            def materialize(plan):
+                time.sleep((plan.ordinal % 3) * 0.002)
+                return [{
+                    "indices": plan.indices,
+                    "noise": tuple(
+                        tuple(request[1].tolist()) for request in plan.augmentation_requests
+                    ),
+                }]
+
+            if not parallel:
+                return [materialize(plan_next(i))[0] for i in range(8)]
+            producer = compare.PlannedMultiProducerPrefetcher(
+                4, plan_next, [materialize, materialize, materialize], max_batches=8
+            )
+            try:
+                return [producer.next_batch()[0] for _ in range(8)]
+            finally:
+                producer.close()
+
+        self.assertEqual(sequence(False), sequence(True))
+
+    def test_parallel_materializer_exception_is_propagated(self) -> None:
+        compare = _load_compare_module()
+
+        def plan_next(ordinal: int):
+            return compare.TrainingBatchPlan(ordinal, (ordinal,), None)
+
+        def materialize(plan):
+            if plan.ordinal == 2:
+                raise RuntimeError("materialize failed")
+            return [{"ordinal": plan.ordinal}]
+
+        producer = compare.PlannedMultiProducerPrefetcher(
+            3, plan_next, [materialize, materialize], max_batches=5
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "materialize failed"):
+                for _ in range(5):
+                    producer.next_batch()
+        finally:
+            producer.close()
+
+    def test_close_unblocks_bounded_planner(self) -> None:
+        compare = _load_compare_module()
+
+        def plan_next(ordinal: int):
+            return compare.TrainingBatchPlan(ordinal, (ordinal,), None)
+
+        producer = compare.PlannedMultiProducerPrefetcher(
+            1, plan_next, [lambda plan: [{"ordinal": plan.ordinal}]], max_batches=100
+        )
+        time.sleep(0.02)
+        producer.close()
+        producer.close()
+        self.assertFalse(producer._planner.is_alive())
+        self.assertTrue(all(not worker.is_alive() for worker in producer._workers))
+
 
 
 if __name__ == "__main__":

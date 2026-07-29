@@ -273,6 +273,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
 
         self._row_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
         self._row_cache_lock = threading.RLock()
+        self._row_cache_condition = threading.Condition(self._row_cache_lock)
+        self._row_cache_loading: set[int] = set()
         self._index: list[tuple[int, int]] = []
         self._row_start_offset: dict[int, int] = {}
         self._row_window_start: dict[int, int] = {}
@@ -305,53 +307,69 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._slate_row_indices: list[int] = []
         self._slate_calls_since_rotate = 0
 
-    def _get_row(self, row_index: int) -> dict[str, Any]:
-        # Lance rows are immutable after loading. Protect the small row-level LRU
-        # so batch datum workers can safely decode different frames in parallel.
-        # Holding the lock during a miss also prevents duplicate full-row reads;
-        # misses occur only when the coverage slate rotates.
-        with self._row_cache_lock:
-            cached = self._row_cache.get(row_index)
-            if cached is not None:
-                self._row_cache.move_to_end(row_index)
-                return cached
-            source_row = self._source_row_indices[row_index]
-            columns = ["state", "actions", "prompt", "image", "wrist_image"]
-            if self._extended_state:
-                columns += ["contact", "objects"]
-            row = self._dataset.take([source_row], columns=columns).to_pylist()[0]
-            if self._action_source != MEASURED_DELTA:
-                assert self._target_dataset is not None
-                target_row = self._target_dataset.take(
-                    [source_row], columns=["hands"]
-                ).to_pylist()[0]
-                target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
-                image_q = np.asarray(row["state"], dtype=np.float32)[:, :26]
-                if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
-                    raise ValueError(
-                        f"target/image q mismatch at source row {source_row}: "
-                        f"target={target_q.shape} image={image_q.shape}"
-                    )
-                row = {**row, "hands": target_row["hands"]}
-            row = project_row_actions(row, self._action_source)
-            row = {
-                **row,
-                "prompt": format_language_prompt(
-                    row["prompt"],
-                    self._rows[row_index]["trajectory_metadata"],
-                    self._language_conditioning,
-                    gesture=(
-                        self._gesture_records[row_index].gesture
-                        if self._language_conditioning == GESTURE_LANGUAGE
-                        else None
-                    ),
+    def _load_row_uncached(self, row_index: int) -> dict[str, Any]:
+        source_row = self._source_row_indices[row_index]
+        columns = ["state", "actions", "prompt", "image", "wrist_image"]
+        if self._extended_state:
+            columns += ["contact", "objects"]
+        row = self._dataset.take([source_row], columns=columns).to_pylist()[0]
+        if self._action_source != MEASURED_DELTA:
+            assert self._target_dataset is not None
+            target_row = self._target_dataset.take(
+                [source_row], columns=["hands"]
+            ).to_pylist()[0]
+            target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
+            image_q = np.asarray(row["state"], dtype=np.float32)[:, :26]
+            if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
+                raise ValueError(
+                    f"target/image q mismatch at source row {source_row}: "
+                    f"target={target_q.shape} image={image_q.shape}"
+                )
+            row = {**row, "hands": target_row["hands"]}
+        row = project_row_actions(row, self._action_source)
+        return {
+            **row,
+            "prompt": format_language_prompt(
+                row["prompt"],
+                self._rows[row_index]["trajectory_metadata"],
+                self._language_conditioning,
+                gesture=(
+                    self._gesture_records[row_index].gesture
+                    if self._language_conditioning == GESTURE_LANGUAGE
+                    else None
                 ),
-            }
+            ),
+        }
+
+    def _get_row(self, row_index: int) -> dict[str, Any]:
+        # Coalesce duplicate misses by row while allowing distinct immutable
+        # Lance rows to load concurrently. The old global miss lock serialized
+        # an entire coverage-slate rotation and produced multi-second GPU gaps.
+        with self._row_cache_condition:
+            while True:
+                cached = self._row_cache.get(row_index)
+                if cached is not None:
+                    self._row_cache.move_to_end(row_index)
+                    return cached
+                if row_index not in self._row_cache_loading:
+                    self._row_cache_loading.add(row_index)
+                    break
+                self._row_cache_condition.wait()
+        try:
+            row = self._load_row_uncached(row_index)
+        except BaseException:
+            with self._row_cache_condition:
+                self._row_cache_loading.discard(row_index)
+                self._row_cache_condition.notify_all()
+            raise
+        with self._row_cache_condition:
             self._row_cache[row_index] = row
             self._row_cache.move_to_end(row_index)
             while len(self._row_cache) > max(4, self._slate_size):
                 self._row_cache.popitem(last=False)
-            return row
+            self._row_cache_loading.remove(row_index)
+            self._row_cache_condition.notify_all()
+        return row
 
 
 def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
@@ -655,6 +673,21 @@ class AugmentationDiagnostics:
         delta = augmented_state - clean_state
         self.realized_noise_squares += float(np.square(delta[valid]).sum())
 
+    def merge_from(self, other: "AugmentationDiagnostics") -> None:
+        self.samples += other.samples
+        self.token_changed_samples += other.token_changed_samples
+        self.valid_coordinates += other.valid_coordinates
+        self.changed_bins += other.changed_bins
+        self.clean_out_of_range_coordinates += other.clean_out_of_range_coordinates
+        self.augmented_out_of_range_coordinates += other.augmented_out_of_range_coordinates
+        self.realized_noise_squares += other.realized_noise_squares
+        self.valid_by_dimension += other.valid_by_dimension
+        self.changed_bins_by_dimension += other.changed_bins_by_dimension
+        self.clean_out_of_range_by_dimension += other.clean_out_of_range_by_dimension
+        self.augmented_out_of_range_by_dimension += other.augmented_out_of_range_by_dimension
+        self.clean_token_lengths.extend(other.clean_token_lengths)
+        self.augmented_token_lengths.extend(other.augmented_token_lengths)
+
     def summary(self, requested_sigma: float, *, token_budget: int = 200) -> dict[str, Any]:
         valid = max(1, self.valid_coordinates)
         valid_dims = self.valid_by_dimension > 0
@@ -752,6 +785,14 @@ class TargetAugmentationDiagnostics:
         self.clean_out_of_range_coordinates += int((np.abs(clean[valid]) > 1.0).sum())
         self.augmented_out_of_range_coordinates += int((np.abs(augmented[valid]) > 1.0).sum())
         self.realized_noise_squares += float(np.square(delta[valid]).sum())
+
+    def merge_from(self, other: "TargetAugmentationDiagnostics") -> None:
+        self.samples += other.samples
+        self.valid_coordinates += other.valid_coordinates
+        self.changed_coordinates += other.changed_coordinates
+        self.clean_out_of_range_coordinates += other.clean_out_of_range_coordinates
+        self.augmented_out_of_range_coordinates += other.augmented_out_of_range_coordinates
+        self.realized_noise_squares += other.realized_noise_squares
 
     def summary(self, requested_sigma: float) -> dict[str, Any]:
         valid = max(1, self.valid_coordinates)
@@ -856,6 +897,55 @@ def _quantile_valid_dimensions(
     return np.isfinite(lo) & np.isfinite(hi) & ((hi - lo) > 1e-6)
 
 
+AugmentationRequest = tuple[int, np.ndarray | None, np.ndarray | None]
+
+
+class TrainingBatchPlan:
+    __slots__ = ("ordinal", "indices", "augmentation_requests")
+
+    def __init__(
+        self,
+        ordinal: int,
+        indices: tuple[int, ...],
+        augmentation_requests: tuple[AugmentationRequest, ...] | None,
+    ) -> None:
+        self.ordinal = int(ordinal)
+        self.indices = tuple(indices)
+        self.augmentation_requests = augmentation_requests
+
+
+def plan_augmentation_requests(
+    dataset: SelectedLanceDataset,
+    *,
+    indices: list[int],
+    state_noise_std: float,
+    target_noise_std: float,
+    rng: np.random.Generator,
+) -> list[AugmentationRequest] | None:
+    """Draw augmentation once, on the ordered planner thread."""
+    if state_noise_std == 0 and target_noise_std == 0:
+        return None
+    requests: list[AugmentationRequest] = []
+    for index in indices:
+        key = int(index % len(dataset))
+        state_noise = (
+            rng.normal(0.0, state_noise_std, size=32).astype(np.float32)
+            if state_noise_std > 0
+            else None
+        )
+        target_noise = (
+            rng.normal(
+                0.0,
+                target_noise_std,
+                size=(dataset._action_horizon, 32),
+            ).astype(np.float32)
+            if target_noise_std > 0
+            else None
+        )
+        requests.append((key, state_noise, target_noise))
+    return requests
+
+
 def build_batch(
     dataset: SelectedLanceDataset,
     data_config: Any,
@@ -866,6 +956,7 @@ def build_batch(
     state_noise_std: float,
     rng: np.random.Generator,
     target_noise_std: float = 0.0,
+    planned_requests: list[AugmentationRequest] | None = None,
     datum_cache: DatumCache | None = None,
     augmentation_diagnostics: AugmentationDiagnostics | None = None,
     target_augmentation_diagnostics: TargetAugmentationDiagnostics | None = None,
@@ -902,23 +993,21 @@ def build_batch(
         raise ValueError("target augmentation requires action_source=pd_target_delta")
 
     # Generate all noise before dispatch so thread scheduling cannot reorder RNG.
-    requests: list[tuple[int, np.ndarray | None, np.ndarray | None]] = []
-    for key in keys:
-        state_noise = (
-            rng.normal(0.0, state_noise_std, size=32).astype(np.float32)
-            if state_noise_std > 0
-            else None
+    requests = (
+        plan_augmentation_requests(
+            dataset,
+            indices=indices,
+            state_noise_std=state_noise_std,
+            target_noise_std=target_noise_std,
+            rng=rng,
         )
-        target_noise = (
-            rng.normal(
-                0.0,
-                target_noise_std,
-                size=(dataset._action_horizon, 32),
-            ).astype(np.float32)
-            if target_noise_std > 0
-            else None
-        )
-        requests.append((key, state_noise, target_noise))
+        if planned_requests is None
+        else planned_requests
+    )
+    if requests is None or len(requests) != len(keys):
+        raise ValueError("augmented batch plan does not match batch indices")
+    if [request[0] for request in requests] != keys:
+        raise ValueError("augmented batch plan keys do not match batch indices")
 
     def build_augmented(
         request: tuple[int, np.ndarray | None, np.ndarray | None]
@@ -1107,6 +1196,172 @@ class BatchPrefetcher:
             )
             self._close_warning_emitted = True
 
+
+class PlannedMultiProducerPrefetcher:
+    """Build centrally planned batches in parallel and emit them by ordinal."""
+
+    def __init__(
+        self,
+        prefetch_batches: int,
+        plan_next: Callable[[int], TrainingBatchPlan],
+        materializers: list[Callable[[TrainingBatchPlan], list[dict[str, Any]]]],
+        *,
+        max_batches: int,
+    ) -> None:
+        if prefetch_batches <= 0:
+            raise ValueError("prefetch_batches must be positive")
+        if max_batches < 0:
+            raise ValueError("max_batches must be non-negative")
+        if not materializers:
+            raise ValueError("materializers must be non-empty")
+        self._plan_next = plan_next
+        self._materializers = materializers
+        self._max_batches = max_batches
+        self._plans: queue.Queue[TrainingBatchPlan] = queue.Queue(maxsize=prefetch_batches)
+        self._results: queue.Queue[tuple[int, list[dict[str, Any]]]] = queue.Queue()
+        self._slots = threading.Semaphore(prefetch_batches)
+        self._stop = threading.Event()
+        self._planner_done = threading.Event()
+        self._error_lock = threading.Lock()
+        self._error: BaseException | None = None
+        self._result_buffer: dict[int, list[dict[str, Any]]] = {}
+        self._expected_ordinal = 0
+        self._stats_lock = threading.Lock()
+        self.planner_seconds = 0.0
+        self.plans_created = 0
+        self.build_seconds = 0.0
+        self.batches_built = 0
+        self._planner = threading.Thread(
+            target=self._plan,
+            name="batch-planner",
+            daemon=True,
+        )
+        self._workers = [
+            threading.Thread(
+                target=self._materialize,
+                args=(worker_id,),
+                name=f"batch-materializer-{worker_id}",
+                daemon=True,
+            )
+            for worker_id in range(len(materializers))
+        ]
+        self._planner.start()
+        for worker in self._workers:
+            worker.start()
+
+    def _set_error(self, error: BaseException) -> None:
+        with self._error_lock:
+            if self._error is None:
+                self._error = error
+        self._stop.set()
+
+    def _raise_if_error(self) -> None:
+        with self._error_lock:
+            error = self._error
+        if error is not None:
+            raise error
+
+    def _plan(self) -> None:
+        try:
+            for ordinal in range(self._max_batches):
+                while not self._stop.is_set():
+                    if self._slots.acquire(timeout=0.1):
+                        break
+                else:
+                    return
+                started_at = time.perf_counter()
+                plan = self._plan_next(ordinal)
+                self.planner_seconds += time.perf_counter() - started_at
+                self.plans_created += 1
+                while not self._stop.is_set():
+                    try:
+                        self._plans.put(plan, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+                else:
+                    self._slots.release()
+                    return
+        except BaseException as error:
+            self._set_error(error)
+        finally:
+            self._planner_done.set()
+
+    def _materialize(self, worker_id: int) -> None:
+        materialize = self._materializers[worker_id]
+        try:
+            while not self._stop.is_set():
+                try:
+                    plan = self._plans.get(timeout=0.1)
+                except queue.Empty:
+                    if self._planner_done.is_set():
+                        return
+                    continue
+                started_at = time.perf_counter()
+                batch = materialize(plan)
+                elapsed = time.perf_counter() - started_at
+                with self._stats_lock:
+                    self.build_seconds += elapsed
+                    self.batches_built += 1
+                self._results.put((plan.ordinal, batch))
+        except BaseException as error:
+            self._set_error(error)
+
+    def next_batch(self) -> list[dict[str, Any]]:
+        while True:
+            self._raise_if_error()
+            buffered = self._result_buffer.pop(self._expected_ordinal, None)
+            if buffered is not None:
+                self._expected_ordinal += 1
+                self._slots.release()
+                return buffered
+            try:
+                ordinal, batch = self._results.get(timeout=0.1)
+            except queue.Empty:
+                if self._planner_done.is_set() and not any(
+                    worker.is_alive() for worker in self._workers
+                ):
+                    self._raise_if_error()
+                    raise RuntimeError("planned batch producers stopped unexpectedly")
+                continue
+            if ordinal in self._result_buffer or ordinal < self._expected_ordinal:
+                raise RuntimeError(f"duplicate planned batch ordinal {ordinal}")
+            self._result_buffer[ordinal] = batch
+
+    def close(self) -> None:
+        self._stop.set()
+        self._planner.join()
+        for worker in self._workers:
+            worker.join()
+
+
+def validate_multi_producer_prefetch_span(
+    *,
+    batch_size: int,
+    batch_producers: int,
+    prefetch_batches: int,
+    slate_rows: int,
+    anchors_per_row: int,
+    sampling_strategy: str,
+) -> dict[str, Any]:
+    outstanding_samples = batch_size * prefetch_batches
+    slate_samples = slate_rows * anchors_per_row
+    status = "not_applicable"
+    if sampling_strategy == "coverage" and batch_producers > 1:
+        status = "ok"
+        if outstanding_samples > slate_samples:
+            raise ValueError(
+                "multi-producer prefetch spans more than one coverage slate: "
+                f"batch_size({batch_size}) * prefetch_batches({prefetch_batches}) "
+                f"= {outstanding_samples} > slate_rows({slate_rows}) * "
+                f"anchors_per_row({anchors_per_row}) = {slate_samples}; "
+                "reduce --prefetch-batches to prevent concurrent row-cache thrash"
+            )
+    return {
+        "status": status,
+        "outstanding_samples": outstanding_samples,
+        "coverage_slate_samples": slate_samples,
+    }
 
 class CoverageSampler:
     """Seeded row coverage grouped into cache-friendly, balanced slates."""
@@ -1353,6 +1608,12 @@ def parse_args() -> argparse.Namespace:
         help="ordered batches to build ahead during blocking train_step requests; 0 is synchronous",
     )
     parser.add_argument(
+        "--batch-producers",
+        type=int,
+        default=1,
+        help="independent batch materializers fed by one deterministic sampling/augmentation planner",
+    )
+    parser.add_argument(
         "--batch-build-workers",
         type=int,
         default=4,
@@ -1498,8 +1759,14 @@ def main() -> int:
         raise ValueError("datum_cache_size must be non-negative")
     if args.prefetch_batches < 0:
         raise ValueError("prefetch_batches must be non-negative")
+    if args.batch_producers <= 0:
+        raise ValueError("batch_producers must be positive")
     if args.batch_build_workers <= 0:
         raise ValueError("batch_build_workers must be positive")
+    if args.batch_build_workers < args.batch_producers:
+        raise ValueError("batch_build_workers must be at least batch_producers")
+    if args.batch_producers > 1 and args.prefetch_batches == 0:
+        raise ValueError("multiple batch producers require positive prefetch_batches")
     if args.slate_size <= 0 or args.coverage_anchors_per_row <= 0:
         raise ValueError("slate_size and coverage_anchors_per_row must be positive")
     if args.augmentation_audit_samples < 0:
@@ -1544,7 +1811,7 @@ def main() -> int:
             max_workers=args.batch_build_workers,
             thread_name_prefix="datum-build",
         )
-        if args.batch_build_workers > 1
+        if args.batch_producers == 1 and args.batch_build_workers > 1
         else None
     )
     coverage_sampler = (
@@ -1556,6 +1823,14 @@ def main() -> int:
         )
         if args.sampling_strategy == "coverage"
         else None
+    )
+    prefetch_contract = validate_multi_producer_prefetch_span(
+        batch_size=args.batch_size,
+        batch_producers=args.batch_producers,
+        prefetch_batches=args.prefetch_batches,
+        slate_rows=min(args.slate_size, len(dataset._row_start_offset)),
+        anchors_per_row=args.coverage_anchors_per_row,
+        sampling_strategy=args.sampling_strategy,
     )
     if args.global_step_offset:
         if coverage_sampler is None:
@@ -1619,6 +1894,8 @@ def main() -> int:
         "augmentation_seed": augmentation_seed,
         "datum_cache_size": args.datum_cache_size,
         "prefetch_batches": args.prefetch_batches,
+        "prefetch_contract": prefetch_contract,
+        "batch_producers": args.batch_producers,
         "batch_build_workers": args.batch_build_workers,
         "sampling_strategy": args.sampling_strategy,
         "slate_size": args.slate_size,
@@ -1669,6 +1946,8 @@ def main() -> int:
             "augmentation_seed": augmentation_seed,
             "datum_cache": datum_cache.summary(),
             "prefetch_batches": args.prefetch_batches,
+            "prefetch_contract": prefetch_contract,
+            "batch_producers": args.batch_producers,
             "batch_build_workers": args.batch_build_workers,
             "augmentation": augmentation_diagnostics.summary(
                 args.state_noise_std,
@@ -1681,6 +1960,89 @@ def main() -> int:
         }), flush=True)
         return 0
 
+    worker_data_configs = [data_config]
+    worker_augmentation_diagnostics = [augmentation_diagnostics]
+    worker_target_diagnostics = [target_augmentation_diagnostics]
+    producer_executors: list[ThreadPoolExecutor | None] = [batch_executor]
+
+    if args.batch_producers > 1:
+        worker_base, worker_remainder = divmod(
+            args.batch_build_workers, args.batch_producers
+        )
+        producer_executors = []
+        for worker_id in range(args.batch_producers):
+            if worker_id > 0:
+                worker_data_configs.append(L._make_data_config(
+                    model_config,
+                    norm_stats,
+                    action_source=dataset._action_source,
+                ))
+                worker_augmentation_diagnostics.append(AugmentationDiagnostics())
+                worker_target_diagnostics.append(TargetAugmentationDiagnostics())
+            worker_count = worker_base + (1 if worker_id < worker_remainder else 0)
+            producer_executors.append(
+                ThreadPoolExecutor(
+                    max_workers=worker_count,
+                    thread_name_prefix=f"datum-build-{worker_id}",
+                ) if worker_count > 1 else None
+            )
+
+    batch_materializers: list[
+        Callable[[TrainingBatchPlan], list[dict[str, Any]]]
+    ] = []
+    if args.batch_producers > 1:
+        def make_materializer(
+            worker_id: int,
+        ) -> Callable[[TrainingBatchPlan], list[dict[str, Any]]]:
+            worker_rng = np.random.default_rng(worker_id)
+
+            def materialize(plan: TrainingBatchPlan) -> list[dict[str, Any]]:
+                return build_batch(
+                    dataset,
+                    worker_data_configs[worker_id],
+                    base_model=args.model,
+                    indices=list(plan.indices),
+                    norm_stats=norm_stats,
+                    state_noise_std=args.state_noise_std,
+                    target_noise_std=args.target_noise_std,
+                    rng=worker_rng,
+                    planned_requests=(
+                        list(plan.augmentation_requests)
+                        if plan.augmentation_requests is not None
+                        else None
+                    ),
+                    datum_cache=datum_cache,
+                    augmentation_diagnostics=worker_augmentation_diagnostics[worker_id],
+                    target_augmentation_diagnostics=worker_target_diagnostics[worker_id],
+                    executor=producer_executors[worker_id],
+                )
+
+            return materialize
+
+        batch_materializers = [
+            make_materializer(worker_id)
+            for worker_id in range(args.batch_producers)
+        ]
+
+    def plan_next_batch(ordinal: int) -> TrainingBatchPlan:
+        indices = (
+            coverage_sampler.sample_indices(args.batch_size)
+            if coverage_sampler
+            else dataset.sample_indices(args.batch_size, sample_rng)
+        )
+        requests = plan_augmentation_requests(
+            dataset,
+            indices=indices,
+            state_noise_std=args.state_noise_std,
+            target_noise_std=args.target_noise_std,
+            rng=augmentation_rng,
+        )
+        return TrainingBatchPlan(
+            ordinal=ordinal,
+            indices=tuple(indices),
+            augmentation_requests=(tuple(requests) if requests is not None else None),
+        )
+
     base_url = args.base_url.rstrip("/")
     headers = L._headers(args.api_key)
     model_id = ""
@@ -1688,7 +2050,7 @@ def main() -> int:
     save_result: dict[str, Any] = {}
     intermediate_checkpoint: dict[str, Any] | None = None
     periodic_checkpoints: list[dict[str, Any]] = []
-    prefetcher: BatchPrefetcher | None = None
+    prefetcher: BatchPrefetcher | PlannedMultiProducerPrefetcher | None = None
     metrics_stream = None
     batch_build_seconds = 0.0
     batch_ready_wait_seconds = 0.0
@@ -1701,7 +2063,16 @@ def main() -> int:
         metrics_stream = args.metrics_jsonl.open("x", encoding="utf-8", buffering=1)
     try:
         model_id, create_result = L._create_model(base_url, headers, base_model=args.model)
-        if args.prefetch_batches:
+        if args.batch_producers > 1:
+            # One planner owns CoverageSampler and augmentation RNG. Independent
+            # materializers may finish out of order; the consumer cannot.
+            prefetcher = PlannedMultiProducerPrefetcher(
+                args.prefetch_batches,
+                plan_next_batch,
+                batch_materializers,
+                max_batches=args.steps,
+            )
+        elif args.prefetch_batches:
             # This sole producer owns both RNG streams, so queue timing cannot
             # change sample selection or augmentation noise.
             prefetcher = BatchPrefetcher(
@@ -1848,9 +2219,20 @@ def main() -> int:
                         time.sleep(sleep_seconds)
                     print("checkpoint resume marker observed; continuing training", flush=True)
 
+        planner_seconds = 0.0
+        plans_created = 0
+        batches_built = len(steps_log) if prefetcher is None else 0
         if prefetcher is not None:
-            batch_build_seconds = prefetcher.build_seconds
             prefetcher.close()
+            batch_build_seconds = prefetcher.build_seconds
+            planner_seconds = getattr(prefetcher, "planner_seconds", 0.0)
+            plans_created = getattr(prefetcher, "plans_created", len(steps_log))
+            batches_built = getattr(prefetcher, "batches_built", len(steps_log))
+        if args.batch_producers > 1:
+            for worker_diagnostics in worker_augmentation_diagnostics[1:]:
+                augmentation_diagnostics.merge_from(worker_diagnostics)
+            for worker_diagnostics in worker_target_diagnostics[1:]:
+                target_augmentation_diagnostics.merge_from(worker_diagnostics)
 
         if args.skip_final_save:
             save_result = {"skipped": True, "reason": "--skip-final-save"}
@@ -1931,12 +2313,17 @@ def main() -> int:
             "augmentation_seed": augmentation_seed,
             "datum_cache": datum_cache.summary(),
             "prefetch_batches": args.prefetch_batches,
+            "prefetch_contract": prefetch_contract,
+            "batch_producers": args.batch_producers,
             "batch_build_workers": args.batch_build_workers,
             "timing_seconds": {
                 "batch_build_total": batch_build_seconds,
+                "batch_planner_total": planner_seconds,
+                "batch_plans_created": plans_created,
+                "batches_built": batches_built,
                 "batch_ready_wait_total": batch_ready_wait_seconds,
                 "train_request_total": request_seconds,
-                "train_requests": args.steps,
+                "train_requests": len(steps_log),
             },
             "elapsed_seconds": time.time() - started_at,
             "inference_run": False,
@@ -1953,8 +2340,9 @@ def main() -> int:
             metrics_stream.close()
         if prefetcher is not None:
             prefetcher.close()
-        if batch_executor is not None:
-            batch_executor.shutdown(wait=True, cancel_futures=True)
+        for executor in producer_executors:
+            if executor is not None:
+                executor.shutdown(wait=True, cancel_futures=True)
         if model_id:
             L._delete_model(base_url, headers, model_id)
 
