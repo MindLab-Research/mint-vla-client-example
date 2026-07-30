@@ -1,5 +1,34 @@
 # Action-LoRA GPU supply-path optimization
 
+## Recommended production defaults
+
+Pass these settings explicitly; the CLI keeps conservative legacy defaults for
+backward compatibility.
+
+| Server GPUs | Batch | Producers | Prefetch | Total build workers | Datum cache | Row cache |
+|---:|---:|---:|---:|---:|---:|---|
+| 4 | 128 | **2** | **2** | 16 | 256 | Complete selected population, preloaded |
+| 8 | 128 | **8** | **8** | 16 | 256 | Complete selected population, preloaded |
+
+For the full Cylinder1 population (`rows 3514–4552`, 1,039 trajectories), use:
+
+```text
+--batch-size 128
+--batch-build-workers 16
+--datum-cache-size 256
+--row-cache-size 1039
+--preload-selected-rows
+```
+
+Add `--batch-producers 2 --prefetch-batches 2` for four GPUs, or
+`--batch-producers 8 --prefetch-batches 8` for eight GPUs. Keep
+`--slate-size 16 --coverage-anchors-per-row 8` in both cases.
+
+Set `--row-cache-size` to the number of selected trajectory rows, not to the GPU
+count. Full-population residency is what makes cross-slate prefetch valid. If the
+population cannot fit host RAM, use the low-memory fallback
+`batch64 / producers2 / prefetch2 / workers16` without cross-slate prefetch.
+
 ## Eight-GPU population-resident result
 
 The eight-GPU bottleneck was full-trajectory Lance I/O, not GPU communication.
@@ -32,9 +61,26 @@ fits host memory and the run is long enough to amortize startup.
 Evidence is in
 `results/benchmarks/eight_gpu_efficiency_port_20260730/`.
 
-## Four-GPU result
+## Four-GPU population-resident result
 
-The formal MANO Action-LoRA path was limited by two coupled mechanisms:
+A simultaneous four-GPU A/B test used the same model, batch128, 128-row
+resident population, norm, Coverage schedule, and StateAug draws:
+
+| Four-GPU supply setting | Samples/s | Mean batch wait | Mean server route | Warm SM |
+|---|---:|---:|---:|---:|
+| P8 / prefetch8 / workers16 | 42.35 | 1.530 ms | 2.913 s | 71.56% |
+| **P2 / prefetch2 / workers16** | **41.49** | **1.415 ms** | 2.972 s | 70.74% |
+
+P2 retains 97.96% of P8 throughput and does not starve the GPUs. The small
+throughput difference is explained by the two GPU groups' server-route times,
+not by batch supply. Four-GPU production therefore uses P2/prefetch2; P8 is
+valid but over-provisions the host queue. Evidence is in
+`results/benchmarks/four_gpu_resident_param_ab_20260730/summary.json`.
+
+## Historical four-GPU bounded-cache result
+
+Before full-population residency, the formal MANO Action-LoRA path was limited
+by two coupled mechanisms:
 
 1. batch 8 did too little work per server step;
 2. the client serialized coverage-slate row loads behind one row-cache miss lock,
@@ -63,10 +109,10 @@ The balanced point is:
 --prefetch-batches 2
 ```
 
-Batch 128 was only 1.6% faster than batch 64. Batch 64 has lower request latency
-(2.24 s versus 4.24 s), slightly lower host RSS, and uses two concurrent batch
-materializers, so it is the recommended long-run setting unless maximum sample
-throughput is the sole objective.
+Batch 128 was only 1.6% faster than batch 64 in this historical bounded-cache
+test. Batch64/P2/prefetch2 remains the low-memory fallback because it stays
+within one 128-sample Coverage slate. The population-resident defaults above
+supersede it on hosts that can retain the selected rows.
 
 ## Measurements
 

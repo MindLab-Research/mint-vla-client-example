@@ -314,6 +314,25 @@ also match the simulator and inference client.
 
 ## 6. Start a fine-tuning run
 
+### Choose the GPU-count defaults
+
+Use these production settings explicitly:
+
+| Server GPUs | Batch | Producers | Prefetch | Total build workers | Datum cache |
+|---:|---:|---:|---:|---:|---:|
+| 4 | 128 | **2** | **2** | 16 | 256 |
+| 8 | 128 | **8** | **8** | 16 | 256 |
+
+Both settings require a population-resident row cache: set `--row-cache-size`
+to the number of selected trajectory rows and pass `--preload-selected-rows`.
+For full Cylinder1 (`rows 3514–4552`), the value is 1,039. Four GPUs can run
+P8/prefetch8, but a controlled A/B retained 97.96% of its throughput with P2
+while keeping batch wait near one millisecond, so P2 is the four-GPU default.
+On the measured host, full Cylinder1 preload took about 433 seconds and the
+client peaked near 233 GiB RSS; confirm host RAM before using the resident
+profile. For the low-memory profile, omit the row-preload flags and use the
+fallback documented below.
+
 Use one parameterized command for the clean and StateAug arms so every setting
 except state noise remains identical:
 
@@ -322,11 +341,21 @@ cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example
 
 ARM=clean                 # use stateaug005 for the augmented arm
 STATE_NOISE=0             # use 0.05 for stateaug005
+GPU_COUNT=4               # set to 8 for an eight-GPU server
 RUN_NAME="gesture03_32d_${ARM}_30k"
-ROWS=$(seq -s, 810 994)
+ROW_START=810
+ROW_END=994
+ROWS=$(seq -s, "${ROW_START}" "${ROW_END}")
+ROW_CACHE_SIZE=$((ROW_END - ROW_START + 1))
 MANIFEST=/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.contact_ctx100_error_v1.json
 NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726
 NORM_SHA=$(sha256sum "${NORM}/norm_stats.json" | awk '{print $1}')
+
+case "${GPU_COUNT}" in
+  4) BATCH_PRODUCERS=2; PREFETCH_BATCHES=2 ;;
+  8) BATCH_PRODUCERS=8; PREFETCH_BATCHES=8 ;;
+  *) echo "GPU_COUNT must be 4 or 8" >&2; exit 2 ;;
+esac
 
 MINT_BASE_URL=http://127.0.0.1:30532 \
 ./scripts/remote/run_client.sh scripts/train/train_cube1_01_compare.py \
@@ -340,7 +369,12 @@ MINT_BASE_URL=http://127.0.0.1:30532 \
   --language-conditioning gesture \
   --extended-state --norm-stats-dir "${NORM}" --norm-sha-expected "${NORM_SHA}" \
   --sampling-strategy coverage --slate-size 16 --coverage-anchors-per-row 8 \
-  --steps 30000 --batch-size 8 --seed 42 --augmentation-seed 43 \
+  --steps 30000 --batch-size 128 \
+  --batch-producers "${BATCH_PRODUCERS}" \
+  --prefetch-batches "${PREFETCH_BATCHES}" \
+  --batch-build-workers 16 --datum-cache-size 256 \
+  --row-cache-size "${ROW_CACHE_SIZE}" --preload-selected-rows \
+  --seed 42 --augmentation-seed 43 \
   --state-noise-std "${STATE_NOISE}" \
   --save-path "${RUN_NAME}" \
   --output-json "/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example/results/training/${RUN_NAME}/result.json"
@@ -362,12 +396,15 @@ samples and `--augmentation-seed 43` generates fresh state noise.
 The client training loop also uses a bounded transformed-datum cache and an
 ordered batch prefetch queue:
 
-- `--datum-cache-size 4096` bounds transformed frame memory; use `0` to disable
-  caching. Large performance probes can use `256` to cap host RSS.
-- `--prefetch-batches 2` builds batches while the server executes the current
-  request; use `0` for synchronous debugging.
-- `--batch-producers 1` preserves the historical single-producer path. Values
-  above one enable independently materialized batches.
+- `--datum-cache-size 256` is the measured production setting; use `0` only for
+  cache-off debugging.
+- `--prefetch-batches 2` on four GPUs or `8` on eight GPUs builds batches while
+  the server executes the current request; use `0` for synchronous debugging.
+- `--batch-producers 2` on four GPUs or `8` on eight GPUs enables independently
+  materialized batches. The historical value `1` remains available for A/B.
+- `--row-cache-size N --preload-selected-rows` loads and retains all `N`
+  selected trajectories before model creation. `N` must equal the selected-row
+  population for the production cross-slate settings above.
 - `--batch-build-workers` is the total datum-thread budget. With multiple
   producers it is divided deterministically across them.
 
@@ -378,22 +415,26 @@ scheduling cannot change rows, frames, StateAug draws, or optimizer batch order.
 The Lance row cache coalesces duplicate misses per row while allowing distinct
 rows to load concurrently.
 
-Keep concurrent prefetch within one CoverageSampler slate. For the standard
-`--slate-size 16 --coverage-anchors-per-row 8` contract, the bound is 128
-outstanding samples:
+With the historical slate-sized row cache, concurrent prefetch must stay within
+one CoverageSampler slate. For the standard values `--slate-size 16` and
+`--coverage-anchors-per-row 8`, that bound is:
 
 ```text
-batch_size * prefetch_batches <= slate_size * coverage_anchors_per_row
+batch_size * prefetch_batches <= 128
 ```
 
-The trainer rejects cross-slate multi-producer settings because concurrent
-slates evict each other's large row payloads and cause repeated PFS reloads. The
-measured four-GPU operating points are:
+The trainer permits the recommended cross-slate settings only after the complete
+selected population has been preloaded into a capacity-matched row cache. The
+output must then report:
 
-- throughput-biased: `--batch-size 128 --batch-producers 1
-  --batch-build-workers 16 --prefetch-batches 1`;
-- balanced latency/throughput: `--batch-size 64 --batch-producers 2
-  --batch-build-workers 16 --prefetch-batches 2`.
+```text
+prefetch_contract.status = population_resident
+row_preload.cache_resident_rows = row_preload.rows
+```
+
+If the population does not fit host RAM, use the low-memory fallback
+`batch64 / producers2 / prefetch2 / workers16`; it stays within one slate and
+does not require full-population residency.
 
 Both require a batch divisible by the server device count. MINT metrics expose
 `device_count:sum`, `used_data_sharding:mean`, and
