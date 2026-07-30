@@ -201,12 +201,22 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._gesture_index_sha256 = (
             self._gesture_index.sha256 if self._gesture_index is not None else None
         )
-        self._target_dataset_path = target_lance_dataset
-        self._target_dataset = (
-            lance.dataset(str(target_lance_dataset)) if target_lance_dataset is not None else None
+        self._dataset_path = Path(lance_dataset).expanduser().resolve()
+        self._target_dataset_path = (
+            Path(target_lance_dataset).expanduser().resolve()
+            if target_lance_dataset is not None
+            else None
         )
-        self._dataset = lance.dataset(str(lance_dataset))
-        self._dataset_path = Path(lance_dataset)
+        self._target_is_image_dataset = (
+            self._target_dataset_path is not None
+            and self._target_dataset_path == self._dataset_path
+        )
+        self._target_dataset = (
+            lance.dataset(str(self._target_dataset_path))
+            if self._target_dataset_path is not None
+            else None
+        )
+        self._dataset = lance.dataset(str(self._dataset_path))
         all_rows = self._dataset.to_table(
             columns=["episode_metadata", "trajectory_metadata", "index"]
         ).to_pylist()
@@ -319,6 +329,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         if not self._index:
             raise ValueError(f"No samples available in selected rows from {lance_dataset}")
         self._slate_size = min(16, len(self._row_start_offset))
+        self._row_cache_capacity_rows: int | None = None
         self._slate_rotate_every = 250
         self._slate_row_indices: list[int] = []
         self._slate_calls_since_rotate = 0
@@ -328,20 +339,25 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
+        if self._action_source != MEASURED_DELTA and self._target_is_image_dataset:
+            columns.append("hands")
         row = self._dataset.take([source_row], columns=columns).to_pylist()[0]
         if self._action_source != MEASURED_DELTA:
             assert self._target_dataset is not None
-            target_row = self._target_dataset.take(
-                [source_row], columns=["hands"]
-            ).to_pylist()[0]
-            target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
+            target_hands = row.get("hands")
+            if target_hands is None:
+                target_row = self._target_dataset.take(
+                    [source_row], columns=["hands"]
+                ).to_pylist()[0]
+                target_hands = target_row["hands"]
+            target_q = np.asarray(target_hands[0]["urdf_dof"], dtype=np.float32)
             image_q = np.asarray(row["state"], dtype=np.float32)[:, :26]
             if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
                 raise ValueError(
                     f"target/image q mismatch at source row {source_row}: "
                     f"target={target_q.shape} image={image_q.shape}"
                 )
-            row = {**row, "hands": target_row["hands"]}
+            row = {**row, "hands": target_hands}
         row = project_row_actions(row, self._action_source)
         return {
             **row,
@@ -381,11 +397,53 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         with self._row_cache_condition:
             self._row_cache[row_index] = row
             self._row_cache.move_to_end(row_index)
-            while len(self._row_cache) > max(4, self._slate_size):
+            while len(self._row_cache) > self.row_cache_capacity_rows():
                 self._row_cache.popitem(last=False)
             self._row_cache_loading.remove(row_index)
             self._row_cache_condition.notify_all()
         return row
+
+    def row_cache_capacity_rows(self) -> int:
+        explicit = getattr(self, "_row_cache_capacity_rows", None)
+        return (
+            max(4, int(explicit))
+            if explicit is not None
+            else max(4, self._slate_size)
+        )
+
+    def set_row_cache_capacity_rows(self, capacity: int) -> int:
+        if capacity <= 0:
+            raise ValueError("row cache size must be positive")
+        effective = min(int(capacity), len(self._row_start_offset))
+        with self._row_cache_condition:
+            self._row_cache_capacity_rows = effective
+            while len(self._row_cache) > effective:
+                self._row_cache.popitem(last=False)
+        return effective
+
+    def preload_selected_rows(self, workers: int) -> dict[str, Any]:
+        if workers <= 0:
+            raise ValueError("row preload workers must be positive")
+        rows = sorted(self._row_start_offset)
+        if self.row_cache_capacity_rows() < len(rows):
+            raise ValueError(
+                "preloading selected rows requires row cache capacity at least "
+                f"the selected population: {self.row_cache_capacity_rows()} < {len(rows)}"
+            )
+        started = time.perf_counter()
+        with ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="row-preload"
+        ) as executor:
+            for _ in executor.map(self._get_row, rows):
+                pass
+        return {
+            "enabled": True,
+            "rows": len(rows),
+            "workers": workers,
+            "seconds": time.perf_counter() - started,
+            "cache_capacity_rows": self.row_cache_capacity_rows(),
+            "cache_resident_rows": len(self._row_cache),
+        }
 
 
 def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
@@ -1364,6 +1422,7 @@ def validate_multi_producer_prefetch_span(
     slate_rows: int,
     anchors_per_row: int,
     sampling_strategy: str,
+    resident_population: bool = False,
 ) -> dict[str, Any]:
     outstanding_samples = batch_size * prefetch_batches
     slate_samples = slate_rows * anchors_per_row
@@ -1371,18 +1430,24 @@ def validate_multi_producer_prefetch_span(
     if sampling_strategy == "coverage" and batch_producers > 1:
         status = "ok"
         if outstanding_samples > slate_samples:
-            raise ValueError(
-                "multi-producer prefetch spans more than one coverage slate: "
-                f"batch_size({batch_size}) * prefetch_batches({prefetch_batches}) "
-                f"= {outstanding_samples} > slate_rows({slate_rows}) * "
-                f"anchors_per_row({anchors_per_row}) = {slate_samples}; "
-                "reduce --prefetch-batches to prevent concurrent row-cache thrash"
-            )
-    return {
+            if resident_population:
+                status = "population_resident"
+            else:
+                raise ValueError(
+                    "multi-producer prefetch spans more than one coverage slate: "
+                    f"batch_size({batch_size}) * prefetch_batches({prefetch_batches}) "
+                    f"= {outstanding_samples} > slate_rows({slate_rows}) * "
+                    f"anchors_per_row({anchors_per_row}) = {slate_samples}; "
+                    "reduce --prefetch-batches to prevent concurrent row-cache thrash"
+                )
+    result = {
         "status": status,
         "outstanding_samples": outstanding_samples,
         "coverage_slate_samples": slate_samples,
     }
+    if resident_population:
+        result["resident_population"] = True
+    return result
 
 class CoverageSampler:
     """Seeded row coverage grouped into cache-friendly, balanced slates."""
@@ -1635,6 +1700,17 @@ def parse_args() -> argparse.Namespace:
         help="maximum transformed frame datums retained per training run; 0 disables caching",
     )
     parser.add_argument(
+        "--row-cache-size",
+        type=int,
+        default=0,
+        help="trajectory rows retained in memory; 0 keeps the historical slate-sized cache",
+    )
+    parser.add_argument(
+        "--preload-selected-rows",
+        action="store_true",
+        help="load every selected trajectory into the explicit row cache before model creation",
+    )
+    parser.add_argument(
         "--prefetch-batches", type=int, default=2,
         help="ordered batches to build ahead during blocking train_step requests; 0 is synchronous",
     )
@@ -1798,6 +1874,10 @@ def main() -> int:
         raise ValueError("checkpoint_resume_timeout_seconds must be non-negative")
     if args.datum_cache_size < 0:
         raise ValueError("datum_cache_size must be non-negative")
+    if args.row_cache_size < 0:
+        raise ValueError("row_cache_size must be non-negative")
+    if args.preload_selected_rows and args.row_cache_size == 0:
+        raise ValueError("--preload-selected-rows requires explicit --row-cache-size")
     if args.prefetch_batches < 0:
         raise ValueError("prefetch_batches must be non-negative")
     if args.batch_producers <= 0:
@@ -1832,6 +1912,18 @@ def main() -> int:
         target_lance_dataset=args.target_lance_dataset,
         extended_state=args.extended_state,
     )
+    if args.row_cache_size:
+        dataset.set_row_cache_capacity_rows(args.row_cache_size)
+    preload_summary = {
+        "enabled": False,
+        "rows": 0,
+        "workers": 0,
+        "seconds": 0.0,
+        "cache_capacity_rows": dataset.row_cache_capacity_rows(),
+        "cache_resident_rows": len(dataset._row_cache),
+    }
+    if args.preload_selected_rows:
+        preload_summary = dataset.preload_selected_rows(args.batch_build_workers)
     sample = dataset[0]
     action_dim = int(sample["observation/state"].shape[0])
     model_config = L._build_model_config(
@@ -1876,6 +1968,10 @@ def main() -> int:
         slate_rows=min(args.slate_size, len(dataset._row_start_offset)),
         anchors_per_row=args.coverage_anchors_per_row,
         sampling_strategy=args.sampling_strategy,
+        resident_population=(
+            bool(args.preload_selected_rows)
+            and preload_summary["cache_resident_rows"] == len(dataset._row_start_offset)
+        ),
     )
     if args.global_step_offset:
         if coverage_sampler is None:
@@ -1940,6 +2036,9 @@ def main() -> int:
         "sample_seed": args.seed,
         "augmentation_seed": augmentation_seed,
         "datum_cache_size": args.datum_cache_size,
+        "row_cache_size_requested": args.row_cache_size,
+        "row_cache_size_effective": dataset.row_cache_capacity_rows(),
+        "row_preload": preload_summary,
         "prefetch_batches": args.prefetch_batches,
         "prefetch_contract": prefetch_contract,
         "batch_producers": args.batch_producers,
@@ -1992,6 +2091,8 @@ def main() -> int:
             "sample_seed": args.seed,
             "augmentation_seed": augmentation_seed,
             "datum_cache": datum_cache.summary(),
+            "row_cache_size_effective": dataset.row_cache_capacity_rows(),
+            "row_preload": preload_summary,
             "prefetch_batches": args.prefetch_batches,
             "prefetch_contract": prefetch_contract,
             "batch_producers": args.batch_producers,
@@ -2360,6 +2461,9 @@ def main() -> int:
             "sample_seed": args.seed,
             "augmentation_seed": augmentation_seed,
             "datum_cache": datum_cache.summary(),
+            "row_cache_size_requested": args.row_cache_size,
+            "row_cache_size_effective": dataset.row_cache_capacity_rows(),
+            "row_preload": preload_summary,
             "prefetch_batches": args.prefetch_batches,
             "prefetch_contract": prefetch_contract,
             "batch_producers": args.batch_producers,
