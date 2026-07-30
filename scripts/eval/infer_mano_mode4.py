@@ -9,10 +9,14 @@ executed by the same 200 Hz native position-servo contract as quality replay.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
+from datetime import datetime, timezone
 from io import BytesIO
 import json
 import os
 from pathlib import Path
+import threading
 import time
 import uuid
 
@@ -39,10 +43,13 @@ from mode4_support import (
     action_session_payload,
     parse_ordered_unique_csv,
 )
+from scripts import contact_windows
+from scripts.eval.result_paths import default_inference_output_dir
 from scripts.gesture_language import DEFAULT_GESTURE_INDEX_PATH, GestureIndex
 from scripts.mano_state_contract import (
     CONTACT_RULE,
     CONTACT_SEMANTICS,
+    EXPECTED_NORM_SHA256,
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
@@ -62,6 +69,11 @@ HAND_DIM = 26
 # Fixed timing exported for audit/tests.
 MANORL_PHYSICS_TIMESTEP = physics.DT
 MANORL_PHYSICS_SUBSTEPS = physics.NATIVE_SUBSTEPS
+
+
+def inferred_contact_manifest_path(dataset: Path) -> Path:
+    """Resolve the release-owned sidecar or a deterministic non-release fallback."""
+    return contact_windows.default_manifest_path(dataset)
 
 
 def reconstruct_absolute_target_chunk(query_q: np.ndarray, pred_phys: np.ndarray) -> np.ndarray:
@@ -165,7 +177,49 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="locked training norm_stats directory; required for B target recovery",
     )
-    parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--norm-sha-expected",
+        default=EXPECTED_NORM_SHA256,
+        help="population-specific expected SHA256 of norm_stats.json",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=default_inference_output_dir("mode4"),
+        help="result root (default: client-local results/inference/mode4_<UTC>_<pid>)",
+    )
+    parser.add_argument(
+        "--frame-window",
+        choices=("contact", "full"),
+        default="contact",
+        help="contact initializes and evaluates only the manifest window; full is an explicit stress test",
+    )
+    parser.add_argument(
+        "--contact-window-manifest",
+        type=Path,
+        default=None,
+        help="contact-window JSON; canonical data resolves release role contact_windows",
+    )
+    parser.add_argument(
+        "--contact-context-frames",
+        type=int,
+        default=contact_windows.DEFAULT_CONTACT_CONTEXT_FRAMES,
+    )
+    parser.add_argument(
+        "--missing-contact-policy",
+        choices=("full", "skip", "error"),
+        default="error",
+    )
+    parser.add_argument(
+        "--action-session-id",
+        default=None,
+        help="reuse an externally owned action session; this evaluator will not delete it",
+    )
+    parser.add_argument(
+        "--keep-action-session",
+        action="store_true",
+        help="retain the action session created by this evaluator after successful completion",
+    )
     parser.add_argument("--chunk-stride", type=int, default=5)
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument(
@@ -176,6 +230,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--act-batch-size", type=int, default=4)
     parser.add_argument(
+        "--row-execution",
+        choices=("lockstep", "sequential"),
+        default="lockstep",
+        help="lockstep fills act_batch with real observations from multiple independent rows",
+    )
+    parser.add_argument(
+        "--row-batch-size",
+        type=int,
+        default=4,
+        help="maximum concurrent MuJoCo rows per lockstep group (must be <= act-batch-size)",
+    )
+    parser.add_argument(
         "--max-warm-request-seconds",
         type=float,
         default=2.0,
@@ -185,6 +251,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=360)
+    parser.add_argument(
+        "--video-mode",
+        choices=("full", "none"),
+        default="full",
+        help="full writes the three canonical videos; none keeps policy observation rendering but skips output-video rendering/encoding",
+    )
+    parser.add_argument(
+        "--client-commit",
+        default=os.environ.get("VLA_CLIENT_GIT_COMMIT"),
+        help="optional client source SHA (launcher supplies this when available)",
+    )
+    parser.add_argument(
+        "--backend-commit", default=None, help="optional paired MINT backend source SHA"
+    )
+    parser.add_argument(
+        "--model-commit", default=None, help="optional paired OpenPI model source SHA"
+    )
     return parser.parse_args()
 
 
@@ -213,7 +296,9 @@ def label(frame: np.ndarray, text: str) -> np.ndarray:
 
 def pad_actions(actions: np.ndarray, frame: int, window_end: int) -> np.ndarray:
     end = min(frame + HORIZON, window_end + 1)
-    result = np.asarray(actions[frame:end], dtype=np.float32)
+    # DeltaActions mutates its input in place. Own this chunk so repeated or
+    # overlapping eval queries cannot corrupt the row's absolute action labels.
+    result = np.array(actions[frame:end], dtype=np.float32, copy=True)
     if result.shape[0] < HORIZON:
         result = np.concatenate(
             [result, np.repeat(result[-1:], HORIZON - result.shape[0], axis=0)],
@@ -270,6 +355,73 @@ def delete_session(args: argparse.Namespace, headers: dict[str, str], session_id
         pass
 
 
+def write_retained_session_marker(args: argparse.Namespace, session_id: str) -> Path:
+    marker = args.output_dir / "action_session.retained.json"
+    payload = {
+        "status": "retained",
+        "retained_at": datetime.now(timezone.utc).isoformat(),
+        "action_session_id": session_id,
+        "base_url": args.base_url,
+        "model": args.model,
+        "model_path": args.model_path,
+        "owner_id": args.owner_id,
+    }
+    temporary = marker.with_suffix(marker.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(marker)
+    return marker
+
+
+def _decode_action_result(
+    datum: dict, payload: dict, timing: dict
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    pred_norm = np.asarray(payload["data"], dtype=np.float32).reshape(payload["shape"])
+    pred_phys = np.asarray(
+        OBS._unnormalize_actions(pred_norm, datum["data_config"]), dtype=np.float32
+    )
+    gt_payload = datum["supervision"]["actions"]
+    gt_norm = np.asarray(gt_payload["data"], dtype=np.float32).reshape(gt_payload["shape"])
+    return pred_norm, pred_phys, gt_norm, timing
+
+
+def query_action_group(
+    *,
+    args: argparse.Namespace,
+    headers: dict[str, str],
+    session_id: str,
+    datums: list[dict],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, dict]]:
+    """Issue one fixed-shape act_batch containing N real row observations."""
+    if args.act_mode != "batch":
+        raise ValueError("lockstep row execution requires --act-mode batch")
+    if not datums or len(datums) > args.act_batch_size:
+        raise ValueError(
+            f"real observation count must be in [1,{args.act_batch_size}], got {len(datums)}"
+        )
+    payloads, shared_timing = L._request_action_batch(
+        args.base_url,
+        headers,
+        session_id,
+        [datum["observation"] for datum in datums],
+        fixed_batch_size=args.act_batch_size,
+    )
+    if len(payloads) < len(datums):
+        raise RuntimeError(
+            f"act_batch returned {len(payloads)} actions for {len(datums)} real observations"
+        )
+    results = []
+    for slot, (datum, payload) in enumerate(zip(datums, payloads, strict=False)):
+        if slot >= len(datums):
+            break
+        timing = {
+            **shared_timing,
+            "batch_slot": slot,
+            "lockstep_real_observations": len(datums),
+        }
+        results.append(_decode_action_result(datum, payload, timing))
+    return results
+
+
 def query_action(
     *,
     args: argparse.Namespace,
@@ -278,43 +430,127 @@ def query_action(
     datum: dict,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
     if args.act_mode == "batch":
-        payloads, timing = L._request_action_batch(
+        return query_action_group(
+            args=args,
+            headers=headers,
+            session_id=session_id,
+            datums=[datum],
+        )[0]
+    started = time.monotonic()
+    result = L._await_result(
+        args.base_url,
+        headers,
+        L._post_json(
             args.base_url,
+            f"/api/v1/mint/action_sessions/{session_id}/act",
             headers,
-            session_id,
-            [datum["observation"]],
-            fixed_batch_size=args.act_batch_size,
-        )
-        payload = payloads[0]
-    else:
-        started = time.monotonic()
-        result = L._await_result(
-            args.base_url,
-            headers,
-            L._post_json(
-                args.base_url,
-                f"/api/v1/mint/action_sessions/{session_id}/act",
-                headers,
-                {"observation": datum["observation"]},
-            ),
-        )
-        timing = {
-            "wall_seconds": time.monotonic() - started,
-            "actual_observation_count": 1,
-            "request_batch_size": 1,
-            "padding_count": 0,
-            "server_elapsed_ms": None,
-            "used_data_sharding": False,
-            "response_batch_size": 1,
-        }
-        payload = result["actions"]
-    pred_norm = np.asarray(payload["data"], dtype=np.float32).reshape(payload["shape"])
-    pred_phys = np.asarray(
-        OBS._unnormalize_actions(pred_norm, datum["data_config"]), dtype=np.float32
+            {"observation": datum["observation"]},
+        ),
     )
-    gt_payload = datum["supervision"]["actions"]
-    gt_norm = np.asarray(gt_payload["data"], dtype=np.float32).reshape(gt_payload["shape"])
-    return pred_norm, pred_phys, gt_norm, timing
+    timing = {
+        "wall_seconds": time.monotonic() - started,
+        "actual_observation_count": 1,
+        "request_batch_size": 1,
+        "padding_count": 0,
+        "server_elapsed_ms": None,
+        "used_data_sharding": False,
+        "response_batch_size": 1,
+        "batch_slot": 0,
+        "lockstep_real_observations": 1,
+    }
+    return _decode_action_result(datum, result["actions"], timing)
+
+
+class LockstepActionBatcher:
+    """Barrier-style coordinator that maps one live query per row into one act_batch."""
+
+    def __init__(self, participant_slots: list[int], dispatch):
+        slots = list(dict.fromkeys(int(slot) for slot in participant_slots))
+        if not slots:
+            raise ValueError("lockstep batcher requires at least one participant")
+        self._active = set(slots)
+        self._pending: dict[int, dict] = {}
+        self._condition = threading.Condition()
+        self._failure: BaseException | None = None
+        self._dispatch = dispatch
+        self._batch_count = 0
+        self._real_observation_count = 0
+        self._padded_observation_count = 0
+        self._thread = threading.Thread(target=self._run, name="mode4-lockstep-batcher", daemon=True)
+        self._thread.start()
+
+    def query(self, slot: int, datum: dict):
+        request = {"datum": datum, "event": threading.Event(), "result": None, "error": None}
+        with self._condition:
+            if self._failure is not None:
+                raise RuntimeError("lockstep batcher has failed") from self._failure
+            if slot not in self._active:
+                raise RuntimeError(f"inactive lockstep slot submitted a query: {slot}")
+            if slot in self._pending:
+                raise RuntimeError(f"lockstep slot already has a pending query: {slot}")
+            self._pending[slot] = request
+            self._condition.notify_all()
+        request["event"].wait()
+        if request["error"] is not None:
+            raise RuntimeError("lockstep action batch failed") from request["error"]
+        return request["result"]
+
+    def retire(self, slot: int) -> None:
+        with self._condition:
+            self._active.discard(int(slot))
+            self._condition.notify_all()
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                self._condition.wait_for(
+                    lambda: self._failure is not None
+                    or (self._pending and set(self._pending) == self._active)
+                    or (not self._active and not self._pending)
+                )
+                if self._failure is not None:
+                    return
+                if not self._active and not self._pending:
+                    return
+                slots = sorted(self._pending)
+                requests_batch = [self._pending.pop(slot) for slot in slots]
+            try:
+                results = self._dispatch([request["datum"] for request in requests_batch])
+                if len(results) != len(requests_batch):
+                    raise RuntimeError(
+                        f"dispatch returned {len(results)} results for {len(requests_batch)} rows"
+                    )
+                self._batch_count += 1
+                self._real_observation_count += len(requests_batch)
+                if results:
+                    timing = results[0][3]
+                    self._padded_observation_count += int(timing.get("padding_count", 0))
+                for request, result in zip(requests_batch, results, strict=True):
+                    request["result"] = result
+            except BaseException as exc:
+                with self._condition:
+                    self._failure = exc
+                for request in requests_batch:
+                    request["error"] = exc
+            finally:
+                for request in requests_batch:
+                    request["event"].set()
+
+    def close(self) -> dict[str, int]:
+        with self._condition:
+            if self._active:
+                raise RuntimeError(f"lockstep participants still active: {sorted(self._active)}")
+            self._condition.notify_all()
+        self._thread.join(timeout=30)
+        if self._thread.is_alive():
+            raise RuntimeError("lockstep batcher did not terminate")
+        if self._failure is not None:
+            raise RuntimeError("lockstep batcher failed") from self._failure
+        return {
+            "batch_requests": self._batch_count,
+            "real_observations": self._real_observation_count,
+            "padding_observations": self._padded_observation_count,
+        }
 
 
 def run_variant(
@@ -329,12 +565,15 @@ def run_variant(
     session_id=None,
     row_index=None,
     output_dir=None,
+    action_query=None,
 ):
     """The sole Mode4: policy-in-the-loop, target-DOF, real MuJoCo dynamics."""
     if mode != "mode4":
         raise ValueError(f"only mode4 exists, got {mode!r}")
     if args.action_source != URDF_TARGET_ABSOLUTE:
         raise ValueError("Mode4 requires urdf_target_absolute checkpoint semantics")
+    video_mode = getattr(args, "video_mode", "full")
+    query_impl = action_query or query_action
     selected_row_index = args.row_index if row_index is None else row_index
     source_frames = full.row_frame_count(row)
     timestamps = np.asarray(row["timestamp"], dtype=np.float64)
@@ -342,20 +581,24 @@ def run_variant(
         raise ValueError(f"invalid source timestamps: {timestamps.shape}")
     if not np.allclose(np.diff(timestamps), 0.005, rtol=0, atol=1e-10):
         raise ValueError("Mode4 requires exact monotonic 200 Hz source timestamps")
+    frame_window = getattr(args, "frame_window", "full")
+    contact_context_frames = int(getattr(args, "contact_context_frames", 0))
+    missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
     window = full.resolve_row_window(
         row,
         row_index=selected_row_index,
-        frame_window="full",
-        contact_context_frames=0,
-        missing_contact_policy="error",
-        manifest_entry=None,
+        frame_window=frame_window,
+        contact_context_frames=contact_context_frames,
+        missing_contact_policy=missing_contact_policy,
+        manifest_entry=manifest_entry,
     )
-    if window is None or window.start_frame != 0:
-        raise ValueError("Mode4 must initialize once at source frame 0")
-    window_end = window.end_frame
+    if window is None:
+        raise ValueError(f"Mode4 row {selected_row_index} was skipped by the window contract")
+    window_start = int(window.start_frame)
+    window_end = int(window.end_frame)
     if args.max_frames > 0:
-        window_end = min(window_end, args.max_frames - 1)
-    frame_count = window_end + 1
+        window_end = min(window_end, window_start + args.max_frames - 1)
+    frame_count = window_end - window_start + 1
     if frame_count < 2:
         raise ValueError("Mode4 needs at least two frames")
     # Canonical MANO metadata says 100 Hz, but the validated quality-replay
@@ -365,6 +608,24 @@ def run_variant(
 
     out = (args.output_dir if output_dir is None else output_dir) / "mode4"
     out.mkdir(parents=True, exist_ok=True)
+    rollout_started = time.perf_counter()
+    phase_seconds = {
+        "scene_setup": 0.0,
+        "session_setup": 0.0,
+        "query_preparation": 0.0,
+        "action_request": 0.0,
+        "target_processing": 0.0,
+        "physics_step": 0.0,
+        "render_and_video": 0.0,
+        "array_finalize": 0.0,
+    }
+    phase_counts = {
+        "queries": 0,
+        "frames": frame_count,
+        "comparison_video_frames_written": 0,
+        "dataset_reference_frames_written": 0,
+    }
+    scene_started = time.perf_counter()
     tmp, model, data, renderer, object_addr, _, hand_addrs, _, limits = physics.make_scene(
         object_name,
         args.width,
@@ -379,20 +640,21 @@ def run_variant(
         if args.extended_state else (None, None, None)
     )
     state = np.zeros(32, dtype=np.float32)
-    state[:HAND_DIM] = np.asarray(row["state"][0], dtype=np.float32)[:HAND_DIM]
+    state[:HAND_DIM] = np.asarray(row["state"][window_start], dtype=np.float32)[:HAND_DIM]
     clipping = new_clipping_diagnostics(limits)
     data.qvel[:] = 0.0
     full.set_scene_state(
         model,
         data,
         state=state[:HAND_DIM],
-        object_pos=row["objects"][0]["pos"][0],
-        object_rot_aa=row["objects"][0]["rot_aa"][0],
+        object_pos=row["objects"][0]["pos"][window_start],
+        object_rot_aa=row["objects"][0]["rot_aa"][window_start],
         object_addr=object_addr,
         hand_addrs=hand_addrs,
     )
     import mujoco as _mujoco
     _mujoco.mj_forward(model, data)
+    phase_seconds["scene_setup"] += time.perf_counter() - scene_started
     # Record lift baseline from Mode 4's actual initialized sim state.
     object_z_initial = (
         float(data.qpos[object_addr + 2]) if args.extended_state else 0.0
@@ -405,6 +667,13 @@ def run_variant(
     commanded_steps = []
     servo_targets = []
     applied_steps = []
+    observation_states = []
+    observation_contacts = []
+    observation_lift = []
+    preclip_targets = []
+    clipping_corrections = []
+    physics_contact_flags = []
+    step_max_contact_forces = []
     gt_norm_steps = []
     hand_states = [np.asarray(data.qpos[hand_addrs], dtype=np.float32).copy()]
     object_positions = [
@@ -425,42 +694,70 @@ def run_variant(
     owns_session = False
     headers = dict(headers)
     try:
+        session_started = time.perf_counter()
         active_session_id, owns_session = acquire_action_session(
             session_id, lambda: create_session(args, headers)
         )
-        with imageio.get_writer(
-            str(head_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as head_writer, imageio.get_writer(
-            str(wrist_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as wrist_writer, imageio.get_writer(
-            str(dataset_path), fps=args.fps, macro_block_size=1, codec="libx264"
-        ) as dataset_writer:
-            sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
-            dataset_head = resize_for_video(decode_jpeg(row["image"][0]), args.width, args.height)
-            dataset_wrist = resize_for_video(
-                decode_jpeg(row["wrist_image"][0]), args.width, args.height
-            )
-            head_writer.append_data(
-                np.concatenate(
-                    [
-                        label(sim_head, "MODE4 PHYSICS frame 0"),
-                        label(dataset_head, "DATASET frame 0"),
-                    ],
-                    axis=1,
+        phase_seconds["session_setup"] += time.perf_counter() - session_started
+        with ExitStack() as video_stack:
+            head_writer = wrist_writer = dataset_writer = None
+            if video_mode == "full":
+                head_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(head_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
                 )
-            )
-            wrist_writer.append_data(
-                np.concatenate(
-                    [
-                        label(sim_wrist, "MODE4 PHYSICS wrist 0"),
-                        label(dataset_wrist, "DATASET wrist 0"),
-                    ],
-                    axis=1,
+                wrist_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(wrist_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
                 )
-            )
-            dataset_writer.append_data(label(dataset_head, "DATASET reference frame 0"))
+                dataset_writer = video_stack.enter_context(
+                    imageio.get_writer(
+                        str(dataset_path), fps=args.fps, macro_block_size=1, codec="libx264"
+                    )
+                )
+                video_started = time.perf_counter()
+                # Preserve the complete demonstration as context, independently
+                # from the window used to initialize and evaluate the policy.
+                for source_frame in range(source_frames):
+                    dataset_reference = resize_for_video(
+                        decode_jpeg(row["image"][source_frame]), args.width, args.height
+                    )
+                    dataset_writer.append_data(
+                        label(dataset_reference, f"DATASET reference source frame {source_frame}")
+                    )
+                phase_counts["dataset_reference_frames_written"] = source_frames
 
-            for frame in range(window_end):
+                sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
+                dataset_head = resize_for_video(
+                    decode_jpeg(row["image"][window_start]), args.width, args.height
+                )
+                dataset_wrist = resize_for_video(
+                    decode_jpeg(row["wrist_image"][window_start]), args.width, args.height
+                )
+                head_writer.append_data(
+                    np.concatenate(
+                        [
+                            label(sim_head, f"MODE4 PHYSICS source frame {window_start}"),
+                            label(dataset_head, f"DATASET source frame {window_start}"),
+                        ],
+                        axis=1,
+                    )
+                )
+                wrist_writer.append_data(
+                    np.concatenate(
+                        [
+                            label(sim_wrist, f"MODE4 PHYSICS wrist source frame {window_start}"),
+                            label(dataset_wrist, f"DATASET wrist source frame {window_start}"),
+                        ],
+                        axis=1,
+                    )
+                )
+                phase_seconds["render_and_video"] += time.perf_counter() - video_started
+                phase_counts["comparison_video_frames_written"] += 1
+
+            for frame in range(window_start, window_end):
                 current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
                 state[:HAND_DIM] = current_q.astype(np.float32)
                 if args.extended_state:
@@ -477,7 +774,12 @@ def run_variant(
                     )
                 else:
                     state[HAND_DIM:] = 0
-                if frame % args.chunk_stride == 0:
+                # Record the policy observation before selecting this transition.
+                observation_states.append(state.copy())
+                observation_contacts.append(state[26:31].copy())
+                observation_lift.append(state[31])
+                if (frame - window_start) % args.chunk_stride == 0:
+                    query_prepare_started = time.perf_counter()
                     head_image, wrist_image = physics.render_current_state(model, data, renderer)
                     datum = build_datum(
                         row,
@@ -490,7 +792,8 @@ def run_variant(
                         window_end=window_end,
                     )
                     datum["data_config"] = data_config
-                    pred_norm, pred_phys, gt_norm, timing = query_action(
+                    phase_seconds["query_preparation"] += time.perf_counter() - query_prepare_started
+                    pred_norm, pred_phys, gt_norm, timing = query_impl(
                         args=args,
                         headers=headers,
                         session_id=active_session_id,
@@ -499,6 +802,8 @@ def run_variant(
                     query_index = len(query_timings)
                     timing = {"query_index": query_index, "source_frame": frame, **timing}
                     query_timings.append(timing)
+                    phase_seconds["action_request"] += float(timing["wall_seconds"])
+                    phase_counts["queries"] += 1
                     if args.act_mode == "batch" and timing.get("used_data_sharding") is not True:
                         raise RuntimeError("act_batch did not use data sharding")
                     if (
@@ -510,6 +815,7 @@ def run_variant(
                         raise RuntimeError(
                             f"warm latency {timing['wall_seconds']:.3f}s exceeds limit"
                         )
+                    target_processing_started = time.perf_counter()
                     rollout_phys = np.asarray(pred_phys, dtype=np.float32).copy()
                     query_q = state[:HAND_DIM].copy()
                     target_hand = reconstruct_absolute_target_chunk(query_q, rollout_phys[:HORIZON])
@@ -523,6 +829,8 @@ def run_variant(
                         }
                     )
                     candidates = [c for c in candidates if frame < c["start"] + HORIZON]
+                    phase_seconds["target_processing"] += time.perf_counter() - target_processing_started
+                target_processing_started = time.perf_counter()
                 active = [c for c in candidates if c["start"] <= frame < c["start"] + HORIZON]
                 if not active:
                     raise RuntimeError(f"no action candidate at frame {frame}")
@@ -545,6 +853,10 @@ def run_variant(
                     current_q, absolute_target - current_q, limits
                 )
                 record_clipping(clipping, clip_event)
+                preclip_target = np.asarray(absolute_target, dtype=np.float32)
+                servo_target = np.asarray(target, dtype=np.float32)
+                phase_seconds["target_processing"] += time.perf_counter() - target_processing_started
+                physics_started = time.perf_counter()
                 before = current_q.copy()
                 diagnostics = physics.step_servo(
                     model=model,
@@ -562,12 +874,22 @@ def run_variant(
                     max_actuator_force, float(diagnostics["max_abs_actuator_force"])
                 )
                 max_qvel = max(max_qvel, float(np.max(np.abs(data.qvel))))
+                physics_contact_flags.append(
+                    [
+                        diagnostics["hand_object_contact"],
+                        diagnostics["object_floor_contact"],
+                        diagnostics["hand_floor_contact"],
+                    ]
+                )
+                step_max_contact_forces.append(diagnostics["max_contact_force"])
                 raw_norm_steps.append(newest["pred_norm"][local_newest])
                 raw_phys_steps.append(newest["pred_phys"][local_newest])
                 commanded = np.zeros(32, dtype=np.float32)
                 commanded[:HAND_DIM] = absolute_target - current_q
                 commanded_steps.append(commanded)
-                servo_targets.append(np.asarray(target, dtype=np.float32))
+                preclip_targets.append(preclip_target)
+                servo_targets.append(servo_target)
+                clipping_corrections.append(servo_target - preclip_target)
                 applied = np.zeros(32, dtype=np.float32)
                 applied[:HAND_DIM] = (after - before).astype(np.float32)
                 applied_steps.append(applied)
@@ -581,35 +903,37 @@ def run_variant(
                         data.qpos[object_addr + 3 : object_addr + 7], dtype=np.float32
                     ).copy()
                 )
-                next_frame = frame + 1
-                sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
-                dataset_head = resize_for_video(
-                    decode_jpeg(row["image"][next_frame]), args.width, args.height
-                )
-                dataset_wrist = resize_for_video(
-                    decode_jpeg(row["wrist_image"][next_frame]), args.width, args.height
-                )
-                head_writer.append_data(
-                    np.concatenate(
-                        [
-                            label(sim_head, f"MODE4 PHYSICS frame {next_frame}"),
-                            label(dataset_head, f"DATASET frame {next_frame}"),
-                        ],
-                        axis=1,
+                phase_seconds["physics_step"] += time.perf_counter() - physics_started
+                if video_mode == "full":
+                    video_started = time.perf_counter()
+                    next_frame = frame + 1
+                    sim_head, sim_wrist = physics.render_current_state(model, data, renderer)
+                    dataset_head = resize_for_video(
+                        decode_jpeg(row["image"][next_frame]), args.width, args.height
                     )
-                )
-                wrist_writer.append_data(
-                    np.concatenate(
-                        [
-                            label(sim_wrist, f"MODE4 PHYSICS wrist {next_frame}"),
-                            label(dataset_wrist, f"DATASET wrist {next_frame}"),
-                        ],
-                        axis=1,
+                    dataset_wrist = resize_for_video(
+                        decode_jpeg(row["wrist_image"][next_frame]), args.width, args.height
                     )
-                )
-                dataset_writer.append_data(
-                    label(dataset_head, f"DATASET reference frame {next_frame}")
-                )
+                    head_writer.append_data(
+                        np.concatenate(
+                            [
+                                label(sim_head, f"MODE4 PHYSICS source frame {next_frame}"),
+                                label(dataset_head, f"DATASET source frame {next_frame}"),
+                            ],
+                            axis=1,
+                        )
+                    )
+                    wrist_writer.append_data(
+                        np.concatenate(
+                            [
+                                label(sim_wrist, f"MODE4 PHYSICS wrist source frame {next_frame}"),
+                                label(dataset_wrist, f"DATASET wrist source frame {next_frame}"),
+                            ],
+                            axis=1,
+                        )
+                    )
+                    phase_seconds["render_and_video"] += time.perf_counter() - video_started
+                    phase_counts["comparison_video_frames_written"] += 1
     finally:
         if owns_session and active_session_id:
             delete_session(args, headers, active_session_id)
@@ -623,23 +947,64 @@ def run_variant(
     raw_phys_all = np.asarray(raw_phys_steps, dtype=np.float32)
     applied_all = np.asarray(applied_steps, dtype=np.float32)
     gt_norm_all = np.asarray(gt_norm_steps, dtype=np.float32)
-    np.save(out / "actions_raw_pred_normalized.npy", raw_norm_all)
-    np.save(out / "actions_raw_pred_physical.npy", raw_phys_all)
-    np.save(out / "actions_commanded_physical.npy", np.asarray(commanded_steps, dtype=np.float32))
-    np.save(out / "servo_position_targets.npy", np.asarray(servo_targets, dtype=np.float32))
-    np.save(out / "actions_applied_physical.npy", applied_all)
-    np.save(out / "hand_state_sim.npy", np.asarray(hand_states, dtype=np.float32))
-    np.save(out / "object_position_sim.npy", np.asarray(object_positions, dtype=np.float32))
-    np.save(out / "object_quaternion_sim.npy", np.asarray(object_quaternions, dtype=np.float32))
+    arrays = {
+        "actions_raw_pred_normalized": out / "actions_raw_pred_normalized.npy",
+        "actions_raw_pred_physical": out / "actions_raw_pred_physical.npy",
+        "actions_commanded_physical": out / "actions_commanded_physical.npy",
+        "preclip_absolute_targets": out / "preclip_absolute_targets.npy",
+        "servo_position_targets": out / "servo_position_targets.npy",
+        "servo_target_clipping_correction": out / "servo_target_clipping_correction.npy",
+        "actions_applied_physical": out / "actions_applied_physical.npy",
+        "rollout_observation_state": out / "rollout_observation_state.npy",
+        "rollout_observation_contacts": out / "rollout_observation_contacts.npy",
+        "rollout_observation_lift": out / "rollout_observation_lift.npy",
+        "physics_contact_flags": out / "physics_contact_flags.npy",
+        "step_max_contact_force": out / "step_max_contact_force.npy",
+        "hand_state_sim": out / "hand_state_sim.npy",
+        "object_position_sim": out / "object_position_sim.npy",
+        "object_quaternion_sim": out / "object_quaternion_sim.npy",
+    }
+    array_finalize_started = time.perf_counter()
+    np.save(arrays["actions_raw_pred_normalized"], raw_norm_all)
+    np.save(arrays["actions_raw_pred_physical"], raw_phys_all)
+    np.save(arrays["actions_commanded_physical"], np.asarray(commanded_steps, dtype=np.float32))
+    np.save(arrays["preclip_absolute_targets"], np.asarray(preclip_targets, dtype=np.float32))
+    np.save(arrays["servo_position_targets"], np.asarray(servo_targets, dtype=np.float32))
+    np.save(
+        arrays["servo_target_clipping_correction"],
+        np.asarray(clipping_corrections, dtype=np.float32),
+    )
+    np.save(arrays["actions_applied_physical"], applied_all)
+    np.save(arrays["rollout_observation_state"], np.asarray(observation_states, dtype=np.float32))
+    np.save(
+        arrays["rollout_observation_contacts"],
+        np.asarray(observation_contacts, dtype=np.float32),
+    )
+    np.save(arrays["rollout_observation_lift"], np.asarray(observation_lift, dtype=np.float32))
+    np.save(arrays["physics_contact_flags"], np.asarray(physics_contact_flags, dtype=np.bool_))
+    np.save(
+        arrays["step_max_contact_force"],
+        np.asarray(step_max_contact_forces, dtype=np.float32),
+    )
+    np.save(arrays["hand_state_sim"], np.asarray(hand_states, dtype=np.float32))
+    np.save(arrays["object_position_sim"], np.asarray(object_positions, dtype=np.float32))
+    np.save(arrays["object_quaternion_sim"], np.asarray(object_quaternions, dtype=np.float32))
+    phase_seconds["array_finalize"] += time.perf_counter() - array_finalize_started
+    phase_seconds["rollout_wall"] = time.perf_counter() - rollout_started
     total_request_seconds = float(sum(float(t["wall_seconds"]) for t in query_timings))
     result = {
         "mode": "mode4",
+        "model_path": args.model_path,
+        "model": args.model,
+        "client_commit": getattr(args, "client_commit", None),
+        "backend_commit": getattr(args, "backend_commit", None),
+        "model_commit": getattr(args, "model_commit", None),
         "physics_dynamics": True,
         "closed_loop": True,
         "observation_feedback": True,
         "state_observation_source": "integrated_mujoco_qpos",
         "image_observation_source": "integrated_mujoco_renderer",
-        "object_pose_source": "sim_owned_after_frame0",
+        "object_pose_source": f"sim_owned_after_source_frame_{window_start}",
         "action_source": args.action_source,
         "extended_state": bool(args.extended_state),
         "state_contract": (
@@ -662,7 +1027,35 @@ def run_variant(
         "object_name": object_name,
         "source_frame_count": source_frames,
         "trajectory_frame_count": frame_count,
-        "frame_window": {"start_frame": 0, "end_frame": window_end, "frame_count": frame_count},
+        "frame_window": {
+            "type": frame_window,
+            "status": getattr(window, "status", frame_window),
+            "start_frame": window_start,
+            "end_frame": window_end,
+            "frame_count": frame_count,
+            "first_contact_frame": getattr(window, "first_contact_frame", None),
+            "last_contact_frame": getattr(window, "last_contact_frame", None),
+            "context_frames": getattr(window, "context_frames", contact_context_frames),
+            "manifest": (
+                str(args.contact_window_manifest)
+                if getattr(args, "contact_window_manifest", None) is not None
+                else None
+            ),
+        },
+        "video_windows": {
+            "dataset_reference": {
+                "type": "full",
+                "start_frame": 0,
+                "end_frame": source_frames - 1,
+                "frame_count": source_frames,
+            },
+            "physics_comparison": {
+                "type": frame_window,
+                "start_frame": window_start,
+                "end_frame": window_end,
+                "frame_count": frame_count,
+            },
+        },
         "physics": {
             "engine": "MuJoCo",
             "controller": "manorl_native_position_servo",
@@ -682,19 +1075,21 @@ def run_variant(
         },
         "joint_limit_clipping": clipping,
         "query_count": len(query_timings),
+        "action_session_id": active_session_id,
+        "action_session_owned_by_variant": owns_session,
+        "video_mode": video_mode,
+        "timing": {
+            "phase_seconds": {name: float(value) for name, value in phase_seconds.items()},
+            "phase_counts": phase_counts,
+        },
         "total_request_seconds": total_request_seconds,
         "mean_request_seconds": total_request_seconds / max(len(query_timings), 1),
         "query_timings": query_timings,
         "pred_has_nan_inf": bool(not np.isfinite(raw_norm_all).all()),
-        "head_video": str(head_path),
-        "wrist_video": str(wrist_path),
-        "dataset_replay_video": str(dataset_path),
-        "arrays": {
-            "servo_position_targets": str(out / "servo_position_targets.npy"),
-            "hand_state_sim": str(out / "hand_state_sim.npy"),
-            "object_position_sim": str(out / "object_position_sim.npy"),
-            "object_quaternion_sim": str(out / "object_quaternion_sim.npy"),
-        },
+        "head_video": str(head_path) if video_mode == "full" else None,
+        "wrist_video": str(wrist_path) if video_mode == "full" else None,
+        "dataset_replay_video": str(dataset_path) if video_mode == "full" else None,
+        "arrays": {name: str(path) for name, path in arrays.items()},
     }
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -711,6 +1106,9 @@ def build_row_summary(
         "mode": "mode4_policy_target_dof_mujoco_physics",
         "model_path": args.model_path,
         "model": args.model,
+        "client_commit": args.client_commit,
+        "backend_commit": args.backend_commit,
+        "model_commit": args.model_commit,
         "action_source": args.action_source,
         "language_conditioning": args.language_conditioning,
         "gesture_index": (
@@ -723,6 +1121,7 @@ def build_row_summary(
         "row_index": row_index,
         "normalization_row_indices": normalization_rows,
         "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
+        "video_mode": getattr(args, "video_mode", "full"),
         "state_contract": (
             STATE_CONTRACT_ID if args.extended_state else None
         ),
@@ -734,10 +1133,26 @@ def build_row_summary(
         ),
         "norm_sha_expected": getattr(args, "norm_sha_expected", None),
         "norm_sha_actual": getattr(args, "norm_sha_actual", None),
-        "frame_window": "full_from_frame0",
-        "object_pose_source": "sim_owned_after_frame0",
+        "frame_window": (
+            results[0].get("frame_window", getattr(args, "frame_window", "full"))
+            if results
+            else getattr(args, "frame_window", "full")
+        ),
+        "video_windows": results[0].get("video_windows") if results else None,
+        "object_pose_source": (
+            results[0].get("object_pose_source", "sim_owned_after_window_start")
+            if results
+            else "sim_owned_after_window_start"
+        ),
+        "contact_window_manifest": (
+            str(args.contact_window_manifest)
+            if getattr(args, "contact_window_manifest", None) is not None
+            else None
+        ),
         "act_mode": args.act_mode,
         "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+        "row_execution": getattr(args, "row_execution", "sequential"),
+        "row_batch_size": getattr(args, "row_batch_size", 1),
         "max_warm_request_seconds": args.max_warm_request_seconds,
         "results": results,
     }
@@ -746,6 +1161,14 @@ def build_row_summary(
 def main() -> int:
     args = parse_args()
     args.base_url = args.base_url.rstrip("/")
+    # Tests and legacy direct callers may construct a minimal Namespace; the
+    # formal CLI defaults new evaluations to contact-window initialization.
+    args.frame_window = getattr(args, "frame_window", "full")
+    args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
+    args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
+    args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
+    args.row_execution = str(getattr(args, "row_execution", "sequential"))
+    args.row_batch_size = int(getattr(args, "row_batch_size", 1))
     args._gesture_index = (
         GestureIndex.load(args.gesture_index)
         if args.language_conditioning == GESTURE_LANGUAGE
@@ -757,6 +1180,14 @@ def main() -> int:
         raise ValueError("--temporal-decay must be in (0, 1]")
     if args.act_batch_size <= 0:
         raise ValueError("--act-batch-size must be positive")
+    if args.row_batch_size <= 0 or args.row_batch_size > args.act_batch_size:
+        raise ValueError("--row-batch-size must be positive and <= --act-batch-size")
+    if args.row_execution == "lockstep" and args.act_mode != "batch":
+        raise ValueError("--row-execution lockstep requires --act-mode batch")
+    if args.contact_context_frames < 0:
+        raise ValueError("--contact-context-frames must be non-negative")
+    if args.action_session_id and args.keep_action_session:
+        raise ValueError("--action-session-id and --keep-action-session are mutually exclusive")
 
     multi_row = args.row_indices is not None
     eval_rows = (
@@ -774,6 +1205,37 @@ def main() -> int:
     args.rollout_action_gains = np.ones(HAND_DIM, dtype=np.float32)
     if any(not 0 <= index < row_count for index in eval_rows):
         raise IndexError(f"row index out of range: {eval_rows}")
+
+    contact_manifest_entries: dict[int, dict] = {}
+    if args.frame_window == "contact":
+        manifest_path = args.contact_window_manifest or inferred_contact_manifest_path(
+            args.lance_dataset
+        )
+        if not manifest_path.is_file():
+            raise FileNotFoundError(
+                f"contact-window inference requires a manifest: {manifest_path}"
+            )
+        manifest_raw, contact_manifest_entries = contact_windows.load_manifest(manifest_path)
+        manifest_dataset = manifest_raw.get("dataset")
+        if manifest_dataset not in (None, str(args.lance_dataset)):
+            raise ValueError(
+                f"contact-window manifest dataset mismatch: {manifest_dataset!r} != "
+                f"{str(args.lance_dataset)!r}"
+            )
+        manifest_context = int(
+            manifest_raw.get("context_frames", args.contact_context_frames)
+        )
+        if manifest_context != args.contact_context_frames:
+            raise ValueError(
+                f"contact-window context mismatch: {manifest_context} != "
+                f"{args.contact_context_frames}"
+            )
+        missing = [row for row in eval_rows if row not in contact_manifest_entries]
+        if missing:
+            raise ValueError(f"contact-window manifest is missing rows: {missing}")
+        args.contact_window_manifest = manifest_path
+    else:
+        args.contact_window_manifest = None
     normalization_rows = (
         list(range(row_count))
         if args.normalization_row_indices.strip().lower() == "all"
@@ -795,8 +1257,10 @@ def main() -> int:
     ]
     if args.extended_state:
         # Authenticate the exact v1 normalization bytes before loading them.
-        _, actual_sha = verify_locked_norm_stats(args.norm_stats_dir)
-        args.norm_sha_expected = actual_sha
+        _, actual_sha = verify_locked_norm_stats(
+            args.norm_stats_dir,
+            expected_sha256=args.norm_sha_expected,
+        )
         args.norm_sha_actual = actual_sha
     norm_stats = L.normalize.load(args.norm_stats_dir)
     if args.extended_state:
@@ -843,38 +1307,28 @@ def main() -> int:
             gesture_index=args._gesture_index,
         )
 
-    if not multi_row:
-        row_index = eval_rows[0]
-        row = load_eval_row(row_index)
-        object_name = full.safe_object_name(row)
-        results = [
-            run_variant(
-                args=args,
-                row=row,
-                data_config=data_config,
-                mode="mode4",
-                headers=headers,
-                object_name=object_name,
-            )
-        ]
-        summary = build_row_summary(
-            args=args,
-            row_index=row_index,
-            normalization_rows=normalization_rows,
-            results=results,
-        )
-        (args.output_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
-        print(json.dumps(summary, indent=2), flush=True)
-        return 0
+    shared_session_id = args.action_session_id
+    created_session = False
+    needs_shared_session = multi_row or bool(args.action_session_id) or args.keep_action_session
+    if needs_shared_session and not shared_session_id:
+        shared_session_id = create_session(args, headers)
+        created_session = True
 
-    shared_session_id = create_session(args, headers)
-    row_summaries: list[dict] = []
+    if args.action_session_id:
+        session_source = "external"
+        session_cleanup_owner = "external"
+    elif created_session:
+        session_source = "created"
+        session_cleanup_owner = "caller" if args.keep_action_session else "evaluator"
+    else:
+        session_source = "variant_ephemeral"
+        session_cleanup_owner = "variant"
+
+    evaluation_succeeded = False
+    retained_marker: Path | None = None
     try:
-        for row_index in eval_rows:
-            row_output_dir = args.output_dir / f"row{row_index}"
-            row_output_dir.mkdir(parents=True, exist_ok=True)
+        if not multi_row:
+            row_index = eval_rows[0]
             row = load_eval_row(row_index)
             object_name = full.safe_object_name(row)
             results = [
@@ -885,59 +1339,167 @@ def main() -> int:
                     mode="mode4",
                     headers=headers,
                     object_name=object_name,
+                    manifest_entry=contact_manifest_entries.get(row_index),
                     session_id=shared_session_id,
-                    row_index=row_index,
-                    output_dir=row_output_dir,
                 )
             ]
-            row_summary = build_row_summary(
+            summary = build_row_summary(
                 args=args,
                 row_index=row_index,
                 normalization_rows=normalization_rows,
                 results=results,
             )
-            (row_output_dir / "summary.json").write_text(
-                json.dumps(row_summary, indent=2), encoding="utf-8"
-            )
-            row_summaries.append(row_summary)
-    finally:
-        delete_session(args, headers, shared_session_id)
+        else:
+            row_summaries: list[dict] = []
+            lockstep_groups: list[dict] = []
 
-    summary = {
-        "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
-        "model_path": args.model_path,
-        "row_indices": eval_rows,
-        "action_source": args.action_source,
-        "language_conditioning": args.language_conditioning,
-        "gesture_index": (
-            str(args._gesture_index.path) if args._gesture_index is not None else None
-        ),
-        "gesture_index_sha256": (
-            args._gesture_index.sha256 if args._gesture_index is not None else None
-        ),
-        "lance_dataset": str(args.lance_dataset),
-        "shared_session": True,
-        "normalization_row_indices": normalization_rows,
-        "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
-        "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
-        ),
-        "contact_semantics": (
-            CONTACT_SEMANTICS if args.extended_state else None
-        ),
-        "contact_rule": (
-            CONTACT_RULE if args.extended_state else None
-        ),
-        "norm_sha_expected": getattr(args, "norm_sha_expected", None),
-        "norm_sha_actual": getattr(args, "norm_sha_actual", None),
-        "frame_window": "full_from_frame0",
-        "object_pose_source": "sim_owned_after_frame0",
-        "act_mode": args.act_mode,
-        "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
-        "max_warm_request_seconds": args.max_warm_request_seconds,
-        "rows": row_summaries,
-    }
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+            def evaluate_loaded_row(
+                row_index: int,
+                row: dict,
+                *,
+                action_query=None,
+            ) -> dict:
+                row_output_dir = args.output_dir / f"row{row_index}"
+                row_output_dir.mkdir(parents=True, exist_ok=True)
+                results = [
+                    run_variant(
+                        args=args,
+                        row=row,
+                        data_config=data_config,
+                        mode="mode4",
+                        headers=headers,
+                        object_name=full.safe_object_name(row),
+                        manifest_entry=contact_manifest_entries.get(row_index),
+                        session_id=shared_session_id,
+                        row_index=row_index,
+                        output_dir=row_output_dir,
+                        action_query=action_query,
+                    )
+                ]
+                row_summary = build_row_summary(
+                    args=args,
+                    row_index=row_index,
+                    normalization_rows=normalization_rows,
+                    results=results,
+                )
+                (row_output_dir / "summary.json").write_text(
+                    json.dumps(row_summary, indent=2), encoding="utf-8"
+                )
+                return row_summary
+
+            if args.row_execution == "sequential" or args.row_batch_size == 1:
+                for row_index in eval_rows:
+                    row_summaries.append(evaluate_loaded_row(row_index, load_eval_row(row_index)))
+            else:
+                for group_start in range(0, len(eval_rows), args.row_batch_size):
+                    group_indices = eval_rows[group_start : group_start + args.row_batch_size]
+                    loaded_rows = [load_eval_row(row_index) for row_index in group_indices]
+
+                    def dispatch(datums: list[dict]):
+                        return query_action_group(
+                            args=args,
+                            headers=headers,
+                            session_id=shared_session_id,
+                            datums=datums,
+                        )
+
+                    batcher = LockstepActionBatcher(list(range(len(group_indices))), dispatch)
+
+                    def evaluate_slot(slot: int) -> dict:
+                        def lockstep_query(*, args, headers, session_id, datum):
+                            del args, headers, session_id
+                            return batcher.query(slot, datum)
+
+                        try:
+                            return evaluate_loaded_row(
+                                group_indices[slot],
+                                loaded_rows[slot],
+                                action_query=lockstep_query,
+                            )
+                        finally:
+                            batcher.retire(slot)
+
+                    with ThreadPoolExecutor(
+                        max_workers=len(group_indices),
+                        thread_name_prefix="mode4-row",
+                    ) as executor:
+                        futures = [
+                            executor.submit(evaluate_slot, slot)
+                            for slot in range(len(group_indices))
+                        ]
+                        group_summaries = [future.result() for future in futures]
+                    batch_stats = batcher.close()
+                    lockstep_groups.append(
+                        {
+                            "row_indices": group_indices,
+                            **batch_stats,
+                        }
+                    )
+                    row_summaries.extend(group_summaries)
+
+            summary = {
+                "mode": "mode4_policy_target_dof_mujoco_physics_multi_row",
+                "model_path": args.model_path,
+                "row_indices": eval_rows,
+                "client_commit": args.client_commit,
+                "backend_commit": args.backend_commit,
+                "model_commit": args.model_commit,
+                "action_source": args.action_source,
+                "language_conditioning": args.language_conditioning,
+                "gesture_index": (
+                    str(args._gesture_index.path) if args._gesture_index is not None else None
+                ),
+                "gesture_index_sha256": (
+                    args._gesture_index.sha256 if args._gesture_index is not None else None
+                ),
+                "lance_dataset": str(args.lance_dataset),
+                "shared_session": True,
+                "normalization_row_indices": normalization_rows,
+                "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
+                "state_contract": STATE_CONTRACT_ID if args.extended_state else None,
+                "contact_semantics": CONTACT_SEMANTICS if args.extended_state else None,
+                "contact_rule": CONTACT_RULE if args.extended_state else None,
+                "norm_sha_expected": getattr(args, "norm_sha_expected", None),
+                "norm_sha_actual": getattr(args, "norm_sha_actual", None),
+                "frame_window": args.frame_window,
+                "contact_window_manifest": (
+                    str(args.contact_window_manifest)
+                    if args.contact_window_manifest is not None
+                    else None
+                ),
+                "object_pose_source": "sim_owned_after_window_start",
+                "act_mode": args.act_mode,
+                "act_batch_size": args.act_batch_size if args.act_mode == "batch" else 1,
+                "row_execution": args.row_execution,
+                "row_batch_size": args.row_batch_size,
+                "lockstep_groups": lockstep_groups,
+                "video_mode": getattr(args, "video_mode", "full"),
+                "max_warm_request_seconds": args.max_warm_request_seconds,
+                "rows": row_summaries,
+            }
+
+        session_metadata = {
+            "id": shared_session_id,
+            "source": session_source,
+            "cleanup_owner": session_cleanup_owner,
+            "retained": bool(args.action_session_id or args.keep_action_session),
+        }
+        if args.keep_action_session:
+            if not shared_session_id or not created_session:
+                raise RuntimeError("retained action session must be created by this evaluator")
+            retained_marker = write_retained_session_marker(args, shared_session_id)
+            session_metadata["marker"] = str(retained_marker)
+        summary["action_session"] = session_metadata
+        (args.output_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        evaluation_succeeded = True
+    finally:
+        if created_session and (not args.keep_action_session or not evaluation_succeeded):
+            delete_session(args, headers, shared_session_id)
+            if retained_marker is not None and not evaluation_succeeded:
+                retained_marker.unlink(missing_ok=True)
+
     print(json.dumps(summary, indent=2), flush=True)
     return 0
 

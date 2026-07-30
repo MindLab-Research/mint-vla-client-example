@@ -47,8 +47,15 @@ CONTACT_RULE = (
 )
 
 
-def verify_locked_norm_stats(norm_stats_dir: Path) -> tuple[Path, str]:
-    """Return the locked norm path and SHA, or fail before it is consumed."""
+def verify_locked_norm_stats(
+    norm_stats_dir: Path, *, expected_sha256: str | None = None
+) -> tuple[Path, str]:
+    """Return an allowlisted, contract-authenticated norm path.
+
+    ``expected_sha256`` is an optional consumer-side assertion used by the newer
+    Mode4 launcher. It narrows the existing strict population allowlist; it does
+    not replace the allowlist or ``data_contract.json`` validation.
+    """
     path = Path(norm_stats_dir) / "norm_stats.json"
     if not path.is_file():
         raise ValueError(f"v1 extended-state requires norm_stats.json at {path}")
@@ -58,7 +65,17 @@ def verify_locked_norm_stats(norm_stats_dir: Path) -> tuple[Path, str]:
         CUBE1_ALL_NORM_SHA256,
         CUBE1_CUBE2_ALL_NORM_SHA256,
     }
-    if actual_sha not in supported:
+    if expected_sha256 is not None:
+        expected = str(expected_sha256).lower()
+        if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+            raise ValueError(f"expected norm SHA256 must be 64 hexadecimal characters, got {expected_sha256!r}")
+        if expected not in supported:
+            raise ValueError(f"expected norm SHA is not allowlisted: {expected}")
+        if actual_sha != expected:
+            raise ValueError(
+                f"v1 extended-state norm SHA mismatch: expected {expected}, got {actual_sha}: {path}"
+            )
+    elif actual_sha not in supported:
         raise ValueError(
             "v1 extended-state norm SHA mismatch: "
             f"expected one of {sorted(supported)}, got {actual_sha}: {path}"

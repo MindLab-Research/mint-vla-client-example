@@ -2,24 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import mujoco
 import numpy as np
 
 import mano_action_support as action_support
+from scripts import contact_windows
 
 
 L = action_support.L
 HORIZON = 10
 ACTION_DIM = 32
-
-
-@dataclass(frozen=True)
-class FullTrajectoryWindow:
-    start_frame: int
-    end_frame: int
-    frame_count: int
 
 
 def safe_object_name(row: dict) -> str:
@@ -55,12 +47,18 @@ def resolve_row_window(
     contact_context_frames: int,
     missing_contact_policy: str,
     manifest_entry: dict | None = None,
-) -> FullTrajectoryWindow:
-    del row_index, contact_context_frames, missing_contact_policy, manifest_entry
-    if frame_window != "full":
-        raise ValueError(f"Mode4 only supports full trajectories, got {frame_window!r}")
+) -> contact_windows.ContactWindow | None:
+    """Resolve the absolute source-frame interval used to initialize and run Mode4."""
     count = row_frame_count(row)
-    return FullTrajectoryWindow(start_frame=0, end_frame=count - 1, frame_count=count)
+    return contact_windows.select_window(
+        row,
+        row_index=row_index,
+        total_frames=count,
+        mode=frame_window,
+        manifest_entry=manifest_entry,
+        context_frames=contact_context_frames,
+        missing_policy=missing_contact_policy,
+    )
 
 
 def build_model_config(base_model: str):

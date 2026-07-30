@@ -14,11 +14,10 @@ from pathlib import Path
 import re
 from typing import Any
 
+from scripts import mano_dataset_release
 
-DEFAULT_GESTURE_INDEX_PATH = (
-    Path(__file__).resolve().parents[1]
-    / "config/datasets/new_all_generated_mano.index.json"
-)
+
+DEFAULT_GESTURE_INDEX_PATH = mano_dataset_release.resolve_role("language_index")
 _GESTURE_PATTERN = re.compile(r"^[0-9]{2}$")
 
 
