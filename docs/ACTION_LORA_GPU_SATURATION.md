@@ -1,6 +1,38 @@
 # Action-LoRA GPU supply-path optimization
 
-## Result
+## Eight-GPU population-resident result
+
+The eight-GPU bottleneck was full-trajectory Lance I/O, not GPU communication.
+A canonical Coverage batch128 advances through 16 new rows per step; each row
+contains an entire image/wrist trajectory and costs about 6.05 seconds to load.
+The external prototype appeared faster because each producer reused a 16-row
+slate for 250 sampling calls, which changes the row-coverage schedule.
+
+The formal path now ports the reusable mechanism—row residency—without porting
+that sampling bias:
+
+```text
+--batch-size 128
+--batch-producers 8
+--batch-build-workers 16
+--prefetch-batches 8
+--row-cache-size 1039
+--preload-selected-rows
+```
+
+On Cylinder1, preloading all 1,039 selected rows took 433.15 seconds and raised
+client RSS to 232.85 GiB. Warm throughput reached **60.19 samples/s**, versus
+16.77 samples/s when only the P8/prefetch8 numbers were copied. Mean batch wait
+fell from 4.238 seconds to 1.076 milliseconds; warm SM rose from 14.58% to
+52.22%. The 100-step Coverage schedule hash and all StateAug diagnostics match
+the previous formal run exactly. The preload breaks even after about 79 steps,
+so this is the recommended eight-GPU setting only when the selected population
+fits host memory and the run is long enough to amortize startup.
+
+Evidence is in
+`results/benchmarks/eight_gpu_efficiency_port_20260730/`.
+
+## Four-GPU result
 
 The formal MANO Action-LoRA path was limited by two coupled mechanisms:
 
@@ -93,8 +125,8 @@ wire batches exactly. Thread timing cannot reorder optimizer inputs.
 
 ### Coverage-slate guard
 
-A standard coverage slate contains `16 rows × 8 anchors = 128 samples`. Parallel
-prefetch must satisfy:
+A standard coverage slate contains `16 rows × 8 anchors = 128 samples`. With a
+bounded slate-sized row cache, parallel prefetch must satisfy:
 
 ```text
 batch_size * prefetch_batches <= 128
@@ -103,13 +135,19 @@ batch_size * prefetch_batches <= 128
 Batch 64 with prefetch 4 violated this invariant. Four materializers spanned two
 slates while the row LRU held one, causing repeated eviction/reload: p95 wait was
 31.0 s and throughput collapsed to 7.50 samples/s. Reducing prefetch to 2 cut
-p95 wait to 3.50 s. The client now rejects cross-slate multi-producer settings
-instead of silently entering this failure mode.
+p95 wait to 3.50 s.
+
+Cross-slate prefetch is accepted only after `--preload-selected-rows` has filled
+an explicit row cache large enough for the complete selected population. This
+state removes eviction by construction; the result records
+`prefetch_contract.status=population_resident`. The client still rejects every
+cross-slate setting backed by a partial cache.
 
 ## Repository impact
 
-- **Client:** owns the concurrent row cache, deterministic planner/materializer,
-  timing metrics, probe-only no-save switch, and documented settings.
+- **Client:** owns the concurrent row cache, optional full-population preload,
+  deterministic planner/materializer, timing metrics, probe-only no-save switch,
+  and documented settings.
 - **MINT:** only adds observability for device count, DATA_AXIS selection, and
   per-device batch size. Existing batched JIT and `PartitionSpec(DATA_AXIS)` do
   the GPU work.
