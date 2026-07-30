@@ -191,10 +191,15 @@ Remove `--print-config` only when the printed allocation is correct.
 
 | Server GPUs | Batch | Producers | Prefetch | Build workers | Datum cache |
 |---:|---:|---:|---:|---:|---:|
-| 4 | 128 | **2** | **2** | 16 | 256 |
+| 4 | **64** | **2** | **2** | 16 | 256 |
 | 8 | 128 | **8** | **8** | 16 | 256 |
 
-Both use `--row-cache-size N --preload-selected-rows`, where `N` is the number
+The validated four-GPU production profile is batch64/P2/prefetch2 with the
+complete selected population resident. The eight-GPU row remains the measured
+throughput profile and also requires the corrected resident-action client.
+Pass `--learning-rate 5e-5` explicitly; the CLI's legacy `1e-4` default is not
+the MANO production setting. Both use `--row-cache-size N` and
+`--preload-selected-rows`, where `N` is the number
 of selected trajectory rows. For full Cylinder1, `N=1039`. See
 [`docs/CLIENT_FINETUNE.md`](docs/CLIENT_FINETUNE.md#choose-the-gpu-count-defaults)
 for a copy-paste command and the low-memory fallback.

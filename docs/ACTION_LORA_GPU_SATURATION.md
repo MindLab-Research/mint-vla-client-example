@@ -7,27 +7,31 @@ backward compatibility.
 
 | Server GPUs | Batch | Producers | Prefetch | Total build workers | Datum cache | Row cache |
 |---:|---:|---:|---:|---:|---:|---|
-| 4 | 128 | **2** | **2** | 16 | 256 | Complete selected population, preloaded |
+| 4 | **64** | **2** | **2** | 16 | 256 | Complete selected population, preloaded |
 | 8 | 128 | **8** | **8** | 16 | 256 | Complete selected population, preloaded |
 
-For the full Cylinder1 population (`rows 3514–4552`, 1,039 trajectories), use:
+For the full Cylinder1 population (`rows 3514–4552`, 1,039 trajectories), both
+profiles use:
 
 ```text
---batch-size 128
+--learning-rate 5e-5
 --batch-build-workers 16
 --datum-cache-size 256
 --row-cache-size 1039
 --preload-selected-rows
+--slate-size 16
+--coverage-anchors-per-row 8
 ```
 
-Add `--batch-producers 2 --prefetch-batches 2` for four GPUs, or
-`--batch-producers 8 --prefetch-batches 8` for eight GPUs. Keep
-`--slate-size 16 --coverage-anchors-per-row 8` in both cases.
+Add `--batch-size 64 --batch-producers 2 --prefetch-batches 2` for four GPUs,
+or `--batch-size 128 --batch-producers 8 --prefetch-batches 8` for eight GPUs.
+Resident training requires Client `7b776872e63342409ffe0f2278de0196bcbfe4ab`
+or later so in-place action transforms cannot mutate cached absolute targets.
 
 Set `--row-cache-size` to the number of selected trajectory rows, not to the GPU
-count. Full-population residency is what makes cross-slate prefetch valid. If the
-population cannot fit host RAM, use the low-memory fallback
-`batch64 / producers2 / prefetch2 / workers16` without cross-slate prefetch.
+count. If the population cannot fit host RAM, the four-GPU bounded-cache
+fallback keeps `batch64 / producers2 / prefetch2 / workers16` but omits the
+population preload.
 
 ## Eight-GPU population-resident result
 
@@ -61,9 +65,25 @@ fits host memory and the run is long enough to amortize startup.
 Evidence is in
 `results/benchmarks/eight_gpu_efficiency_port_20260730/`.
 
-## Four-GPU population-resident result
+## Four-GPU corrected production result
 
-A simultaneous four-GPU A/B test used the same model, batch128, 128-row
+The production profile is now batch64/P2/prefetch2/workers16 with complete row
+residency. A corrected 500-step full-Cylinder1 probe sustained **38.91
+samples/s** with mean batch wait below one millisecond. Its successive 100-step
+loss medians decreased **0.2225 → 0.1454 → 0.1297 → 0.1166 → 0.1109**; the
+final loss was 0.1021 and the last-100 raw-gradient median was 0.2366. The
+formal 50K run reproduced the same downward trend after automatic handoff.
+
+This numerical acceptance depends on copying action windows before
+`DeltaActions`. Before Client `7b77687`, `np.asarray` returned a view into the
+resident absolute-action array and the in-place delta transform repeatedly
+subtracted query state across Coverage epochs. Both batch64 and batch128 then
+showed rising loss. That evidence falsified the earlier batch-size-only account
+and made the cache-alias fix part of the production contract.
+
+## Historical four-GPU producer-count A/B
+
+A simultaneous four-GPU throughput A/B used the same model, batch128, 128-row
 resident population, norm, Coverage schedule, and StateAug draws:
 
 | Four-GPU supply setting | Samples/s | Mean batch wait | Mean server route | Warm SM |
@@ -73,8 +93,9 @@ resident population, norm, Coverage schedule, and StateAug draws:
 
 P2 retains 97.96% of P8 throughput and does not starve the GPUs. The small
 throughput difference is explained by the two GPU groups' server-route times,
-not by batch supply. Four-GPU production therefore uses P2/prefetch2; P8 is
-valid but over-provisions the host queue. Evidence is in
+not by batch supply. This A/B establishes P2/prefetch2 as the four-GPU supply
+setting; it does not establish batch128 as a long-run numerical default. The
+corrected production batch is 64. Evidence is in
 `results/benchmarks/four_gpu_resident_param_ab_20260730/summary.json`.
 
 ## Historical four-GPU bounded-cache result
@@ -111,8 +132,9 @@ The balanced point is:
 
 Batch 128 was only 1.6% faster than batch 64 in this historical bounded-cache
 test. Batch64/P2/prefetch2 remains the low-memory fallback because it stays
-within one 128-sample Coverage slate. The population-resident defaults above
-supersede it on hosts that can retain the selected rows.
+within one 128-sample Coverage slate. On hosts that can retain the selected
+rows, the corrected production profile keeps the same batch/producers/prefetch
+values and adds full-population preload for higher sustained throughput.
 
 ## Measurements
 

@@ -320,18 +320,25 @@ Use these production settings explicitly:
 
 | Server GPUs | Batch | Producers | Prefetch | Total build workers | Datum cache |
 |---:|---:|---:|---:|---:|---:|
-| 4 | 128 | **2** | **2** | 16 | 256 |
+| 4 | **64** | **2** | **2** | 16 | 256 |
 | 8 | 128 | **8** | **8** | 16 | 256 |
+
+The four-GPU production default is the numerically accepted batch64 profile.
+It sustained **38.91 samples/s** in the corrected 500-step full-population
+probe, with Coverage-block loss medians decreasing from 0.2225 to 0.1109 and
+mean batch wait below one millisecond. The earlier batch128 four-GPU runs were
+throughput probes, not long-horizon numerical acceptance.
 
 Both settings require a population-resident row cache: set `--row-cache-size`
 to the number of selected trajectory rows and pass `--preload-selected-rows`.
-For full Cylinder1 (`rows 3514–4552`), the value is 1,039. Four GPUs can run
-P8/prefetch8, but a controlled A/B retained 97.96% of its throughput with P2
-while keeping batch wait near one millisecond, so P2 is the four-GPU default.
-On the measured host, full Cylinder1 preload took about 433 seconds and the
-client peaked near 233 GiB RSS; confirm host RAM before using the resident
-profile. For the low-memory profile, omit the row-preload flags and use the
-fallback documented below.
+For full Cylinder1 (`rows 3514–4552`), the value is 1,039. Resident training
+requires Client commit `7b776872e63342409ffe0f2278de0196bcbfe4ab` or later:
+it copies each action window before OpenPI's in-place `DeltaActions` transform.
+Without that fix, repeated row reuse corrupts cached absolute targets across
+Coverage epochs. On the measured host, full Cylinder1 preload took about
+429–433 seconds and the client peaked near 233 GiB RSS; confirm host RAM before
+using the resident profile. For the low-memory profile, omit the row-preload
+flags and use the fallback documented below.
 
 Use one parameterized command for the clean and StateAug arms so every setting
 except state noise remains identical:
@@ -352,8 +359,8 @@ NORM=/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_
 NORM_SHA=$(sha256sum "${NORM}/norm_stats.json" | awk '{print $1}')
 
 case "${GPU_COUNT}" in
-  4) BATCH_PRODUCERS=2; PREFETCH_BATCHES=2 ;;
-  8) BATCH_PRODUCERS=8; PREFETCH_BATCHES=8 ;;
+  4) BATCH_SIZE=64;  BATCH_PRODUCERS=2; PREFETCH_BATCHES=2 ;;
+  8) BATCH_SIZE=128; BATCH_PRODUCERS=8; PREFETCH_BATCHES=8 ;;
   *) echo "GPU_COUNT must be 4 or 8" >&2; exit 2 ;;
 esac
 
@@ -369,7 +376,7 @@ MINT_BASE_URL=http://127.0.0.1:30532 \
   --language-conditioning gesture \
   --extended-state --norm-stats-dir "${NORM}" --norm-sha-expected "${NORM_SHA}" \
   --sampling-strategy coverage --slate-size 16 --coverage-anchors-per-row 8 \
-  --steps 30000 --batch-size 128 \
+  --steps 30000 --batch-size "${BATCH_SIZE}" --learning-rate 5e-5 \
   --batch-producers "${BATCH_PRODUCERS}" \
   --prefetch-batches "${PREFETCH_BATCHES}" \
   --batch-build-workers 16 --datum-cache-size 256 \
@@ -398,10 +405,14 @@ ordered batch prefetch queue:
 
 - `--datum-cache-size 256` is the measured production setting; use `0` only for
   cache-off debugging.
-- `--prefetch-batches 2` on four GPUs or `8` on eight GPUs builds batches while
-  the server executes the current request; use `0` for synchronous debugging.
-- `--batch-producers 2` on four GPUs or `8` on eight GPUs enables independently
-  materialized batches. The historical value `1` remains available for A/B.
+- Four GPUs use `--batch-size 64`, `--prefetch-batches 2`, and
+  `--batch-producers 2`; this is the corrected production profile. Continue
+  checkpoint-level monitoring during the active 50K acceptance run.
+- Eight GPUs use the measured throughput profile `--batch-size 128`,
+  `--prefetch-batches 8`, and `--batch-producers 8`.
+- Prefetch builds batches while the server executes the current request; use
+  `0` only for synchronous debugging. The historical producer value `1`
+  remains available for A/B.
 - `--row-cache-size N --preload-selected-rows` loads and retains all `N`
   selected trajectories before model creation. `N` must equal the selected-row
   population for the production cross-slate settings above.
@@ -423,18 +434,24 @@ one CoverageSampler slate. For the standard values `--slate-size 16` and
 batch_size * prefetch_batches <= 128
 ```
 
-The trainer permits the recommended cross-slate settings only after the complete
-selected population has been preloaded into a capacity-matched row cache. The
-output must then report:
+The trainer permits cross-slate settings only after the complete selected
+population has been preloaded into a capacity-matched row cache. The eight-GPU
+batch128/prefetch8 profile must report
+`prefetch_contract.status = population_resident`. Four-GPU batch64/prefetch2
+exactly meets the historical
+128-sample slate bound, so its status may remain `ok`; verify residency directly
+in both profiles:
 
 ```text
-prefetch_contract.status = population_resident
+prefetch_contract.resident_population = true
 row_preload.cache_resident_rows = row_preload.rows
 ```
 
-If the population does not fit host RAM, use the low-memory fallback
-`batch64 / producers2 / prefetch2 / workers16`; it stays within one slate and
-does not require full-population residency.
+If the population does not fit host RAM, retain the four-GPU values
+`batch64 / producers2 / prefetch2 / workers16` but omit
+`--preload-selected-rows` and the population-sized row cache. That bounded-cache
+fallback stays within one slate, but its measured throughput is lower because
+rows are reloaded from Lance.
 
 Both require a batch divisible by the server device count. MINT metrics expose
 `device_count:sum`, `used_data_sharding:mean`, and
