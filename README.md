@@ -66,6 +66,54 @@ The locked gesture03 v1 norm SHA256 is:
 507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d
 ```
 
+## MANO state44 v2 profile
+
+`openpi/pi05-action-lora-r16-state44-finetune` uses profile
+`pi05_action_lora_r16_state44_v1`. It separates a 44D observation from the
+unchanged B-schema action `[10,32]`:
+
+```text
+state[0:26]  = MANO qpos26
+state[26:31] = index / thumb / ring / middle / pinky target-object contact
+state[31]    = object lift from trajectory or rollout initialization
+state[32:37] = signed fingertip-sphere to target collision-surface distance (m)
+state[37:42] = causal 25 ms fingertip-to-palm radial rate (m/s; + closing)
+state[42]    = object-floor contact-pair presence
+state[43]    = elapsed duration of the current >=2-finger contact run (s)
+
+action[0:32] = existing query-anchored B schema; action[26:32] stays physical zero
+```
+
+Finger order is fixed to `index/thumb/ring/middle/pinky`. Training source poses
+and Mode4 both use the same MuJoCo URDF fingertip markers and target-object
+collision geoms. Source timestamps must advance by exactly 5 ms; the rate uses
+the current sample and the sample five steps in the past. Persistence resets to
+zero below two simultaneous finger contacts and has no hard physical clip; its
+authenticated population quantiles provide normalization. The profile ends at
+index 43 and contains no opposition/load-geometry score.
+
+StateAug perturbs qpos only. It recomputes the five surface distances from the
+perturbed qpos and current object pose, while preserving the clean radial-rate
+history because an independently perturbed frame does not define a valid 25 ms
+trajectory. State normalization must have width 44 and action normalization
+must have width 32; state32 norms are rejected.
+
+Build a versioned norm and perform the full raw-token audit before training:
+
+```bash
+./scripts/remote/run_client.sh scripts/train/prepare_mano_state44_profile.py \
+  --lance-dataset "$DATASET" --target-lance-dataset "$DATASET" \
+  --row-indices "$ROWS" --frame-window contact --contact-context-frames 100 \
+  --contact-window-manifest "$CONTACT_MANIFEST" \
+  --gesture-index config/datasets/new_all_generated_mano.index.json \
+  --norm-output-dir "$OUTPUT/norm" --report-json "$OUTPUT/report.json"
+```
+
+The command writes the norm only when every selected sample is at or below the
+immutable 200-token prefix limit. Training and Mode4 must pass both the output
+norm SHA and `--state-contract state44`; the state44 model identity and contract
+are rejected if selected independently.
+
 ## Current deployment map
 
 | Component | Path / branch |
@@ -89,8 +137,10 @@ implement the following validated path:
 - OpenPI pi0.5 action-expert LoRA, rank 16, trained through the MINT HTTP API;
 - B-exact `urdf_target_absolute` supervision and query-anchored action
   reconstruction, with `action[26:32]` fixed to physical zero;
-- `mano_five_finger_contact_lift_v1` 32D observations;
-- clean and state-augmented training, with StateAug restricted to MANO qpos;
+- backward-compatible `mano_five_finger_contact_lift_v1` state32 and the
+  separately versioned `mano_five_finger_contact_geom_rate_v2` state44 profile;
+- clean and state-augmented training, with StateAug noise restricted to MANO
+  qpos and state44 surface geometry recomputed from the perturbed qpos;
 - exact-byte normalization locking and state/action provenance metadata;
 - cooperative deadline checkpoint saving;
 - Mode4 closed-loop MuJoCo rollout with native position-servo control,

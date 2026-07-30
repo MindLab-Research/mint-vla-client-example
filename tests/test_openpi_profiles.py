@@ -5,6 +5,8 @@ import unittest
 from scripts.openpi_profiles import (
     ACTION_LORA_R16_MODEL,
     ACTION_LORA_R16_PROFILE,
+    ACTION_LORA_R16_STATE44_MODEL,
+    ACTION_LORA_R16_STATE44_PROFILE,
     LEGACY_L_LORA_MODEL,
     LEGACY_L_LORA_PROFILE,
     resolve_profile,
@@ -28,6 +30,15 @@ class OpenPIProfileTests(unittest.TestCase):
             ("gemma_2b_lora", "gemma_300m"),
         )
         self.assertEqual(LEGACY_L_LORA_PROFILE.base_model, LEGACY_L_LORA_MODEL)
+
+    def test_state44_profile_separates_state_and_action_widths(self) -> None:
+        profile = resolve_profile(ACTION_LORA_R16_STATE44_MODEL)
+        self.assertEqual(profile, ACTION_LORA_R16_STATE44_PROFILE)
+        self.assertEqual((profile.state_dim, profile.action_dim), (44, 32))
+        self.assertEqual(profile.action_horizon, 10)
+        self.assertEqual(profile.max_tokens, 200)
+        self.assertTrue(profile.fail_on_token_truncation)
+        self.assertEqual(profile.state_contract_id, "mano_five_finger_contact_geom_rate_v2")
 
     def test_rejects_conflicting_model_and_profile(self) -> None:
         with self.assertRaisesRegex(ValueError, "does not match profile"):

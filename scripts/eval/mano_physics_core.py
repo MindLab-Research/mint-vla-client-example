@@ -22,6 +22,15 @@ NATIVE_SUBSTEPS = 2
 FRICTIONLOSS = 0.1
 ARMATURE = 0.01
 FLOOR_TOP_Z = -0.001
+STATE44_FINGERTIP_LINKS = {
+    "index": "index_dip",
+    "thumb": "thumb_ip",
+    "ring": "ring_dip",
+    "middle": "middle_dip",
+    "pinky": "pinky_dip",
+}
+STATE44_MARKER_PREFIX = "state44_fingertip_"
+
 SELF_COLLISION_GROUPS = {
     "thumb": ("thumb_cmc", "thumb_mcp", "thumb_ip"),
     "index": ("index_mcp", "index_pip", "index_dip"),
@@ -98,7 +107,44 @@ def add_collision_geom(*, builder, body, collision, urdf_path, name, contact):
     ET.SubElement(body, "geom", attributes)
 
 
-def configure_physics(builder, *, hand_urdf, object_urdf, object_name, hand_joints):
+def _add_state44_fingertip_markers(builder, *, hand_urdf: Path) -> None:
+    """Compile the five URDF fingertip spheres as non-colliding measurement geoms."""
+    hand_root = ET.parse(hand_urdf).getroot()
+    for finger, link_name in STATE44_FINGERTIP_LINKS.items():
+        body = builder.root.find(f".//body[@name='{link_name}']")
+        link = hand_root.find(f"link[@name='{link_name}']")
+        if body is None or link is None:
+            raise ValueError(f"missing state44 fingertip link/body {link_name!r}")
+        markers = [
+            visual
+            for visual in link.findall("visual")
+            if visual.find("geometry/sphere") is not None
+        ]
+        if len(markers) != 1:
+            raise ValueError(f"expected one URDF fingertip marker on {link_name!r}, got {len(markers)}")
+        marker = markers[0]
+        sphere = marker.find("geometry/sphere")
+        attributes = {
+            "name": f"{STATE44_MARKER_PREFIX}{finger}",
+            "type": "sphere",
+            "size": str(float(sphere.attrib["radius"])),
+            "contype": "0",
+            "conaffinity": "0",
+            "rgba": "0 0 0 0",
+        }
+        scene_export._geom_origin_attrib(marker, attributes)
+        ET.SubElement(body, "geom", attributes)
+
+
+def configure_physics(
+    builder,
+    *,
+    hand_urdf,
+    object_urdf,
+    object_name,
+    hand_joints,
+    state44_features: bool = False,
+):
     option = builder.root.find("option")
     if option is None:
         raise ValueError("scene missing option")
@@ -136,6 +182,8 @@ def configure_physics(builder, *, hand_urdf, object_urdf, object_name, hand_join
             collision_count += 1
     if not collision_count:
         raise ValueError("hand URDF has no collision geometry")
+    if state44_features:
+        _add_state44_fingertip_markers(builder, hand_urdf=hand_urdf)
 
     object_body = builder.root.find(f".//body[@name='{object_name}_body']")
     object_link = ET.parse(object_urdf).getroot().find("link")
@@ -206,7 +254,14 @@ def configure_physics(builder, *, hand_urdf, object_urdf, object_name, hand_join
 
 
 def make_scene(
-    object_name, width, height, *, physics=False, physics_timestep=DT, create_renderer=True
+    object_name,
+    width,
+    height,
+    *,
+    physics=False,
+    physics_timestep=DT,
+    create_renderer=True,
+    state44_features=False,
 ):
     object_urdf = chunk_helper.DEFAULT_OBJECTS_URDF_DIR / f"{object_name}.urdf"
     builder, object_joint, hand_joints = chunk_helper.build_scene(
@@ -223,6 +278,7 @@ def make_scene(
             object_urdf=object_urdf,
             object_name=object_name,
             hand_joints=hand_joints,
+            state44_features=state44_features,
         )
     tmp = tempfile.TemporaryDirectory(prefix=f"mano_rollout_{object_name}_")
     xml = Path(tmp.name) / "scene.xml"
@@ -419,3 +475,79 @@ def finger_contacts_from_mujoco(model, data, object_name, *,
         if finger is not None:
             contacts[FINGER_NAMES.index(finger)] = 1.0
     return contacts
+
+
+def resolve_state44_feature_ids(model, object_name):
+    """Resolve measurement geoms and palm body for state44 geometry features."""
+    from scripts.mano_state_contract import FINGER_NAMES
+
+    tip_geom_ids = []
+    for finger in FINGER_NAMES:
+        name = f"{STATE44_MARKER_PREFIX}{finger}"
+        geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
+        if geom_id < 0:
+            raise ValueError(f"missing state44 fingertip measurement geom {name!r}")
+        tip_geom_ids.append(int(geom_id))
+    object_geom_ids = [
+        gi
+        for gi in range(model.ngeom)
+        if (mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, gi) or "").startswith(
+            f"{object_name}_collision_"
+        )
+    ]
+    if not object_geom_ids:
+        raise ValueError(f"missing state44 object collision geoms for {object_name!r}")
+    palm_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "palm")
+    if palm_body_id < 0:
+        raise ValueError("missing MANO palm body for state44 features")
+    return tuple(tip_geom_ids), tuple(object_geom_ids), int(palm_body_id)
+
+
+def state44_geometry_from_mujoco(
+    model,
+    data,
+    object_name,
+    *,
+    tip_geom_ids=None,
+    object_geom_ids=None,
+    palm_body_id=None,
+):
+    """Return signed surface distance5, palm radial distance5, and floor support.
+
+    The fingertip measurement geoms are the five URDF marker spheres. They have
+    contype=conaffinity=0 and therefore do not change dynamics. ``mj_geomDistance``
+    returns the signed surface-to-surface distance to the object's collision geom.
+    """
+    if tip_geom_ids is None or object_geom_ids is None or palm_body_id is None:
+        tip_geom_ids, object_geom_ids, palm_body_id = resolve_state44_feature_ids(
+            model, object_name
+        )
+    signed_distances = np.empty(len(tip_geom_ids), dtype=np.float32)
+    radial_distances = np.empty(len(tip_geom_ids), dtype=np.float32)
+    palm_position = np.asarray(data.xpos[palm_body_id], dtype=np.float64)
+    fromto = np.zeros(6, dtype=np.float64)
+    for index, tip_geom_id in enumerate(tip_geom_ids):
+        distances = [
+            float(
+                mujoco.mj_geomDistance(
+                    model,
+                    data,
+                    tip_geom_id,
+                    object_geom_id,
+                    1.0,
+                    fromto,
+                )
+            )
+            for object_geom_id in object_geom_ids
+        ]
+        distance = min(distances)
+        if not np.isfinite(distance) or distance >= 1.0:
+            raise FloatingPointError(
+                f"invalid state44 fingertip-object distance for geom {tip_geom_id}: {distance}"
+            )
+        signed_distances[index] = np.float32(distance)
+        radial_distances[index] = np.float32(
+            np.linalg.norm(np.asarray(data.geom_xpos[tip_geom_id]) - palm_position)
+        )
+    floor_support = np.float32("object_floor" in contact_types(model, data, object_name))
+    return signed_distances, radial_distances, floor_support

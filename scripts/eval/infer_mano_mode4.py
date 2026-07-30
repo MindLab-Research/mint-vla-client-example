@@ -53,6 +53,12 @@ from scripts.mano_state_contract import (
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
+from scripts.mano_state44_contract import (
+    STATE44_CONTRACT_ID,
+    STATE44_DIM,
+    State44History,
+    assemble_live_state44,
+)
 from scripts.target_actions import URDF_TARGET_ABSOLUTE, project_row_actions
 from scripts.train.train_cube1_01_compare import (
     GESTURE_LANGUAGE,
@@ -69,6 +75,17 @@ HAND_DIM = 26
 # Fixed timing exported for audit/tests.
 MANORL_PHYSICS_TIMESTEP = physics.DT
 MANORL_PHYSICS_SUBSTEPS = physics.NATIVE_SUBSTEPS
+
+
+def resolved_state_contract_id(args: argparse.Namespace) -> str | None:
+    state_contract = getattr(
+        args, "state_contract", "state32" if getattr(args, "extended_state", False) else None
+    )
+    if state_contract == "state44":
+        return STATE44_CONTRACT_ID
+    if state_contract == "state32":
+        return STATE_CONTRACT_ID
+    return None
 
 
 def inferred_contact_manifest_path(dataset: Path) -> Path:
@@ -151,8 +168,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extended-state",
         action="store_true",
-        help="use MANO extended 32-dim state: finger contacts from live MuJoCo at [26:31], "
-        "lift height from sim object at [31]. Must match training contract.",
+        help="legacy alias for --state-contract state32",
+    )
+    parser.add_argument(
+        "--state-contract",
+        choices=("state32", "state44"),
+        default=None,
+        help="versioned MANO observation contract; state44 requires the state44 model identity",
     )
     parser.add_argument(
         "--language-conditioning",
@@ -626,6 +648,11 @@ def run_variant(
         "dataset_reference_frames_written": 0,
     }
     scene_started = time.perf_counter()
+    state_contract = getattr(
+        args, "state_contract", "state32" if getattr(args, "extended_state", False) else None
+    )
+    use_state44 = state_contract == "state44"
+    state_dim = STATE44_DIM if use_state44 else 32
     tmp, model, data, renderer, object_addr, _, hand_addrs, _, limits = physics.make_scene(
         object_name,
         args.width,
@@ -633,13 +660,57 @@ def run_variant(
         physics=True,
         physics_timestep=physics.DT,
         create_renderer=True,
+        state44_features=use_state44,
     )
     # Pre-resolve keypoint/object geom IDs once at scene init (not per-frame string scan).
     kp_geom_ids, obj_geom_ids, geom_to_finger = (
         physics.resolve_keypoint_geom_ids(model, object_name)
         if args.extended_state else (None, None, None)
     )
-    state = np.zeros(32, dtype=np.float32)
+    state44_tip_geom_ids, state44_object_geom_ids, state44_palm_body_id = (
+        physics.resolve_state44_feature_ids(model, object_name)
+        if use_state44
+        else (None, None, None)
+    )
+    state44_history = None
+    if use_state44:
+        prior_radial = []
+        prior_contacts = []
+        for prior_frame in range(0, window_start):
+            full.set_scene_state(
+                model,
+                data,
+                state=np.asarray(row["state"][prior_frame], dtype=np.float32)[:HAND_DIM],
+                object_pos=row["objects"][0]["pos"][prior_frame],
+                object_rot_aa=row["objects"][0]["rot_aa"][prior_frame],
+                object_addr=object_addr,
+                hand_addrs=hand_addrs,
+            )
+            prior_contacts.append(
+                physics.finger_contacts_from_mujoco(
+                    model,
+                    data,
+                    object_name,
+                    keypoint_geom_ids=kp_geom_ids,
+                    object_geom_ids=obj_geom_ids,
+                    geom_id_to_finger=geom_to_finger,
+                )
+            )
+            _surface, radial, _floor = physics.state44_geometry_from_mujoco(
+                model,
+                data,
+                object_name,
+                tip_geom_ids=state44_tip_geom_ids,
+                object_geom_ids=state44_object_geom_ids,
+                palm_body_id=state44_palm_body_id,
+            )
+            if prior_frame >= window_start - 5:
+                prior_radial.append(radial)
+        state44_history = State44History(
+            prior_radial_distances=np.asarray(prior_radial, dtype=np.float32).reshape(-1, 5),
+            prior_contacts=np.asarray(prior_contacts, dtype=np.float32).reshape(-1, 5),
+        )
+    state = np.zeros(state_dim, dtype=np.float32)
     state[:HAND_DIM] = np.asarray(row["state"][window_start], dtype=np.float32)[:HAND_DIM]
     clipping = new_clipping_diagnostics(limits)
     data.qvel[:] = 0.0
@@ -670,6 +741,10 @@ def run_variant(
     observation_states = []
     observation_contacts = []
     observation_lift = []
+    observation_surface_distances = []
+    observation_radial_rates = []
+    observation_floor_support = []
+    observation_multicontact_persistence = []
     preclip_targets = []
     clipping_corrections = []
     physics_contact_flags = []
@@ -760,7 +835,35 @@ def run_variant(
             for frame in range(window_start, window_end):
                 current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
                 state[:HAND_DIM] = current_q.astype(np.float32)
-                if args.extended_state:
+                if use_state44:
+                    fc = physics.finger_contacts_from_mujoco(
+                        model,
+                        data,
+                        object_name,
+                        keypoint_geom_ids=kp_geom_ids,
+                        object_geom_ids=obj_geom_ids,
+                        geom_id_to_finger=geom_to_finger,
+                    )
+                    surface, radial, floor_support = physics.state44_geometry_from_mujoco(
+                        model,
+                        data,
+                        object_name,
+                        tip_geom_ids=state44_tip_geom_ids,
+                        object_geom_ids=state44_object_geom_ids,
+                        palm_body_id=state44_palm_body_id,
+                    )
+                    assert state44_history is not None
+                    radial_rate, persistence = state44_history.observe(radial, fc)
+                    state = assemble_live_state44(
+                        hand_qpos=current_q,
+                        contacts=fc,
+                        object_lift=float(data.qpos[object_addr + 2]) - object_z_initial,
+                        signed_surface_distances=surface,
+                        radial_rates=radial_rate,
+                        floor_support=float(floor_support),
+                        persistence=float(persistence),
+                    )
+                elif args.extended_state:
                     state[HAND_DIM:] = 0
                     fc = physics.finger_contacts_from_mujoco(
                         model, data, object_name,
@@ -778,6 +881,11 @@ def run_variant(
                 observation_states.append(state.copy())
                 observation_contacts.append(state[26:31].copy())
                 observation_lift.append(state[31])
+                if use_state44:
+                    observation_surface_distances.append(state[32:37].copy())
+                    observation_radial_rates.append(state[37:42].copy())
+                    observation_floor_support.append(state[42])
+                    observation_multicontact_persistence.append(state[43])
                 if (frame - window_start) % args.chunk_stride == 0:
                     query_prepare_started = time.perf_counter()
                     head_image, wrist_image = physics.render_current_state(model, data, renderer)
@@ -964,6 +1072,16 @@ def run_variant(
         "object_position_sim": out / "object_position_sim.npy",
         "object_quaternion_sim": out / "object_quaternion_sim.npy",
     }
+    if use_state44:
+        arrays.update(
+            {
+                "rollout_observation_surface_distance": out / "rollout_observation_surface_distance.npy",
+                "rollout_observation_radial_rate": out / "rollout_observation_radial_rate.npy",
+                "rollout_observation_floor_support": out / "rollout_observation_floor_support.npy",
+                "rollout_observation_multicontact_persistence": out
+                / "rollout_observation_multicontact_persistence.npy",
+            }
+        )
     array_finalize_started = time.perf_counter()
     np.save(arrays["actions_raw_pred_normalized"], raw_norm_all)
     np.save(arrays["actions_raw_pred_physical"], raw_phys_all)
@@ -981,6 +1099,23 @@ def run_variant(
         np.asarray(observation_contacts, dtype=np.float32),
     )
     np.save(arrays["rollout_observation_lift"], np.asarray(observation_lift, dtype=np.float32))
+    if use_state44:
+        np.save(
+            arrays["rollout_observation_surface_distance"],
+            np.asarray(observation_surface_distances, dtype=np.float32),
+        )
+        np.save(
+            arrays["rollout_observation_radial_rate"],
+            np.asarray(observation_radial_rates, dtype=np.float32),
+        )
+        np.save(
+            arrays["rollout_observation_floor_support"],
+            np.asarray(observation_floor_support, dtype=np.float32),
+        )
+        np.save(
+            arrays["rollout_observation_multicontact_persistence"],
+            np.asarray(observation_multicontact_persistence, dtype=np.float32),
+        )
     np.save(arrays["physics_contact_flags"], np.asarray(physics_contact_flags, dtype=np.bool_))
     np.save(
         arrays["step_max_contact_force"],
@@ -1002,13 +1137,28 @@ def run_variant(
         "physics_dynamics": True,
         "closed_loop": True,
         "observation_feedback": True,
-        "state_observation_source": "integrated_mujoco_qpos",
+        "state_observation_source": (
+            "integrated_mujoco_state44" if use_state44 else "integrated_mujoco_qpos"
+        ),
         "image_observation_source": "integrated_mujoco_renderer",
         "object_pose_source": f"sim_owned_after_source_frame_{window_start}",
         "action_source": args.action_source,
         "extended_state": bool(args.extended_state),
-        "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
+        "state_contract": resolved_state_contract_id(args),
+        "state_dim": state_dim,
+        "action_dim": 32,
+        "state44_feature_contract": (
+            {
+                "surface_distance": "signed_urdf_fingertip_sphere_to_target_collision_surface_meters",
+                "radial_rate": "causal_25ms_fingertip_to_palm_radial_rate_meters_per_second",
+                "radial_rate_sign": "positive_closing_negative_opening",
+                "sample_dt_seconds": 0.005,
+                "floor_support": "mujoco_target_object_floor_contact_pair_presence",
+                "multicontact_persistence": "elapsed_seconds_current_at_least_two_finger_contact_run",
+                "finger_order": "index/thumb/ring/middle/pinky",
+            }
+            if use_state44
+            else None
         ),
         "contact_semantics": (
             CONTACT_SEMANTICS if args.extended_state else None
@@ -1122,9 +1272,9 @@ def build_row_summary(
         "normalization_row_indices": normalization_rows,
         "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
         "video_mode": getattr(args, "video_mode", "full"),
-        "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
-        ),
+        "state_contract": resolved_state_contract_id(args),
+        "state_dim": L.resolve_profile(args.model).state_dim,
+        "action_dim": L.resolve_profile(args.model).action_dim,
         "contact_semantics": (
             CONTACT_SEMANTICS if args.extended_state else None
         ),
@@ -1161,6 +1311,17 @@ def build_row_summary(
 def main() -> int:
     args = parse_args()
     args.base_url = args.base_url.rstrip("/")
+    args.state_contract = getattr(args, "state_contract", None)
+    if args.extended_state and args.state_contract not in {None, "state32"}:
+        raise ValueError("--extended-state cannot be combined with --state-contract state44")
+    if args.extended_state:
+        args.state_contract = "state32"
+    profile = L.resolve_profile(args.model)
+    if profile.state_dim == STATE44_DIM and args.state_contract != "state44":
+        raise ValueError(f"{args.model} requires --state-contract state44")
+    if args.state_contract == "state44" and profile.state_dim != STATE44_DIM:
+        raise ValueError("--state-contract state44 requires the state44 model identity")
+    args.extended_state = args.state_contract is not None
     # Tests and legacy direct callers may construct a minimal Namespace; the
     # formal CLI defaults new evaluations to contact-window initialization.
     args.frame_window = getattr(args, "frame_window", "full")
@@ -1263,6 +1424,14 @@ def main() -> int:
         )
         args.norm_sha_actual = actual_sha
     norm_stats = L.normalize.load(args.norm_stats_dir)
+    if args.extended_state or profile.state_dim == STATE44_DIM:
+        expected_norm_dims = {"state": profile.state_dim, "actions": profile.action_dim}
+        for key, expected_dim in expected_norm_dims.items():
+            if key not in norm_stats or np.asarray(norm_stats[key].mean).shape != (expected_dim,):
+                actual = None if key not in norm_stats else np.asarray(norm_stats[key].mean).shape
+                raise ValueError(
+                    f"normalization {key!r} width must be {expected_dim}, got {actual}"
+                )
     if args.extended_state:
         # Structural validation follows the exact-byte check.
         _sq01 = np.asarray(norm_stats["state"].q01, dtype=np.float32)
@@ -1280,6 +1449,14 @@ def main() -> int:
             raise ValueError(
                 f"extended-state norm cache lift range must be > 1e-4, got {_lift_range}"
             )
+        if args.state_contract == "state44":
+            if not np.isclose(_sq01[42], 0.0) or not np.isclose(_sq99[42], 1.0):
+                raise ValueError(
+                    f"state44 norm cache floor support q01/q99 must be 0/1, got "
+                    f"{_sq01[42]}/{_sq99[42]}"
+                )
+            if np.any((_sq99[32:42] - _sq01[32:42]) <= 1e-8):
+                raise ValueError("state44 norm cache has degenerate distance/rate quantiles")
     data_config = L._make_data_config(
         full.build_model_config(args.model), norm_stats, action_source=args.action_source
     )
@@ -1456,7 +1633,9 @@ def main() -> int:
                 "shared_session": True,
                 "normalization_row_indices": normalization_rows,
                 "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
-                "state_contract": STATE_CONTRACT_ID if args.extended_state else None,
+                "state_contract": resolved_state_contract_id(args),
+                "state_dim": profile.state_dim,
+                "action_dim": profile.action_dim,
                 "contact_semantics": CONTACT_SEMANTICS if args.extended_state else None,
                 "contact_rule": CONTACT_RULE if args.extended_state else None,
                 "norm_sha_expected": getattr(args, "norm_sha_expected", None),

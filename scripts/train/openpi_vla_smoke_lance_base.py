@@ -65,6 +65,7 @@ from scripts import contact_windows as contact_windows_lib
 from scripts import mano_dataset_release
 from scripts.openpi_profiles import (
     ACTION_LORA_R16_MODEL,
+    ACTION_LORA_R16_STATE44_MODEL,
     LEGACY_L_LORA_MODEL,
     MODEL_CHOICES,
     OpenPIClientProfile,
@@ -75,6 +76,7 @@ from scripts.target_actions import MANO_DELTA_MASK_SEGMENTS, URDF_TARGET_ABSOLUT
 # Backwards-compatible name for the default L-LoRA server identity.
 PI05_MODEL = LEGACY_L_LORA_MODEL
 PI05_ACTION_LORA_R16_MODEL = ACTION_LORA_R16_MODEL
+PI05_ACTION_LORA_R16_STATE44_MODEL = ACTION_LORA_R16_STATE44_MODEL
 
 
 # --------------------------------------------------------------------------- #
@@ -281,6 +283,7 @@ class LanceViewpi05Dataset:
         contact_window_manifest: Path | None = None,
         missing_contact_policy: str = "full",
         extended_state: bool = False,
+        state_contract: str | None = None,
     ) -> None:
         """`slate_size`/`slate_rotate_every` control `sample_indices()`'s
         episode-slate rotation (see its docstring) -- irrelevant if callers
@@ -288,12 +291,17 @@ class LanceViewpi05Dataset:
         `_compute_norm_stats`, `probe_lance_dataset`), only used by
         `sample_indices()`.
 
-        `extended_state`: when True, load `contact` and `objects` columns and
-        build the MANO 32-dim extended state contract (finger contacts at
-        [26:31], lift height at [31]). When False (default), state[26:32]
-        remains zeros (legacy contract for old checkpoints).
+        `extended_state`: legacy alias for state_contract="state32".
+        `state_contract`: None for legacy raw state, "state32" for contact/lift,
+        or "state44" for contact/lift + fingertip geometry/dynamics.
         """
-        self._extended_state = bool(extended_state)
+        if state_contract not in {None, "state32", "state44"}:
+            raise ValueError(f"unsupported state_contract {state_contract!r}")
+        if extended_state and state_contract not in {None, "state32"}:
+            raise ValueError("--extended-state cannot be combined with state_contract=state44")
+        self._state_contract = state_contract or ("state32" if extended_state else None)
+        self._extended_state = self._state_contract is not None
+        self._state_dim = 44 if self._state_contract == "state44" else 32
         self._dataset = lance.dataset(str(lance_dataset))
         self._dataset_path = Path(lance_dataset)
         # Metadata stays small; contact records are scanned separately and
@@ -416,8 +424,20 @@ class LanceViewpi05Dataset:
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
+        if self._state_contract == "state44":
+            columns.append("timestamp")
         table = self._dataset.take([row_index], columns=columns)
         row = table.to_pylist()[0]
+        if self._state_contract == "state44":
+            from scripts.mano_state44_contract import compute_source_state44_sequence
+
+            metadata = self._rows[row_index].get("trajectory_metadata") or {}
+            object_names = metadata.get("object_names") or []
+            if len(object_names) != 1:
+                raise ValueError(f"state44 requires exactly one object name, got {object_names!r}")
+            row["_state44_sequence"] = compute_source_state44_sequence(
+                {**row, "trajectory_metadata": metadata}, object_names[0]
+            )
         self._row_cache[row_index] = row
         self._row_cache.move_to_end(row_index)
         while len(self._row_cache) > self._row_cache_capacity():
@@ -481,7 +501,9 @@ class LanceViewpi05Dataset:
         if actions.shape[0] < self._action_horizon:
             pad = np.repeat(actions[-1:], self._action_horizon - actions.shape[0], axis=0)
             actions = np.concatenate([actions, pad], axis=0)
-        if self._extended_state:
+        if getattr(self, "_state_contract", None) == "state44":
+            state = np.asarray(row["_state44_sequence"][frame], dtype=np.float32).copy()
+        elif self._extended_state:
             from scripts.mano_state_contract import build_extended_state
             objects = row["objects"]
             traj_meta = self._rows[row_index].get("trajectory_metadata", {})
@@ -523,6 +545,7 @@ def _build_model_config(
     action_horizon: int,
     action_dim: int = 32,
     *,
+    state_dim: int | None = None,
     base_model: str | None = None,
     profile: OpenPIClientProfile | str | None = None,
 ) -> pi0_config.Pi0Config:
@@ -532,19 +555,24 @@ def _build_model_config(
     server responsibilities selected by ``base_model`` in HTTP payloads.
     """
     resolved = resolve_profile(base_model, profile=profile)
+    resolved_state_dim = resolved.state_dim if state_dim is None else int(state_dim)
     if resolved.discrete_state_input and (
-        action_dim != resolved.action_dim or action_horizon != resolved.action_horizon
+        resolved_state_dim != resolved.state_dim
+        or action_dim != resolved.action_dim
+        or action_horizon != resolved.action_horizon
     ):
         raise ValueError(
-            f"{resolved.profile_id} requires action_dim={resolved.action_dim} "
-            f"and action_horizon={resolved.action_horizon}; got "
-            f"{action_dim} and {action_horizon}"
+            f"{resolved.profile_id} requires state_dim={resolved.state_dim}, "
+            f"action_dim={resolved.action_dim}, and action_horizon={resolved.action_horizon}; got "
+            f"{resolved_state_dim}, {action_dim}, and {action_horizon}"
         )
     return pi0_config.Pi0Config(
         pi05=True,
+        state_dim=resolved_state_dim,
         action_dim=action_dim,
         action_horizon=action_horizon,
         max_token_len=resolved.max_tokens,
+        fail_on_token_truncation=resolved.fail_on_token_truncation,
         discrete_state_input=resolved.discrete_state_input,
         # Adapter ownership remains server-side, but matching variants prevent
         # the client transform declaration from drifting from that contract.
@@ -654,9 +682,22 @@ def _pi05_datum_from_transformed(base_model: str, item: dict[str, Any]) -> dict[
       - rank-1 state, rank-2 actions [action_horizon, action_dim].
     """
     model_cfg = MODEL_CONFIGS[base_model]
+    profile = resolve_profile(base_model)
     prompt_mask = np.asarray(item["tokenized_prompt_mask"]).astype(bool)
     prompt_tokens = np.asarray(item["tokenized_prompt"])[prompt_mask].astype(int).tolist()
+    state = np.asarray(item["state"], dtype=np.float32)
     actions = np.asarray(item["actions"], dtype=np.float32)
+    if state.shape != (profile.state_dim,):
+        raise ValueError(
+            f"{profile.profile_id} requires transformed state shape {(profile.state_dim,)}, "
+            f"got {state.shape}"
+        )
+    expected_actions = (profile.action_horizon, profile.action_dim)
+    if actions.shape != expected_actions:
+        raise ValueError(
+            f"{profile.profile_id} requires transformed actions shape {expected_actions}, "
+            f"got {actions.shape}"
+        )
     image_chunks = []
     for camera_name in model_cfg.camera_layout:
         image_chunks.append({
@@ -668,8 +709,8 @@ def _pi05_datum_from_transformed(base_model: str, item: dict[str, Any]) -> dict[
     return {
         "observation": {
             "state": {
-                "data": np.asarray(item["state"], dtype=np.float32).reshape(-1).tolist(),
-                "shape": list(np.asarray(item["state"]).shape),
+                "data": state.reshape(-1).tolist(),
+                "shape": list(state.shape),
                 "dtype": "float32",
             },
             "model_input": {"chunks": [*image_chunks, {"type": "encoded_text", "tokens": prompt_tokens}]},
@@ -778,13 +819,20 @@ def main() -> int:
         missing_contact_policy=args.missing_contact_policy,
     )
 
-    # Infer action_dim from the dataset
     sample = dataset[0]
-    action_dim = sample["observation/state"].shape[0]  # state and actions have same dim
-    print(f"Inferred action_dim={action_dim} from dataset")
+    profile = resolve_profile(args.model)
+    state_dim = int(sample["observation/state"].shape[0])
+    if state_dim != profile.state_dim:
+        raise ValueError(
+            f"dataset state width {state_dim} disagrees with profile state_dim {profile.state_dim}"
+        )
+    print(f"Resolved state_dim={state_dim}, action_dim={profile.action_dim} from profile")
 
     model_config = _build_model_config(
-        args.action_horizon, action_dim=action_dim, base_model=args.model
+        args.action_horizon,
+        state_dim=state_dim,
+        action_dim=profile.action_dim,
+        base_model=args.model,
     )
     norm_stats = _compute_norm_stats(dataset)
     data_config = _make_data_config(model_config, norm_stats)

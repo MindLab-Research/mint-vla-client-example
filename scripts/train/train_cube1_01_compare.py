@@ -34,6 +34,7 @@ from scripts.gesture_language import (
     GestureIndex,
     format_gesture_prompt,
 )
+from scripts.mano_state44_contract import STATE44_CONTRACT_ID
 from scripts.mano_state_contract import (
     CONTACT_RULE,
     CONTACT_SEMANTICS,
@@ -69,6 +70,14 @@ LANGUAGE_CONDITIONING_CHOICES = (
     OBJECT_ONLY_LANGUAGE,
     MOTION_VARIANT_LANGUAGE,
 )
+
+
+def resolved_state_contract_id(state_contract: str | None) -> str | None:
+    if state_contract == "state44":
+        return STATE44_CONTRACT_ID
+    if state_contract == "state32":
+        return STATE_CONTRACT_ID
+    return None
 
 
 def dataset_release_provenance() -> dict[str, str]:
@@ -175,6 +184,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         gesture_index: Path = DEFAULT_GESTURE_INDEX_PATH,
         target_lance_dataset: Path | None = None,
         extended_state: bool = False,
+        state_contract: str | None = None,
     ) -> None:
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
@@ -188,7 +198,13 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 f"expected one of {LANGUAGE_CONDITIONING_CHOICES}"
             )
         self._action_source = action_source
-        self._extended_state = bool(extended_state)
+        if state_contract not in {None, "state32", "state44"}:
+            raise ValueError(f"unsupported state_contract {state_contract!r}")
+        if extended_state and state_contract not in {None, "state32"}:
+            raise ValueError("--extended-state cannot be combined with state_contract=state44")
+        self._state_contract = state_contract or ("state32" if extended_state else None)
+        self._extended_state = self._state_contract is not None
+        self._state_dim = 44 if self._state_contract == "state44" else 32
         self._language_conditioning = language_conditioning
         self._gesture_index = (
             GestureIndex.load(gesture_index)
@@ -298,6 +314,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             raise ValueError(f"frame_window must be contact or full, got {self._frame_window!r}")
 
         self._row_cache: OrderedDict[int, dict[str, Any]] = OrderedDict()
+        self._state44_sequence_cache: dict[int, np.ndarray] = {}
+        self._state44_sequence_lock = threading.RLock()
         self._row_cache_lock = threading.RLock()
         self._row_cache_condition = threading.Condition(self._row_cache_lock)
         self._row_cache_loading: set[int] = set()
@@ -339,6 +357,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
+        if getattr(self, "_state_contract", None) == "state44":
+            columns.append("timestamp")
         if self._action_source != MEASURED_DELTA and self._target_is_image_dataset:
             columns.append("hands")
         row = self._dataset.take([source_row], columns=columns).to_pylist()[0]
@@ -359,6 +379,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 )
             row = {**row, "hands": target_hands}
         row = project_row_actions(row, self._action_source)
+        if getattr(self, "_state_contract", None) == "state44":
+            row["_state44_sequence"] = self._get_state44_sequence(row_index, row)
         return {
             **row,
             "prompt": format_language_prompt(
@@ -372,6 +394,34 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 ),
             ),
         }
+
+    def _get_state44_sequence(
+        self, row_index: int, loaded_row: dict[str, Any] | None = None
+    ) -> np.ndarray:
+        if getattr(self, "_state_contract", None) != "state44":
+            raise ValueError("state44 sequence cache requires state_contract=state44")
+        with self._state44_sequence_lock:
+            cached = self._state44_sequence_cache.get(row_index)
+            if cached is not None:
+                return cached
+        source_row = self._source_row_indices[row_index]
+        source = loaded_row
+        if source is None:
+            source = self._dataset.take(
+                [source_row], columns=["state", "objects", "contact", "timestamp"]
+            ).to_pylist()[0]
+        from scripts.mano_state44_contract import compute_source_state44_sequence
+
+        metadata = self._rows[row_index]["trajectory_metadata"]
+        object_names = metadata.get("object_names") or []
+        if len(object_names) != 1:
+            raise ValueError(f"state44 requires exactly one object name, got {object_names!r}")
+        sequence = compute_source_state44_sequence(
+            {**source, "trajectory_metadata": metadata}, object_names[0]
+        )
+        with self._state44_sequence_lock:
+            existing = self._state44_sequence_cache.setdefault(row_index, sequence)
+        return existing
 
     def _get_row(self, row_index: int) -> dict[str, Any]:
         # Coalesce duplicate misses by row while allowing distinct immutable
@@ -402,6 +452,28 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             self._row_cache_loading.remove(row_index)
             self._row_cache_condition.notify_all()
         return row
+
+    def state44_surface_distances_for_sample(
+        self, key: int, augmented_hand_qpos: np.ndarray
+    ) -> np.ndarray:
+        if getattr(self, "_state_contract", None) != "state44":
+            raise ValueError("state44 surface recomputation requires state_contract=state44")
+        local_row, frame = self._index[int(key) % len(self)]
+        row = self._get_row(local_row)
+        object_names = self._rows[local_row]["trajectory_metadata"].get("object_names") or []
+        if len(object_names) != 1:
+            raise ValueError(f"state44 requires exactly one object name, got {object_names!r}")
+        from scripts.mano_state44_contract import compute_state44_geometry_frame
+
+        surface, _radial, _floor = compute_state44_geometry_frame(
+            object_name=object_names[0],
+            hand_qpos=np.asarray(augmented_hand_qpos, dtype=np.float32),
+            object_position=np.asarray(row["objects"][0]["pos"][frame], dtype=np.float32),
+            object_rotation_axis_angle=np.asarray(
+                row["objects"][0]["rot_aa"][frame], dtype=np.float32
+            ),
+        )
+        return surface
 
     def row_cache_capacity_rows(self) -> int:
         explicit = getattr(self, "_row_cache_capacity_rows", None)
@@ -476,7 +548,12 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
             {**image_row, "hands": target_row["hands"]}, dataset._action_source
         )
         start, end = frames_by_row[local_row]
-        states = np.asarray(image_row["state"][start : end + 1], dtype=np.float32)
+        if getattr(dataset, "_state_contract", None) == "state44":
+            states = np.asarray(
+                dataset._get_state44_sequence(local_row)[start : end + 1], dtype=np.float32
+            )
+        else:
+            states = np.asarray(image_row["state"][start : end + 1], dtype=np.float32)
         if dataset._action_source == URDF_TARGET_ABSOLUTE:
             # Match the exact model supervision population. Dataset item t emits
             # target[t:t+H], repeat-padded at the selected window end, and
@@ -506,25 +583,32 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
         _s = np.asarray(state_result.std, dtype=np.float32).copy()
         _q01 = np.asarray(state_result.q01, dtype=np.float32).copy()
         _q99 = np.asarray(state_result.q99, dtype=np.float32).copy()
-        _m[26:31] = 0.5; _s[26:31] = 0.5
-        _q01[26:31] = 0.0; _q99[26:31] = 1.0
-        # Compute lift height stats from objects data
-        lift_values = []
-        for local_row in sorted(frames_by_row):
-            source_row = dataset._source_row_indices[local_row]
-            obj_row = dataset._dataset.take([source_row], columns=["objects"]).to_pylist()[0]
-            obj_pos = np.asarray(obj_row["objects"][0]["pos"], dtype=np.float64)
-            start, end = frames_by_row[local_row]
-            lift = obj_pos[start:end+1, 2] - obj_pos[0, 2]
-            lift_values.append(lift)
-        lift_all = np.concatenate(lift_values)
-        lift_stats = L.normalize.RunningStats()
-        lift_stats.update(lift_all.reshape(-1, 1))
-        lift_result = lift_stats.get_statistics()
-        _m[31] = float(np.asarray(lift_result.mean).flat[0])
-        _s[31] = float(np.asarray(lift_result.std).flat[0])
-        _q01[31] = float(np.asarray(lift_result.q01).flat[0])
-        _q99[31] = float(np.asarray(lift_result.q99).flat[0])
+        _m[26:31] = 0.5
+        _s[26:31] = 0.5
+        _q01[26:31] = 0.0
+        _q99[26:31] = 1.0
+        if getattr(dataset, "_state_contract", None) == "state44":
+            # Floor support is the second binary state44 field.
+            _m[42] = 0.5
+            _s[42] = 0.5
+            _q01[42] = 0.0
+            _q99[42] = 1.0
+        else:
+            # State32 source rows do not carry lift in their stored state.
+            lift_values = []
+            for local_row in sorted(frames_by_row):
+                source_row = dataset._source_row_indices[local_row]
+                obj_row = dataset._dataset.take([source_row], columns=["objects"]).to_pylist()[0]
+                obj_pos = np.asarray(obj_row["objects"][0]["pos"], dtype=np.float64)
+                start, end = frames_by_row[local_row]
+                lift_values.append(obj_pos[start : end + 1, 2] - obj_pos[0, 2])
+            lift_stats = L.normalize.RunningStats()
+            lift_stats.update(np.concatenate(lift_values).reshape(-1, 1))
+            lift_result = lift_stats.get_statistics()
+            _m[31] = float(np.asarray(lift_result.mean).flat[0])
+            _s[31] = float(np.asarray(lift_result.std).flat[0])
+            _q01[31] = float(np.asarray(lift_result.q01).flat[0])
+            _q99[31] = float(np.asarray(lift_result.q99).flat[0])
         state_result = L.normalize.NormStats(mean=_m, std=_s, q01=_q01, q99=_q99)
     return {
         "state": state_result,
@@ -560,12 +644,13 @@ def load_or_compute_norm_stats(
             raise ValueError(f"normalization cache is missing norm_stats.json: {path}")
         actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     stats = L.normalize.load(norm_stats_dir)
-    for key in ("state", "actions"):
+    expected_dimensions = {"state": int(getattr(dataset, "_state_dim", 32)), "actions": 32}
+    for key, expected_dim in expected_dimensions.items():
         if key not in stats:
             raise ValueError(f"normalization cache is missing {key!r}: {path}")
-        if tuple(np.asarray(stats[key].mean).shape) != (32,):
+        if tuple(np.asarray(stats[key].mean).shape) != (expected_dim,):
             raise ValueError(
-                f"normalization cache {key!r} mean must have shape (32,), "
+                f"normalization cache {key!r} mean must have shape {(expected_dim,)}, "
                 f"got {np.asarray(stats[key].mean).shape}"
             )
         if stats[key].q01 is None or stats[key].q99 is None:
@@ -587,6 +672,17 @@ def load_or_compute_norm_stats(
             raise ValueError(
                 f"extended-state norm cache lift range must be > 1e-4, got {lift_range}: {path}"
             )
+        if getattr(dataset, "_state_contract", None) == "state44":
+            if not np.isclose(state_q01[42], 0.0) or not np.isclose(state_q99[42], 1.0):
+                raise ValueError(
+                    f"state44 norm cache floor support q01/q99 must be 0/1, got "
+                    f"{state_q01[42]}/{state_q99[42]}: {path}"
+                )
+            continuous_ranges = state_q99[32:42] - state_q01[32:42]
+            if np.any(continuous_ranges <= 1e-8):
+                raise ValueError(
+                    f"state44 norm cache has degenerate distance/rate quantiles: {continuous_ranges}: {path}"
+                )
     return stats, {
         "source": "loaded",
         "directory": str(norm_stats_dir.resolve()),
@@ -617,6 +713,7 @@ def advance_coverage_rngs(
     completed_steps: int,
     batch_size: int,
     action_horizon: int,
+    state_dim: int = 32,
     state_noise_std: float,
     target_noise_std: float,
 ) -> None:
@@ -625,7 +722,7 @@ def advance_coverage_rngs(
         sampler.sample_indices(batch_size)
         for _ in range(batch_size):
             if state_noise_std > 0:
-                augmentation_rng.normal(0.0, state_noise_std, size=(32,))
+                augmentation_rng.normal(0.0, state_noise_std, size=(state_dim,))
             if target_noise_std > 0:
                 augmentation_rng.normal(
                     0.0, target_noise_std, size=(action_horizon, 32)
@@ -708,7 +805,10 @@ class DatumCache:
 
 
 class AugmentationDiagnostics:
-    def __init__(self) -> None:
+    def __init__(self, state_dim: int = 32) -> None:
+        self.state_dim = int(state_dim)
+        if self.state_dim <= 0:
+            raise ValueError("augmentation diagnostic state_dim must be positive")
         self.samples = 0
         self.token_changed_samples = 0
         self.valid_coordinates = 0
@@ -716,10 +816,10 @@ class AugmentationDiagnostics:
         self.clean_out_of_range_coordinates = 0
         self.augmented_out_of_range_coordinates = 0
         self.realized_noise_squares = 0.0
-        self.valid_by_dimension = np.zeros(32, dtype=np.int64)
-        self.changed_bins_by_dimension = np.zeros(32, dtype=np.int64)
-        self.clean_out_of_range_by_dimension = np.zeros(32, dtype=np.int64)
-        self.augmented_out_of_range_by_dimension = np.zeros(32, dtype=np.int64)
+        self.valid_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.changed_bins_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.clean_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.augmented_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
         self.clean_token_lengths: list[int] = []
         self.augmented_token_lengths: list[int] = []
 
@@ -773,19 +873,19 @@ class AugmentationDiagnostics:
         bin_rates = np.divide(
             self.changed_bins_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         clean_out_of_range_rates = np.divide(
             self.clean_out_of_range_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         augmented_out_of_range_rates = np.divide(
             self.augmented_out_of_range_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         active_bin_rates = bin_rates[valid_dims]
@@ -1008,7 +1108,9 @@ def plan_augmentation_requests(
     for index in indices:
         key = int(index % len(dataset))
         state_noise = (
-            rng.normal(0.0, state_noise_std, size=32).astype(np.float32)
+            rng.normal(
+                0.0, state_noise_std, size=int(getattr(dataset, "_state_dim", 32))
+            ).astype(np.float32)
             if state_noise_std > 0
             else None
         )
@@ -1103,12 +1205,16 @@ def build_batch(
 
         if state_noise is not None:
             clean_state = np.asarray(prepared.prefix["state"], dtype=np.float32)
-            if clean_state.shape != (32,):
+            state_dim = int(getattr(dataset, "_state_dim", 32))
+            expected_state_shape = (state_dim,)
+            if clean_state.shape != expected_state_shape:
                 raise ValueError(
-                    "discrete-state augmentation requires normalized state shape (32,), "
-                    f"got {clean_state.shape}"
+                    "discrete-state augmentation requires normalized state shape "
+                    f"{expected_state_shape}, got {clean_state.shape}"
                 )
-            valid_state = _quantile_valid_dimensions(norm_stats, "state", 32)
+            valid_state = _quantile_valid_dimensions(
+                norm_stats, "state", state_dim
+            )
             if getattr(dataset, "_extended_state", False):
                 # Extended state: only noise hand qpos [0:26]; do NOT pollute
                 # finger contacts [26:31] or lift height [31].
@@ -1117,6 +1223,27 @@ def build_batch(
             augmented_state[valid_state] = (
                 clean_state[valid_state] + state_noise[valid_state]
             ).astype(np.float32)
+            if getattr(dataset, "_state_contract", None) == "state44":
+                # Preserve geometric consistency: qpos noise changes fingertip
+                # surface distances. Radial-rate5 remains the clean causal
+                # trajectory feature because a single-frame perturbation does
+                # not define a physically valid 25 ms history window.
+                state_q01 = np.asarray(norm_stats["state"].q01, dtype=np.float32)
+                state_q99 = np.asarray(norm_stats["state"].q99, dtype=np.float32)
+                state_range = state_q99 - state_q01 + 1e-6
+                augmented_qpos = (
+                    (augmented_state[:26] + 1.0) * 0.5 * state_range[:26]
+                    + state_q01[:26]
+                )
+                surface_physical = dataset.state44_surface_distances_for_sample(
+                    key, augmented_qpos
+                )
+                augmented_state[32:37] = (
+                    (surface_physical - state_q01[32:37])
+                    / state_range[32:37]
+                    * 2.0
+                    - 1.0
+                ).astype(np.float32)
             transformed = _tokenize_prepared(
                 prepared.prefix,
                 prepared.token_transform,
@@ -1671,8 +1798,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--extended-state",
         action="store_true",
-        help="use MANO extended 32-dim state: finger contacts at [26:31], lift height at [31]. "
-        "Requires recomputed norm stats. Old checkpoints are incompatible.",
+        help="legacy alias for --state-contract state32",
+    )
+    parser.add_argument(
+        "--state-contract",
+        choices=("state32", "state44"),
+        default=None,
+        help="versioned MANO observation contract; state44 requires the state44 model identity",
     )
     parser.add_argument(
         "--target-noise-std",
@@ -1795,6 +1927,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+    if args.extended_state and args.state_contract not in {None, "state32"}:
+        raise ValueError("--extended-state cannot be combined with --state-contract state44")
+    if args.extended_state:
+        args.state_contract = "state32"
+    profile = resolve_profile(args.model)
+    if profile.state_dim == 44 and args.state_contract != "state44":
+        raise ValueError(f"{args.model} requires --state-contract state44")
+    if args.state_contract == "state44" and profile.state_dim != 44:
+        raise ValueError("--state-contract state44 requires the state44 model identity")
+    args.extended_state = args.state_contract is not None
     if args.action_source != MEASURED_DELTA and args.target_lance_dataset is None:
         args.target_lance_dataset = mano_dataset_release.resolve_role("target_dataset")
     return args
@@ -1910,7 +2052,8 @@ def main() -> int:
         language_conditioning=args.language_conditioning,
         gesture_index=args.gesture_index,
         target_lance_dataset=args.target_lance_dataset,
-        extended_state=args.extended_state,
+        extended_state=False,
+        state_contract=args.state_contract,
     )
     if args.row_cache_size:
         dataset.set_row_cache_capacity_rows(args.row_cache_size)
@@ -1925,9 +2068,17 @@ def main() -> int:
     if args.preload_selected_rows:
         preload_summary = dataset.preload_selected_rows(args.batch_build_workers)
     sample = dataset[0]
-    action_dim = int(sample["observation/state"].shape[0])
+    state_dim = int(sample["observation/state"].shape[0])
+    profile = resolve_profile(args.model)
+    if state_dim != profile.state_dim:
+        raise ValueError(
+            f"dataset state width {state_dim} disagrees with profile state_dim {profile.state_dim}"
+        )
     model_config = L._build_model_config(
-        args.action_horizon, action_dim=action_dim, base_model=args.model
+        args.action_horizon,
+        state_dim=state_dim,
+        action_dim=profile.action_dim,
+        base_model=args.model,
     )
     norm_stats, norm_stats_provenance = load_or_compute_norm_stats(
         dataset,
@@ -1941,7 +2092,7 @@ def main() -> int:
         args.seed, args.augmentation_seed
     )
     datum_cache = DatumCache(args.datum_cache_size)
-    augmentation_diagnostics = AugmentationDiagnostics()
+    augmentation_diagnostics = AugmentationDiagnostics(dataset._state_dim)
     target_augmentation_diagnostics = TargetAugmentationDiagnostics()
     batch_executor = (
         ThreadPoolExecutor(
@@ -1982,6 +2133,7 @@ def main() -> int:
             completed_steps=args.global_step_offset,
             batch_size=args.batch_size,
             action_horizon=args.action_horizon,
+            state_dim=dataset._state_dim,
             state_noise_std=args.state_noise_std,
             target_noise_std=args.target_noise_std,
         )
@@ -1994,13 +2146,13 @@ def main() -> int:
             str(args.target_lance_dataset) if args.target_lance_dataset else None
         ),
         "model": args.model,
-        "profile_id": resolve_profile(args.model).profile_id,
+        "profile_id": profile.profile_id,
+        "state_dim": profile.state_dim,
+        "action_dim": profile.action_dim,
         "action_source": args.action_source,
         "language_conditioning": args.language_conditioning,
         "extended_state": bool(args.extended_state),
-        "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
-        ),
+        "state_contract": resolved_state_contract_id(args.state_contract),
         "contact_semantics": (
             CONTACT_SEMANTICS if args.extended_state else None
         ),
@@ -2401,13 +2553,14 @@ def main() -> int:
             "dataset_release": release_provenance,
             "base_url": base_url,
             "model": args.model,
+            "profile_id": profile.profile_id,
+            "state_dim": profile.state_dim,
+            "action_dim": profile.action_dim,
             "model_id": model_id,
             "action_source": args.action_source,
             "language_conditioning": args.language_conditioning,
             "extended_state": bool(args.extended_state),
-            "state_contract": (
-                STATE_CONTRACT_ID if args.extended_state else None
-            ),
+            "state_contract": resolved_state_contract_id(args.state_contract),
             "contact_semantics": (
                 CONTACT_SEMANTICS if args.extended_state else None
             ),

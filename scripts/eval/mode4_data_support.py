@@ -62,7 +62,13 @@ def resolve_row_window(
 
 
 def build_model_config(base_model: str):
-    return L._build_model_config(HORIZON, action_dim=ACTION_DIM, base_model=base_model)
+    profile = L.resolve_profile(base_model)
+    return L._build_model_config(
+        HORIZON,
+        state_dim=profile.state_dim,
+        action_dim=ACTION_DIM,
+        base_model=base_model,
+    )
 
 
 def set_scene_state(

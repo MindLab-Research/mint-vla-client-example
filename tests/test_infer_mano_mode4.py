@@ -467,5 +467,117 @@ class Mode4LoopTests(unittest.TestCase):
             )
 
 
+class Mode4State44LoopTests(unittest.TestCase):
+    def test_state44_live_observation_and_component_artifacts(self):
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        row = {
+            "state": np.zeros((2, 32), np.float32),
+            "actions": np.zeros((2, 32), np.float32),
+            "image": [b"", b""],
+            "wrist_image": [b"", b""],
+            "objects": [{"pos": [[0.3, 0, 0.1]] * 2, "rot_aa": [[0, 0, 0]] * 2}],
+            "timestamp": np.asarray([0.0, 0.005]),
+            "prompt": "pick up cube1",
+            "trajectory_metadata": {"data_fps": 100},
+            "episode_metadata": {"fps": 100},
+        }
+        window = types.SimpleNamespace(
+            start_frame=0, end_frame=1, frame_count=2, status="full",
+            first_contact_frame=None, last_contact_frame=None, context_frames=0,
+        )
+        data = types.SimpleNamespace(qpos=np.zeros(33), qvel=np.zeros(32), time=0.0)
+        data.qpos[3] = 1
+        renderer = types.SimpleNamespace(close=lambda: None)
+        scene_tmp = tempfile.TemporaryDirectory()
+        args = types.SimpleNamespace(
+            action_source="urdf_target_absolute", row_index=0, max_frames=0,
+            width=8, height=8, chunk_stride=1, output_dir=None, fps=10,
+            model="openpi/pi05-action-lora-r16-state44-finetune", act_mode="single",
+            extended_state=True, state_contract="state44", language_conditioning="gesture",
+            max_warm_request_seconds=0, temporal_decay=0.4, frame_window="full",
+            contact_context_frames=0, missing_contact_policy="error",
+            contact_window_manifest=None, base_url="x", model_path="p",
+            client_commit="client", backend_commit="backend", model_commit="model",
+            video_mode="none",
+        )
+        pred = np.zeros((10, 32), np.float32)
+        contacts = np.asarray([1, 1, 0, 0, 0], dtype=np.float32)
+        surface = np.asarray([0.01, 0.02, 0.03, 0.04, 0.05], dtype=np.float32)
+        radial = np.asarray([0.1, 0.11, 0.12, 0.13, 0.14], dtype=np.float32)
+
+        def set_scene(_model, current, **kwargs):
+            current.qpos[0:3] = kwargs["object_pos"]
+            current.qpos[3] = 1
+            current.qpos[7:33] = kwargs["state"]
+
+        def step(**kwargs):
+            current = kwargs["data"]
+            current.qpos[7:33] = kwargs["target"]
+            current.time += 0.005
+            return {
+                "hand_object_contact": True, "object_floor_contact": True,
+                "hand_floor_contact": False, "max_ncon": 2,
+                "max_contact_force": 1.0, "max_abs_actuator_force": 2.0,
+            }
+
+        output_tmp = tempfile.TemporaryDirectory()
+        out = output_tmp.name
+        with mock.patch.object(
+            mode4.full, "row_frame_count", return_value=2
+        ), mock.patch.object(
+            mode4.full, "resolve_row_window", return_value=window
+        ), mock.patch.object(
+            mode4.full, "set_scene_state", side_effect=set_scene
+        ), mock.patch.object(
+            mode4.physics, "make_scene",
+            return_value=(scene_tmp, object(), data, renderer, 0, 0, list(range(7, 33)), list(range(6, 32)), object()),
+        ), mock.patch.object(
+            mode4.physics, "resolve_keypoint_geom_ids", return_value=(object(), object(), object())
+        ), mock.patch.object(
+            mode4.physics, "resolve_state44_feature_ids", return_value=((1, 2, 3, 4, 5), (6,), 7)
+        ), mock.patch.object(
+            mode4.physics, "finger_contacts_from_mujoco", return_value=contacts
+        ), mock.patch.object(
+            mode4.physics, "state44_geometry_from_mujoco", return_value=(surface, radial, np.float32(1.0))
+        ), mock.patch.object(
+            mode4.physics, "render_current_state", return_value=(frame, frame)
+        ), mock.patch.object(
+            mode4.physics, "nearest_wrapped_position_target",
+            side_effect=lambda current, delta, limits: (current + delta, None),
+        ), mock.patch.object(
+            mode4.physics, "step_servo", side_effect=step
+        ), mock.patch.object(
+            mode4, "new_clipping_diagnostics", return_value={}
+        ), mock.patch.object(
+            mode4, "record_clipping"
+        ), mock.patch.object(
+            mode4, "build_datum", return_value={"observation": {}, "data_config": object()}
+        ), mock.patch.object(
+            mode4, "query_action", return_value=(pred, pred, pred, {"wall_seconds": 0.01, "used_data_sharding": False})
+        ), mock.patch.object(
+            mode4, "acquire_action_session", return_value=("s", False)
+        ), mock.patch.object(mode4.mujoco, "mj_forward"):
+            result = mode4.run_variant(
+                args=args, row=row, data_config=object(), mode="mode4", headers={},
+                object_name="cube1", session_id="s", output_dir=Path(out),
+            )
+        output = Path(out) / "mode4"
+        observed = np.load(output / "rollout_observation_state.npy")
+        self.assertEqual(observed.shape, (1, 44))
+        np.testing.assert_array_equal(observed[0, 26:31], contacts)
+        np.testing.assert_array_equal(observed[0, 32:37], surface)
+        np.testing.assert_array_equal(observed[0, 37:42], 0.0)
+        self.assertEqual(observed[0, 42], 1.0)
+        self.assertEqual(observed[0, 43], 0.0)
+        self.assertEqual(result["state_dim"], 44)
+        self.assertEqual(result["action_dim"], 32)
+        self.assertEqual(result["state_contract"], "mano_five_finger_contact_geom_rate_v2")
+        self.assertIn("rollout_observation_surface_distance", result["arrays"])
+        self.assertIn("rollout_observation_radial_rate", result["arrays"])
+        self.assertIn("rollout_observation_floor_support", result["arrays"])
+        self.assertIn("rollout_observation_multicontact_persistence", result["arrays"])
+        output_tmp.cleanup()
+
+
 if __name__ == "__main__":
     unittest.main()

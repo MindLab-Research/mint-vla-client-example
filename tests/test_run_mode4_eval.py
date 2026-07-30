@@ -183,6 +183,47 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 hashlib.sha256(release_manifest.read_bytes()).hexdigest(),
             )
 
+    def test_state44_config_records_independent_state_and_action_widths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state44-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state44-finetune",
+                    "--state-contract",
+                    "state44",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["state_contract"], "state44")
+            self.assertEqual(evaluation["state_dim"], 44)
+            self.assertEqual(evaluation["action_dim"], 32)
+
+    def test_state44_model_and_contract_must_be_selected_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state44-output",
+                    "--state-contract",
+                    "state44",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("state44 requires model", completed.stderr)
+
     def test_rejects_population_norm_sha_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -33,6 +33,7 @@ MANO_RELEASE_SHA256=$(sha256sum "${MANO_DATASET_RELEASE}" | awk '{print $1}')
 
 MODEL=openpi/pi05-action-lora-r16-finetune
 MODEL_PATH=
+STATE_CONTRACT=state32
 DATASET=${MINT_LANCE_DATASET}
 ROWS=
 NORMALIZATION_ROWS=
@@ -107,6 +108,7 @@ Endpoint selection (choose exactly one):
 
 Evaluation options:
   --model NAME                model identity (default: action-LoRA rank 16)
+  --state-contract state32|state44 (default: state32)
   --chunk-stride N            query stride, 1..9 (default: 5)
   --temporal-decay FLOAT      ensemble decay in (0, 1] (default: 0.4)
   --act-mode batch|single     action endpoint mode (default: batch)
@@ -160,6 +162,7 @@ while (($#)); do
   case "$1" in
     --model) MODEL=${2:?}; shift 2 ;;
     --model-path) MODEL_PATH=${2:?}; shift 2 ;;
+    --state-contract) STATE_CONTRACT=${2:?}; shift 2 ;;
     --dataset|--lance-dataset) DATASET=${2:?}; shift 2 ;;
     --rows|--row-indices) ROWS=${2:?}; shift 2 ;;
     --normalization-rows|--normalization-row-indices) NORMALIZATION_ROWS=${2:?}; shift 2 ;;
@@ -389,6 +392,14 @@ fi
 [[ "$ACT_MODE" == batch || "$ACT_MODE" == single ]] || fail "--act-mode must be batch or single"
 [[ "$ROW_EXECUTION" == lockstep || "$ROW_EXECUTION" == sequential ]] || \
   fail "--row-execution must be lockstep or sequential"
+[[ "$STATE_CONTRACT" == state32 || "$STATE_CONTRACT" == state44 ]] || \
+  fail "--state-contract must be state32 or state44"
+if [[ "$STATE_CONTRACT" == state44 ]]; then
+  [[ "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]] || \
+    fail "state44 requires model openpi/pi05-action-lora-r16-state44-finetune"
+elif [[ "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]]; then
+  fail "state44 model identity requires --state-contract state44"
+fi
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
 require_positive_int --row-batch-size "$ROW_BATCH_SIZE"
@@ -508,7 +519,7 @@ from datetime import datetime, timezone
     client_commit, client_dirty, backend_commit, model_commit, mint_dirty,
     openpi_dirty, norm_sha, norm_sha_expected, release_id, release_manifest, release_sha,
     verification, endpoint_mode, endpoint_label,
-    base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
+    base_url, model, model_path, state_contract, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
     max_warm, max_frames, fps, width, height, video_mode, frame_window,
     contact_manifest, contact_context,
@@ -530,6 +541,9 @@ payload={
     'evaluation': {
         'model': model,
         'model_path': model_path,
+        'state_contract': state_contract,
+        'state_dim': 44 if state_contract == 'state44' else 32,
+        'action_dim': 32,
         'lance_dataset': dataset,
         'row_indices': row_ids,
         'normalization_row_indices': normalization,
@@ -596,7 +610,7 @@ CONFIG_ARGS=(
   "$CLIENT_COMMIT" "$CLIENT_DIRTY" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$MINT_DIRTY"
   "$OPENPI_DIRTY" "$NORM_SHA256" "$NORM_SHA_EXPECTED" "$MANO_RELEASE_ID" "$MANO_DATASET_RELEASE"
   "$MANO_RELEASE_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
-  "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
+  "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$STATE_CONTRACT" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$ROW_EXECUTION" "$ROW_BATCH_SIZE"
   "$MAX_WARM_REQUEST_SECONDS" "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE" "$FRAME_WINDOW"
@@ -725,7 +739,7 @@ EVAL_ARGS=(
   --base-url "$BASE_URL" --api-key "$MINT_API_KEY" --model "$MODEL"
   --model-path "$MODEL_PATH" --owner-id "$OWNER_ID" --lance-dataset "$DATASET"
   --row-indices "$ROWS" --language-conditioning "$LANGUAGE_CONDITIONING"
-  --normalization-row-indices "$NORMALIZATION_ROWS" --extended-state
+  --normalization-row-indices "$NORMALIZATION_ROWS" --state-contract "$STATE_CONTRACT"
   --norm-stats-dir "$NORM_STATS_DIR" --output-dir "$OUTPUT_DIR/artifacts"
   --chunk-stride "$CHUNK_STRIDE" --temporal-decay "$TEMPORAL_DECAY"
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
