@@ -424,6 +424,14 @@ only when no sample exceeds 200 tokens. Use the resulting SHA with
 `--model openpi/pi05-action-lora-r16-state44-finetune --state-contract state44`.
 A state32 norm or independently selected state44 model/contract is rejected.
 
+The certified rows507–2503 contact-ctx100 audit covers 1,997 rows and
+1,160,274 samples. It found zero token overflows (maximum 182/200) and produced
+state44/action32 norm SHA
+`cd916feee01138f957ca400fad25d02ebb18029e8fc4844c8019f3814caf622a`.
+Its report and validation manifest are in
+`/vePFS-Mindverse/user/intern/wenxi/results/training/state44_profile_population_507_2503_20260730/`.
+Do not reuse this norm for a different population.
+
 State44 uses a fixed 5 ms causal clock. Radial rate compares the current
 fingertip-to-palm radius with the radius five samples earlier; persistence is
 the elapsed duration of the current at-least-two-finger contact run and resets

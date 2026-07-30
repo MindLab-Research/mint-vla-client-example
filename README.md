@@ -114,6 +114,19 @@ immutable 200-token prefix limit. Training and Mode4 must pass both the output
 norm SHA and `--state-contract state44`; the state44 model identity and contract
 are rejected if selected independently.
 
+The certified rows507–2503 contact-ctx100 population contains 1,997 rows and
+1,160,274 selected frames. Its full audit had zero overflows: raw token lengths
+were min143, p50=163, p95=172, p99=175, max182. The authenticated norm is:
+
+```text
+cd916feee01138f957ca400fad25d02ebb18029e8fc4844c8019f3814caf622a
+```
+
+Artifacts are under
+`/vePFS-Mindverse/user/intern/wenxi/results/training/state44_profile_population_507_2503_20260730/`;
+`validation_manifest.json` binds the population, norm, report, and three feature
+branch commits. This norm is valid only for that exact row/window population.
+
 ## Current deployment map
 
 | Component | Path / branch |
