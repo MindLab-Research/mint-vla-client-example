@@ -853,6 +853,11 @@ class AugmentationDiagnostics:
         self.realized_noise_squares += float(np.square(delta[valid]).sum())
 
     def merge_from(self, other: "AugmentationDiagnostics") -> None:
+        if self.state_dim != other.state_dim:
+            raise ValueError(
+                f"cannot merge augmentation diagnostics with state dims "
+                f"{self.state_dim} and {other.state_dim}"
+            )
         self.samples += other.samples
         self.token_changed_samples += other.token_changed_samples
         self.valid_coordinates += other.valid_coordinates
@@ -2277,7 +2282,9 @@ def main() -> int:
                     norm_stats,
                     action_source=dataset._action_source,
                 ))
-                worker_augmentation_diagnostics.append(AugmentationDiagnostics())
+                worker_augmentation_diagnostics.append(
+                    AugmentationDiagnostics(dataset._state_dim)
+                )
                 worker_target_diagnostics.append(TargetAugmentationDiagnostics())
             worker_count = worker_base + (1 if worker_id < worker_remainder else 0)
             producer_executors.append(

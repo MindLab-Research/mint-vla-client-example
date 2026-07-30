@@ -13,6 +13,15 @@ from scripts.train import train_cube1_01_compare as compare
 from scripts.train.prepare_mano_state44_profile import raw_pi05_token_length
 
 
+def test_augmentation_diagnostics_preserve_state44_width_across_workers() -> None:
+    aggregate = compare.AugmentationDiagnostics(44)
+    worker = compare.AugmentationDiagnostics(44)
+    aggregate.merge_from(worker)
+    assert len(aggregate.summary(0.0)["bin_changed_fraction_by_dimension"]) == 44
+    with pytest.raises(ValueError, match="state dims"):
+        aggregate.merge_from(compare.AugmentationDiagnostics(32))
+
+
 def test_legacy_non_discrete_config_keeps_shared_width_fallback() -> None:
     config = base._build_model_config(
         10, action_dim=7, base_model=LEGACY_L_LORA_MODEL
