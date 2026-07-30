@@ -474,7 +474,10 @@ class LanceViewpi05Dataset:
         window = self._row_windows[row_index]
         row = self._get_row(row_index)
         end = min(frame + self._action_horizon, window.end_frame + 1)
-        actions = np.asarray(row["actions"][frame:end], dtype=np.float32)
+        # `row["actions"]` may be a resident numpy array. DeltaActions mutates
+        # its input in place, so returning a view would subtract the query state
+        # from the cached absolute targets again on every reuse/coverage epoch.
+        actions = np.asarray(row["actions"][frame:end], dtype=np.float32).copy()
         if actions.shape[0] < self._action_horizon:
             pad = np.repeat(actions[-1:], self._action_horizon - actions.shape[0], axis=0)
             actions = np.concatenate([actions, pad], axis=0)
