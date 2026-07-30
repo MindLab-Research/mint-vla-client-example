@@ -7,10 +7,17 @@ import numpy as np
 import pytest
 
 from mint_server.backend.core.model_registry import MODEL_CONFIGS
-from scripts.openpi_profiles import ACTION_LORA_R16_STATE44_MODEL
+from scripts.openpi_profiles import ACTION_LORA_R16_STATE44_MODEL, LEGACY_L_LORA_MODEL
 from scripts.train import openpi_vla_smoke_lance_base as base
 from scripts.train import train_cube1_01_compare as compare
 from scripts.train.prepare_mano_state44_profile import raw_pi05_token_length
+
+
+def test_legacy_non_discrete_config_keeps_shared_width_fallback() -> None:
+    config = base._build_model_config(
+        10, action_dim=7, base_model=LEGACY_L_LORA_MODEL
+    )
+    assert config.state_dim == config.action_dim == 7
 
 
 def test_state44_model_config_keeps_action_projection_width_32() -> None:

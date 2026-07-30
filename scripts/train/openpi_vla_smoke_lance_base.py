@@ -555,7 +555,9 @@ def _build_model_config(
     server responsibilities selected by ``base_model`` in HTTP payloads.
     """
     resolved = resolve_profile(base_model, profile=profile)
-    resolved_state_dim = resolved.state_dim if state_dim is None else int(state_dim)
+    resolved_state_dim = (
+        resolved.state_dim if resolved.discrete_state_input else action_dim
+    ) if state_dim is None else int(state_dim)
     if resolved.discrete_state_input and (
         resolved_state_dim != resolved.state_dim
         or action_dim != resolved.action_dim
@@ -822,16 +824,20 @@ def main() -> int:
     sample = dataset[0]
     profile = resolve_profile(args.model)
     state_dim = int(sample["observation/state"].shape[0])
-    if state_dim != profile.state_dim:
+    action_dim = int(sample["actions"].shape[-1])
+    if profile.discrete_state_input and (
+        state_dim != profile.state_dim or action_dim != profile.action_dim
+    ):
         raise ValueError(
-            f"dataset state width {state_dim} disagrees with profile state_dim {profile.state_dim}"
+            f"dataset state/action widths {(state_dim, action_dim)} disagree with "
+            f"profile widths {(profile.state_dim, profile.action_dim)}"
         )
-    print(f"Resolved state_dim={state_dim}, action_dim={profile.action_dim} from profile")
+    print(f"Resolved state_dim={state_dim}, action_dim={action_dim}")
 
     model_config = _build_model_config(
         args.action_horizon,
         state_dim=state_dim,
-        action_dim=profile.action_dim,
+        action_dim=action_dim,
         base_model=args.model,
     )
     norm_stats = _compute_norm_stats(dataset)
