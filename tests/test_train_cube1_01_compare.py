@@ -1178,3 +1178,98 @@ class TestDeadlineBreak:
 
         assert stop_reason is None
         assert completed_step == 0
+
+class CompareResidentRowCacheTests(unittest.TestCase):
+    def test_resident_row_flags_are_explicit(self) -> None:
+        compare = _load_compare_module()
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--row-cache-size", "1039", "--preload-selected-rows",
+            "--lance-dataset", "dataset.lance", "--save-path", "save",
+            "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertEqual(args.row_cache_size, 1039)
+        self.assertTrue(args.preload_selected_rows)
+
+    def test_population_residency_allows_cross_slate_prefetch(self) -> None:
+        compare = _load_compare_module()
+        result = compare.validate_multi_producer_prefetch_span(
+            batch_size=128,
+            batch_producers=8,
+            prefetch_batches=8,
+            slate_rows=16,
+            anchors_per_row=8,
+            sampling_strategy="coverage",
+            resident_population=True,
+        )
+        self.assertEqual(result, {
+            "status": "population_resident",
+            "outstanding_samples": 1024,
+            "coverage_slate_samples": 128,
+            "resident_population": True,
+        })
+
+    def test_preload_requires_capacity_for_every_selected_row(self) -> None:
+        compare = _load_compare_module()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._row_start_offset = {i: i for i in range(5)}
+        dataset._row_cache = compare.OrderedDict()
+        dataset._row_cache_lock = threading.RLock()
+        dataset._row_cache_condition = threading.Condition(dataset._row_cache_lock)
+        dataset._row_cache_loading = set()
+        dataset._slate_size = 2
+        dataset._row_cache_capacity_rows = None
+        with self.assertRaisesRegex(ValueError, "selected population"):
+            dataset.preload_selected_rows(2)
+
+    def test_preload_populates_each_row_once(self) -> None:
+        compare = _load_compare_module()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._row_start_offset = {i: i for i in range(5)}
+        dataset._row_cache = compare.OrderedDict()
+        dataset._row_cache_lock = threading.RLock()
+        dataset._row_cache_condition = threading.Condition(dataset._row_cache_lock)
+        dataset._row_cache_loading = set()
+        dataset._slate_size = 2
+        dataset._row_cache_capacity_rows = None
+        calls = []
+        def load(row):
+            calls.append(row)
+            return {"row": row}
+        dataset._load_row_uncached = load
+        self.assertEqual(dataset.set_row_cache_capacity_rows(5), 5)
+        summary = dataset.preload_selected_rows(3)
+        self.assertEqual(sorted(calls), list(range(5)))
+        self.assertEqual(summary["cache_resident_rows"], 5)
+        self.assertEqual(dataset.row_cache_capacity_rows(), 5)
+
+    def test_same_lance_row_fuses_hands_read(self) -> None:
+        compare = _load_compare_module()
+        state = np.zeros((2, 32), dtype=np.float32)
+        hands = [{"urdf_dof": state[:, :26].tolist()}]
+        row = {
+            "state": state.tolist(), "actions": state.tolist(), "prompt": "pick",
+            "image": [[], []], "wrist_image": [[], []], "contact": [[], []],
+            "objects": [{"pos": [[0, 0, 0], [0, 0, 0]]}], "hands": hands,
+        }
+        class Taken:
+            def to_pylist(self): return [row]
+        class FakeDataset:
+            def __init__(self): self.calls = []
+            def take(self, indices, columns):
+                self.calls.append((indices, columns)); return Taken()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._source_row_indices = [7]
+        dataset._extended_state = True
+        dataset._action_source = "urdf_target_absolute"
+        dataset._target_is_image_dataset = True
+        dataset._dataset = FakeDataset(); dataset._target_dataset = dataset._dataset
+        dataset._rows = [{"trajectory_metadata": {}}]
+        dataset._language_conditioning = "object_only"; dataset._gesture_records = {}
+        with patch.object(compare, "project_row_actions", side_effect=lambda value, _: value), patch.object(
+            compare, "format_language_prompt", return_value="pick"
+        ):
+            loaded = dataset._load_row_uncached(0)
+        self.assertIs(loaded["hands"], hands)
+        self.assertEqual(len(dataset._dataset.calls), 1)
+        self.assertIn("hands", dataset._dataset.calls[0][1])
