@@ -39,6 +39,11 @@ from scripts.mano_state_contract import (
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
+from scripts.mano_state54_contract import (
+    CONTACT_RULE as STATE54_CONTACT_RULE,
+    CONTACT_SEMANTICS as STATE54_CONTACT_SEMANTICS,
+    STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
+)
 from scripts.openpi_profiles import resolve_profile
 from scripts.target_actions import (
     ACTION_SOURCES,
@@ -159,6 +164,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         gesture_index: Path = DEFAULT_GESTURE_INDEX_PATH,
         target_lance_dataset: Path | None = None,
         extended_state: bool = False,
+        state_contract: str | None = None,
     ) -> None:
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
@@ -171,8 +177,17 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 f"unsupported language conditioning {language_conditioning!r}; "
                 f"expected one of {LANGUAGE_CONDITIONING_CHOICES}"
             )
+        if state_contract not in (None, STATE54_CONTRACT_ID):
+            raise ValueError(f"unsupported state contract {state_contract!r}")
+        if extended_state and state_contract is not None:
+            raise ValueError("--extended-state and --state-contract are mutually exclusive")
         self._action_source = action_source
-        self._extended_state = bool(extended_state)
+        self._state_contract = state_contract
+        self._extended_state = bool(extended_state or state_contract is not None)
+        if state_contract == STATE54_CONTRACT_ID:
+            from scripts.mano_state54_contract import ManoFingertipFK
+
+            self._state54_fk = ManoFingertipFK()
         self._language_conditioning = language_conditioning
         self._gesture_index = (
             GestureIndex.load(gesture_index)
@@ -318,12 +333,37 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._slate_row_indices: list[int] = []
         self._slate_calls_since_rotate = 0
 
+    def load_state54_numeric_row(self, row_index: int) -> dict[str, Any]:
+        """Load state54/action source columns without materializing JPEG payloads."""
+        if self._state_contract != STATE54_CONTRACT_ID:
+            raise ValueError("numeric state54 loader requires the state54 contract")
+        source_row = self._source_row_indices[row_index]
+        row = self._dataset.take(
+            [source_row], columns=["state", "actions", "contact", "objects", "hands"]
+        ).to_pylist()[0]
+        if self._action_source != MEASURED_DELTA:
+            assert self._target_dataset is not None
+            target_hands = row["hands"] if self._target_is_image_dataset else self._target_dataset.take(
+                [source_row], columns=["hands"]
+            ).to_pylist()[0]["hands"]
+            target_q = np.asarray(target_hands[0]["urdf_dof"], dtype=np.float32)
+            image_q = np.asarray(row["state"], dtype=np.float32)[:, :26]
+            if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
+                raise ValueError(f"target/image q mismatch at source row {source_row}")
+            row = {**row, "hands": target_hands}
+        return self._attach_state54_window(
+            project_row_actions(row, self._action_source), row_index
+        )
+
     def _load_row_uncached(self, row_index: int) -> dict[str, Any]:
         source_row = self._source_row_indices[row_index]
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
-        if self._action_source != MEASURED_DELTA and self._target_is_image_dataset:
+        if (
+            self._state_contract is not None
+            or (self._action_source != MEASURED_DELTA and self._target_is_image_dataset)
+        ):
             columns.append("hands")
         row = self._dataset.take([source_row], columns=columns).to_pylist()[0]
         if self._action_source != MEASURED_DELTA:
@@ -343,6 +383,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 )
             row = {**row, "hands": target_hands}
         row = project_row_actions(row, self._action_source)
+        row = self._attach_state54_window(row, row_index)
         return {
             **row,
             "prompt": format_language_prompt(
@@ -356,6 +397,31 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 ),
             ),
         }
+
+    def state54_fingertips_for_qpos(self, flat_index: int, hand_qpos: np.ndarray) -> np.ndarray:
+        """Recompute raw object-frame fingertip features for an augmented qpos."""
+        from scripts.mano_state54_contract import (
+            axis_angle_to_matrix,
+            fingertips_in_collision_box_frame,
+        )
+
+        if self._state_contract != STATE54_CONTRACT_ID:
+            raise ValueError("state54 FK requested from a non-state54 dataset")
+        local_row, frame = self._index[int(flat_index)]
+        row = self._get_row(local_row)
+        metadata = self._rows[local_row]["trajectory_metadata"]
+        object_names = metadata.get("object_names") or []
+        if len(object_names) != 1:
+            raise ValueError("state54 FK requires exactly one object")
+        obj = row["objects"][0]
+        rotation = axis_angle_to_matrix(np.asarray(obj["rot_aa"][frame], dtype=np.float64))
+        tip_world = self._state54_fk(np.asarray(hand_qpos, dtype=np.float32))
+        return fingertips_in_collision_box_frame(
+            tip_world,
+            np.asarray(obj["pos"][frame], dtype=np.float64),
+            rotation,
+            object_names[0],
+        )
 
     def _get_row(self, row_index: int) -> dict[str, Any]:
         # Coalesce duplicate misses by row while allowing distinct immutable
@@ -446,21 +512,32 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
         )
     state_stats = L.normalize.RunningStats()
     action_stats = L.normalize.RunningStats()
+    state54 = getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID
     for local_row in sorted(frames_by_row):
         source_row = dataset._source_row_indices[local_row]
-        image_row = dataset._dataset.take(
-            [source_row], columns=["state", "actions"]
-        ).to_pylist()[0]
-        target_row = dataset._target_dataset.take([source_row], columns=["hands"]).to_pylist()[0]
-        target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
-        image_q = np.asarray(image_row["state"], dtype=np.float32)[:, :26]
+        start, end = frames_by_row[local_row]
+        if state54:
+            cached_row = dataset.load_state54_numeric_row(local_row)
+            window = dataset._row_windows[local_row]
+            if (start, end) != (window.start_frame, window.end_frame):
+                raise ValueError("state54 norm population must cover each selected window exactly")
+            states = np.asarray(cached_row["_state54_window"], dtype=np.float32)
+            image_q = np.asarray(cached_row["state"], dtype=np.float32)[:, :26]
+            target_q = np.asarray(cached_row["hands"][0]["urdf_dof"], dtype=np.float32)
+            projected = cached_row
+        else:
+            image_row = dataset._dataset.take(
+                [source_row], columns=["state", "actions"]
+            ).to_pylist()[0]
+            target_row = dataset._target_dataset.take([source_row], columns=["hands"]).to_pylist()[0]
+            target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
+            image_q = np.asarray(image_row["state"], dtype=np.float32)[:, :26]
+            projected = project_row_actions(
+                {**image_row, "hands": target_row["hands"]}, dataset._action_source
+            )
+            states = np.asarray(image_row["state"][start : end + 1], dtype=np.float32)
         if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
             raise ValueError(f"target/image q mismatch while normalizing source row {source_row}")
-        projected = project_row_actions(
-            {**image_row, "hands": target_row["hands"]}, dataset._action_source
-        )
-        start, end = frames_by_row[local_row]
-        states = np.asarray(image_row["state"][start : end + 1], dtype=np.float32)
         if dataset._action_source == URDF_TARGET_ABSOLUTE:
             # Match the exact model supervision population. Dataset item t emits
             # target[t:t+H], repeat-padded at the selected window end, and
@@ -492,6 +569,18 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
         _q99 = np.asarray(state_result.q99, dtype=np.float32).copy()
         _m[26:31] = 0.5; _s[26:31] = 0.5
         _q01[26:31] = 0.0; _q99[26:31] = 1.0
+        if state54:
+            from scripts.mano_state54_contract import FORCE_LOG1P_MAX
+
+            # Sparse per-finger empirical quantiles are invalid (pinky q99=0).
+            # All fingers share a physical 0..50 N scale after log1p so load
+            # magnitude remains comparable and positive pinky loads do not
+            # collapse to one saturated token.  Contact age is defined/clipped
+            # physically at 0..1 second and uses that exact fixed range.
+            _q01[47:52] = 0.0
+            _q99[47:52] = FORCE_LOG1P_MAX
+            _q01[53] = 0.0
+            _q99[53] = 1.0
         # Compute lift height stats from objects data
         lift_values = []
         for local_row in sorted(frames_by_row):
@@ -539,12 +628,16 @@ def load_or_compute_norm_stats(
             raise ValueError(f"normalization cache is missing norm_stats.json: {path}")
         actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     stats = L.normalize.load(norm_stats_dir)
-    for key in ("state", "actions"):
+    expected_widths = {
+        "state": 54 if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID else 32,
+        "actions": 32,
+    }
+    for key, width in expected_widths.items():
         if key not in stats:
             raise ValueError(f"normalization cache is missing {key!r}: {path}")
-        if tuple(np.asarray(stats[key].mean).shape) != (32,):
+        if tuple(np.asarray(stats[key].mean).shape) != (width,):
             raise ValueError(
-                f"normalization cache {key!r} mean must have shape (32,), "
+                f"normalization cache {key!r} mean must have shape ({width},), "
                 f"got {np.asarray(stats[key].mean).shape}"
             )
         if stats[key].q01 is None or stats[key].q99 is None:
@@ -987,6 +1080,8 @@ def plan_augmentation_requests(
     for index in indices:
         key = int(index % len(dataset))
         state_noise = (
+            # StateAug perturbs only the 26 qpos coordinates.  Keep this
+            # action-width vector for the exact B-schema residual correction.
             rng.normal(0.0, state_noise_std, size=32).astype(np.float32)
             if state_noise_std > 0
             else None
@@ -1082,20 +1177,37 @@ def build_batch(
 
         if state_noise is not None:
             clean_state = np.asarray(prepared.prefix["state"], dtype=np.float32)
-            if clean_state.shape != (32,):
+            state_dim = resolve_profile(base_model).state_dim
+            if clean_state.shape != (state_dim,):
                 raise ValueError(
-                    "discrete-state augmentation requires normalized state shape (32,), "
-                    f"got {clean_state.shape}"
+                    "discrete-state augmentation requires normalized state shape "
+                    f"({state_dim},), got {clean_state.shape}"
                 )
-            valid_state = _quantile_valid_dimensions(norm_stats, "state", 32)
-            if getattr(dataset, "_extended_state", False):
-                # Extended state: only noise hand qpos [0:26]; do NOT pollute
-                # finger contacts [26:31] or lift height [31].
-                valid_state[26:] = False
+            if state_noise.shape != (32,):
+                raise ValueError(f"state augmentation noise must have shape (32,), got {state_noise.shape}")
+            valid_qpos = _quantile_valid_dimensions(norm_stats, "state", state_dim)[:26]
+            valid_state = np.zeros(state_dim, dtype=bool)
+            valid_state[:26] = valid_qpos
             augmented_state = clean_state.copy()
-            augmented_state[valid_state] = (
-                clean_state[valid_state] + state_noise[valid_state]
+            qpos_indices = np.flatnonzero(valid_qpos)
+            augmented_state[qpos_indices] = (
+                clean_state[qpos_indices] + state_noise[qpos_indices]
             ).astype(np.float32)
+            if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID:
+                stats = norm_stats["state"]
+                q01 = np.asarray(stats.q01, dtype=np.float32)
+                q99 = np.asarray(stats.q99, dtype=np.float32)
+                qpos_range = q99[:26] - q01[:26]
+                augmented_qpos_raw = q01[:26] + (
+                    (augmented_state[:26] + 1.0) * 0.5 * (qpos_range + 1e-6)
+                )
+                raw_tips = dataset.state54_fingertips_for_qpos(key, augmented_qpos_raw).reshape(-1)
+                tip_lo, tip_hi = q01[32:47], q99[32:47]
+                augmented_state[32:47] = (
+                    (raw_tips - tip_lo) / (tip_hi - tip_lo + 1e-6) * 2.0 - 1.0
+                ).astype(np.float32)
+            # Contacts, lift, force, velocity and contact age remain exact.  In
+            # state54 only qpos and its causal fingertip FK descendants change.
             transformed = _tokenize_prepared(
                 prepared.prefix,
                 prepared.token_transform,
@@ -1644,6 +1756,15 @@ def parse_args() -> argparse.Namespace:
         "Requires recomputed norm stats. Old checkpoints are incompatible.",
     )
     parser.add_argument(
+        "--state-contract",
+        choices=(STATE54_CONTRACT_ID,),
+        default=None,
+        help=(
+            "explicit incompatible observation contract; state54 requires the dedicated "
+            "state54 model identity and exact authenticated 54D norm"
+        ),
+    )
+    parser.add_argument(
         "--target-noise-std",
         type=float,
         default=0.0,
@@ -1853,6 +1974,15 @@ def main() -> int:
         raise ValueError("augmentation_audit_samples must be non-negative")
     if args.augmentation_audit_samples and not args.dry_run:
         raise ValueError("augmentation_audit_samples requires --dry-run")
+    profile = resolve_profile(args.model)
+    if profile.state_dim == 54 and args.state_contract != STATE54_CONTRACT_ID:
+        raise ValueError(
+            f"{profile.profile_id} requires --state-contract {STATE54_CONTRACT_ID}"
+        )
+    if args.state_contract == STATE54_CONTRACT_ID and profile.state_dim != 54:
+        raise ValueError(
+            f"{STATE54_CONTRACT_ID} requires the dedicated state54 model identity"
+        )
     row_count = int(lance.dataset(str(args.lance_dataset)).count_rows())
     row_indices, row_selection = parse_row_indices(args.row_indices, row_count)
     dataset = SelectedLanceDataset(
@@ -1870,6 +2000,7 @@ def main() -> int:
         gesture_index=args.gesture_index,
         target_lance_dataset=args.target_lance_dataset,
         extended_state=args.extended_state,
+        state_contract=args.state_contract,
     )
     if args.row_cache_size:
         dataset.set_row_cache_capacity_rows(args.row_cache_size)
@@ -1884,9 +2015,14 @@ def main() -> int:
     if args.preload_selected_rows:
         preload_summary = dataset.preload_selected_rows(args.batch_build_workers)
     sample = dataset[0]
-    action_dim = int(sample["observation/state"].shape[0])
+    observed_state_dim = int(sample["observation/state"].shape[0])
+    if observed_state_dim != profile.state_dim:
+        raise ValueError(
+            f"dataset state width {observed_state_dim} does not match "
+            f"profile state_dim {profile.state_dim}"
+        )
     model_config = L._build_model_config(
-        args.action_horizon, action_dim=action_dim, base_model=args.model
+        args.action_horizon, action_dim=profile.action_dim, base_model=args.model
     )
     norm_stats, norm_stats_provenance = load_or_compute_norm_stats(dataset, args.norm_stats_dir)
     data_config = L._make_data_config(
@@ -1952,16 +2088,26 @@ def main() -> int:
         "language_conditioning": args.language_conditioning,
         "extended_state": bool(args.extended_state),
         "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
+            (STATE_CONTRACT_ID if args.extended_state else args.state_contract)
         ),
         "contact_semantics": (
-            CONTACT_SEMANTICS if args.extended_state else None
+            (
+                CONTACT_SEMANTICS
+                if args.extended_state
+                else STATE54_CONTACT_SEMANTICS if args.state_contract else None
+            )
         ),
         "contact_rule": (
-            CONTACT_RULE if args.extended_state else None
+            (
+                CONTACT_RULE
+                if args.extended_state
+                else STATE54_CONTACT_RULE if args.state_contract else None
+            )
         ),
         "norm_sha_expected": (
-            norm_stats_provenance.get("sha256") if args.extended_state else None
+            norm_stats_provenance.get("sha256")
+                if (args.extended_state or args.state_contract)
+                else None
         ),
         "norm_sha_actual": norm_stats_provenance.get("sha256"),
         "gesture_index": (
@@ -2358,16 +2504,26 @@ def main() -> int:
             "language_conditioning": args.language_conditioning,
             "extended_state": bool(args.extended_state),
             "state_contract": (
-                STATE_CONTRACT_ID if args.extended_state else None
+                (STATE_CONTRACT_ID if args.extended_state else args.state_contract)
             ),
             "contact_semantics": (
-                CONTACT_SEMANTICS if args.extended_state else None
+                (
+                CONTACT_SEMANTICS
+                if args.extended_state
+                else STATE54_CONTACT_SEMANTICS if args.state_contract else None
+            )
             ),
             "contact_rule": (
-                CONTACT_RULE if args.extended_state else None
+                (
+                CONTACT_RULE
+                if args.extended_state
+                else STATE54_CONTACT_RULE if args.state_contract else None
+            )
             ),
             "norm_sha_expected": (
-                norm_stats_provenance.get("sha256") if args.extended_state else None
+                norm_stats_provenance.get("sha256")
+                if (args.extended_state or args.state_contract)
+                else None
             ),
             "norm_sha_actual": norm_stats_provenance.get("sha256"),
             "gesture_index": (

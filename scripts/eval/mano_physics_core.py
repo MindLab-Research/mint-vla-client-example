@@ -419,3 +419,40 @@ def finger_contacts_from_mujoco(model, data, object_name, *,
         if finger is not None:
             contacts[FINGER_NAMES.index(finger)] = 1.0
     return contacts
+
+
+def finger_contact_and_force_from_mujoco(
+    model, data, object_name, *, keypoint_geom_ids=None, object_geom_ids=None,
+    geom_id_to_finger=None,
+):
+    """Return state54 binary contacts and log1p summed normal loads by finger."""
+    from scripts.mano_state54_contract import FINGER_NAMES
+
+    if keypoint_geom_ids is None or object_geom_ids is None or geom_id_to_finger is None:
+        keypoint_geom_ids, object_geom_ids, geom_id_to_finger = resolve_keypoint_geom_ids(
+            model, object_name
+        )
+    contacts = np.zeros(len(FINGER_NAMES), dtype=np.float32)
+    loads = np.zeros(len(FINGER_NAMES), dtype=np.float64)
+    force = np.zeros(6, dtype=np.float64)
+    for contact_index in range(data.ncon):
+        contact = data.contact[contact_index]
+        g1, g2 = int(contact.geom1), int(contact.geom2)
+        if g1 in object_geom_ids and g2 in keypoint_geom_ids:
+            hand_geom = g2
+        elif g2 in object_geom_ids and g1 in keypoint_geom_ids:
+            hand_geom = g1
+        else:
+            continue
+        finger = geom_id_to_finger.get(hand_geom)
+        if finger is None:
+            continue
+        finger_index = FINGER_NAMES.index(finger)
+        contacts[finger_index] = 1.0
+        force[:] = 0.0
+        mujoco.mj_contactForce(model, data, contact_index, force)
+        normal_load = float(force[0])
+        if not np.isfinite(normal_load) or normal_load < -1e-8:
+            raise FloatingPointError(f"invalid MuJoCo normal contact load {normal_load}")
+        loads[finger_index] += max(0.0, normal_load)
+    return contacts, np.log1p(loads).astype(np.float32)

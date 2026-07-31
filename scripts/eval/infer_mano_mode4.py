@@ -53,6 +53,16 @@ from scripts.mano_state_contract import (
     STATE_CONTRACT_ID,
     verify_locked_norm_stats,
 )
+from scripts.mano_state54_contract import (
+    CONTACT_RULE as STATE54_CONTACT_RULE,
+    CONTACT_SEMANTICS as STATE54_CONTACT_SEMANTICS,
+    STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
+    State54TemporalTracker,
+    build_state54,
+    fingertips_in_collision_box_frame,
+    fingertip_world_from_mujoco,
+)
+from scripts.openpi_profiles import resolve_profile
 from scripts.target_actions import URDF_TARGET_ABSOLUTE, project_row_actions
 from scripts.train.train_cube1_01_compare import (
     GESTURE_LANGUAGE,
@@ -153,6 +163,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="use MANO extended 32-dim state: finger contacts from live MuJoCo at [26:31], "
         "lift height from sim object at [31]. Must match training contract.",
+    )
+    parser.add_argument(
+        "--state-contract",
+        choices=(STATE54_CONTRACT_ID,),
+        default=None,
+        help="explicit 54D live-MuJoCo observation contract; incompatible with --extended-state",
     )
     parser.add_argument(
         "--language-conditioning",
@@ -637,9 +653,11 @@ def run_variant(
     # Pre-resolve keypoint/object geom IDs once at scene init (not per-frame string scan).
     kp_geom_ids, obj_geom_ids, geom_to_finger = (
         physics.resolve_keypoint_geom_ids(model, object_name)
-        if args.extended_state else (None, None, None)
+        if (args.extended_state or getattr(args, "state_contract", None) == STATE54_CONTRACT_ID)
+        else (None, None, None)
     )
-    state = np.zeros(32, dtype=np.float32)
+    state_dim = 54 if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID else 32
+    state = np.zeros(state_dim, dtype=np.float32)
     state[:HAND_DIM] = np.asarray(row["state"][window_start], dtype=np.float32)[:HAND_DIM]
     clipping = new_clipping_diagnostics(limits)
     data.qvel[:] = 0.0
@@ -656,9 +674,23 @@ def run_variant(
     _mujoco.mj_forward(model, data)
     phase_seconds["scene_setup"] += time.perf_counter() - scene_started
     # Record lift baseline from Mode 4's actual initialized sim state.
-    object_z_initial = (
-        float(data.qpos[object_addr + 2]) if args.extended_state else 0.0
+    if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID:
+        # Training lift is always relative to source frame zero, even when the
+        # selected contact window starts later.  Preserve that exact baseline.
+        object_z_initial = float(row["objects"][0]["pos"][0][2])
+    elif args.extended_state:
+        # Preserve the validated dev_v2 32D behavior unchanged.
+        object_z_initial = float(data.qpos[object_addr + 2])
+    else:
+        object_z_initial = 0.0
+    object_body_id = (
+        mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, f"{object_name}_body")
+        if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID
+        else -1
     )
+    if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID and object_body_id < 0:
+        raise ValueError(f"state54 cannot resolve MuJoCo body for {object_name!r}")
+    state54_temporal = State54TemporalTracker()
 
     candidates = []
     query_timings = []
@@ -760,7 +792,38 @@ def run_variant(
             for frame in range(window_start, window_end):
                 current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
                 state[:HAND_DIM] = current_q.astype(np.float32)
-                if args.extended_state:
+                if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID:
+                    fc, finger_force = physics.finger_contact_and_force_from_mujoco(
+                        model, data, object_name,
+                        keypoint_geom_ids=kp_geom_ids,
+                        object_geom_ids=obj_geom_ids,
+                        geom_id_to_finger=geom_to_finger,
+                    )
+                    tip_world = fingertip_world_from_mujoco(model, data)
+                    object_rotation = np.asarray(
+                        data.xmat[object_body_id], dtype=np.float64
+                    ).reshape(3, 3)
+                    tip_features = fingertips_in_collision_box_frame(
+                        tip_world,
+                        np.asarray(data.xpos[object_body_id], dtype=np.float64),
+                        object_rotation,
+                        object_name,
+                    )
+                    relative_velocity, multifinger_contact_age = state54_temporal.update(
+                        object_z=float(data.xpos[object_body_id, 2]),
+                        palm_z=float(current_q[2]),
+                        finger_contacts=fc,
+                    )
+                    state = build_state54(
+                        hand_qpos=current_q.astype(np.float32),
+                        finger_contacts=fc,
+                        lift_height=float(data.xpos[object_body_id, 2]) - object_z_initial,
+                        fingertip_collision_box_xyz=tip_features,
+                        finger_log1p_force=finger_force,
+                        relative_vertical_velocity=relative_velocity,
+                        multifinger_contact_age=multifinger_contact_age,
+                    )
+                elif args.extended_state:
                     state[HAND_DIM:] = 0
                     fc = physics.finger_contacts_from_mujoco(
                         model, data, object_name,
@@ -1008,12 +1071,20 @@ def run_variant(
         "action_source": args.action_source,
         "extended_state": bool(args.extended_state),
         "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
+            (STATE_CONTRACT_ID if args.extended_state else getattr(args, "state_contract", None))
         ),
         "contact_semantics": (
-            CONTACT_SEMANTICS if args.extended_state else None
+            (
+                CONTACT_SEMANTICS
+                if args.extended_state
+                else STATE54_CONTACT_SEMANTICS if getattr(args, "state_contract", None) else None
+            )
         ),
-        "contact_rule": CONTACT_RULE if args.extended_state else None,
+        "contact_rule": (
+                CONTACT_RULE
+                if args.extended_state
+                else STATE54_CONTACT_RULE if getattr(args, "state_contract", None) else None
+            ),
         "norm_sha_expected": getattr(args, "norm_sha_expected", None),
         "norm_sha_actual": getattr(args, "norm_sha_actual", None),
         "language_conditioning": args.language_conditioning,
@@ -1123,13 +1194,21 @@ def build_row_summary(
         "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
         "video_mode": getattr(args, "video_mode", "full"),
         "state_contract": (
-            STATE_CONTRACT_ID if args.extended_state else None
+            (STATE_CONTRACT_ID if args.extended_state else getattr(args, "state_contract", None))
         ),
         "contact_semantics": (
-            CONTACT_SEMANTICS if args.extended_state else None
+            (
+                CONTACT_SEMANTICS
+                if args.extended_state
+                else STATE54_CONTACT_SEMANTICS if getattr(args, "state_contract", None) else None
+            )
         ),
         "contact_rule": (
-            CONTACT_RULE if args.extended_state else None
+            (
+                CONTACT_RULE
+                if args.extended_state
+                else STATE54_CONTACT_RULE if getattr(args, "state_contract", None) else None
+            )
         ),
         "norm_sha_expected": getattr(args, "norm_sha_expected", None),
         "norm_sha_actual": getattr(args, "norm_sha_actual", None),
@@ -1164,6 +1243,7 @@ def main() -> int:
     # Tests and legacy direct callers may construct a minimal Namespace; the
     # formal CLI defaults new evaluations to contact-window initialization.
     args.frame_window = getattr(args, "frame_window", "full")
+    args.state_contract = getattr(args, "state_contract", None)
     args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
     args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
     args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
@@ -1199,6 +1279,15 @@ def main() -> int:
         raise ValueError("row selection must not be empty")
     eval_rows = [int(index) for index in eval_rows]
 
+    profile = resolve_profile(args.model)
+    if args.extended_state and args.state_contract is not None:
+        raise ValueError("--extended-state and --state-contract are mutually exclusive")
+    if profile.state_dim == 54 and args.state_contract != STATE54_CONTRACT_ID:
+        raise ValueError(
+            f"{profile.profile_id} requires --state-contract {STATE54_CONTRACT_ID}"
+        )
+    if args.state_contract == STATE54_CONTRACT_ID and profile.state_dim != 54:
+        raise ValueError("state54 requires the dedicated state54 model identity")
     source = lance.dataset(str(args.lance_dataset))
     row_count = source.count_rows()
     target_source = source
@@ -1456,9 +1545,17 @@ def main() -> int:
                 "shared_session": True,
                 "normalization_row_indices": normalization_rows,
                 "norm_stats_dir": str(args.norm_stats_dir) if args.norm_stats_dir else None,
-                "state_contract": STATE_CONTRACT_ID if args.extended_state else None,
-                "contact_semantics": CONTACT_SEMANTICS if args.extended_state else None,
-                "contact_rule": CONTACT_RULE if args.extended_state else None,
+                "state_contract": (STATE_CONTRACT_ID if args.extended_state else getattr(args, "state_contract", None)),
+                "contact_semantics": (
+                CONTACT_SEMANTICS
+                if args.extended_state
+                else STATE54_CONTACT_SEMANTICS if getattr(args, "state_contract", None) else None
+            ),
+                "contact_rule": (
+                CONTACT_RULE
+                if args.extended_state
+                else STATE54_CONTACT_RULE if getattr(args, "state_contract", None) else None
+            ),
                 "norm_sha_expected": getattr(args, "norm_sha_expected", None),
                 "norm_sha_actual": getattr(args, "norm_sha_actual", None),
                 "frame_window": args.frame_window,

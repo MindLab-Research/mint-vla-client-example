@@ -38,6 +38,7 @@ ROWS=
 NORMALIZATION_ROWS=
 NORM_STATS_DIR=
 NORM_SHA_EXPECTED=
+STATE_CONTRACT=
 OUTPUT_DIR=
 RUN_NAME=
 OWNER_ID=
@@ -93,6 +94,7 @@ Required evaluation options:
   --normalization-rows, --normalization-row-indices CSV|all
   --norm-stats-dir PATH       checkpoint's locked normalization directory
   --norm-sha-expected SHA     population-specific expected norm_stats.json SHA256
+  --state-contract ID        use explicit state54 contract instead of legacy --extended-state
   --owner, --owner-id ID      MINT action-session owner ID; supplied by --reuse-server-info
 
 Endpoint selection (choose exactly one):
@@ -165,6 +167,7 @@ while (($#)); do
     --normalization-rows|--normalization-row-indices) NORMALIZATION_ROWS=${2:?}; shift 2 ;;
     --norm-stats-dir) NORM_STATS_DIR=${2:?}; shift 2 ;;
     --norm-sha-expected) NORM_SHA_EXPECTED=${2:?}; shift 2 ;;
+    --state-contract) STATE_CONTRACT=${2:?}; shift 2 ;;
     --output-dir) OUTPUT_DIR=${2:?}; shift 2 ;;
     --run-name) RUN_NAME=${2:?}; shift 2 ;;
     --owner|--owner-id) OWNER_ID=${2:?}; shift 2 ;;
@@ -725,7 +728,7 @@ EVAL_ARGS=(
   --base-url "$BASE_URL" --api-key "$MINT_API_KEY" --model "$MODEL"
   --model-path "$MODEL_PATH" --owner-id "$OWNER_ID" --lance-dataset "$DATASET"
   --row-indices "$ROWS" --language-conditioning "$LANGUAGE_CONDITIONING"
-  --normalization-row-indices "$NORMALIZATION_ROWS" --extended-state
+  --normalization-row-indices "$NORMALIZATION_ROWS"
   --norm-stats-dir "$NORM_STATS_DIR" --output-dir "$OUTPUT_DIR/artifacts"
   --chunk-stride "$CHUNK_STRIDE" --temporal-decay "$TEMPORAL_DECAY"
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
@@ -737,6 +740,11 @@ EVAL_ARGS=(
   --client-commit "$CLIENT_COMMIT" --backend-commit "$BACKEND_COMMIT"
   --model-commit "$OPENPI_COMMIT"
 )
+if [[ -n "$STATE_CONTRACT" ]]; then
+  EVAL_ARGS+=(--state-contract "$STATE_CONTRACT")
+else
+  EVAL_ARGS+=(--extended-state)
+fi
 if [[ -n "$NORM_SHA_EXPECTED" ]]; then
   EVAL_ARGS+=(--norm-sha-expected "$NORM_SHA_EXPECTED")
 fi

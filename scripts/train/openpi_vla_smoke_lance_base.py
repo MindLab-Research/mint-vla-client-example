@@ -74,6 +74,7 @@ from scripts.target_actions import MANO_DELTA_MASK_SEGMENTS, URDF_TARGET_ABSOLUT
 # Backwards-compatible name for the default L-LoRA server identity.
 PI05_MODEL = LEGACY_L_LORA_MODEL
 PI05_ACTION_LORA_R16_MODEL = ACTION_LORA_R16_MODEL
+PI05_ACTION_LORA_R16_STATE54_MODEL = "openpi/pi05-action-lora-r16-state54-finetune"
 
 
 # --------------------------------------------------------------------------- #
@@ -280,6 +281,7 @@ class LanceViewpi05Dataset:
         contact_window_manifest: Path | None = None,
         missing_contact_policy: str = "full",
         extended_state: bool = False,
+        state_contract: str | None = None,
     ) -> None:
         """`slate_size`/`slate_rotate_every` control `sample_indices()`'s
         episode-slate rotation (see its docstring) -- irrelevant if callers
@@ -292,7 +294,13 @@ class LanceViewpi05Dataset:
         [26:31], lift height at [31]). When False (default), state[26:32]
         remains zeros (legacy contract for old checkpoints).
         """
-        self._extended_state = bool(extended_state)
+        from scripts.mano_state54_contract import STATE_CONTRACT_ID as STATE54_CONTRACT_ID
+        if state_contract not in (None, STATE54_CONTRACT_ID):
+            raise ValueError(f"unsupported state contract {state_contract!r}")
+        if extended_state and state_contract is not None:
+            raise ValueError("--extended-state and state_contract are mutually exclusive")
+        self._state_contract = state_contract
+        self._extended_state = bool(extended_state or state_contract is not None)
         self._dataset = lance.dataset(str(lance_dataset))
         self._dataset_path = Path(lance_dataset)
         # Metadata stays small; contact records are scanned separately and
@@ -415,8 +423,11 @@ class LanceViewpi05Dataset:
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
+        if self._state_contract is not None:
+            columns += ["hands"]
         table = self._dataset.take([row_index], columns=columns)
         row = table.to_pylist()[0]
+        row = self._attach_state54_window(row, row_index)
         self._row_cache[row_index] = row
         self._row_cache.move_to_end(row_index)
         while len(self._row_cache) > self._row_cache_capacity():
@@ -468,6 +479,40 @@ class LanceViewpi05Dataset:
             result.append(self.flat_index(row_index, frame))
         return result
 
+    def _attach_state54_window(self, row: dict[str, Any], row_index: int) -> dict[str, Any]:
+        from scripts.mano_state54_contract import (
+            STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
+            build_state54_window,
+        )
+
+        if getattr(self, "_state_contract", None) != STATE54_CONTRACT_ID:
+            return row
+        metadata = self._rows[row_index].get("trajectory_metadata", {})
+        object_names = metadata.get("object_names") if isinstance(metadata, dict) else None
+        if not isinstance(object_names, list) or len(object_names) != 1:
+            raise ValueError(
+                f"state54 requires exactly one trajectory object, got {object_names!r} "
+                f"at local row {row_index}"
+            )
+        hands, objects = row.get("hands"), row.get("objects")
+        if not isinstance(hands, list) or len(hands) != 1:
+            raise ValueError(f"state54 requires exactly one hand at local row {row_index}")
+        if not isinstance(objects, list) or len(objects) != 1:
+            raise ValueError(f"state54 requires exactly one object at local row {row_index}")
+        window = self._row_windows[row_index]
+        hand, obj = hands[0], objects[0]
+        state54 = build_state54_window(
+            hand_qpos=np.asarray(hand["urdf_dof"], dtype=np.float32),
+            mano_joint_pos=np.asarray(hand["mano_joint_pos"], dtype=np.float32),
+            frame_contacts=row["contact"],
+            object_name=object_names[0],
+            object_position_world=np.asarray(obj["pos"], dtype=np.float32),
+            object_rotation_aa=np.asarray(obj["rot_aa"], dtype=np.float32),
+            window_start=window.start_frame,
+            window_end=window.end_frame,
+        )
+        return {**row, "_state54_window": state54}
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         row_index, frame = self._index[index]
         window = self._row_windows[row_index]
@@ -480,7 +525,11 @@ class LanceViewpi05Dataset:
         if actions.shape[0] < self._action_horizon:
             pad = np.repeat(actions[-1:], self._action_horizon - actions.shape[0], axis=0)
             actions = np.concatenate([actions, pad], axis=0)
-        if self._extended_state:
+        if getattr(self, "_state_contract", None) is not None:
+            state = np.asarray(
+                row["_state54_window"][frame - window.start_frame], dtype=np.float32
+            )
+        elif self._extended_state:
             from scripts.mano_state_contract import build_extended_state
             objects = row["objects"]
             traj_meta = self._rows[row_index].get("trajectory_metadata", {})
@@ -542,8 +591,10 @@ def _build_model_config(
     return pi0_config.Pi0Config(
         pi05=True,
         action_dim=action_dim,
+        state_dim=resolved.state_dim,
         action_horizon=action_horizon,
         max_token_len=resolved.max_tokens,
+        fail_on_token_truncation=resolved.fail_on_token_truncation,
         discrete_state_input=resolved.discrete_state_input,
         # Adapter ownership remains server-side, but matching variants prevent
         # the client transform declaration from drifting from that contract.
