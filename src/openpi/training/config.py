@@ -120,7 +120,10 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.TokenizePrompt(
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.PadStatesAndActions(
+                            model_config.action_dim,
+                            model_config.state_dim,
+                        ),
                     ],
                 )
             case _model.ModelType.PI05:
@@ -133,7 +136,10 @@ class ModelTransformFactory(GroupFactory):
                             _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
-                        _transforms.PadStatesAndActions(model_config.action_dim),
+                        _transforms.PadStatesAndActions(
+                            model_config.action_dim,
+                            model_config.state_dim,
+                        ),
                     ],
                 )
             case _model.ModelType.PI0_FAST:
