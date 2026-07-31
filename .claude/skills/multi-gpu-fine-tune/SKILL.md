@@ -1,11 +1,11 @@
 ---
 name: multi-gpu-fine-tune
-description: 纯 HTTP 多卡 LoRA 微调 OpenPI pi0.5 — 不 import mint_server、不调 mint driver, 仅用 requests 打 HTTP, 8 卡 bs=128+8 生产者达 ~55 samples/s (mint 水位). 用于在 client 侧(不碰 mint 代码层级)跑通端到端训练并避免常见性能/启动陷阱.
+description: 纯 HTTP 多卡 LoRA 微调 OpenPI pi0.5 — 不 import mint_server、不调 mint driver, 仅用 requests 打 HTTP. 8 卡 bs=128+8 生产者 ~52 samples/s (SM busy_mean 71%, 忙窗 ~90%); 4 卡限 CUDA_VISIBLE_DEVICES 起 server, bs=128+4 生产者 ~52 samples/s (SM busy_mean 75%). 用于在 client 侧跑通端到端训练并避免性能/启动陷阱.
 ---
 
 # multi-gpu-fine-tune (纯 client 多卡微调)
 
-通过**纯 HTTP** 在 8 卡 mint-server 上对 OpenPI pi0.5 做 LoRA 微调, **不 import `mint_server`、不 subprocess 调 mint driver**。多生产者预取内置, bs=128 + 8 生产者即可占满 8 卡 GPU (稳态 ~55 samples/s, 与 mint driver 一致)。
+通过**纯 HTTP** 在 8 卡 mint-server 上对 OpenPI pi0.5 做 LoRA 微调, **不 import `mint_server`、不 subprocess 调 mint driver**。多生产者预取内置, bs=128 + 8 生产者即可占满 8 卡 GPU (稳态 ~52 samples/s, SM busy_mean 71%/忙窗 ~90%, 与 mint driver 一致)。
 
 ## 何时用
 
@@ -72,7 +72,7 @@ bash scripts/remote/run_client.sh scripts/train/train_http_multiprod.py \
 脚本每步打印一行 JSON: `{"step": N, "loss": x, "queue_wait": y, "step_time": z}`。最后打印 `final loss ... throughput=N samples/s`。
 
 - **稳态水位看 `step_time`**, 不是末行 throughput。
-- 末行 `throughput = batch_size * steps / elapsed`, 把首步 ~80s XLA 编译摊进了每步 —— 短跑 (steps<50) 会显著低估。稳态 `step_time ≈ 2.1-2.2s` → 真实 ~58 samples/s。
+- 末行 `throughput = batch_size * steps / elapsed`, 把首步 ~80s XLA 编译摊进了每步 —— 短跑 (steps<50) 会显著低估。稳态 `step_time ≈ 2.14-2.16s` → 真实 ~52 samples/s。
 - `queue_wait` 应 ≈0.001s (生产者喂得及); 若涨到几秒, 说明生产者数不够或磁盘 IO 跟不上。
 
 ### 4. 确认 GPU 真分 8 卡 (可选, 排查"没加速")
@@ -95,10 +95,10 @@ nvidia-smi dmon -s u -d 1 -c 10
 client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame, 冷启动几分钟卡死。脚本内 `_compute_norm_stats_fast` 用 PyArrow 向量化 (`.combine_chunks().flatten()`), ~12s。**不要**退回慢版。该函数自包含 (不依赖 mint)。
 
 ### 4. throughput 数字偏低 → 口径陷阱
-`throughput = batch_size * steps / elapsed` 把首步 ~80s 编译摊进每步。1000 步实测 55.4 (摊销影响小); 但短跑 (10 步) 会显示 ~12, **别被吓到** —— 看稳态 `step_time≈2.16s` 才是真实水位。要算"稳态吞吐"用 `batch_size / step_time`。
+`throughput = batch_size * steps / elapsed` 把首步 ~80s 编译摊进每步。400 步实测 ~52 (摊销影响小); 但短跑 (10 步) 会显示 ~12, **别被吓到** —— 看稳态 `step_time≈2.14s` 才是真实水位。要算"稳态吞吐"用 `batch_size / step_time`。
 
 ### 5. bs=256 静默退出 → 与"打满 GPU"无关, 别靠加大 batch
-bs=256 在 mint driver 稳定版也静默退出 (model created + auto 选 8 后、首步前退出, 0 traceback; server 端有 80s train_step 200 OK 但 client 0 输出)。疑似 OOM 或响应过大。**bs=128 已达 ~55 samples/s, 不需要靠 256 打满**。若未来确需更大 batch, 前台 `--steps 1 --batch-size 256` 看完整 stderr 精准诊断。
+bs=256 在 mint driver 稳定版也静默退出 (model created + auto 选 8 后、首步前退出, 0 traceback; server 端有 80s train_step 200 OK 但 client 0 输出)。疑似 OOM 或响应过大。**bs=128 已达 ~52 samples/s, 不需要靠 256 打满**。若未来确需更大 batch, 前台 `--steps 1 --batch-size 256` 看完整 stderr 精准诊断。
 
 ### 6. async 流水线 → 已作废, 不要复活
 曾试 httpx.AsyncClient 让 HTTP 往返与 GPU 重叠, 前台 3 步 ~60 samples/s 但 step4 静默退出 (无 traceback, py-spy 抓不到 host-venv standalone python)。**根因是 §1 的误诊**: 同步版在 fresh server 上已达水位, async 解的是不存在的问题。代码已回退, 同步版是唯一推荐实现。
@@ -106,17 +106,61 @@ bs=256 在 mint driver 稳定版也静默退出 (model created + auto 选 8 后�
 ### 7. polling 不是瓶颈 (别去优化)
 `/api/v1/mint/vla/train_step` 返回 `request_id`, 但 server 端 `handle_train_step` 用 `_run_inline` **同步 await 完 forward_backward+optim_step 才返回**。client 第一次 `/retrieve_future` 就拿到结果, 没有 1s 轮询空等。别试图把 `poll_interval_s=1.0` 调小或改 long-poll。
 
+### 8. SM% 短跑测不准 → 必须 ≥60 步 + fresh server
+同一配置 (bs=128, p=4, 4 卡) 的 SM 利用率 (nvidia-smi `utilization.gpu`) 随步数读出**不同值**: 短跑 ~33% → 60 步 ~50% → 400 步才是真实 **74.5%** (busy_mean)。但 `step_time` 全程 2.16s 不变, 说明 GPU 实际计算量从未改变 —— 变的只是采样能否抓到稳态满载段。短跑时 server JIT 编译抖动 + 预热污染了"忙窗"判定。这与 §4 (短跑 throughput 偏低) 是同一类口径陷阱。
+
+**测 SM 利用率的正确姿势**:
+- 高频采样 `nvidia-smi --query-gpu=utilization.gpu -i <visible-gpus> -d 0.2` (1s 采样 vs ~2-3s step 会大量落在 HTTP 间隙, 均值失真)。
+- 只采 server 实际可见的卡 (4 卡 server 采 0-3, 别采全部 8 张把空闲卡拉低均值)。
+- `gpu_busy_mean` = 仅在"任一卡 >5% busy"的样本上求均值 (排除 HTTP 空闲间隙); 另报"忙窗均值" (样本 >5% busy 时) 看纯计算阶段 (~90%)。
+- **跑 ≥60 步**, 且 server 必须 fresh。30 步的 33% 是错的。
+
+## 跑 4 卡 (限 server 可见 GPU)
+
+8 卡脚本能直接复用到 4 卡, **前提是起一个只看 4 张 GPU 的 fresh server** —— 数据并行分片数由 server 进程的 `CUDA_VISIBLE_DEVICES` 决定, client 无法单方面限制。bs 仍是"可见 GPU 数 (4) 的倍数"。
+
+起 4 卡 fresh server (照搬 `mint/scripts/wip/_start_pi05_server_8gpu.sh`, 仅改两处):
+
+```bash
+# 关键差异: CUDA_VISIBLE_DEVICES=0,1,2,3 (4 卡) + 自选端口
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export MINT_PORT=30540
+# 其余 env (MINT_ALLOWED_NO_RAY / MINT_SUPPORTED_MODELS / OPENPI_DATA_HOME / 权重路径 / PYTHONPATH) 同 8 卡脚本
+nohup "$GRB/host-venv/bin/python" -u "$REPO/scripts/wip/_run_local_openpi_server.py" > /tmp/pi05_server_4gpu.log 2>&1 &
+curl -s http://127.0.0.1:30540/openapi.json >/dev/null && echo ready   # 200 即就绪
+```
+
+4 卡推荐参数 (2026-07-31 实测, fresh server, bs 必须是 4 的倍数):
+
+| 配置 | step_time | throughput | SM% busy_mean | 备注 |
+|---|---|---|---|---|
+| **bs=128 + 4 生产者** | 2.16s | 52.2 samples/s | **74.5%** (忙窗 ~90%) | 4 卡最优; loss 1.01→0.089 |
+| bs=128 + 8 生产者 | ~2.13s | ~53 | — | ⚠️ step~221 静默退出 (生产者多于卡数), **4 卡别用 >4 生产者** |
+| bs=256 + 8 生产者 | 6.3s | 40.6 | ~48 | **4 卡不 OOM 但 step_time 翻倍, 无收益, 别用** |
+
+- **生产者数 = 卡数** (4 生产者 ↔ 4 卡); >4 生产者会撞静默退出, <4 会饿队列。
+- 4 卡吞吐 ~52 samples/s (≈ 8 卡 52, 因 4 卡每步算 2× 样本但卡数减半), busy_mean 74.5% / 忙窗 ~90% —— 与 8 卡同形态 (HTTP-bound), 全样本均值 50% (HTTP 往返 + optim Python 遍历空转)。
+
 ## 关键脚本
 
 - `scripts/train/train_http_multiprod.py` — 本 skill 的训练脚本, 纯 HTTP + 多生产者预取。
 - `scripts/train/openpi_vla_smoke_lance_base.py` — HTTP/dataset/transform helper (L 模块); `train_http_multiprod` import 它。mint driver 也 import 同一份。
 - `scripts/remote/run_client.sh` — 启动器, 配 PYTHONPATH (含 openpi) + 预检 server。
 
-## 实测水位 (fresh server, 2026-07-29, 8×A800, mano lance)
+## 实测水位 (fresh server, 8×A800, mano lance, 同口径 400 步 + 0.2s 采样, 2026-07-31)
 
-| 配置 | step_time | throughput | 备注 |
-|---|---|---|---|
-| bs=128 + 8 生产者 (同步) | ~2.16s | 55.4 samples/s (1000步) | 8 卡同步满载, loss 0.96→0.087 |
-| bs=128 + 8 生产者 (旧 server) | ~4.9s | ~25 | stale-server 误诊, 非瓶颈 |
+两个 SM 口径都要看:
+- **busy_mean**: 仅在"任一卡 >5% busy"的样本上求均值 (排除 HTTP 空闲间隙) = GPU 真在算时的利用率。
+- **全样本均值**: 含 HTTP 往返 + optim Python 遍历的空闲间隙 (GPU 空转) = 整体占空比。
 
-对照 mint driver (同 fresh server): 2.1s/57 — 一致。
+| 配置 | step_time | throughput | SM% busy_mean | SM% 全样本 | 忙窗峰值 | 备注 |
+|---|---|---|---|---|---|---|
+| 8 卡 bs=128 + 8 生产者 (同步) | 2.14s | 51.6 samples/s | **71.2%** | 50.0% | ~90% | 8 卡; loss 1.05→0.097 |
+| 4 卡 bs=128 + 4 生产者 | 2.16s | 52.2 samples/s | **74.5%** | 50.0% | ~90% | 4 卡; loss 1.01→0.089 |
+| 8 卡 bs=128 + 8 生产者 (旧 server) | ~4.9s | ~25 | ~23% | — | — | stale-server 误诊, 非瓶颈 |
+
+对照 mint driver (同 fresh 8 卡 server): 2.1s/57 — 一致。
+
+**GPU 已打满到实用区**: 忙窗峰值 ~90% (8 卡同步涨跌, 数据并行 `PartitionSpec(DATA_AXIS)` 真分片), busy_mean 71-75%。全样本均值 50% 是因为每步有约一半时间在 **HTTP 往返 + optim_step 的 Python pytree 遍历** (server 端 `_run_inline` 同步执行, GPU 空等) —— 这是同步 HTTP 训练的结构性上限, 不是数据并行没生效。要继续提升需把 optim Python 遍历挪进 jit (碰 `mint_server` 源码, 越界, 需授权)。
+
+**4 卡 SM 略高于 8 卡 (74.5% vs 71.2%)**: 4 卡每卡算 bs/4=32、8 卡每卡算 bs/8=16, 4 卡单卡负载更满、空闲间隙更少。但 4 卡吞吐与 8 卡相当 (52 vs 52, 因 4 卡 step_time 2.16s ≈ 8 卡 2.14s) —— 4 卡每步算 2 倍样本但卡数减半, 总吞吐持平。8 卡吞吐上限更高 (能加大 batch); 4 卡单卡吃得更满。
