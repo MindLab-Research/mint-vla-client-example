@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 LEGACY_L_LORA_MODEL = "openpi/pi05-libero-low-mem-finetune"
 ACTION_LORA_R16_MODEL = "openpi/pi05-action-lora-r16-finetune"
+ACTION_LORA_R16_STATE54_MODEL = "openpi/pi05-action-lora-r16-state54-finetune"
 
 
 @dataclass(frozen=True)
@@ -20,8 +21,10 @@ class OpenPIClientProfile:
     paligemma_variant: str
     action_expert_variant: str
     action_dim: int = 32
+    state_dim: int = 32
     action_horizon: int = 10
     max_tokens: int = 200
+    fail_on_token_truncation: bool = False
 
 
 LEGACY_L_LORA_PROFILE = OpenPIClientProfile(
@@ -38,10 +41,24 @@ ACTION_LORA_R16_PROFILE = OpenPIClientProfile(
     paligemma_variant="gemma_2b",
     action_expert_variant="gemma_300m_lora_r16",
 )
+ACTION_LORA_R16_STATE54_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state54_v1",
+    base_model=ACTION_LORA_R16_STATE54_MODEL,
+    discrete_state_input=True,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    state_dim=54,
+    max_tokens=256,
+    fail_on_token_truncation=True,
+)
 
 MODEL_PROFILES = {
     profile.base_model: profile
-    for profile in (LEGACY_L_LORA_PROFILE, ACTION_LORA_R16_PROFILE)
+    for profile in (
+        LEGACY_L_LORA_PROFILE,
+        ACTION_LORA_R16_PROFILE,
+        ACTION_LORA_R16_STATE54_PROFILE,
+    )
 }
 PROFILE_IDS = {profile.profile_id: profile for profile in MODEL_PROFILES.values()}
 MODEL_CHOICES = tuple(MODEL_PROFILES)
