@@ -43,6 +43,7 @@ from scripts.mano_state54_contract import (
     CONTACT_RULE as STATE54_CONTACT_RULE,
     CONTACT_SEMANTICS as STATE54_CONTACT_SEMANTICS,
     STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
+    verify_locked_state54_norm_stats,
 )
 from scripts.openpi_profiles import resolve_profile
 from scripts.target_actions import (
@@ -610,6 +611,7 @@ def load_or_compute_norm_stats(
     dataset: SelectedLanceDataset, norm_stats_dir: Path | None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extended_state = bool(getattr(dataset, "_extended_state", False))
+    state54 = getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID
     if norm_stats_dir is None:
         if extended_state:
             raise ValueError(
@@ -622,7 +624,9 @@ def load_or_compute_norm_stats(
             "sha256": None,
         }
     path = norm_stats_dir / "norm_stats.json"
-    if extended_state:
+    if state54:
+        path, actual_sha = verify_locked_state54_norm_stats(norm_stats_dir)
+    elif extended_state:
         path, actual_sha = verify_locked_norm_stats(norm_stats_dir)
     else:
         if not path.is_file():
@@ -660,6 +664,15 @@ def load_or_compute_norm_stats(
             raise ValueError(
                 f"extended-state norm cache lift range must be > 1e-4, got {lift_range}: {path}"
             )
+        if state54:
+            from scripts.mano_state54_contract import FORCE_LOG1P_MAX
+
+            if not np.allclose(state_q01[47:52], 0.0) or not np.allclose(
+                state_q99[47:52], FORCE_LOG1P_MAX
+            ):
+                raise ValueError("state54 force norm must use fixed 0..log1p(50N)")
+            if not np.isclose(state_q01[53], 0.0) or not np.isclose(state_q99[53], 1.0):
+                raise ValueError("state54 contact-age norm must use fixed 0..1s")
     return stats, {
         "source": "loaded",
         "directory": str(norm_stats_dir.resolve()),

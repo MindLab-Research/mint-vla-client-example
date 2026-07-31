@@ -61,6 +61,7 @@ from scripts.mano_state54_contract import (
     build_state54,
     fingertips_in_collision_box_frame,
     fingertip_world_from_mujoco,
+    verify_locked_state54_norm_stats,
 )
 from scripts.openpi_profiles import resolve_profile
 from scripts.target_actions import URDF_TARGET_ABSOLUTE, project_row_actions
@@ -1344,7 +1345,13 @@ def main() -> int:
         "trajectory_metadata",
         "episode_metadata",
     ]
-    if args.extended_state:
+    if args.state_contract == STATE54_CONTRACT_ID:
+        _, actual_sha = verify_locked_state54_norm_stats(
+            args.norm_stats_dir,
+            expected_sha256=args.norm_sha_expected,
+        )
+        args.norm_sha_actual = actual_sha
+    elif args.extended_state:
         # Authenticate the exact v1 normalization bytes before loading them.
         _, actual_sha = verify_locked_norm_stats(
             args.norm_stats_dir,

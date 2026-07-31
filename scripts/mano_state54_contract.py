@@ -27,6 +27,9 @@ boundary.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
+from pathlib import Path
 import threading
 from typing import Any, Mapping, Sequence
 
@@ -46,6 +49,11 @@ SOURCE_INTERVAL_SECONDS = 0.005
 CONTACT_AGE_CLIP_SECONDS = 1.0
 FORCE_REFERENCE_NEWTONS = 50.0
 FORCE_LOG1P_MAX = float(np.log1p(FORCE_REFERENCE_NEWTONS))
+STATE54_NORM_SHA256 = "f91a0f1b326b33df0aa90bd1e5433bbae1128276bdd690415b5cebd8b50e1cc9"
+POPULATION_ROW_INDICES_SHA256 = "5fd0ed493c18b563d1deb280624f0f8b3c47fd7d4d11fcb8ee17650d3d74a654"
+POPULATION_TRAJECTORIES = 1_997
+POPULATION_ACTIVE_FRAMES = 1_160_274
+PROFILE_MAX_TOKEN_LEN = 256
 
 FINGER_NAMES = ("index", "thumb", "ring", "middle", "pinky")
 FINGER_CONTACT_SLICE = slice(26, 31)
@@ -88,6 +96,69 @@ OBJECT_COLLISION_BOXES: Mapping[str, ObjectCollisionBox] = {
         local_center=np.asarray([-0.000047717, -0.003572410, -0.000630386], dtype=np.float64),
     ),
 }
+
+
+def verify_locked_state54_norm_stats(
+    norm_stats_dir: Path, *, expected_sha256: str | None = None
+) -> tuple[Path, str]:
+    """Authenticate norm bytes, population/data contract, and zero-truncation audit."""
+    directory = Path(norm_stats_dir)
+    norm_path = directory / "norm_stats.json"
+    if not norm_path.is_file():
+        raise ValueError(f"state54 requires norm_stats.json at {norm_path}")
+    actual_sha = hashlib.sha256(norm_path.read_bytes()).hexdigest()
+    expected = STATE54_NORM_SHA256 if expected_sha256 is None else str(expected_sha256).lower()
+    if expected != STATE54_NORM_SHA256:
+        raise ValueError(f"state54 expected norm SHA is not allowlisted: {expected}")
+    if actual_sha != expected:
+        raise ValueError(f"state54 norm SHA mismatch: expected {expected}, got {actual_sha}")
+
+    contract_path = directory / "data_contract.json"
+    if not contract_path.is_file():
+        raise ValueError(f"state54 norm requires data_contract.json at {contract_path}")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    required = {
+        "norm_stats_sha256": actual_sha,
+        "state_contract": STATE_CONTRACT_ID,
+        "state_dim": STATE_DIM,
+        "action_dim": ACTION_DIM,
+        "action_horizon": 10,
+        "action_source": "urdf_target_absolute",
+        "row_indices_sha256": POPULATION_ROW_INDICES_SHA256,
+        "trajectory_count": POPULATION_TRAJECTORIES,
+        "active_frame_count": POPULATION_ACTIVE_FRAMES,
+        "action_vector_count": POPULATION_ACTIVE_FRAMES * 10,
+        "force_reference_newtons": FORCE_REFERENCE_NEWTONS,
+        "source_interval_seconds": SOURCE_INTERVAL_SECONDS,
+        "contact_age_clip_seconds": CONTACT_AGE_CLIP_SECONDS,
+        "max_token_len": PROFILE_MAX_TOKEN_LEN,
+    }
+    for key, value in required.items():
+        if contract.get(key) != value:
+            raise ValueError(
+                f"state54 data contract {key!r} mismatch: expected {value!r}, "
+                f"got {contract.get(key)!r}: {contract_path}"
+            )
+
+    audit_path = directory / "token_audit.json"
+    if not audit_path.is_file():
+        raise ValueError(f"state54 norm requires token_audit.json at {audit_path}")
+    audit_sha = hashlib.sha256(audit_path.read_bytes()).hexdigest()
+    if contract.get("token_audit_sha256") != audit_sha:
+        raise ValueError("state54 token audit SHA does not match data_contract.json")
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    if not (
+        audit.get("zero_truncation") is True
+        and audit.get("overflow_count") == 0
+        and audit.get("audited_active_frames") == POPULATION_ACTIVE_FRAMES
+        and audit.get("profile_max_token_len") == PROFILE_MAX_TOKEN_LEN
+        and int(audit.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1))
+        <= PROFILE_MAX_TOKEN_LEN
+        and audit.get("norm_stats_sha256") == actual_sha
+        and audit.get("population_row_indices_sha256") == POPULATION_ROW_INDICES_SHA256
+    ):
+        raise ValueError(f"state54 token audit contract is invalid: {audit_path}")
+    return norm_path, actual_sha
 
 
 def _require_shape(name: str, value: Any, shape: tuple[int, ...]) -> np.ndarray:
