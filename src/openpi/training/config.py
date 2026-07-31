@@ -118,7 +118,10 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.PaligemmaTokenizer(
+                                model_config.max_token_len,
+                                fail_on_truncation=model_config.fail_on_token_truncation,
+                            ),
                         ),
                         _transforms.PadStatesAndActions(
                             model_config.action_dim,
@@ -132,8 +135,16 @@ class ModelTransformFactory(GroupFactory):
                     inputs=[
                         _transforms.InjectDefaultPrompt(self.default_prompt),
                         _transforms.ResizeImages(224, 224),
+                        *(
+                            [_transforms.ValidateStateDimension(model_config.state_dim)]
+                            if model_config.fail_on_token_truncation
+                            else []
+                        ),
                         _transforms.TokenizePrompt(
-                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            _tokenizer.PaligemmaTokenizer(
+                                model_config.max_token_len,
+                                fail_on_truncation=model_config.fail_on_token_truncation,
+                            ),
                             discrete_state_input=model_config.discrete_state_input,
                         ),
                         _transforms.PadStatesAndActions(

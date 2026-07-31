@@ -325,6 +325,22 @@ class PromptFromLeRobotTask(DataTransformFn):
 
 
 @dataclasses.dataclass(frozen=True)
+class ValidateStateDimension(DataTransformFn):
+    """Fail before tokenization when a strict profile is missing state features."""
+
+    model_state_dim: int
+
+    def __call__(self, data: DataDict) -> DataDict:
+        actual = int(np.asarray(data["state"]).shape[-1])
+        if actual != self.model_state_dim:
+            raise ValueError(
+                f"strict state profile requires exact width {self.model_state_dim}, "
+                f"got {actual}; missing features cannot be padded"
+            )
+        return data
+
+
+@dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
     """Zero-pads states and actions to independent model dimensions."""
 
