@@ -93,3 +93,16 @@ def test_state54_openpi_config_keeps_action32_and_strict_state54():
     assert config.action_horizon == 10
     assert config.max_token_len == 256
     assert config.fail_on_token_truncation is True
+
+
+def test_augmentation_diagnostics_support_state54_width():
+    from scripts.train.train_cube1_01_compare import AugmentationDiagnostics
+
+    diagnostics = AugmentationDiagnostics(54)
+    clean = np.zeros(54, dtype=np.float32)
+    augmented = clean.copy(); augmented[:26] = 0.1
+    valid = np.zeros(54, dtype=bool); valid[:26] = True
+    diagnostics.record(clean, augmented, valid, [1], [2])
+    summary = diagnostics.summary(0.05, token_budget=256)
+    assert summary["valid_coordinates"] == 26
+    assert len(summary["bin_changed_fraction_by_dimension"]) == 54

@@ -82,6 +82,7 @@ def compute_norm(dataset, output_dir: Path) -> dict:
         "action_dim": 32,
         "action_horizon": 10,
         "active_frames": len(dataset),
+        "action_vectors": len(dataset) * 10,
         "trajectory_count": len(dataset._row_windows),
         "row_indices_sha256": EXPECTED_ROW_DIGEST,
         "norm_stats_sha256": sha,

@@ -781,7 +781,7 @@ class DatumCache:
 
 
 class AugmentationDiagnostics:
-    def __init__(self) -> None:
+    def __init__(self, state_dim: int = 32) -> None:
         self.samples = 0
         self.token_changed_samples = 0
         self.valid_coordinates = 0
@@ -789,10 +789,13 @@ class AugmentationDiagnostics:
         self.clean_out_of_range_coordinates = 0
         self.augmented_out_of_range_coordinates = 0
         self.realized_noise_squares = 0.0
-        self.valid_by_dimension = np.zeros(32, dtype=np.int64)
-        self.changed_bins_by_dimension = np.zeros(32, dtype=np.int64)
-        self.clean_out_of_range_by_dimension = np.zeros(32, dtype=np.int64)
-        self.augmented_out_of_range_by_dimension = np.zeros(32, dtype=np.int64)
+        self.state_dim = int(state_dim)
+        if self.state_dim <= 0:
+            raise ValueError("augmentation diagnostic state_dim must be positive")
+        self.valid_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.changed_bins_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.clean_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.augmented_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
         self.clean_token_lengths: list[int] = []
         self.augmented_token_lengths: list[int] = []
 
@@ -826,6 +829,11 @@ class AugmentationDiagnostics:
         self.realized_noise_squares += float(np.square(delta[valid]).sum())
 
     def merge_from(self, other: "AugmentationDiagnostics") -> None:
+        if self.state_dim != other.state_dim:
+            raise ValueError(
+                f"cannot merge augmentation diagnostics with widths "
+                f"{self.state_dim} and {other.state_dim}"
+            )
         self.samples += other.samples
         self.token_changed_samples += other.token_changed_samples
         self.valid_coordinates += other.valid_coordinates
@@ -846,19 +854,19 @@ class AugmentationDiagnostics:
         bin_rates = np.divide(
             self.changed_bins_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         clean_out_of_range_rates = np.divide(
             self.clean_out_of_range_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         augmented_out_of_range_rates = np.divide(
             self.augmented_out_of_range_by_dimension,
             self.valid_by_dimension,
-            out=np.zeros(32, dtype=np.float64),
+            out=np.zeros(self.state_dim, dtype=np.float64),
             where=valid_dims,
         )
         active_bin_rates = bin_rates[valid_dims]
@@ -2038,7 +2046,7 @@ def main() -> int:
         args.seed, args.augmentation_seed
     )
     datum_cache = DatumCache(args.datum_cache_size)
-    augmentation_diagnostics = AugmentationDiagnostics()
+    augmentation_diagnostics = AugmentationDiagnostics(profile.state_dim)
     target_augmentation_diagnostics = TargetAugmentationDiagnostics()
     batch_executor = (
         ThreadPoolExecutor(
@@ -2230,7 +2238,9 @@ def main() -> int:
                     norm_stats,
                     action_source=dataset._action_source,
                 ))
-                worker_augmentation_diagnostics.append(AugmentationDiagnostics())
+                worker_augmentation_diagnostics.append(
+                    AugmentationDiagnostics(profile.state_dim)
+                )
                 worker_target_diagnostics.append(TargetAugmentationDiagnostics())
             worker_count = worker_base + (1 if worker_id < worker_remainder else 0)
             producer_executors.append(
