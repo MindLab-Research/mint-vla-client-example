@@ -361,7 +361,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         if self._extended_state:
             columns += ["contact", "objects"]
         if (
-            self._state_contract is not None
+            getattr(self, "_state_contract", None) is not None
             or (self._action_source != MEASURED_DELTA and self._target_is_image_dataset)
         ):
             columns.append("hands")
@@ -383,7 +383,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 )
             row = {**row, "hands": target_hands}
         row = project_row_actions(row, self._action_source)
-        row = self._attach_state54_window(row, row_index)
+        if getattr(self, "_state_contract", None) == STATE54_CONTRACT_ID:
+            row = self._attach_state54_window(row, row_index)
         return {
             **row,
             "prompt": format_language_prompt(
@@ -1185,13 +1186,18 @@ def build_batch(
                 )
             if state_noise.shape != (32,):
                 raise ValueError(f"state augmentation noise must have shape (32,), got {state_noise.shape}")
-            valid_qpos = _quantile_valid_dimensions(norm_stats, "state", state_dim)[:26]
-            valid_state = np.zeros(state_dim, dtype=bool)
-            valid_state[:26] = valid_qpos
+            quantile_valid = _quantile_valid_dimensions(norm_stats, "state", state_dim)
+            if getattr(dataset, "_extended_state", False):
+                # Both 32D extended and state54 perturb qpos only.  Preserve the
+                # historical non-extended profile's all-32D augmentation.
+                valid_state = np.zeros(state_dim, dtype=bool)
+                valid_state[:26] = quantile_valid[:26]
+            else:
+                valid_state = quantile_valid
             augmented_state = clean_state.copy()
-            qpos_indices = np.flatnonzero(valid_qpos)
-            augmented_state[qpos_indices] = (
-                clean_state[qpos_indices] + state_noise[qpos_indices]
+            valid_indices = np.flatnonzero(valid_state)
+            augmented_state[valid_indices] = (
+                clean_state[valid_indices] + state_noise[valid_indices]
             ).astype(np.float32)
             if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID:
                 stats = norm_stats["state"]
