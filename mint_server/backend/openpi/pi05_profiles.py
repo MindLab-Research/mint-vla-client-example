@@ -24,9 +24,10 @@ class Pi05Profile:
     max_token_len: int
     discrete_state_input: bool
     expected_trainable_count: int
+    state_dim: int | None = None
 
     def manifest(self) -> dict[str, Any]:
-        return {
+        manifest = {
             "profile_id": self.profile_id,
             "paligemma_variant": self.paligemma_variant,
             "action_expert_variant": self.action_expert_variant,
@@ -36,6 +37,15 @@ class Pi05Profile:
             "discrete_state_input": self.discrete_state_input,
             "expected_trainable_count": self.expected_trainable_count,
         }
+        # Preserve the published v1 manifest byte contract.  A distinct state
+        # dimension is explicit and hash-authenticated for new profiles.
+        if self.resolved_state_dim != self.action_dim:
+            manifest["state_dim"] = self.resolved_state_dim
+        return manifest
+
+    @property
+    def resolved_state_dim(self) -> int:
+        return self.action_dim if self.state_dim is None else self.state_dim
 
     @property
     def manifest_hash(self) -> str:
@@ -49,6 +59,7 @@ class Pi05Profile:
         return {
             "pi05": True,
             "action_dim": self.action_dim,
+            "state_dim": self.resolved_state_dim,
             "action_horizon": self.action_horizon,
             "max_token_len": self.max_token_len,
             "discrete_state_input": self.discrete_state_input,
@@ -62,13 +73,29 @@ PI05_ACTION_LORA_R16_V1 = Pi05Profile(
     paligemma_variant="gemma_2b",
     action_expert_variant="gemma_300m_lora_r16",
     action_dim=32,
+    state_dim=None,
     action_horizon=10,
     max_token_len=200,
     discrete_state_input=True,
     expected_trainable_count=13_224_992,
 )
 
-_PROFILES = {PI05_ACTION_LORA_R16_V1.profile_id: PI05_ACTION_LORA_R16_V1}
+PI05_ACTION_LORA_R16_STATE54_V1 = Pi05Profile(
+    profile_id="pi05_action_lora_r16_state54_v1",
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    action_dim=32,
+    state_dim=54,
+    action_horizon=10,
+    max_token_len=256,
+    discrete_state_input=True,
+    expected_trainable_count=13_224_992,
+)
+
+_PROFILES = {
+    profile.profile_id: profile
+    for profile in (PI05_ACTION_LORA_R16_V1, PI05_ACTION_LORA_R16_STATE54_V1)
+}
 
 
 # This is intentionally outside Pi05Profile.manifest(): it is a runtime model-layout
@@ -99,7 +126,10 @@ def validate_profile_trainable_leaves(
     profile: Pi05Profile, actual: Mapping[str, tuple[int, ...]]
 ) -> None:
     """Fail closed when a profiled model's trainable leaves differ from its layout contract."""
-    if profile.profile_id != PI05_ACTION_LORA_R16_V1.profile_id:
+    if profile.profile_id not in {
+        PI05_ACTION_LORA_R16_V1.profile_id,
+        PI05_ACTION_LORA_R16_STATE54_V1.profile_id,
+    }:
         return
 
     expected = _PI05_ACTION_LORA_R16_V1_TRAINABLE_LEAF_SHAPES

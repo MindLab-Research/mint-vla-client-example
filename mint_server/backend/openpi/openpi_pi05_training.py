@@ -22,6 +22,7 @@ OPENPI_PI05_LORA_RANK = 16
 OPENPI_PI05_CONFIG_NAMES = {
     "openpi/pi05-libero-low-mem-finetune": "pi05_libero",
     "openpi/pi05-action-lora-r16-finetune": "pi05_libero",
+    "openpi/pi05-action-lora-r16-state54-finetune": "pi05_libero",
 }
 
 
@@ -117,13 +118,22 @@ def _common_input_payload(
         )
 
     action_dim = int(model_config.action_dim or 0)
-    if action_dim <= 0:
-        raise ValueError("OpenPI pi0.5 model config must define a positive action_dim")
+    state_dim = int(getattr(model_config, "state_dim", None) or action_dim)
+    if action_dim <= 0 or state_dim <= 0:
+        raise ValueError("OpenPI pi0.5 model config must define positive state_dim and action_dim")
 
     state_data, state_shape = _tensor_payload(state_input, "state")
     if len(state_shape) != 1:
         raise ValueError("OpenPI pi0.5 state must be rank-1")
-    state = _pad([float(value) for value in state_data], action_dim, key="state")
+    source_state_dim = int(state_shape[0])
+    if len(state_data) != source_state_dim:
+        raise ValueError("OpenPI pi0.5 state data length does not match shape")
+    if state_dim != action_dim and source_state_dim != state_dim:
+        raise ValueError(
+            f"OpenPI pi0.5 profiled state must have exact width {state_dim}, "
+            f"got {source_state_dim}; missing state54 features cannot be padded"
+        )
+    state = _pad([float(value) for value in state_data], state_dim, key="state")
 
     image_bytes = {
         name: {
@@ -331,6 +341,7 @@ class OpenPIPi05TrainingEngine:
             "config_name": get_openpi_pi05_config_name(session.base_model),
             "learning_rate": float(session.learning_rate),
             "action_dim": int(model_config.action_dim or 0),
+            "state_dim": int(getattr(model_config, "state_dim", None) or model_config.action_dim or 0),
             "action_horizon": int(model_config.action_horizon or 0),
             "max_token_len": int(model_config.max_model_len),
             "camera_layout": list(model_config.camera_layout),

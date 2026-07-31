@@ -124,6 +124,7 @@ class OpenPIPi05ActionSession:
         self._action_session_id = str(payload["action_session_id"])
         self._base_model = str(payload["base_model"])
         self._action_dim = int(payload["action_dim"])
+        self._state_dim = int(payload.get("state_dim", self._action_dim))
         self._action_horizon = int(payload["action_horizon"])
         self._max_token_len = int(payload["max_token_len"])
         self._camera_layout = tuple(str(name) for name in payload["camera_layout"])
@@ -134,7 +135,8 @@ class OpenPIPi05ActionSession:
             self._profile = get_pi05_profile(str(profile_manifest.get("profile_id") or ""))
             if profile_manifest != self._profile.checkpoint_manifest():
                 raise ValueError("OpenPI pi0.5 action payload profile manifest does not match its profile ID")
-            if (self._action_dim, self._action_horizon, self._max_token_len) != (
+            if (self._state_dim, self._action_dim, self._action_horizon, self._max_token_len) != (
+                self._profile.resolved_state_dim,
                 self._profile.action_dim,
                 self._profile.action_horizon,
                 self._profile.max_token_len,
@@ -148,6 +150,7 @@ class OpenPIPi05ActionSession:
                 else {
                     "pi05": True,
                     "action_dim": self._action_dim,
+                    "state_dim": self._state_dim,
                     "action_horizon": self._action_horizon,
                     "max_token_len": self._max_token_len,
                     "discrete_state_input": False,
@@ -188,6 +191,7 @@ class OpenPIPi05ActionSession:
         return {
             "base_model": self._base_model,
             "action_dim": self._action_dim,
+            "state_dim": self._state_dim,
             "action_horizon": self._action_horizon,
             "max_token_len": self._max_token_len,
             "camera_layout": list(self._camera_layout),
@@ -250,15 +254,25 @@ class OpenPIPi05ActionSession:
         state = _tensor_to_numpy(payload["extra_inputs"]["state"], dtype=np.float32)
         if state.ndim != 1:
             state = state.reshape(-1)
+        if self._state_dim != self._action_dim and state.size != self._state_dim:
+            raise ValueError(
+                f"OpenPI pi0.5 profiled state must have exact width {self._state_dim}, "
+                f"got {state.size}; missing state54 features cannot be padded"
+            )
         state = jnp.asarray(
-            _pad([float(x) for x in state.tolist()], self._action_dim)[None, ...],
+            _pad([float(x) for x in state.tolist()], self._state_dim)[None, ...],
             dtype=jnp.float32,
         )
 
         # Pad/truncate to the fixed max_token_len so the sampler is compiled once
         # regardless of prompt length (see openpi_pi05_worker._padded_prompt).
         n = int(self._max_token_len)
-        toks = [int(t) for t in text_chunks[0]["tokens"]][:n]
+        toks = [int(t) for t in text_chunks[0]["tokens"]]
+        if len(toks) > n:
+            raise ValueError(
+                f"OpenPI pi0.5 prompt exceeds max_token_len without truncation: "
+                f"tokens={len(toks)} max={n}"
+            )
         real = len(toks)
         if real < n:
             toks = toks + [0] * (n - real)
@@ -471,12 +485,22 @@ class OpenPIPi05ActionSession:
         state = _tensor_to_numpy(payload["extra_inputs"]["state"], dtype=np.float32)
         if state.ndim != 1:
             state = state.reshape(-1)
-        state = _pad([float(x) for x in state.tolist()], self._action_dim)
+        if self._state_dim != self._action_dim and state.size != self._state_dim:
+            raise ValueError(
+                f"OpenPI pi0.5 profiled state must have exact width {self._state_dim}, "
+                f"got {state.size}; missing state54 features cannot be padded"
+            )
+        state = _pad([float(x) for x in state.tolist()], self._state_dim)
 
         # Pad/truncate to the fixed max_token_len so the sampler is compiled once
         # regardless of prompt length (see openpi_pi05_worker._padded_prompt).
         n = int(self._max_token_len)
-        toks = [int(t) for t in text_chunks[0]["tokens"]][:n]
+        toks = [int(t) for t in text_chunks[0]["tokens"]]
+        if len(toks) > n:
+            raise ValueError(
+                f"OpenPI pi0.5 prompt exceeds max_token_len without truncation: "
+                f"tokens={len(toks)} max={n}"
+            )
         real = len(toks)
         if real < n:
             toks = toks + [0] * (n - real)

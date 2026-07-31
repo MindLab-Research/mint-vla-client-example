@@ -155,6 +155,7 @@ def _pi05_model_config():
         camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
         action_dim=32,
         action_horizon=10,
+        profile=None,
     )
 
 
@@ -423,3 +424,19 @@ def test_openpi_pi05_save_weights_for_sampler_creates_checkpoint_root(tmp_path: 
         "save_sampler_weights",
         {"export_path": str(tmp_path / "model-1" / "export-1")},
     )
+
+
+def test_state54_runtime_payload_requires_exact_state_without_padding() -> None:
+    from mint_server.backend.core.model_registry import MODEL_CONFIGS
+    from mint_server.backend.openpi.openpi_pi05_training import build_openpi_pi05_sft_runtime_payload
+
+    config = MODEL_CONFIGS["openpi/pi05-action-lora-r16-state54-finetune"]
+    datum = _make_datum()
+    datum.loss_fn_inputs["state"] = TensorData(data=[0.25] * 54, shape=[54], dtype="float32")
+    payload = build_openpi_pi05_sft_runtime_payload(datum=datum, model_config=config)
+    assert len(payload["state"]) == 54
+    assert len(payload["actions"][0]) == 32
+
+    datum.loss_fn_inputs["state"] = TensorData(data=[0.25] * 32, shape=[32], dtype="float32")
+    with pytest.raises(ValueError, match="missing state54 features cannot be padded"):
+        build_openpi_pi05_sft_runtime_payload(datum=datum, model_config=config)

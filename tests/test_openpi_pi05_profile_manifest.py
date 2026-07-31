@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from mint_server.backend.openpi.pi05_profiles import (
+    PI05_ACTION_LORA_R16_STATE54_V1,
     PI05_ACTION_LORA_R16_V1,
     PROFILE_MANIFEST_FILENAME,
     validate_profile_manifest,
@@ -14,6 +15,13 @@ def test_profile_manifest_atomic_round_trip(tmp_path: Path) -> None:
     assert path == tmp_path / PROFILE_MANIFEST_FILENAME
     assert validate_profile_manifest(tmp_path, PI05_ACTION_LORA_R16_V1) == path
     assert list(tmp_path.glob(f".{PROFILE_MANIFEST_FILENAME}.*.tmp")) == []
+
+
+def test_state54_manifest_is_distinct_without_changing_v1_manifest() -> None:
+    assert "state_dim" not in PI05_ACTION_LORA_R16_V1.manifest()
+    assert PI05_ACTION_LORA_R16_STATE54_V1.manifest()["state_dim"] == 54
+    assert PI05_ACTION_LORA_R16_STATE54_V1.action_dim == 32
+    assert PI05_ACTION_LORA_R16_STATE54_V1.manifest_hash != PI05_ACTION_LORA_R16_V1.manifest_hash
 
 
 def test_profile_manifest_rejects_missing_and_wrong_content(tmp_path: Path) -> None:

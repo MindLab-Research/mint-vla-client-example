@@ -101,6 +101,9 @@ class ModelConfig:
     training_backend: str = "mint_text"
     camera_layout: tuple[str, ...] = ()
     action_dim: int | None = None
+    # Observation state width can differ from the action head width.  None means
+    # action_dim for backward compatibility with every existing model entry.
+    state_dim: int | None = None
     action_horizon: int | None = None
     action_token_budget: int | None = None
     # Immutable architecture/training contract for OpenPI pi0.5 identities.
@@ -188,6 +191,23 @@ MODEL_CONFIGS = {
         action_dim=32,
         action_horizon=10,
         profile="pi05_action_lora_r16_v1",
+    ),
+    "openpi/pi05-action-lora-r16-state54-finetune": ModelConfig(
+        num_parameters=3.0,
+        is_moe=False,
+        inference_tp=1,
+        inference_dp=1,
+        train_tp=1,
+        train_ep=1,
+        max_model_len=256,
+        policy_family="flow_action",
+        inference_modality="actions",
+        training_backend="openpi_pi05",
+        camera_layout=("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
+        state_dim=54,
+        action_dim=32,
+        action_horizon=10,
+        profile="pi05_action_lora_r16_state54_v1",
     ),
     # Dense models (train_tp=1, train_ep=1 - uses PEFT backend)
     # 7B+ models: gradient_checkpointing=True to avoid OOM with long sequences

@@ -214,6 +214,7 @@ class OpenPIPi05WorkerSession:
         self._payload = payload
         self._model_id = str(payload["model_id"])
         self._action_dim = int(payload["action_dim"])
+        self._state_dim = int(payload.get("state_dim", self._action_dim))
         self._action_horizon = int(payload["action_horizon"])
         self._config_name = str(payload["config_name"])
         self._learning_rate = float(payload.get("learning_rate") or 0.0)
@@ -224,7 +225,8 @@ class OpenPIPi05WorkerSession:
             self._profile = get_pi05_profile(str(profile_manifest.get("profile_id") or ""))
             if profile_manifest != self._profile.checkpoint_manifest():
                 raise ValueError("OpenPI pi0.5 training payload profile manifest does not match its profile ID")
-            if (self._action_dim, self._action_horizon, self._max_token_len) != (
+            if (self._state_dim, self._action_dim, self._action_horizon, self._max_token_len) != (
+                self._profile.resolved_state_dim,
                 self._profile.action_dim,
                 self._profile.action_horizon,
                 self._profile.max_token_len,
@@ -248,6 +250,7 @@ class OpenPIPi05WorkerSession:
                 else {
                     "pi05": True,
                     "action_dim": self._action_dim,
+                    "state_dim": self._state_dim,
                     "action_horizon": self._action_horizon,
                     "max_token_len": self._max_token_len,
                     "discrete_state_input": False,
@@ -441,8 +444,13 @@ class OpenPIPi05WorkerSession:
         # constant and the step is compiled exactly once.
         jnp = self._jnp
         n = int(self._max_token_len)
-        tok = [int(t) for t in tokens][:n]
-        msk = [bool(m) for m in mask][:n]
+        tok = [int(t) for t in tokens]
+        msk = [bool(m) for m in mask]
+        if len(tok) > n or len(msk) > n:
+            raise ValueError(
+                f"OpenPI pi0.5 prompt exceeds max_token_len without truncation: "
+                f"tokens={len(tok)} mask={len(msk)} max={n}"
+            )
         if len(tok) < n:
             pad = n - len(tok)
             tok = tok + [0] * pad
@@ -478,8 +486,13 @@ class OpenPIPi05WorkerSession:
         """Same padding as `_padded_prompt`, but returns plain lists (for stacking
         into a batch with np.stack), not a batch=1 jnp-wrapped dict."""
         n = int(self._max_token_len)
-        tok = [int(t) for t in tokens][:n]
-        msk = [bool(m) for m in mask][:n]
+        tok = [int(t) for t in tokens]
+        msk = [bool(m) for m in mask]
+        if len(tok) > n or len(msk) > n:
+            raise ValueError(
+                f"OpenPI pi0.5 prompt exceeds max_token_len without truncation: "
+                f"tokens={len(tok)} mask={len(msk)} max={n}"
+            )
         if len(tok) < n:
             pad = n - len(tok)
             tok = tok + [0] * pad

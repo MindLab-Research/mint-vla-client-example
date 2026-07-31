@@ -3,6 +3,7 @@ from mint_server.backend.core.model_registry import MODEL_CONFIGS, list_supporte
 
 OPENPI_PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"
 OPENPI_PI05_ACTION_LORA_R16_MODEL = "openpi/pi05-action-lora-r16-finetune"
+OPENPI_PI05_ACTION_LORA_R16_STATE54_MODEL = "openpi/pi05-action-lora-r16-state54-finetune"
 
 
 def test_openpi_pi05_profile_is_registered_with_vla_metadata() -> None:
@@ -23,6 +24,16 @@ def test_openpi_pi05_action_lora_r16_registry_identity_resolves_profile() -> Non
     assert config.profile == "pi05_action_lora_r16_v1"
     assert config.action_dim == 32
     assert config.action_horizon == 10
+
+
+def test_openpi_pi05_state54_registry_separates_state_and_action_widths() -> None:
+    config = MODEL_CONFIGS[OPENPI_PI05_ACTION_LORA_R16_STATE54_MODEL]
+
+    assert config.profile == "pi05_action_lora_r16_state54_v1"
+    assert config.state_dim == 54
+    assert config.action_dim == 32
+    assert config.action_horizon == 10
+    assert config.max_model_len == 256
 
 
 def test_openpi_pi05_profile_is_not_in_default_supported_models_without_opt_in(monkeypatch) -> None:
