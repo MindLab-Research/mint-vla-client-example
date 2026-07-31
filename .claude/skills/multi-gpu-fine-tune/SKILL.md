@@ -97,8 +97,19 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 ### 4. throughput 数字偏低 → 口径陷阱
 `throughput = batch_size * steps / elapsed` 把首步 ~80s 编译摊进每步。400 步实测 ~52 (摊销影响小); 但短跑 (10 步) 会显示 ~12, **别被吓到** —— 看稳态 `step_time≈2.14s` 才是真实水位。要算"稳态吞吐"用 `batch_size / step_time`。
 
-### 5. bs=256 静默退出 → 与"打满 GPU"无关, 别靠加大 batch
-bs=256 在 mint driver 稳定版也静默退出 (model created + auto 选 8 后、首步前退出, 0 traceback; server 端有 80s train_step 200 OK 但 client 0 输出)。疑似 OOM 或响应过大。**bs=128 已达 ~52 samples/s, 不需要靠 256 打满**。若未来确需更大 batch, 前台 `--steps 1 --batch-size 256` 看完整 stderr 精准诊断。
+### 5. GPU 显存触顶点 = bs=2048 (每卡 256 样本); bs≤1024 显存几乎不涨
+**LoRA 冻结 base 权重, 梯度只算 r=16 参数, batch 大小对 GPU 显存几乎无影响** —— bs 64→1024 (8×) 每卡显存仅 61901→61947 MiB (差 46 MiB), 62GB 几乎全是固定开销 (base 权重 bf16 ~12GB + JAX 编译缓存)。服务化时 GPU 显存不是约束:
+
+| bs | 每卡样本 | 每卡显存 | step_time | 结果 |
+|---|---|---|---|---|
+| 128 | 16 | 61.9 GB | 2.14s | ✅ 推荐水位 (~52 samples/s) |
+| 256 | 32 | 61.9 GB | 3.96s | ✅ (旧"静默退出"结论作废, 能跑) |
+| 512 | 64 | 61.9 GB | 7.8s | ✅ |
+| 1024 | 128 | 61.9 GB | 15s | ✅ |
+| 2048 | 256 | — | — | ❌ OOM (单卡 alloc 80GB, 撞 80GB 上限) |
+
+**触顶 bs=2048** (8 卡每卡 256 样本): `RESOURCE_EXHAUSTED: Out of memory trying to allocate 80784354400 bytes`。这是真 OOM (不是误诊)。
+**真正的"大规模数据"瓶颈不是 GPU 显存, 而是 client 侧**: bs 翻倍 `queue_wait` 暴涨 (64→17s, 1024→70s), client 构建/传输大 batch 跟不上, GPU 空等; throughput 在 bs≥256 后封顶 ~66 samples/s 不再涨 (step_time 随 bs 线性涨, 单步延迟↑但吞吐不升)。**bs=128 是甜点 (52 samples/s、2.14s/step), 再加大 batch 只增单步延迟不提升吞吐。**
 
 ### 6. async 流水线 → 已作废, 不要复活
 曾试 httpx.AsyncClient 让 HTTP 往返与 GPU 重叠, 前台 3 步 ~60 samples/s 但 step4 静默退出 (无 traceback, py-spy 抓不到 host-venv standalone python)。**根因是 §1 的误诊**: 同步版在 fresh server 上已达水位, async 解的是不存在的问题。代码已回退, 同步版是唯一推荐实现。
