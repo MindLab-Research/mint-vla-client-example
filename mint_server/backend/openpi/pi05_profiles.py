@@ -59,17 +59,20 @@ class Pi05Profile:
         return {**self.manifest(), "manifest_hash": self.manifest_hash}
 
     def pi0_config_kwargs(self) -> dict[str, Any]:
-        return {
+        kwargs = {
             "pi05": True,
             "action_dim": self.action_dim,
-            "state_dim": self.resolved_state_dim,
             "action_horizon": self.action_horizon,
             "max_token_len": self.max_token_len,
-            "fail_on_token_truncation": self.fail_on_token_truncation,
             "discrete_state_input": self.discrete_state_input,
             "paligemma_variant": self.paligemma_variant,
             "action_expert_variant": self.action_expert_variant,
         }
+        if self.resolved_state_dim != self.action_dim:
+            kwargs["state_dim"] = self.resolved_state_dim
+        if self.fail_on_token_truncation:
+            kwargs["fail_on_token_truncation"] = True
+        return kwargs
 
 
 PI05_ACTION_LORA_R16_V1 = Pi05Profile(

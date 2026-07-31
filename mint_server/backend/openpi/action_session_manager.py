@@ -403,11 +403,13 @@ class OpenPIPi05ActionSessionManager:
             "checkpoint_path": checkpoint_path,
             "config_name": config_name,
             "action_dim": int(model_config.action_dim or 0),
-            "state_dim": int(getattr(model_config, "state_dim", None) or model_config.action_dim or 0),
             "action_horizon": int(model_config.action_horizon or 0),
             "max_token_len": int(model_config.max_model_len),
             "camera_layout": list(model_config.camera_layout),
         }
+        state_dim = int(getattr(model_config, "state_dim", None) or model_config.action_dim or 0)
+        if state_dim != int(model_config.action_dim or 0):
+            create_payload["state_dim"] = state_dim
         if profile is not None:
             create_payload["profile"] = profile.checkpoint_manifest()
         client = await _create_openpi_action_runtime_client(

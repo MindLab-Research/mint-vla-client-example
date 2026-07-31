@@ -341,11 +341,13 @@ class OpenPIPi05TrainingEngine:
             "config_name": get_openpi_pi05_config_name(session.base_model),
             "learning_rate": float(session.learning_rate),
             "action_dim": int(model_config.action_dim or 0),
-            "state_dim": int(getattr(model_config, "state_dim", None) or model_config.action_dim or 0),
             "action_horizon": int(model_config.action_horizon or 0),
             "max_token_len": int(model_config.max_model_len),
             "camera_layout": list(model_config.camera_layout),
         }
+        state_dim = int(getattr(model_config, "state_dim", None) or model_config.action_dim or 0)
+        if state_dim != int(model_config.action_dim or 0):
+            payload["state_dim"] = state_dim
         if model_config.profile:
             profile = profile_from_model_config(model_config)
             payload["profile"] = profile.checkpoint_manifest()
