@@ -57,6 +57,7 @@ from scripts.mano_state54_contract import (
     CONTACT_RULE as STATE54_CONTACT_RULE,
     CONTACT_SEMANTICS as STATE54_CONTACT_SEMANTICS,
     STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
+    STATE54_NORM_SHA256,
     State54TemporalTracker,
     build_state54,
     fingertips_in_collision_box_frame,
@@ -196,7 +197,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--norm-sha-expected",
-        default=EXPECTED_NORM_SHA256,
+        default="",
         help="population-specific expected SHA256 of norm_stats.json",
     )
     parser.add_argument(
@@ -1245,6 +1246,12 @@ def main() -> int:
     # formal CLI defaults new evaluations to contact-window initialization.
     args.frame_window = getattr(args, "frame_window", "full")
     args.state_contract = getattr(args, "state_contract", None)
+    if not getattr(args, "norm_sha_expected", ""):
+        args.norm_sha_expected = (
+            STATE54_NORM_SHA256
+            if args.state_contract == STATE54_CONTRACT_ID
+            else EXPECTED_NORM_SHA256
+        )
     args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
     args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
     args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
