@@ -118,7 +118,33 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 - **bs≥1536: 反而优雅返回** `RESOURCE_EXHAUSTED` error (server 存活, client 收到 error 可重试)。
 - 不知为何中间档 (1280) 比更大档 (1536) 更暴力 (疑似 OOM 时 XLA 编译阶段崩溃 vs 运行阶段优雅捕获)。**服务化务必把单请求 bs 控制在 ≤1024**, 留足余量, 永远别让 batch 落进 1152-1280 崩溃区。
 
-**真正的吞吐瓶颈不是 GPU 显存, 而是 client 侧**: bs 翻倍 `queue_wait` 暴涨 (64→17s, 1024→70s), client 构建/传输大 batch 跟不上, GPU 空等; throughput 在 bs≥256 后封顶 ~66 samples/s 不再涨 (step_time 随 bs 线性涨, 单步延迟↑但吞吐不升)。**bs=128 是甜点 (52 samples/s、2.14s/step), 再加大 batch 只增单步延迟不提升吞吐, 还可能撞崩溃区。**
+**真正的吞吐瓶颈不是 GPU 显存, 而是 client 侧**: bs 翻倍 `queue_wait` 暴涨 (64→17s, 1024→70s), client 构建/传输大 batch 跟不上, GPU 空等; throughput 在 bs≥256 后封顶 ~66 samples/s 不再涨 (step_time 随 bs 线性涨, 单步延迟↑但吞吐不升)。**bs=128 是吞吐甜点 (52 samples/s、2.14s/step)。**
+
+### 5b. 大 batch 拉高 GPU 占用率 (但吞吐不升) — 8 卡 + 4 卡实测 (100 步, 2026-07-31)
+
+加大 batch 的**收益是 GPU 占用率, 不是吞吐**: 单卡算更多样本 → GPU 计算段拉长 → HTTP 空闲间隙占比下降 → busy_mean 从 ~71% 拉到 ~95% (忙窗几乎打满)。但 step_time 随 bs 近线性涨, throughput 封顶。
+
+**8 卡** (8 生产者):
+
+| bs | 每卡样本 | step_time | throughput | SM% busy_mean | 全样本 | 结果 |
+|---|---|---|---|---|---|---|
+| 128 (甜点) | 16 | 2.14s | 52 | 71.2% | 50.0% | ✅ 吞吐最优 |
+| 1024 | 128 | 15.4s | 57.7 | **91.5%** | 51.2% | ✅ 安全上限, 占用拉满 |
+| 1152 | 144 | 18.3s | 59.4 | **95.6%** | 51.8% | ✅ 触顶前, 占用最高 |
+
+**4 卡** (4 生产者, 真 4 卡分片):
+
+| bs | 每卡样本 | step_time | throughput | SM% busy_mean | 全样本 | 结果 |
+|---|---|---|---|---|---|---|
+| 128 (甜点) | 32 | 2.16s | 52 | 74.5% | 50.0% | ✅ 吞吐最优 |
+| 512 | 128 | 12.1s | 36.7 | **94.5%** | 59.8% | ✅ 安全上限, 占用拉满 |
+| 768 | 192 | — | — | — | — | ❌ OOM (优雅, alloc 56.7GB) |
+
+**服务化选型**:
+- 要**吞吐**: bs=128 (8 卡/4 卡都 52 samples/s, 最优)。
+- 要**GPU 占用率** (如按 GPU 时计费、或想让单卡算满): 8 卡 bs=1024 (busy 91.5%, 57.7 samples/s, 仍安全); 4 卡 bs=512 (busy 94.5%, 但吞吐反降到 36.7 — 4 卡大 batch 不划算)。
+- **触顶点与卡数无关, 由每卡样本数决定**: 每卡 ≤128 安全、每卡 192 OOM (alloc 56.7GB)、每卡 ~160 崩溃区。8 卡安全上限 bs=1024, 4 卡安全上限 bs=512。
+- **4 卡 server 起法陷阱**: `_start_pi05_server_8gpu.sh:24` 硬编码 `CUDA_VISIBLE_DEVICES=0-7`, 会覆盖命令行传的 4 卡限制 → 假 4 卡 (8 卡都占, 每卡 79.6GB)。4 卡必须 inline 起 server (不经过该脚本), 见下文"跑 4 卡"。
 
 ### 6. async 流水线 → 已作废, 不要复活
 曾试 httpx.AsyncClient 让 HTTP 往返与 GPU 重叠, 前台 3 步 ~60 samples/s 但 step4 静默退出 (无 traceback, py-spy 抓不到 host-venv standalone python)。**根因是 §1 的误诊**: 同步版在 fresh server 上已达水位, async 解的是不存在的问题。代码已回退, 同步版是唯一推荐实现。
@@ -139,13 +165,27 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 
 8 卡脚本能直接复用到 4 卡, **前提是起一个只看 4 张 GPU 的 fresh server** —— 数据并行分片数由 server 进程的 `CUDA_VISIBLE_DEVICES` 决定, client 无法单方面限制。bs 仍是"可见 GPU 数 (4) 的倍数"。
 
-起 4 卡 fresh server (照搬 `mint/scripts/wip/_start_pi05_server_8gpu.sh`, 仅改两处):
+起 4 卡 fresh server — **必须 inline 起, 不要用 `_start_pi05_server_8gpu.sh`** (该脚本第 24 行硬编码 `CUDA_VISIBLE_DEVICES=0-7`, 会覆盖你传的 4 卡限制 → 假 4 卡, 8 张卡全占满 79.6GB/卡, bs=512 都 OOM):
 
 ```bash
-# 关键差异: CUDA_VISIBLE_DEVICES=0,1,2,3 (4 卡) + 自选端口
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export MINT_PORT=30540
-# 其余 env (MINT_ALLOWED_NO_RAY / MINT_SUPPORTED_MODELS / OPENPI_DATA_HOME / 权重路径 / PYTHONPATH) 同 8 卡脚本
+# inline 起, 绕开硬编码脚本; 关键: CUDA_VISIBLE_DEVICES=0,1,2,3
+REPO=/vePFS-Mindverse/user/intern/wenxi/mint
+GRB=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl
+EXTRA=/vePFS-Mindverse/user/intern/wenxi/mint_env/extra-pydeps
+export CUDA_VISIBLE_DEVICES=0,1,2,3 MINT_PORT=30560 MINT_HOST=0.0.0.0
+export MINT_UVICORN_WORKERS=1 MINT_SKIP_SUPERVISOR=1 MINT_ALLOW_NO_RAY=1 MINT_USAGE_BACKEND=disabled
+export MINT_RAY_NAMESPACE="vla_4gpu" MINT_SUPPORTED_MODELS="openpi/pi05-libero-low-mem-finetune"
+export OPENPI_DATA_HOME=/vePFS-Mindverse/share/models/openpi HF_HOME=/vePFS-Mindverse/share/huggingface
+export MINT_OPENPI_PI05_CHECKPOINT_BASE_DIR=/vePFS-Mindverse/share/mint/dev/data/wenxi/openpi-pi05-checkpoints
+export MINT_OPENPI_PI05_ASSETS_BASE_DIR=/vePFS-Mindverse/share/code/conley/openpi/assets
+export MINT_OPENPI_PI05_WEIGHTS_PATH=/vePFS-Mindverse/share/models/openpi/pi05_base/params
+export MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME=1 MINT_RUNTIME_CHECKPOINT_DIR=/vePFS-Mindverse/share/mint/dev/data/runtime-checkpoints
+export XLA_FLAGS="--xla_gpu_enable_command_buffer="
+export LD_LIBRARY_PATH="/usr/local/cuda/compat:${LD_LIBRARY_PATH:-}"
+export PYTHONPATH="${REPO}:${EXTRA}:${GRB}/site-packages:${GRB}/src/openpi/src:${GRB}/src/openpi/packages/openpi-client/src"
+nohup "$GRB/host-venv/bin/python" -u "$REPO/scripts/wip/_run_local_openpi_server.py" > /tmp/pi05_server_4gpu.log 2>&1 &
+# 验证真 4 卡: 模型加载后应只有 GPU 0-3 占用 (~62GB), 4-7 全空
+curl -s http://127.0.0.1:30560/openapi.json >/dev/null && echo ready
 nohup "$GRB/host-venv/bin/python" -u "$REPO/scripts/wip/_run_local_openpi_server.py" > /tmp/pi05_server_4gpu.log 2>&1 &
 curl -s http://127.0.0.1:30540/openapi.json >/dev/null && echo ready   # 200 即就绪
 ```
