@@ -97,19 +97,28 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 ### 4. throughput 数字偏低 → 口径陷阱
 `throughput = batch_size * steps / elapsed` 把首步 ~80s 编译摊进每步。400 步实测 ~52 (摊销影响小); 但短跑 (10 步) 会显示 ~12, **别被吓到** —— 看稳态 `step_time≈2.14s` 才是真实水位。要算"稳态吞吐"用 `batch_size / step_time`。
 
-### 5. GPU 显存触顶点 = bs=2048 (每卡 256 样本); bs≤1024 显存几乎不涨
-**LoRA 冻结 base 权重, 梯度只算 r=16 参数, batch 大小对 GPU 显存几乎无影响** —— bs 64→1024 (8×) 每卡显存仅 61901→61947 MiB (差 46 MiB), 62GB 几乎全是固定开销 (base 权重 bf16 ~12GB + JAX 编译缓存)。服务化时 GPU 显存不是约束:
+### 5. GPU 显存触顶点 = bs 1152~1280 之间; bs≤1024 显存几乎不涨
+**LoRA 冻结 base 权重, 梯度只算 r=16 参数, batch 大小对 GPU 显存几乎无影响** —— bs 64→1152 (18×) 每卡显存仅 61901→61907 MiB (差 6 MiB), 62GB 几乎全是固定开销 (base 权重 bf16 ~12GB + JAX 编译缓存)。服务化时 GPU 显存不是约束, 真正约束是触顶时的**崩溃行为**:
 
-| bs | 每卡样本 | 每卡显存 | step_time | 结果 |
-|---|---|---|---|---|
-| 128 | 16 | 61.9 GB | 2.14s | ✅ 推荐水位 (~52 samples/s) |
-| 256 | 32 | 61.9 GB | 3.96s | ✅ (旧"静默退出"结论作废, 能跑) |
-| 512 | 64 | 61.9 GB | 7.8s | ✅ |
-| 1024 | 128 | 61.9 GB | 15s | ✅ |
-| 2048 | 256 | — | — | ❌ OOM (单卡 alloc 80GB, 撞 80GB 上限) |
+| bs | 每卡样本 | 每卡显存 | step_time | server 行为 | 结论 |
+|---|---|---|---|---|---|
+| 128 | 16 | 61.9 GB | 2.14s | 存活 | ✅ 推荐甜点 (~52 samples/s) |
+| 256 | 32 | 61.9 GB | 3.96s | 存活 | ✅ |
+| 512 | 64 | 61.9 GB | 7.8s | 存活 | ✅ |
+| 1024 | 128 | 61.9 GB | 15s | 存活 | ✅ **安全上限** |
+| 1152 | 144 | 61.9 GB | 17s | 存活 | ✅ |
+| 1280 | 160 | — | — | **崩溃 (server 进程被杀)** | ❌ 服务中断 |
+| 1536 | 192 | — | — | 优雅返回 error | ❌ (alloc 56.7GB) |
+| 2048 | 256 | — | — | 优雅返回 error | ❌ (alloc 75.2GB) |
 
-**触顶 bs=2048** (8 卡每卡 256 样本): `RESOURCE_EXHAUSTED: Out of memory trying to allocate 80784354400 bytes`。这是真 OOM (不是误诊)。
-**真正的"大规模数据"瓶颈不是 GPU 显存, 而是 client 侧**: bs 翻倍 `queue_wait` 暴涨 (64→17s, 1024→70s), client 构建/传输大 batch 跟不上, GPU 空等; throughput 在 bs≥256 后封顶 ~66 samples/s 不再涨 (step_time 随 bs 线性涨, 单步延迟↑但吞吐不升)。**bs=128 是甜点 (52 samples/s、2.14s/step), 再加大 batch 只增单步延迟不提升吞吐。**
+**触顶点: bs 1152~1280 之间 (每卡 ~144-160 样本)**。每卡每样本线性激活 ~294MB (`compute_loss` 里 PaliGemma LLM 的 `b×seq×embed_dim` 激活), 每卡余 ~18GB / 294MB ≈ 61 样本 → 8 卡 bs ≈ 488~1024 区间安全, 实测 1152 仍活、1280 崩。
+
+**服务化关键: 触顶行为分两档, 必须远离崩溃区**:
+- **bs=1280: 直接杀死 server 进程** (client 报 `ConnectionError: Remote end closed connection`, healthz=000, 需重启 server)。这是最危险的档位 —— 服务中断。
+- **bs≥1536: 反而优雅返回** `RESOURCE_EXHAUSTED` error (server 存活, client 收到 error 可重试)。
+- 不知为何中间档 (1280) 比更大档 (1536) 更暴力 (疑似 OOM 时 XLA 编译阶段崩溃 vs 运行阶段优雅捕获)。**服务化务必把单请求 bs 控制在 ≤1024**, 留足余量, 永远别让 batch 落进 1152-1280 崩溃区。
+
+**真正的吞吐瓶颈不是 GPU 显存, 而是 client 侧**: bs 翻倍 `queue_wait` 暴涨 (64→17s, 1024→70s), client 构建/传输大 batch 跟不上, GPU 空等; throughput 在 bs≥256 后封顶 ~66 samples/s 不再涨 (step_time 随 bs 线性涨, 单步延迟↑但吞吐不升)。**bs=128 是甜点 (52 samples/s、2.14s/step), 再加大 batch 只增单步延迟不提升吞吐, 还可能撞崩溃区。**
 
 ### 6. async 流水线 → 已作废, 不要复活
 曾试 httpx.AsyncClient 让 HTTP 往返与 GPU 重叠, 前台 3 步 ~60 samples/s 但 step4 静默退出 (无 traceback, py-spy 抓不到 host-venv standalone python)。**根因是 §1 的误诊**: 同步版在 fresh server 上已达水位, async 解的是不存在的问题。代码已回退, 同步版是唯一推荐实现。
