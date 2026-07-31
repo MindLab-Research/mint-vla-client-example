@@ -106,3 +106,45 @@ def test_augmentation_diagnostics_support_state54_width():
     summary = diagnostics.summary(0.05, token_budget=256)
     assert summary["valid_coordinates"] == 26
     assert len(summary["bin_changed_fraction_by_dimension"]) == 54
+
+
+def test_state54_norm_verifier_authenticates_token_audit(tmp_path, monkeypatch):
+    import hashlib, json
+    import scripts.mano_state54_contract as contract
+
+    norm = tmp_path / "norm_stats.json"; norm.write_text("exact-norm-bytes")
+    norm_sha = hashlib.sha256(norm.read_bytes()).hexdigest()
+    monkeypatch.setattr(contract, "STATE54_NORM_SHA256", norm_sha)
+    audit_payload = {
+        "zero_truncation": True, "overflow_count": 0,
+        "audited_active_frames": contract.POPULATION_ACTIVE_FRAMES,
+        "profile_max_token_len": contract.PROFILE_MAX_TOKEN_LEN,
+        "maximum_token_length": 229, "norm_stats_sha256": norm_sha,
+        "population_row_indices_sha256": contract.POPULATION_ROW_INDICES_SHA256,
+    }
+    audit = tmp_path / "token_audit.json"
+    audit.write_text(json.dumps(audit_payload, sort_keys=True))
+    audit_sha = hashlib.sha256(audit.read_bytes()).hexdigest()
+    data_contract = {
+        "norm_stats_sha256": norm_sha, "state_contract": contract.STATE_CONTRACT_ID,
+        "state_dim": 54, "action_dim": 32, "action_horizon": 10,
+        "action_source": "urdf_target_absolute",
+        "row_indices_sha256": contract.POPULATION_ROW_INDICES_SHA256,
+        "trajectory_count": contract.POPULATION_TRAJECTORIES,
+        "active_frame_count": contract.POPULATION_ACTIVE_FRAMES,
+        "action_vector_count": contract.POPULATION_ACTIVE_FRAMES * 10,
+        "force_reference_newtons": contract.FORCE_REFERENCE_NEWTONS,
+        "source_interval_seconds": contract.SOURCE_INTERVAL_SECONDS,
+        "contact_age_clip_seconds": contract.CONTACT_AGE_CLIP_SECONDS,
+        "max_token_len": contract.PROFILE_MAX_TOKEN_LEN,
+        "token_audit_sha256": audit_sha,
+    }
+    (tmp_path / "data_contract.json").write_text(json.dumps(data_contract))
+    assert contract.verify_locked_state54_norm_stats(tmp_path) == (norm, norm_sha)
+
+    audit_payload["maximum_token_length"] = 257
+    audit.write_text(json.dumps(audit_payload, sort_keys=True))
+    data_contract["token_audit_sha256"] = hashlib.sha256(audit.read_bytes()).hexdigest()
+    (tmp_path / "data_contract.json").write_text(json.dumps(data_contract))
+    with pytest.raises(ValueError, match="token audit contract is invalid"):
+        contract.verify_locked_state54_norm_stats(tmp_path)
