@@ -809,6 +809,9 @@ class AugmentationDiagnostics:
         self.changed_bins_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
         self.clean_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
         self.augmented_out_of_range_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.causal_derived_valid_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.causal_derived_changed_by_dimension = np.zeros(self.state_dim, dtype=np.int64)
+        self.causal_derived_delta_squares = 0.0
         self.clean_token_lengths: list[int] = []
         self.augmented_token_lengths: list[int] = []
 
@@ -819,6 +822,7 @@ class AugmentationDiagnostics:
         valid: np.ndarray,
         clean_tokens: list[int],
         augmented_tokens: list[int],
+        causal_derived: np.ndarray | None = None,
     ) -> None:
         self.samples += 1
         self.token_changed_samples += clean_tokens != augmented_tokens
@@ -828,6 +832,16 @@ class AugmentationDiagnostics:
         changed = (clean_bins != augmented_bins) & valid
         clean_out_of_range = ((clean_state < -1.0) | (clean_state > 1.0)) & valid
         augmented_out_of_range = ((augmented_state < -1.0) | (augmented_state > 1.0)) & valid
+        if causal_derived is None:
+            causal_derived = np.zeros(self.state_dim, dtype=bool)
+        else:
+            causal_derived = np.asarray(causal_derived, dtype=bool)
+            if causal_derived.shape != (self.state_dim,):
+                raise ValueError(
+                    f"causal-derived diagnostic mask must have shape ({self.state_dim},), "
+                    f"got {causal_derived.shape}"
+                )
+        causal_derived_changed = (clean_bins != augmented_bins) & causal_derived
         self.valid_coordinates += int(valid.sum())
         self.changed_bins += int(np.count_nonzero(changed))
         self.clean_out_of_range_coordinates += int(np.count_nonzero(clean_out_of_range))
@@ -836,6 +850,11 @@ class AugmentationDiagnostics:
         self.changed_bins_by_dimension += changed.astype(np.int64)
         self.clean_out_of_range_by_dimension += clean_out_of_range.astype(np.int64)
         self.augmented_out_of_range_by_dimension += augmented_out_of_range.astype(np.int64)
+        self.causal_derived_valid_by_dimension += causal_derived.astype(np.int64)
+        self.causal_derived_changed_by_dimension += causal_derived_changed.astype(np.int64)
+        self.causal_derived_delta_squares += float(
+            np.square((augmented_state - clean_state)[causal_derived]).sum()
+        )
         self.clean_token_lengths.append(len(clean_tokens))
         self.augmented_token_lengths.append(len(augmented_tokens))
         delta = augmented_state - clean_state
@@ -858,6 +877,9 @@ class AugmentationDiagnostics:
         self.changed_bins_by_dimension += other.changed_bins_by_dimension
         self.clean_out_of_range_by_dimension += other.clean_out_of_range_by_dimension
         self.augmented_out_of_range_by_dimension += other.augmented_out_of_range_by_dimension
+        self.causal_derived_valid_by_dimension += other.causal_derived_valid_by_dimension
+        self.causal_derived_changed_by_dimension += other.causal_derived_changed_by_dimension
+        self.causal_derived_delta_squares += other.causal_derived_delta_squares
         self.clean_token_lengths.extend(other.clean_token_lengths)
         self.augmented_token_lengths.extend(other.augmented_token_lengths)
 
@@ -883,6 +905,14 @@ class AugmentationDiagnostics:
             where=valid_dims,
         )
         active_bin_rates = bin_rates[valid_dims]
+        causal_derived_valid = self.causal_derived_valid_by_dimension > 0
+        causal_derived_rates = np.divide(
+            self.causal_derived_changed_by_dimension,
+            self.causal_derived_valid_by_dimension,
+            out=np.zeros(self.state_dim, dtype=np.float64),
+            where=causal_derived_valid,
+        )
+        causal_derived_coordinates = int(self.causal_derived_valid_by_dimension.sum())
         lengths = self.augmented_token_lengths
         return {
             "samples": self.samples,
@@ -915,6 +945,15 @@ class AugmentationDiagnostics:
                 sum(length >= token_budget for length in lengths) / max(1, len(lengths))
             ),
             "bin_changed_fraction_by_dimension": bin_rates.tolist(),
+            "causal_derived_valid_coordinates": causal_derived_coordinates,
+            "causal_derived_bin_changed_fraction": (
+                int(self.causal_derived_changed_by_dimension.sum())
+                / max(1, causal_derived_coordinates)
+            ),
+            "causal_derived_rms_delta_normalized": math.sqrt(
+                self.causal_derived_delta_squares / max(1, causal_derived_coordinates)
+            ),
+            "causal_derived_bin_changed_fraction_by_dimension": causal_derived_rates.tolist(),
             "clean_out_of_range_fraction_by_dimension": clean_out_of_range_rates.tolist(),
             "augmented_out_of_range_fraction_by_dimension": augmented_out_of_range_rates.tolist(),
         }
@@ -1278,12 +1317,16 @@ def build_batch(
                 augmented_acts[:, 6:26] -= state_noise[6:26] * _scale[6:26]
                 # wire format stores actions as reshape(-1).tolist()
                 datum = _replace_wire_actions(datum, augmented_acts.reshape(-1))
+            causal_derived = np.zeros(state_dim, dtype=bool)
+            if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID:
+                causal_derived[32:47] = quantile_valid[32:47]
             state_diagnostic = (
                 clean_state,
                 augmented_state,
                 valid_state,
                 clean_tokens,
                 augmented_tokens,
+                causal_derived,
             )
 
         if target_noise is not None:
