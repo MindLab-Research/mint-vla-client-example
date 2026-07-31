@@ -20,6 +20,7 @@ def test_profile_manifest_atomic_round_trip(tmp_path: Path) -> None:
 def test_state54_manifest_is_distinct_without_changing_v1_manifest() -> None:
     assert "state_dim" not in PI05_ACTION_LORA_R16_V1.manifest()
     assert PI05_ACTION_LORA_R16_STATE54_V1.manifest()["state_dim"] == 54
+    assert PI05_ACTION_LORA_R16_STATE54_V1.manifest()["fail_on_token_truncation"] is True
     assert PI05_ACTION_LORA_R16_STATE54_V1.action_dim == 32
     assert PI05_ACTION_LORA_R16_STATE54_V1.manifest_hash != PI05_ACTION_LORA_R16_V1.manifest_hash
 

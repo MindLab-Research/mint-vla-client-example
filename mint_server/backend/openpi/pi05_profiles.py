@@ -25,6 +25,7 @@ class Pi05Profile:
     discrete_state_input: bool
     expected_trainable_count: int
     state_dim: int | None = None
+    fail_on_token_truncation: bool = False
 
     def manifest(self) -> dict[str, Any]:
         manifest = {
@@ -41,6 +42,8 @@ class Pi05Profile:
         # dimension is explicit and hash-authenticated for new profiles.
         if self.resolved_state_dim != self.action_dim:
             manifest["state_dim"] = self.resolved_state_dim
+        if self.fail_on_token_truncation:
+            manifest["fail_on_token_truncation"] = True
         return manifest
 
     @property
@@ -62,6 +65,7 @@ class Pi05Profile:
             "state_dim": self.resolved_state_dim,
             "action_horizon": self.action_horizon,
             "max_token_len": self.max_token_len,
+            "fail_on_token_truncation": self.fail_on_token_truncation,
             "discrete_state_input": self.discrete_state_input,
             "paligemma_variant": self.paligemma_variant,
             "action_expert_variant": self.action_expert_variant,
@@ -90,6 +94,7 @@ PI05_ACTION_LORA_R16_STATE54_V1 = Pi05Profile(
     max_token_len=256,
     discrete_state_input=True,
     expected_trainable_count=13_224_992,
+    fail_on_token_truncation=True,
 )
 
 _PROFILES = {
