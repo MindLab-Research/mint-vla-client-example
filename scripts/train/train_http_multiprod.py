@@ -14,9 +14,14 @@ openpi_profiles.py.
 Usage (via the repo's launcher, which sets PYTHONPATH/env):
   bash scripts/remote/run_client.sh scripts/train/train_http_multiprod.py \
     --lance-dataset <path> --steps 2000
-Recommended (GPU-saturating, auto producer count):
-  --batch-size 128            # 8-GPU data-parallel (must be a multiple of 8)
-  --num-producers auto        # default; auto-selects 8 at bs=128
+Recommended (pass the server's GPU count, it auto-matches the optimal config):
+  --num-gpus 8                # server sees 8 GPUs -> producers=8, bs=128
+  --num-gpus 4                # server sees 4 GPUs -> producers=4, bs=128
+  --num-gpus 1                # single GPU -> producers=1, bs=128
+  # bs=128 is the measured sweet spot for 1/2/4/8-GPU. producers==num_gpus is
+  # required (4-GPU with >4 producers silently exits ~step 221). bs must be a
+  # multiple of num_gpus for data-parallel sharding.
+Without --num-gpus, falls back to --num-producers auto (selects by batch_size).
 """
 
 from __future__ import annotations
@@ -130,12 +135,30 @@ class MultiProducerPrefetcher:
 def auto_num_producers(batch_size: int) -> int:
     """Calibrated (2026-07-28, 8x A800, mano): bs<=8->1, 64->4, 128->8.
     Rule: num_producers >= ceil(data_load/gpu_compute). 8 @ bs=128 -> sm% 55.7%.
+    Only used when --num-gpus is NOT passed. Prefer --num-gpus (producers==cards).
     """
     if batch_size <= 8:
         return 1
     if batch_size <= 64:
         return 4
     return 8
+
+
+def producers_for_gpus(num_gpus: int, batch_size: int) -> int:
+    """Optimal producers = card count (measured 1/2/4/8-GPU, 2026-08-01):
+    producers must equal the server's visible GPU count, else a silent exit
+    occurs at >4 producers on a 4-GPU server. bs must be a multiple of
+    num_gpus for data-parallel sharding. bs=128 is the sweet spot for all
+    card counts (1/2/4/8-GPU all measured at bs=128).
+    """
+    if num_gpus <= 0:
+        raise ValueError(f"num_gpus must be positive, got {num_gpus}")
+    if batch_size % num_gpus != 0:
+        raise ValueError(
+            f"batch_size {batch_size} must be a multiple of num_gpus {num_gpus} "
+            f"for data-parallel sharding (per-card = {batch_size}/{num_gpus})"
+        )
+    return num_gpus
 
 
 def _compute_norm_stats_fast(dataset) -> dict:
@@ -169,7 +192,13 @@ def main() -> int:
     p.add_argument("--model", default=BASE_MODEL, choices=L.MODEL_CHOICES)
     p.add_argument("--steps", type=int, default=2000)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--num-producers", default="auto", help="'auto' (default) or explicit int")
+    p.add_argument("--num-gpus", type=int, default=None,
+                   help="server's visible GPU count. When set, auto-matches the "
+                        "optimal config: producers==num_gpus (measured sweet spot "
+                        "for 1/2/4/8-GPU), and validates batch_size is a multiple "
+                        "of num_gpus. bs=128 works for all card counts. Mutually "
+                        "exclusive with --num-producers.")
+    p.add_argument("--num-producers", default="auto", help="'auto' (default) or explicit int; ignored if --num-gpus set")
     p.add_argument("--prefetch-depth", type=int, default=0, help="0=max(2,num_producers)")
     p.add_argument("--lora-rank", type=int, default=16)
     p.add_argument("--seed", type=int, default=42)
@@ -188,12 +217,21 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    # num_producers
-    if args.num_producers == "auto":
+    # num_producers: prefer --num-gpus (producers == server's visible GPU count,
+    # the measured sweet spot for 1/2/4/8-GPU). Fall back to auto-by-batch-size
+    # only when --num-gpus is not given.
+    if args.num_gpus is not None:
+        num_producers = producers_for_gpus(args.num_gpus, args.batch_size)
+        print(json.dumps({"num_gpus": args.num_gpus,
+                          "num_producers": num_producers,
+                          "batch_size": args.batch_size,
+                          "per_card_samples": args.batch_size // args.num_gpus,
+                          "note": "producers == num_gpus (measured optimal); bs=128 sweet spot for all card counts"}), flush=True)
+    elif args.num_producers == "auto":
         num_producers = auto_num_producers(args.batch_size)
         print(json.dumps({"num_producers_auto": num_producers,
                           "batch_size": args.batch_size,
-                          "note": "pass --num-producers <N> to override"}), flush=True)
+                          "note": "pass --num-gpus <N> to match server GPU count (recommended)"}), flush=True)
     else:
         num_producers = max(1, int(args.num_producers))
     prefetch_depth = args.prefetch_depth or max(2, num_producers)
@@ -233,22 +271,42 @@ def main() -> int:
     started = time.time()
     print(f"{'step':>4} {'loss':>8}  (bs={args.batch_size} producers={num_producers}, sync HTTP + multi-producer prefetch)", flush=True)
 
+    timing = str(os.environ.get("MINT_TIMING") or "").strip() in ("1", "true", "True")
     try:
         for step in range(1, args.steps + 1):
             t0 = time.perf_counter()
             batch = prefetcher.next_batch()  # built by producer threads; queue_wait~0 when fed
             t1 = time.perf_counter()
-            result = L._await_result(base_url, headers, L._post_json(
-                base_url, "/api/v1/mint/vla/train_step", headers,
-                {"model_id": model_id, "loss_fn": "flow_matching", "data": batch},
-            ))
-            t2 = time.perf_counter()
-            metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
-            loss = metrics.get("loss:mean")
-            steps_log.append({"step": step, "loss": loss, "metrics": metrics})
-            print(json.dumps({"step": step, "loss": loss,
-                               "queue_wait": round(t1 - t0, 3),
-                               "step_time": round(t2 - t0, 3)}), flush=True)
+            if timing:
+                # Split the HTTP path: POST (serialize+upload+server-enqueue) vs
+                # retrieve_future (server forward_backward+optim_step + download).
+                post_res = L._post_json(
+                    base_url, "/api/v1/mint/vla/train_step", headers,
+                    {"model_id": model_id, "loss_fn": "flow_matching", "data": batch},
+                )
+                t1b = time.perf_counter()
+                result = L._await_result(base_url, headers, post_res)
+                t2 = time.perf_counter()
+                metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+                loss = metrics.get("loss:mean")
+                steps_log.append({"step": step, "loss": loss, "metrics": metrics})
+                print(json.dumps({"step": step, "loss": loss,
+                                   "queue_wait": round(t1 - t0, 3),
+                                   "post_time": round(t1b - t1, 3),
+                                   "retrieve_time": round(t2 - t1b, 3),
+                                   "step_time": round(t2 - t0, 3)}), flush=True)
+            else:
+                result = L._await_result(base_url, headers, L._post_json(
+                    base_url, "/api/v1/mint/vla/train_step", headers,
+                    {"model_id": model_id, "loss_fn": "flow_matching", "data": batch},
+                ))
+                t2 = time.perf_counter()
+                metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+                loss = metrics.get("loss:mean")
+                steps_log.append({"step": step, "loss": loss, "metrics": metrics})
+                print(json.dumps({"step": step, "loss": loss,
+                                   "queue_wait": round(t1 - t0, 3),
+                                   "step_time": round(t2 - t0, 3)}), flush=True)
 
         save_result = {}
         if args.save_checkpoint_name:

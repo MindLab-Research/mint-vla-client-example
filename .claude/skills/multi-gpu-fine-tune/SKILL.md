@@ -37,8 +37,8 @@ description: 纯 HTTP 多卡 LoRA 微调 OpenPI pi0.5 — 不 import mint_server
 |---|---|---|
 | Lance 数据集路径 | (必填) | `image/wrist_image/state/actions/prompt` schema |
 | 训练步数 | 400 | |
-| batch size | 128 (8 卡) | **必须是可见 GPU 数 (8) 的倍数**, 否则 batch 不会数据并行分片 (退化为每卡重复算同一份, 仍能跑但拿不到多卡加速) |
-| 生产者数 | auto (bs=128→8) | 1=可复现串行; ≥2 每个 producer 独立 dataset/rng |
+| **server GPU 数** | **必填** | **传 `--num-gpus N`, client 自动匹配最优参数**: producers=N (实测 1/2/4/8 卡甜点), bs=128 (所有卡数通用)。**生产者数必须等于卡数**, 否则 4 卡用 >4 生产者会静默退出 |
+| batch size | 128 | bs=128 是 1/2/4/8 卡通用甜点; 若改, 必须是 num_gpus 的倍数 (否则数据并行不分片) |
 | checkpoint 名 | 省略→自动 | 省略则不存 checkpoint (仅 probe) |
 | LoRA rank | 16 | server 目前硬拒其他值 |
 | base model | `openpi/pi05-libero-low-mem-finetune` | 唯一支持的 openpi_pi05 后端模型 |
@@ -54,16 +54,20 @@ curl -s http://localhost:<port>/openapi.json | head   # 200 即就绪
 
 ### 2. 跑训练 (用启动器, 它配好 PYTHONPATH/env)
 
+**只需传 `--num-gpus`(server 的可见 GPU 数), client 自动匹配最优参数** (producers=num_gpus, bs=128):
+
 ```bash
 MINT_BASE_URL=http://localhost:<port> \
 bash scripts/remote/run_client.sh scripts/train/train_http_multiprod.py \
   --base-url http://localhost:<port> \
   --lance-dataset <lance-path> \
-  --steps 400 --batch-size 128 \
-  --num-producers auto \
+  --steps 400 --num-gpus 8 \      # 8 卡 server; 4 卡传 4, 2 卡传 2, 1 卡传 1
   --save-checkpoint-name <name>   # 省略则不存 checkpoint
   --output-json results/logs/<run>.json
 ```
+
+`--num-gpus` 会自动: producers=卡数 (实测甜点), bs 默认 128 (1/2/4/8 卡通用), 校验 bs 是 num_gpus 倍数。启动时打印 `{"num_gpus": N, "num_producers": N, "per_card_samples": 128/N}` 确认匹配。
+不传 `--num-gpus` 则回退 `--num-producers auto` (按 bs 选, 兼容旧用法, 但不推荐)。
 
 启动器预检会先打 `/openapi.json`; 端口不对会立即报 `MINT server preflight failed`。
 
