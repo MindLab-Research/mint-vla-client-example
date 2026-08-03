@@ -730,16 +730,23 @@ def render_release_row(
     image_bytes = sum(map(len, head_images)) + sum(map(len, wrist_images))
     source_hands = source.get("hands") or []
     source_slots = source_meta.get("hand_slots") or []
+    source_names = source_meta.get("hand_names") or []
     source_shapes = source_meta.get("mano_hand_shapes") or []
     if (
         not isinstance(source_slots, list)
         or len(source_slots) != len(source_hands)
         or source_slots.count("right") != 1
-        or len(source_shapes) != len(source_hands)
+        or not isinstance(source_names, list)
+        or source_names.count("right") != 1
+        or len(source_shapes) != len(source_names)
     ):
-        raise ValueError("source hand slots/shapes cannot resolve exactly one right hand")
-    right_index = source_slots.index("right")
-    right_shape = [source_shapes[right_index]]
+        raise ValueError(
+            "source hand_slots cannot resolve right hand or "
+            "hand_names/mano_hand_shapes are not aligned"
+        )
+    # hands use sparse physical slots, while mano_hand_shapes is compact and
+    # follows hand_names. These indices are intentionally resolved separately.
+    right_shape = [source_shapes[source_names.index("right")]]
     source_identity = str(source_provenance.get("source_identity"))
     if source_identity != quality.get("source_identity"):
         raise ValueError("release source provenance identity mismatch")
