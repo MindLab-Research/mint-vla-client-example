@@ -14,8 +14,8 @@ fi
 
 : "${MINT_BASE_URL:=http://127.0.0.1:30532}"
 : "${MINT_API_KEY:=tml-dummy}"
-: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16}"
-: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16}"
+: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-state46-28dof}"
+: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-state46-28dof}"
 : "${MINT_GRB_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl}"
 : "${MINT_CPU_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu}"
 : "${MINT_EXTRA_PYDEPS:=/vePFS-Mindverse/user/intern/wenxi/mint_env/extra-pydeps}"
