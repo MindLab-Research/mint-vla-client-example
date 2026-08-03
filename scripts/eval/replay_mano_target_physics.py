@@ -17,9 +17,13 @@ from scripts.eval import manorl_native_physics as physics
 DT=physics.DT; FRAME_DT=0.005; SUBSTEPS=physics.NATIVE_SUBSTEPS; HAND_DIM=physics.HAND_DIM
 CONTRACT='mano_native_target_replay_28d_200hz_v1'
 SOURCE_CONTRACT='synthetic_mano_28d_checkpoint_rollout_v2_2'
-EXPECTED_DATASET_VERSION=1; EXPECTED_ROWS=16_905; EXPECTED_FRAGMENTS=133
-DEFAULT_DATASET=('/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/source/'
-                 'guangguan_all_actions_checkpoint2200_ratio5_seed42_v22.lance')
+EXPECTED_DATASET_VERSION=1; EXPECTED_ROWS=5_425; EXPECTED_FRAGMENTS=43
+RELEASE_ROOT=Path('/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand')
+DEFAULT_DATASET=str(RELEASE_ROOT/'source/guangguan_all_actions_checkpoint2200_ratio5_seed42_v22.lance')
+DEFAULT_ACCEPTED_MANIFEST=str(RELEASE_ROOT/'manifests/guangguan_merged_v1_quality_rules_8cm100f_rot30deg.accepted_rows.json')
+DEFAULT_FILTER_VERIFICATION=str(RELEASE_ROOT/'manifests/source_filter_verification.json')
+EXPECTED_ACCEPTED_MANIFEST_SHA256='2ae0dbd86a4fadc25d25fbc4ea692651761119ac0a7142d205ec5921186d582c'
+EXPECTED_FILTER_VERIFICATION_SHA256='f85351f5ecb145fc720f5909e0b439e76f92d3fa43fc3321d43c772e4fe7e9c3'
 SOURCE_COLUMNS=['index','trajectory_metadata','timestamp','hands','objects','provenance']
 _SCENES={}
 
@@ -84,30 +88,60 @@ def validate_dataset(ds,path,version):
     return {'path':str(path),'version':version,'row_count':rows,'fragment_count':fragments,'schema_names':names,'metadata_sha256':lance_fingerprint(path)}
 
 
-def build_source_index(ds,batch_size=128):
-    """Stream compact identity metadata only; trajectory arrays stay in Lance."""
-    entries=[]; scanner=ds.scanner(columns=['index','trajectory_metadata','provenance'],batch_size=batch_size)
+def validate_filter_contract(accepted_path,verification_path,dataset_path,source_summary):
+    accepted_path=Path(accepted_path).expanduser().resolve(); verification_path=Path(verification_path).expanduser().resolve()
+    if sha256(accepted_path)!=EXPECTED_ACCEPTED_MANIFEST_SHA256: raise ValueError('accepted-row manifest SHA256 mismatch')
+    if sha256(verification_path)!=EXPECTED_FILTER_VERIFICATION_SHA256: raise ValueError('source filter verification SHA256 mismatch')
+    accepted=json.loads(accepted_path.read_text()); verification=json.loads(verification_path.read_text()); rows=accepted.get('rows')
+    selection=accepted.get('selection') or {}
+    if accepted.get('schema')!='manorl.synthetic_quality_accepted_row_manifest.v1' or not isinstance(rows,list): raise ValueError('invalid accepted-row manifest schema')
+    if len(rows)!=EXPECTED_ROWS or selection.get('rows_to_retain')!=EXPECTED_ROWS or selection.get('rows_to_reject')!=11_480: raise ValueError('accepted-row population mismatch')
+    original_indices=[int(row.get('row_index',-1)) for row in rows]
+    if original_indices!=sorted(original_indices) or len(set(original_indices))!=EXPECTED_ROWS or not all(row.get('accepted') is True for row in rows): raise ValueError('accepted-row order/identity contract mismatch')
+    if verification.get('status')!='verified_and_rejected_rows_deleted' or verification.get('rows_before')!=16_905 or verification.get('rows_retained')!=EXPECTED_ROWS or verification.get('rows_deleted')!=11_480: raise ValueError('source filter verification population mismatch')
+    if Path(verification.get('server_source_lance','')).resolve()!=Path(dataset_path).resolve() or verification.get('schema')!=source_summary['schema_names']: raise ValueError('source filter verification dataset/schema mismatch')
+    if verification.get('accepted_manifest_sha256')!=EXPECTED_ACCEPTED_MANIFEST_SHA256 or verification.get('nas_source_modified') is not False or verification.get('original_server_backup_deleted') is not True: raise ValueError('source filter verification integrity mismatch')
+    filtered_manifest=Path(verification.get('filtered_tree_manifest','')).resolve()
+    if not filtered_manifest.is_file() or sha256(filtered_manifest)!=verification.get('filtered_tree_manifest_sha256'): raise ValueError('filtered source tree manifest mismatch')
+    summary={'accepted_manifest':str(accepted_path),'accepted_manifest_sha256':EXPECTED_ACCEPTED_MANIFEST_SHA256,
+             'filter_verification':str(verification_path),'filter_verification_sha256':EXPECTED_FILTER_VERIFICATION_SHA256,
+             'filtered_tree_manifest':str(filtered_manifest),'filtered_tree_manifest_sha256':verification['filtered_tree_manifest_sha256'],
+             'rows_before':verification['rows_before'],'rows_retained':verification['rows_retained'],'rows_deleted':verification['rows_deleted'],
+             'predicate':selection.get('predicate'),'row_index_order':selection.get('row_index_order'),
+             'row_index_sha256':selection.get('row_index_sha256'),'uuid_sha256':selection.get('uuid_sha256')}
+    return rows,summary
+
+
+def build_source_index(ds,accepted_rows,batch_size=128):
+    """Stream compact IDs and bind every filtered row to its accepted lineage."""
+    if len(accepted_rows)!=EXPECTED_ROWS: raise ValueError(f'accepted identity count {len(accepted_rows)} != {EXPECTED_ROWS}')
+    entries=[]; scanner=ds.scanner(columns=['index','provenance'],batch_size=batch_size)
     for batch in scanner.to_batches():
         for row in batch.to_pylist():
-            i=len(entries); idx=row.get('index') or {}; meta=row.get('trajectory_metadata') or {}; prov=row.get('provenance') or {}
-            obj=idx.get('scene'); objects=meta.get('object_names') or []; gesture=meta.get('gesture'); identity=prov.get('source_identity')
-            if idx.get('is_generated') is not True or not isinstance(obj,str) or obj not in objects or not isinstance(gesture,str) or prov.get('contract')!=SOURCE_CONTRACT: raise ValueError(f'invalid compact source identity at row {i}')
-            if not isinstance(identity,str) or not identity.startswith(f'{obj}_{gesture}_'): raise ValueError(f'source identity mismatch at row {i}')
-            entries.append({'row_index':i,'uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),
-                            'object_type':obj,'gesture':gesture,'total_frames':int(meta.get('total_frames',-1)),
+            i=len(entries)
+            if i>=len(accepted_rows): raise ValueError('filtered source contains rows beyond accepted manifest')
+            accepted=accepted_rows[i]; idx=row.get('index') or {}; prov=row.get('provenance') or {}
+            obj=idx.get('scene'); identity=prov.get('source_identity'); gesture=str(accepted.get('pair','')).rsplit('_',1)[-1]
+            observed=(str(idx.get('uuid')),str(obj),str(identity)); expected=(str(accepted.get('uuid')),str(accepted.get('object')),str(accepted.get('source_identity')))
+            if idx.get('is_generated') is not True or prov.get('contract')!=SOURCE_CONTRACT or observed!=expected: raise ValueError(f'filtered/accepted identity mismatch at row {i}: {observed} != {expected}')
+            if not identity.startswith(f'{obj}_{gesture}_'): raise ValueError(f'source identity/gesture mismatch at filtered row {i}')
+            entries.append({'row_index':i,'original_merged_row_index':int(accepted['row_index']),
+                            'uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),
+                            'object_type':obj,'gesture':gesture,'total_frames':int(accepted.get('frames',-1)),
                             'source_identity':identity,'source_dataset':prov.get('dataset_path'),
                             'source_dataset_version':prov.get('dataset_version'),'source_row_index':prov.get('row_index'),
                             'checkpoint_update':prov.get('checkpoint_update'),'checkpoint_sha256':prov.get('checkpoint_sha256')})
     if len(entries)!=EXPECTED_ROWS: raise ValueError(f'streamed identity count {len(entries)} != {EXPECTED_ROWS}')
-    uuids=[e['uuid'] for e in entries]
-    if len(set(uuids))!=len(uuids): raise ValueError('generated UUIDs are not unique')
+    uuids=[entry['uuid'] for entry in entries]; original=[entry['original_merged_row_index'] for entry in entries]
+    if len(set(uuids))!=len(uuids) or original!=sorted(original) or len(set(original))!=len(original): raise ValueError('filtered UUID/original-row identity is not unique and ordered')
     return entries
 
 
-def make_run_identity(args,object_name,source_summary):
+def make_run_identity(args,object_name,source_summary,filter_summary):
     return {'contract':CONTRACT,'source_contract':SOURCE_CONTRACT,'object':object_name,
             'source_dataset':str(Path(args.dataset).resolve()),'source_dataset_version':int(args.dataset_version),
-            'source_metadata_sha256':source_summary['metadata_sha256'],'script_sha256':sha256(Path(__file__)),
+            'source_metadata_sha256':source_summary['metadata_sha256'],'filtered_population':filter_summary,
+            'script_sha256':sha256(Path(__file__)),
             'physics_adapter_sha256':sha256(Path(physics.__file__)),'client_commit':os.environ.get('VLA_CLIENT_GIT_COMMIT','unknown'),
             'manorl':physics.runtime_provenance(object_name),'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS,
             'control_input':'hands[right].urdf_dof_target[t] absolute position target','external_target_modification':False}
@@ -207,7 +241,9 @@ def replay(row_index,row,ident,run_id):
              'dynamics':{'max_contacts':int(max_ncon),'max_contact_force':float(max_force),'max_abs_actuator_force':float(max_act),'max_abs_qvel':float(max_qvel)},'diagnostics':_control_limits(targets[:-1],limits),
              'timing':{'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS,'intervals':T-1,'mj_steps':expected_steps,'sim_time':float(data.time),'object_sim_owned_after_frame0':True,'final_source_target_executed':False},
              'initial_errors':{'qpos':float(qerr[0]),'position_m':float(poserr[0]),'rotation_rad':float(roterr[0])}}
-    result={'status':'ok','grade':grade,'qualified':grade in ('A','B'),'row_index':row_index,'row_uuid':str(row['index']['uuid']),'seed_uuid':str(row['index']['seed_uuid']),'source_identity':ident['source_identity'],'object':obj,'gesture':ident['gesture'],'frames':T,'valid_transition_count':T-1,'metrics':metrics,'provenance':run_id}
+    result={'status':'ok','grade':grade,'qualified':grade in ('A','B'),'row_index':row_index,
+            'original_merged_row_index':int(ident['original_merged_row_index']),
+            'row_uuid':str(row['index']['uuid']),'seed_uuid':str(row['index']['seed_uuid']),'source_identity':ident['source_identity'],'object':obj,'gesture':ident['gesture'],'frames':T,'valid_transition_count':T-1,'metrics':metrics,'provenance':run_id}
     arrays={'timestamp':ts.astype(np.float64),'simulated_time':sim_time.astype(np.float64),'state_producing_target_index':np.arange(-1,T-1,dtype=np.int64),'target_index':np.arange(T-1,dtype=np.int64),'target_qpos':targets[:-1].astype(np.float32),'source_target_qpos':targets.astype(np.float32),
             'simulated_full_qpos':full_q.astype(np.float32),'simulated_full_qvel':full_v.astype(np.float32),'simulated_hand_qpos':sim_q.astype(np.float32),'recorded_hand_qpos':q.astype(np.float32),'simulated_object_position':sim_pos.astype(np.float32),'recorded_object_position':ref_pos.astype(np.float32),
             'simulated_object_quaternion':sim_quat.astype(np.float32),'recorded_object_quaternion':ref_quat.astype(np.float32),'qpos_error':qerr.astype(np.float32),'object_position_error':poserr.astype(np.float32),'object_rotation_error':roterr.astype(np.float32)}
@@ -226,7 +262,9 @@ def record_one(job):
         return {'row_index':row_index,'status':'ok','grade':result['grade']}
     except Exception as e:
         idx=row.get('index') or {}
-        invalid={'status':'invalid','grade':None,'qualified':False,'row_index':row_index,'row_uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),'object':ident.get('object_type'),'gesture':ident.get('gesture'),'provenance':run_id,'error_type':type(e).__name__,'error':str(e),'traceback':traceback.format_exc(limit=10)}
+        invalid={'status':'invalid','grade':None,'qualified':False,'row_index':row_index,
+                 'original_merged_row_index':ident.get('original_merged_row_index'),
+                 'row_uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),'object':ident.get('object_type'),'gesture':ident.get('gesture'),'provenance':run_id,'error_type':type(e).__name__,'error':str(e),'traceback':traceback.format_exc(limit=10)}
         atomic_json(js,invalid); return {'row_index':row_index,'status':'invalid','error':f'{type(e).__name__}: {e}'}
 
 def validate_record_population(records,expected_rows,entries,object_name,run_id=None):
@@ -238,6 +276,8 @@ def validate_record_population(records,expected_rows,entries,object_name,run_id=
     if bad: raise ValueError(f'cannot aggregate {len(bad)} non-ok rows: {[r["row_index"] for r in bad[:20]]}')
     uuids=[r.get('row_uuid') for r in records]; expected=[str(entries[i].get('uuid')) for i in expected_rows]
     if uuids!=expected or len(set(uuids))!=len(uuids): raise ValueError('record UUID order/uniqueness mismatch')
+    original=[r.get('original_merged_row_index') for r in records]; expected_original=[entries[i].get('original_merged_row_index') for i in expected_rows]
+    if original!=expected_original: raise ValueError('record original merged-row identity mismatch')
     if any(r.get('object')!=object_name for r in records): raise ValueError('record object mismatch')
     if run_id is not None and any(r.get('provenance')!=run_id for r in records): raise ValueError('record provenance mismatch')
 
@@ -283,6 +323,7 @@ def iter_jobs(ds,rows,entries,out,resume,run_id,batch_size):
 def main():
  p=argparse.ArgumentParser(description=__doc__)
  p.add_argument('--dataset',default=DEFAULT_DATASET); p.add_argument('--dataset-version',type=int,default=EXPECTED_DATASET_VERSION)
+ p.add_argument('--accepted-manifest',default=DEFAULT_ACCEPTED_MANIFEST); p.add_argument('--filter-verification',default=DEFAULT_FILTER_VERIFICATION)
  p.add_argument('--output-dir',required=True); p.add_argument('--object',required=True)
  p.add_argument('--rows',default='',help='global indices/ranges; ranges are end-exclusive and must belong to --object')
  p.add_argument('--workers',type=int,default=8); p.add_argument('--batch-size',type=int,default=8); p.add_argument('--index-batch-size',type=int,default=128)
@@ -291,10 +332,12 @@ def main():
  if min(a.workers,a.batch_size,a.index_batch_size)<1: raise ValueError('workers and batch sizes must be positive')
  import lance
  dataset_path=Path(a.dataset).expanduser().resolve(); ds=lance.dataset(str(dataset_path),version=a.dataset_version)
- source=validate_dataset(ds,dataset_path,a.dataset_version); entries=build_source_index(ds,a.index_batch_size); all_rows=object_rows(entries,a.object); selected=all_rows if not a.rows else parse_rows(a.rows,source['row_count'])
+ source=validate_dataset(ds,dataset_path,a.dataset_version)
+ accepted_rows,filter_summary=validate_filter_contract(a.accepted_manifest,a.filter_verification,dataset_path,source)
+ entries=build_source_index(ds,accepted_rows,a.index_batch_size); all_rows=object_rows(entries,a.object); selected=all_rows if not a.rows else parse_rows(a.rows,source['row_count'])
  outside=[i for i in selected if entries[i].get('object_type')!=a.object]
  if outside: raise ValueError(f'rows not belonging to {a.object}: {outside[:20]}')
- root=Path(a.output_dir).expanduser().resolve(); out=root/'objects'/a.object; run_id=make_run_identity(a,a.object,source)
+ root=Path(a.output_dir).expanduser().resolve(); out=root/'objects'/a.object; run_id=make_run_identity(a,a.object,source,filter_summary)
  with single_object_lock(root):
   ensure_manifest(out,run_id,all_rows)
   if a.aggregate:

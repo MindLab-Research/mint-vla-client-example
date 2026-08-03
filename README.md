@@ -293,7 +293,9 @@ for a copy-paste command and the low-memory fallback.
 - `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target
   physics-quality producer, migrated in place to metadata-resolved right-hand
   28D targets while preserving object locking, resume checksums, grading,
-  multiprocessing, and Lance aggregation.
+  multiprocessing, and Lance aggregation. Its production population is the
+  verified 5,425-row filtered Lance; startup binds every filtered UUID to the
+  accepted-row manifest and records both filtered and original merged indices.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,

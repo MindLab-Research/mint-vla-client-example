@@ -27,12 +27,12 @@ def test_parse_rows_uses_end_exclusive_ranges_and_deduplicates():
 
 def test_population_validation_rejects_missing_rows_and_uuid_aliases():
     entries = [
-        {"uuid": "u0"},
-        {"uuid": "u1"},
+        {"uuid": "u0", "original_merged_row_index": 10},
+        {"uuid": "u1", "original_merged_row_index": 20},
     ]
     valid = [
-        {"row_index": 0, "status": "ok", "row_uuid": "u0", "object": "cube"},
-        {"row_index": 1, "status": "ok", "row_uuid": "u1", "object": "cube"},
+        {"row_index": 0, "original_merged_row_index": 10, "status": "ok", "row_uuid": "u0", "object": "cube"},
+        {"row_index": 1, "original_merged_row_index": 20, "status": "ok", "row_uuid": "u1", "object": "cube"},
     ]
     replay.validate_record_population(valid, [0, 1], entries, "cube")
     with pytest.raises(ValueError, match="population mismatch"):
@@ -95,6 +95,7 @@ def _identity():
         "object_type": "cube1",
         "gesture": "01",
         "source_identity": "cube1_01_1",
+        "original_merged_row_index": 2239,
     }
 
 
@@ -177,9 +178,56 @@ def test_replay_preserves_old_loop_but_executes_only_raw_targets_with_successors
     result, trace = replay.replay(7, row, _identity(), {"contract": "test"})
     source_targets = np.asarray(row["hands"][1]["urdf_dof_target"])
 
+    assert result["original_merged_row_index"] == 2239
     assert result["metrics"]["timing"]["mj_steps"] == 6
     assert result["metrics"]["timing"]["final_source_target_executed"] is False
     np.testing.assert_allclose(executed, source_targets[:-1])
     np.testing.assert_allclose(trace["target_qpos"], source_targets[:-1])
     np.testing.assert_allclose(trace["source_target_qpos"], source_targets)
     np.testing.assert_array_equal(trace["target_index"], [0, 1, 2])
+
+
+def test_compact_index_binds_filtered_rows_to_accepted_lineage(monkeypatch):
+    class Batch:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def to_pylist(self):
+            return self._rows
+
+    class Scanner:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def to_batches(self):
+            return [Batch(self._rows)]
+
+    class Dataset:
+        def scanner(self, *, columns, batch_size):
+            assert columns == ["index", "provenance"]
+            assert batch_size == 16
+            return Scanner([
+                {
+                    "index": {"uuid": "u0", "seed_uuid": "s0", "scene": "cube1", "is_generated": True},
+                    "provenance": {"contract": replay.SOURCE_CONTRACT, "source_identity": "cube1_01_7"},
+                },
+                {
+                    "index": {"uuid": "u1", "seed_uuid": "s1", "scene": "banana", "is_generated": True},
+                    "provenance": {"contract": replay.SOURCE_CONTRACT, "source_identity": "banana_02_9"},
+                },
+            ])
+
+    accepted = [
+        {"row_index": 7, "uuid": "u0", "object": "cube1", "pair": "cube1_01", "source_identity": "cube1_01_7", "frames": 4},
+        {"row_index": 99, "uuid": "u1", "object": "banana", "pair": "banana_02", "source_identity": "banana_02_9", "frames": 5},
+    ]
+    monkeypatch.setattr(replay, "EXPECTED_ROWS", 2)
+
+    entries = replay.build_source_index(Dataset(), accepted, batch_size=16)
+
+    assert [entry["row_index"] for entry in entries] == [0, 1]
+    assert [entry["original_merged_row_index"] for entry in entries] == [7, 99]
+    assert [entry["gesture"] for entry in entries] == ["01", "02"]
+    changed = [dict(accepted[0]), {**accepted[1], "uuid": "wrong"}]
+    with pytest.raises(ValueError, match="filtered/accepted identity mismatch"):
+        replay.build_source_index(Dataset(), changed, batch_size=16)
