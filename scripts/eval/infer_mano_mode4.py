@@ -145,6 +145,83 @@ def condition_row_language(
     }
 
 
+def initialize_replay_snapshot_window(
+    *,
+    model,
+    data,
+    row: dict,
+    window_start: int,
+    object_addr: int,
+    hand_addrs: np.ndarray,
+) -> dict:
+    """Initialize exact accepted pose plus interval-ending generalized velocity."""
+    if window_start < 0:
+        raise ValueError(f"invalid replay snapshot frame: {window_start}")
+    hand = np.asarray(row["hands"][0]["urdf_dof"], dtype=np.float64)
+    targets = np.asarray(row["hands"][0]["urdf_dof_target"], dtype=np.float64)
+    object_pos = np.asarray(row["objects"][0]["pos"], dtype=np.float64)
+    object_rot_aa = np.asarray(row["objects"][0]["rot_aa"], dtype=np.float64)
+    frame_count = len(hand)
+    if hand.shape != (frame_count, HAND_DIM) or targets.shape != (frame_count, HAND_DIM):
+        raise ValueError(f"invalid replay hand/target shapes: {hand.shape}/{targets.shape}")
+    if object_pos.shape != (frame_count, 3) or object_rot_aa.shape != (frame_count, 3):
+        raise ValueError(
+            f"invalid replay object pose shapes: {object_pos.shape}/{object_rot_aa.shape}"
+        )
+    if window_start >= frame_count:
+        raise ValueError(f"replay snapshot frame {window_start} >= {frame_count}")
+    if not all(np.all(np.isfinite(value)) for value in (hand, targets, object_pos, object_rot_aa)):
+        raise ValueError("non-finite replay snapshot initialization inputs")
+
+    previous_qpos = None
+    if window_start > 0:
+        full.set_scene_state(
+            model,
+            data,
+            state=hand[window_start - 1],
+            object_pos=object_pos[window_start - 1],
+            object_rot_aa=object_rot_aa[window_start - 1],
+            object_addr=object_addr,
+            hand_addrs=hand_addrs,
+        )
+        previous_qpos = np.array(data.qpos, dtype=np.float64, copy=True)
+    full.set_scene_state(
+        model,
+        data,
+        state=hand[window_start],
+        object_pos=object_pos[window_start],
+        object_rot_aa=object_rot_aa[window_start],
+        object_addr=object_addr,
+        hand_addrs=hand_addrs,
+    )
+    current_qpos = np.array(data.qpos, dtype=np.float64, copy=True)
+    data.qvel[:] = 0.0
+    if previous_qpos is not None:
+        mujoco.mj_differentiatePos(
+            model,
+            data.qvel,
+            0.005,
+            previous_qpos,
+            current_qpos,
+        )
+    data.qpos[:] = current_qpos
+    data.ctrl[:] = targets[window_start]
+    data.qfrc_applied[:] = 0.0
+    mujoco.mj_forward(model, data)
+    return {
+        "initialization_mode": "accepted_pose_backward_qvel_snapshot_v1",
+        "source_frame": int(window_start),
+        "qvel_source": (
+            "zero_at_source_frame0"
+            if window_start == 0
+            else "mj_differentiatePos_previous_to_current_5ms"
+        ),
+        "ctrl_source": "urdf_dof_target_at_source_frame",
+        "max_abs_qvel": float(np.max(np.abs(data.qvel))),
+        "max_abs_ctrl": float(np.max(np.abs(data.ctrl))),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:30530")
@@ -211,6 +288,15 @@ def parse_args() -> argparse.Namespace:
         choices=("contact", "full"),
         default="contact",
         help="contact initializes and evaluates only the manifest window; full is an explicit stress test",
+    )
+    parser.add_argument(
+        "--initialization-mode",
+        choices=("source-window", "replay-snapshot-window"),
+        default="source-window",
+        help=(
+            "replay-snapshot-window restores accepted pose, backward-difference qvel, "
+            "and frame target; required for replay-snapshot State54 data"
+        ),
     )
     parser.add_argument(
         "--contact-window-manifest",
@@ -662,18 +748,39 @@ def run_variant(
     state = np.zeros(state_dim, dtype=np.float32)
     state[:HAND_DIM] = np.asarray(row["state"][window_start], dtype=np.float32)[:HAND_DIM]
     clipping = new_clipping_diagnostics(limits)
-    data.qvel[:] = 0.0
-    full.set_scene_state(
-        model,
-        data,
-        state=state[:HAND_DIM],
-        object_pos=row["objects"][0]["pos"][window_start],
-        object_rot_aa=row["objects"][0]["rot_aa"][window_start],
-        object_addr=object_addr,
-        hand_addrs=hand_addrs,
-    )
-    import mujoco as _mujoco
-    _mujoco.mj_forward(model, data)
+    initialization_mode = str(getattr(args, "initialization_mode", "source-window"))
+    if initialization_mode == "replay-snapshot-window":
+        if getattr(args, "state_contract", None) != STATE54_CONTRACT_ID:
+            raise ValueError("replay-snapshot-window is supported only for State54")
+        initialization = initialize_replay_snapshot_window(
+            model=model,
+            data=data,
+            row=row,
+            window_start=window_start,
+            object_addr=object_addr,
+            hand_addrs=hand_addrs,
+        )
+        state[:HAND_DIM] = np.asarray(data.qpos[hand_addrs], dtype=np.float32)
+    else:
+        data.qvel[:] = 0.0
+        full.set_scene_state(
+            model,
+            data,
+            state=state[:HAND_DIM],
+            object_pos=row["objects"][0]["pos"][window_start],
+            object_rot_aa=row["objects"][0]["rot_aa"][window_start],
+            object_addr=object_addr,
+            hand_addrs=hand_addrs,
+        )
+        mujoco.mj_forward(model, data)
+        initialization = {
+            "initialization_mode": "source_window_pose_zero_qvel_v1",
+            "source_frame": window_start,
+            "qvel_source": "zero",
+            "ctrl_source": "scene_default",
+            "max_abs_qvel": 0.0,
+            "max_abs_ctrl": float(np.max(np.abs(data.ctrl))) if hasattr(data, "ctrl") else 0.0,
+        }
     phase_seconds["scene_setup"] += time.perf_counter() - scene_started
     # Record lift baseline from Mode 4's actual initialized sim state.
     if getattr(args, "state_contract", None) == STATE54_CONTRACT_ID:
@@ -1070,6 +1177,7 @@ def run_variant(
         "state_observation_source": "integrated_mujoco_qpos",
         "image_observation_source": "integrated_mujoco_renderer",
         "object_pose_source": f"sim_owned_after_source_frame_{window_start}",
+        "initialization": initialization,
         "action_source": args.action_source,
         "extended_state": bool(args.extended_state),
         "state_contract": (

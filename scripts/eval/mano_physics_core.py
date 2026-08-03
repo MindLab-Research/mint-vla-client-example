@@ -324,6 +324,10 @@ def step_servo(*, model, data, target, substeps, object_name=None):
             max_force = max(max_force, float(np.linalg.norm(force[:3])))
     if not np.isclose(data.time, started + model.opt.timestep * substeps, rtol=0, atol=1e-10):
         raise FloatingPointError("MuJoCo time mismatch")
+    # mj_step leaves derived kinematics/contact data at its pre-integration
+    # stage. Refresh so policy state, force extraction, and rendering describe
+    # the same post-integration timestamp as data.qpos.
+    mujoco.mj_forward(model, data)
     if not np.isfinite(data.qpos).all() or not np.isfinite(data.qvel).all():
         raise FloatingPointError("MuJoCo non-finite state")
     return {

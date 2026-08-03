@@ -104,6 +104,48 @@ class Mode4ContractTests(unittest.TestCase):
                 model=model, data=data, target=np.zeros(26), substeps=2, object_name="cube1"
             )
             self.assertAlmostEqual(data.time, 0.005)
+            fresh = mujoco.MjData(model)
+            fresh.qpos[:] = data.qpos
+            fresh.qvel[:] = data.qvel
+            mujoco.mj_forward(model, fresh)
+            np.testing.assert_allclose(data.xpos, fresh.xpos, rtol=0, atol=1e-12)
+            np.testing.assert_allclose(data.geom_xpos, fresh.geom_xpos, rtol=0, atol=1e-12)
+        finally:
+            tmp.cleanup()
+
+    def test_replay_snapshot_initialization_restores_pose_velocity_and_target(self):
+        scene = physics.make_scene(
+            "cube1", 64, 64, physics=True, physics_timestep=physics.DT, create_renderer=False
+        )
+        tmp, model, data, _, object_addr, _, hand_addrs, _, _ = scene
+        try:
+            hand = np.zeros((2, 26), dtype=np.float64)
+            hand[1, 0] = 0.002
+            target = np.zeros((2, 26), dtype=np.float64)
+            target[1, 0] = 0.003
+            pos = np.asarray([[0.0, 0.0, 1.0], [0.0, 0.0, 1.001]], dtype=np.float64)
+            rot = np.zeros((2, 3), dtype=np.float64)
+            row = {
+                "hands": [{"urdf_dof": hand, "urdf_dof_target": target}],
+                "objects": [{"pos": pos, "rot_aa": rot}],
+            }
+            diagnostics = mode4.initialize_replay_snapshot_window(
+                model=model,
+                data=data,
+                row=row,
+                window_start=1,
+                object_addr=object_addr,
+                hand_addrs=hand_addrs,
+            )
+            np.testing.assert_allclose(data.qpos[hand_addrs], hand[1], rtol=0, atol=1e-12)
+            np.testing.assert_allclose(data.qpos[object_addr : object_addr + 3], pos[1], rtol=0, atol=1e-12)
+            np.testing.assert_allclose(data.ctrl, target[1], rtol=0, atol=1e-12)
+            self.assertAlmostEqual(float(np.max(np.abs(data.qvel))), 0.4, places=12)
+            self.assertAlmostEqual(data.qvel[object_addr], 0.0, places=12)
+            self.assertEqual(
+                diagnostics["initialization_mode"],
+                "accepted_pose_backward_qvel_snapshot_v1",
+            )
         finally:
             tmp.cleanup()
 
