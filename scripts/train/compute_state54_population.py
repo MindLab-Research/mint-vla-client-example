@@ -12,7 +12,12 @@ import numpy as np
 
 import openpi_vla_smoke_lance_base as L
 from openpi.models.tokenizer import PaligemmaTokenizer
-from scripts.mano_state54_contract import STATE_CONTRACT_ID, STATE_DIM
+from scripts.mano_state54_contract import (
+    STATE_CONTRACT_ID,
+    STATE_DIM,
+    axis_angle_to_matrix,
+    fingertips_in_collision_box_frame,
+)
 from scripts.train.train_cube1_01_compare import (
     GESTURE_LANGUAGE,
     SelectedLanceDataset,
@@ -98,20 +103,32 @@ def effective_prompt(dataset, local_row: int) -> str:
     )
 
 
-def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int, row_digest: str) -> dict:
+def audit_tokens(
+    dataset,
+    norm_dir: Path,
+    output_dir: Path,
+    max_token_len: int,
+    row_digest: str,
+    *,
+    state_noise_std: float,
+    augmentation_seed: int,
+) -> dict:
     stats = L.normalize.load(norm_dir)
     q01 = np.asarray(stats["state"].q01, dtype=np.float32)
     q99 = np.asarray(stats["state"].q99, dtype=np.float32)
     if q01.shape != (STATE_DIM,) or q99.shape != (STATE_DIM,):
         raise ValueError("token audit requires exact 54D quantile stats")
-    # 4096 is only an audit instrument.  It prevents the production tokenizer's
-    # max-length branch from hiding the raw token length under test.
     tokenizer = PaligemmaTokenizer(max_len=4096)
     histogram: dict[int, int] = {}
-    maximum = -1
+    augmented_histogram: dict[int, int] = {}
+    maximum = augmented_maximum = -1
     maximum_examples: list[dict] = []
-    total = 0
-    overflow = 0
+    augmented_maximum_examples: list[dict] = []
+    total = overflow = augmented_overflow = 0
+    qpos_valid = (q99[:26] - q01[:26]) > 1e-6
+    rng = np.random.default_rng(augmentation_seed)
+    noise_square_sum = 0.0
+    noise_value_count = 0
     started = time.time()
     progress_path = output_dir / "token_audit.progress.json"
     for ordinal, local_row in enumerate(sorted(dataset._row_windows)):
@@ -123,41 +140,96 @@ def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int, 
         prompt = effective_prompt(dataset, local_row)
         source_row = dataset._source_row_indices[local_row]
         window = dataset._row_windows[local_row]
+        obj = numeric["objects"][0]
+        object_names = dataset._rows[local_row]["trajectory_metadata"].get("object_names") or []
+        if len(object_names) != 1:
+            raise ValueError(f"row{source_row} has invalid object identity")
         for offset, state in enumerate(normalized):
+            source_frame = window.start_frame + offset
             _tokens, mask = tokenizer.tokenize(prompt, state)
             length = int(np.count_nonzero(mask))
             if length >= 4096:
                 raise ValueError("audit tokenizer ceiling was reached; raw length is unknown")
             histogram[length] = histogram.get(length, 0) + 1
             total += 1
-            if length > max_token_len:
-                overflow += 1
+            overflow += int(length > max_token_len)
+            example = {
+                "source_row": source_row,
+                "source_frame": source_frame,
+                "prompt": prompt,
+                "token_length": length,
+            }
             if length > maximum:
-                maximum = length
-                maximum_examples = [{
-                    "source_row": source_row,
-                    "source_frame": window.start_frame + offset,
-                    "prompt": prompt,
-                    "token_length": length,
-                }]
+                maximum, maximum_examples = length, [example]
             elif length == maximum and len(maximum_examples) < 20:
-                maximum_examples.append({
-                    "source_row": source_row,
-                    "source_frame": window.start_frame + offset,
-                    "prompt": prompt,
-                    "token_length": length,
-                })
+                maximum_examples.append(example)
+
+            if state_noise_std > 0:
+                noise = rng.normal(0.0, state_noise_std, size=32).astype(np.float32)
+                augmented = np.array(state, dtype=np.float32, copy=True)
+                augmented[:26][qpos_valid] += noise[:26][qpos_valid]
+                noise_square_sum += float(np.sum(np.square(noise[:26][qpos_valid])))
+                noise_value_count += int(np.count_nonzero(qpos_valid))
+                raw_qpos = q01[:26] + (
+                    (augmented[:26] + 1.0) * 0.5 * (q99[:26] - q01[:26] + 1e-6)
+                )
+                tip_world = dataset._state54_fk(raw_qpos.astype(np.float32))
+                tip_box = fingertips_in_collision_box_frame(
+                    tip_world,
+                    np.asarray(obj["pos"][source_frame], dtype=np.float64),
+                    axis_angle_to_matrix(
+                        np.asarray(obj["rot_aa"][source_frame], dtype=np.float64)
+                    ),
+                    str(object_names[0]),
+                ).reshape(-1)
+                augmented[32:47] = (
+                    (tip_box - q01[32:47])
+                    / (q99[32:47] - q01[32:47] + 1e-6)
+                    * 2.0
+                    - 1.0
+                ).astype(np.float32)
+                _aug_tokens, aug_mask = tokenizer.tokenize(prompt, augmented)
+                aug_length = int(np.count_nonzero(aug_mask))
+                if aug_length >= 4096:
+                    raise ValueError("augmented audit tokenizer ceiling was reached")
+                augmented_histogram[aug_length] = augmented_histogram.get(aug_length, 0) + 1
+                augmented_overflow += int(aug_length > max_token_len)
+                aug_example = {**example, "token_length": aug_length}
+                if aug_length > augmented_maximum:
+                    augmented_maximum, augmented_maximum_examples = aug_length, [aug_example]
+                elif aug_length == augmented_maximum and len(augmented_maximum_examples) < 20:
+                    augmented_maximum_examples.append(aug_example)
         if ordinal % 10 == 0 or ordinal + 1 == len(dataset._row_windows):
             write_json(progress_path, {
                 "completed_rows": ordinal + 1,
                 "total_rows": len(dataset._row_windows),
                 "audited_frames": total,
-                "current_max": maximum,
-                "overflow_count": overflow,
+                "clean_current_max": maximum,
+                "clean_overflow_count": overflow,
+                "augmented_current_max": augmented_maximum,
+                "augmented_overflow_count": augmented_overflow,
                 "elapsed_seconds": time.time() - started,
             })
     if total != len(dataset):
         raise ValueError(f"token audit population mismatch: {total} != {len(dataset)}")
+    augmentation = None
+    if state_noise_std > 0:
+        augmentation = {
+            "requested_sigma": state_noise_std,
+            "seed": augmentation_seed,
+            "samples": total,
+            "realized_sigma": float(np.sqrt(noise_square_sum / noise_value_count)),
+            "minimum_token_length": min(augmented_histogram),
+            "maximum_token_length": augmented_maximum,
+            "headroom_at_maximum": max_token_len - augmented_maximum,
+            "overflow_count": augmented_overflow,
+            "zero_truncation": augmented_overflow == 0,
+            "token_length_histogram": {
+                str(k): augmented_histogram[k] for k in sorted(augmented_histogram)
+            },
+            "maximum_examples": augmented_maximum_examples,
+            "causal_recomputation": "qpos26_noise_then_MuJoCo_FK_tipXYZ15;other_features_clean",
+        }
     result = {
         "state_contract": STATE_CONTRACT_ID,
         "population_row_indices_sha256": row_digest,
@@ -172,13 +244,15 @@ def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int, 
         "zero_truncation": overflow == 0,
         "token_length_histogram": {str(k): histogram[k] for k in sorted(histogram)},
         "maximum_examples": maximum_examples,
+        "augmentation": augmentation,
         "elapsed_seconds": time.time() - started,
         "norm_stats_sha256": hashlib.sha256((norm_dir / "norm_stats.json").read_bytes()).hexdigest(),
     }
     write_json(output_dir / "token_audit.json", result)
-    if overflow:
+    if overflow or augmented_overflow:
         raise ValueError(
-            f"max_token_len={max_token_len} truncates {overflow} frames; observed max={maximum}"
+            f"max_token_len={max_token_len} truncates clean={overflow} augmented={augmented_overflow}; "
+            f"observed maxima={maximum}/{augmented_maximum}"
         )
     return result
 
@@ -194,6 +268,8 @@ def main() -> None:
     parser.add_argument("--state54-replay-feature-release-sha256", required=True)
     parser.add_argument("--mode", choices=("norm", "tokens", "both"), default="both")
     parser.add_argument("--max-token-len", type=int, default=256)
+    parser.add_argument("--state-noise-std", type=float, default=0.0)
+    parser.add_argument("--augmentation-seed", type=int, default=43)
     args = parser.parse_args()
     rows, row_digest = load_rows(args.rows_csv)
     dataset = make_dataset(args, rows)
@@ -202,7 +278,13 @@ def main() -> None:
         print(json.dumps(compute_norm(dataset, args.output_dir, row_digest), sort_keys=True), flush=True)
     if args.mode in ("tokens", "both"):
         print(json.dumps(audit_tokens(
-            dataset, args.output_dir, args.output_dir, args.max_token_len, row_digest
+            dataset,
+            args.output_dir,
+            args.output_dir,
+            args.max_token_len,
+            row_digest,
+            state_noise_std=args.state_noise_std,
+            augmentation_seed=args.augmentation_seed,
         ), sort_keys=True), flush=True)
 
 
