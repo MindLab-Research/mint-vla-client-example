@@ -47,6 +47,7 @@ if [[ -e "$RESULT_JSON" || -e "$METRICS_JSONL" ]]; then
 fi
 
 MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
+STATE_NOISE_STD=${STATE41_STATE_NOISE_STD:-0}
 FINAL_PATH="${RUN_ID}_step20000"
 CHECKPOINT_TEMPLATE="${RUN_ID}_step{step}"
 EXTRA_ARGS=()
@@ -57,7 +58,7 @@ fi
   printf 'started=%s\n' "$(date -Is)"
   printf 'profile_report=%s\n' "$(realpath "$PROFILE_REPORT")"
   printf 'dataset=%s\nrows=%s\nnorm_sha256=%s\n' "$DATASET" "$ROW_INDICES" "$NORM_SHA"
-  printf 'model=%s\nsteps=20000\ncheckpoint_every=4000\n' "$MODEL"
+  printf 'model=%s\nsteps=20000\ncheckpoint_every=4000\nstate_noise_std=%s\n' "$MODEL" "$STATE_NOISE_STD"
 } | tee "$DRIVER_LOG"
 
 exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
@@ -86,7 +87,7 @@ exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
   --prefetch-batches 2 \
   --batch-producers 1 \
   --batch-build-workers 4 \
-  --state-noise-std 0 \
+  --state-noise-std "$STATE_NOISE_STD" \
   --target-noise-std 0 \
   --checkpoint-every 4000 \
   --checkpoint-save-path-template "$CHECKPOINT_TEMPLATE" \

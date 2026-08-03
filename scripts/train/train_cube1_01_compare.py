@@ -1242,9 +1242,10 @@ def build_batch(
                 norm_stats, "state", state_dim
             )
             if getattr(dataset, "_extended_state", False):
-                # Extended state: only noise hand qpos [0:26]; do NOT pollute
-                # finger contacts [26:31] or lift height [31].
-                valid_state[26:] = False
+                # State41 augmentation perturbs only qpos28. Keep contact,
+                # lift, distance, floor, and duration features unchanged.
+                qpos_dim = 28 if getattr(dataset, "_state_contract", None) == "state41" else 26
+                valid_state[qpos_dim:] = False
             augmented_state = clean_state.copy()
             augmented_state[valid_state] = (
                 clean_state[valid_state] + state_noise[valid_state]
@@ -2007,10 +2008,6 @@ from scripts.deadline import parse_stop_at
 def main() -> int:
     args = parse_args()
     validate_state_noise(args.model, args.state_noise_std)
-    if args.state_contract == "state41" and args.state_noise_std > 0:
-        raise ValueError(
-            "state41 StateAug is disabled until noisy 28D geometry recomputation is implemented"
-        )
     if args.extended_state:
         expected_norm_sha = str(args.norm_sha_expected).lower()
         if len(expected_norm_sha) != 64 or any(
