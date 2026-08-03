@@ -528,6 +528,9 @@ class RunMode4EvalContractTests(unittest.TestCase):
             root = Path(temp)
             (root / "mint").mkdir()
             (root / "openpi").mkdir()
+            norm = root / "norm"
+            norm.mkdir()
+            (norm / "norm_stats.json").write_text('{"fixture": true}\n', encoding="utf-8")
             completed = subprocess.run(
                 [
                     "bash",
@@ -544,6 +547,8 @@ class RunMode4EvalContractTests(unittest.TestCase):
                     str(root / "openpi"),
                     "--python-bin",
                     "/bin/true",
+                    "--norm-stats",
+                    str(norm / "norm_stats.json"),
                     "--print-config",
                 ],
                 cwd=REPO_ROOT,
@@ -558,6 +563,7 @@ class RunMode4EvalContractTests(unittest.TestCase):
                 "model=openpi/pi05-action-lora-r16-state41-28dof-finetune",
                 completed.stderr,
             )
+            self.assertIn("norm_stats_path=", completed.stderr)
 
 
 if __name__ == "__main__":

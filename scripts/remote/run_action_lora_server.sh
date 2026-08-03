@@ -9,6 +9,7 @@ MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-state41-28do
 OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof}
 PYTHON_BIN=${MINT_PYTHON_BIN:-/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}
 MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
+NORM_STATS_PATH=${MINT_OPENPI_PI05_NORM_STATS:-}
 ENABLE_JAX_PERSISTENT_CACHE=0
 PRINT_CONFIG=0
 while (($#)); do
@@ -21,6 +22,7 @@ while (($#)); do
     --openpi-root) OPENPI_ROOT=${2:?}; shift 2 ;;
     --python-bin) PYTHON_BIN=${2:?}; shift 2 ;;
     --model) MODEL=${2:?}; shift 2 ;;
+    --norm-stats) NORM_STATS_PATH=${2:?}; shift 2 ;;
     --enable-jax-persistent-cache) ENABLE_JAX_PERSISTENT_CACHE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help)
@@ -35,6 +37,7 @@ Options:
   --openpi-root PATH   paired OpenPI checkout (default: MINT_OPENPI_ROOT or project path)
   --python-bin PATH    GPU runtime Python (default: MINT_PYTHON_BIN or project path)
   --model ID           enabled Action-LoRA model identity (default: state41 28DoF)
+  --norm-stats PATH    locked norm_stats.json used for checkpoint assets
   --enable-jax-persistent-cache
                      opt in to JAX persistent executable serialization
   --print-config       validate and print configuration without starting
@@ -68,6 +71,21 @@ for path in "$MINT_ROOT" "$OPENPI_ROOT"; do
 done
 [[ -x "$PYTHON_BIN" ]] || { echo "runtime Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 mkdir -p "$RUNTIME_ROOT"/{openpi_checkpoint_base,runtime_checkpoints,tmp,action_state}
+ASSETS_BASE_DIR=${MINT_OPENPI_PI05_ASSETS_BASE_DIR:-/vePFS-Mindverse/share/code/conley/openpi/assets}
+if [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune ]]; then
+  [[ -n "$NORM_STATS_PATH" ]] || { echo "--norm-stats is required for the state41 Action-LoRA server" >&2; exit 64; }
+fi
+if [[ -n "$NORM_STATS_PATH" ]]; then
+  [[ "$NORM_STATS_PATH" = /* ]] || { echo "--norm-stats must be absolute" >&2; exit 64; }
+  [[ -f "$NORM_STATS_PATH" ]] || { echo "norm stats file missing: $NORM_STATS_PATH" >&2; exit 2; }
+  ASSETS_BASE_DIR="$RUNTIME_ROOT/openpi_assets"
+  NORM_DEST="$ASSETS_BASE_DIR/pi05_libero/physical-intelligence/libero/norm_stats.json"
+  mkdir -p "$(dirname "$NORM_DEST")"
+  cp "$NORM_STATS_PATH" "$NORM_DEST"
+  NORM_STATS_SHA256=$(sha256sum "$NORM_DEST" | awk '{print $1}')
+else
+  NORM_STATS_SHA256=
+fi
 if ((ENABLE_JAX_PERSISTENT_CACHE)); then
   mkdir -p "$CACHE_DIR"
 fi
@@ -82,6 +100,9 @@ mint_action_lora_server:
   visible_gpus=$GPU_IDS
   model=$MODEL
   port=$PORT
+  assets_base_dir=$ASSETS_BASE_DIR
+  norm_stats_path=${NORM_STATS_PATH:-none}
+  norm_stats_sha256=${NORM_STATS_SHA256:-none}
 EOF
 if ((PRINT_CONFIG)); then
   exit 0
@@ -92,7 +113,7 @@ export MINT_SUPPORTED_MODELS=$MODEL MINT_ALLOW_NO_RAY=1 MINT_SKIP_SUPERVISOR=1
 export MINT_USAGE_BACKEND=disabled MINT_UVICORN_WORKERS=1
 export MINT_OPENPI_PI05_ACTION_DIRECT_RUNTIME=1
 export MINT_OPENPI_PI05_WEIGHTS_PATH=/vePFS-Mindverse/share/models/openpi/pi05_base/params
-export MINT_OPENPI_PI05_ASSETS_BASE_DIR=/vePFS-Mindverse/share/code/conley/openpi/assets
+export MINT_OPENPI_PI05_ASSETS_BASE_DIR="$ASSETS_BASE_DIR"
 export MINT_OPENPI_PI05_CHECKPOINT_BASE_DIR="$RUNTIME_ROOT/openpi_checkpoint_base"
 export MINT_RUNTIME_CHECKPOINT_DIR="$RUNTIME_ROOT/runtime_checkpoints"
 export MINT_CHECKPOINT_DIR="$RUNTIME_ROOT/runtime_checkpoints/persistent_cache"

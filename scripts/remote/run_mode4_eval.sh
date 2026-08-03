@@ -705,7 +705,8 @@ trap 'exit 143' TERM
 if ((OWN_SERVER)); then
   SERVER_CMD=("$SCRIPT_DIR/run_action_lora_server.sh"
     --runtime-root "$SERVER_RUNTIME_ROOT" --port "$SERVER_PORT" --gpus "$SERVER_GPUS"
-    --mint-root "$MINT_CODE_ROOT" --openpi-root "$MINT_OPENPI_ROOT" --python-bin "$MINT_PYTHON_BIN")
+    --mint-root "$MINT_CODE_ROOT" --openpi-root "$MINT_OPENPI_ROOT" --python-bin "$MINT_PYTHON_BIN"
+    --norm-stats "$NORM_STATS_DIR/norm_stats.json")
   if ((ENABLE_JAX_PERSISTENT_CACHE)); then
     SERVER_CMD+=(--enable-jax-persistent-cache)
     [[ -z "$SERVER_CACHE_DIR" ]] || SERVER_CMD+=(--cache-dir "$SERVER_CACHE_DIR")
