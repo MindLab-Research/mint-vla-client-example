@@ -213,8 +213,7 @@ def replay(row_index,row,ident,run_id):
     import mujoco
     T,q,targets,ref_pos,ref_aa,ts,obj=validate_row(row,row_index,ident); _,model,_,_,objaddr,_,handaddr,_,limits=scene(obj)
     data=mujoco.MjData(model); data.qpos[:]=0; data.qpos[objaddr:objaddr+3]=ref_pos[0]; data.qpos[objaddr+3:objaddr+7]=mano_action_support.axis_angle_to_wxyz(ref_aa[0]); data.qpos[handaddr]=q[0]; data.qvel[:]=0; mujoco.mj_forward(model,data)
-    body=mujoco.mj_name2id(model,mujoco.mjtObj.mjOBJ_BODY,obj)
-    if body<0: raise ValueError(f'compiled object body missing: {obj}')
+    body=physics.object_body_id(model,obj)
     full_q=np.empty((T,model.nq)); full_v=np.empty((T,model.nv)); sim_q=np.empty((T,HAND_DIM)); sim_pos=np.empty((T,3)); sim_quat=np.empty((T,4)); sim_time=np.empty(T)
     ref_quat=np.stack([mano_action_support.axis_angle_to_wxyz(value) for value in ref_aa]); qerr=np.empty(T); poserr=np.empty(T); roterr=np.empty(T)
     contacts={'hand_object':0,'object_floor':0,'hand_floor':0}; first={k:None for k in contacts}; max_ncon=max_force=max_act=max_qvel=0.; warnings=[]

@@ -203,6 +203,7 @@ def test_replay_preserves_old_loop_but_executes_only_raw_targets_with_successors
             "max_abs_actuator_force": 0.0,
         }
 
+    monkeypatch.setattr(replay.physics, "object_body_id", lambda _model, _object: 1)
     monkeypatch.setattr(replay.physics, "step_servo", step_servo)
     result, trace = replay.replay(7, row, _identity(), {"contract": "test"})
     source_targets = np.asarray(row["hands"][1]["urdf_dof_target"])

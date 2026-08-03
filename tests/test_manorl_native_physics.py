@@ -58,6 +58,20 @@ def test_legacy_visual_contract_adds_only_visual_elements(preset):
     assert light_names == ["key_light", "fill_light", "rim_light", "top_light"]
 
 
+def test_object_body_resolution_uses_authoritative_runtime_name():
+    import mujoco
+
+    _, model, *_ = physics.make_scene(
+        "iphone", 1, 1, physics=True, create_renderer=False
+    )
+    body_id = physics.object_body_id(model, "iphone")
+    assert mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) == "iphone17"
+    hand_geoms, object_geoms, floor_geom = physics._contact_ids(model, "iphone")
+    assert len(hand_geoms) == 16
+    assert object_geoms
+    assert floor_geom >= 0
+
+
 def test_head_camera_preset_registry_has_two_versions_and_current_default():
     from scripts.eval import mano_action_support as legacy
 

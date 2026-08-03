@@ -230,6 +230,20 @@ def visual_invariance(model: Any) -> dict[str, Any]:
         raise ValueError("model was not compiled with the legacy visual contract") from exc
 
 
+def object_body_id(model: Any, object_name: str) -> int:
+    """Resolve compiled body identity from the authoritative object runtime."""
+    import mujoco
+
+    runtime = _runtime()
+    body_name = runtime["assets"].object_runtime(object_name).body_name
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id < 0:
+        raise ValueError(
+            f"compiled object body missing for {object_name}: expected {body_name}"
+        )
+    return int(body_id)
+
+
 def make_scene(
     object_name: str,
     width: int,
@@ -264,10 +278,8 @@ def make_scene(
     object_joint = mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_JOINT, object_spec.free_joint_name
     )
-    object_body = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, object_spec.body_name
-    )
-    if object_joint < 0 or object_body < 0:
+    object_body = object_body_id(model, object_name)
+    if object_joint < 0:
         raise ValueError(f"compiled object ABI missing for {object_name}")
     joint_ids = [
         mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
@@ -315,9 +327,7 @@ def _contact_ids(model: Any, object_name: str) -> tuple[set[int], set[int], int]
         return cached
     import mujoco
 
-    object_body = mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_BODY, object_name
-    )
+    object_body = object_body_id(model, object_name)
     floor_geom = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
     object_geoms = {
         index
