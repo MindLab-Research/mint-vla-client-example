@@ -45,7 +45,7 @@ def make_dataset(args, rows):
         row_indices=rows,
         action_horizon=10,
         frame_window="contact",
-        contact_context_frames=100,
+        contact_context_frames=60,
         contact_window_manifest=args.contact_window_manifest,
         missing_contact_policy="error",
         action_source=URDF_TARGET_ABSOLUTE,
