@@ -18,14 +18,20 @@ from typing import Any
 import lance
 
 from scripts.replay_state54_data import (
+    DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID,
+    SNAPSHOT_FEATURE_SCHEMA_ID,
     atomic_json,
     atomic_npz,
     replay_trace_state54_features,
     sha256_file,
+    snapshot_trace_state54_features,
 )
 
 SCHEMA_VERSION = 1
-FEATURE_SCHEMA_ID = "state54_replay_features_v1"
+FEATURE_SCHEMA_BY_MODE = {
+    "deterministic-replay": DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID,
+    "snapshot-backward": SNAPSHOT_FEATURE_SCHEMA_ID,
+}
 
 
 def canonical_sha256(payload: Any) -> str:
@@ -70,13 +76,16 @@ def derive_one(job: dict[str, Any]) -> dict[str, Any]:
             f"row{job['row_index']} trace SHA mismatch: "
             f"{actual_trace_sha} != {job['trace_sha256']}"
         )
-    report, arrays = replay_trace_state54_features(
-        job["trace_path"], object_name=job["object_name"]
+    derive = (
+        replay_trace_state54_features
+        if job["derivation_mode"] == "deterministic-replay"
+        else snapshot_trace_state54_features
     )
+    report, arrays = derive(job["trace_path"], object_name=job["object_name"])
     report.update(
         {
             "schema_version": SCHEMA_VERSION,
-            "feature_schema_id": FEATURE_SCHEMA_ID,
+            "feature_schema_id": job["feature_schema_id"],
             "row_index": job["row_index"],
             "row_uuid": job["row_uuid"],
             "seed_uuid": job["seed_uuid"],
@@ -125,6 +134,8 @@ def _source_jobs(args: argparse.Namespace, release: dict[str, Any]) -> list[dict
                 "frame_count": frame_count,
                 "trace_path": str(trace_path),
                 "trace_sha256": trace_sha,
+                "derivation_mode": args.derivation_mode,
+                "feature_schema_id": FEATURE_SCHEMA_BY_MODE[args.derivation_mode],
             }
         )
     return jobs
@@ -138,6 +149,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--row-end-inclusive", type=int, default=1020)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=16)
+    parser.add_argument(
+        "--derivation-mode",
+        choices=tuple(FEATURE_SCHEMA_BY_MODE),
+        required=True,
+    )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()
 
@@ -178,7 +194,7 @@ def main() -> int:
     population_sha = canonical_sha256(population)
     build_manifest = {
         "schema_version": SCHEMA_VERSION,
-        "feature_schema_id": FEATURE_SCHEMA_ID,
+        "feature_schema_id": FEATURE_SCHEMA_BY_MODE[args.derivation_mode],
         "status": "building",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source_release": str(args.source_release.resolve()),
@@ -191,6 +207,7 @@ def main() -> int:
         "population_sha256": population_sha,
         "population": population,
         "workers": args.workers,
+        "derivation_mode": args.derivation_mode,
     }
     manifest_path = args.output_dir / "build_manifest.json"
     if manifest_path.exists():
@@ -203,6 +220,7 @@ def main() -> int:
             "row_end_inclusive",
             "row_count",
             "population_sha256",
+            "derivation_mode",
         ):
             if existing.get(key) != build_manifest[key]:
                 raise ValueError(f"existing build manifest disagrees on {key!r}")
@@ -237,31 +255,39 @@ def main() -> int:
 
     reports.sort(key=lambda item: int(item["row_index"]))
     failed = [report for report in reports if report["status"] != "passed"]
-    entries = [
-        {
-            key: report[key]
-            for key in (
-                "row_index",
-                "row_uuid",
-                "seed_uuid",
-                "source_row_index",
-                "object_name",
-                "frame_count",
-                "trace_sha256",
-                "output_npz",
-                "output_npz_sha256",
-                "max_abs_hand_qpos_error",
-                "max_abs_object_position_error",
-                "max_sign_invariant_object_quaternion_error",
-                "contact_mismatch_values",
-                "force_nonzero_frames",
-                "force_nonzero_values",
-                "max_log1p_force",
-            )
-        }
-        for report in reports
-        if report["status"] == "passed"
-    ]
+    common_entry_keys = (
+        "derivation_mode",
+        "row_index",
+        "row_uuid",
+        "seed_uuid",
+        "source_row_index",
+        "object_name",
+        "frame_count",
+        "trace_sha256",
+        "output_npz",
+        "output_npz_sha256",
+        "contact_mismatch_values",
+        "force_nonzero_frames",
+        "force_nonzero_values",
+        "max_log1p_force",
+    )
+    optional_entry_keys = (
+        "max_abs_hand_qpos_error",
+        "max_abs_object_position_error",
+        "max_sign_invariant_object_quaternion_error",
+        "snapshot_state_source",
+        "snapshot_qvel_source",
+        "snapshot_ctrl_source",
+    )
+    entries = []
+    for report in reports:
+        if report["status"] != "passed":
+            continue
+        entry = {key: report[key] for key in common_entry_keys}
+        entry.update(
+            {key: report[key] for key in optional_entry_keys if key in report}
+        )
+        entries.append(entry)
     feature_manifest_sha = canonical_sha256(entries)
     final_release = {
         **{key: value for key, value in build_manifest.items() if key != "status"},

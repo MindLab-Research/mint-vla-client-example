@@ -38,7 +38,14 @@ PHYSICS_SUBSTEPS = 2
 HAND_ATOL = 2e-6
 OBJECT_POSITION_ATOL = 2e-6
 OBJECT_QUATERNION_ATOL = 2e-6
-FEATURE_SCHEMA_ID = "state54_replay_features_v1"
+DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID = "state54_replay_features_v1"
+SNAPSHOT_FEATURE_SCHEMA_ID = "state54_replay_snapshot_features_v1"
+FEATURE_SCHEMA_IDS = {
+    DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID,
+    SNAPSHOT_FEATURE_SCHEMA_ID,
+}
+# Backwards-compatible public name for the first proof release.
+FEATURE_SCHEMA_ID = DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID
 
 
 class ReplayState54FeatureStore:
@@ -67,10 +74,12 @@ class ReplayState54FeatureStore:
         release = json.loads(self.release_path.read_text(encoding="utf-8"))
         if release.get("status") != "accepted":
             raise ValueError("replay State54 feature release is not accepted")
-        if release.get("feature_schema_id") != FEATURE_SCHEMA_ID:
+        feature_schema_id = release.get("feature_schema_id")
+        if feature_schema_id not in FEATURE_SCHEMA_IDS:
             raise ValueError(
-                f"replay State54 feature schema mismatch: {release.get('feature_schema_id')!r}"
+                f"replay State54 feature schema mismatch: {feature_schema_id!r}"
             )
+        self.feature_schema_id = str(feature_schema_id)
         actual_source = Path(str(release.get("source_dataset", ""))).resolve()
         expected_source = Path(source_dataset).expanduser().resolve()
         if actual_source != expected_source:
@@ -92,7 +101,7 @@ class ReplayState54FeatureStore:
 
     def provenance(self) -> dict[str, Any]:
         return {
-            "feature_schema_id": FEATURE_SCHEMA_ID,
+            "feature_schema_id": self.feature_schema_id,
             "root": str(self.root),
             "release": str(self.release_path),
             "release_sha256": self.release_sha256,
@@ -366,6 +375,7 @@ def replay_trace_state54_features(
             and np.all(np.isfinite(replay_tip_box_xyz))
         )
         diagnostics: dict[str, Any] = {
+            "derivation_mode": "deterministic_target_replay_v1",
             "status": "passed"
             if (
                 float(np.max(hand_error)) <= HAND_ATOL
@@ -415,6 +425,132 @@ def replay_trace_state54_features(
         temporary.cleanup()
 
 
+def snapshot_trace_state54_features(
+    trace_path: str | Path,
+    *,
+    object_name: str,
+) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+    """Recover frame-aligned loads from exact saved poses and backward qvel.
+
+    The accepted replay release stores float32 targets, which can cause a new
+    continuous rollout to diverge chaotically from the saved image/qpos trace.
+    Snapshot reconstruction avoids drift: each frame uses the accepted qpos,
+    ``mj_differentiatePos`` recovers the interval-ending generalized velocity,
+    and ``mj_forward`` solves contacts/loads under that state and command.
+    """
+    trace = load_accepted_trace(trace_path)
+    hand = trace["hand_qpos"]
+    position = trace["object_position"]
+    quaternion = trace["object_quaternion_wxyz"]
+    contacts_expected = trace["contacts"]
+    targets = trace["absolute_target_qpos"]
+    frame_count = len(trace["timestamp"])
+
+    temporary, model, _unused_data, renderer, object_addr, _, hand_addrs, _, _limits = (
+        physics.make_scene(
+            object_name,
+            1,
+            1,
+            physics=True,
+            physics_timestep=physics.DT,
+            create_renderer=False,
+        )
+    )
+    if renderer is not None:
+        temporary.cleanup()
+        raise RuntimeError("snapshot force reconstruction unexpectedly created a renderer")
+    try:
+        keypoint_geom_ids, object_geom_ids, geom_id_to_finger = (
+            physics.resolve_keypoint_geom_ids(model, object_name)
+        )
+        object_body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, f"{object_name}_body"
+        )
+        if object_body_id < 0:
+            raise ValueError(f"cannot resolve MuJoCo body for {object_name!r}")
+        full_qpos = np.zeros((frame_count, model.nq), dtype=np.float64)
+        full_qpos[:, object_addr : object_addr + 3] = position
+        full_qpos[:, object_addr + 3 : object_addr + 7] = quaternion
+        full_qpos[:, hand_addrs] = hand
+
+        data = mujoco.MjData(model)
+        snapshot_contacts = np.empty_like(contacts_expected)
+        snapshot_log1p_force = np.empty_like(contacts_expected)
+        snapshot_tip_box_xyz = np.empty((frame_count, 5, 3), dtype=np.float32)
+        for frame in range(frame_count):
+            data.qpos[:] = full_qpos[frame]
+            data.qvel[:] = 0.0
+            if frame > 0:
+                mujoco.mj_differentiatePos(
+                    model,
+                    data.qvel,
+                    SOURCE_DT_SECONDS,
+                    full_qpos[frame - 1],
+                    full_qpos[frame],
+                )
+            data.ctrl[:] = targets[frame]
+            data.qfrc_applied[:] = 0.0
+            mujoco.mj_forward(model, data)
+            contacts, log1p_force = physics.finger_contact_and_force_from_mujoco(
+                model,
+                data,
+                object_name,
+                keypoint_geom_ids=keypoint_geom_ids,
+                object_geom_ids=object_geom_ids,
+                geom_id_to_finger=geom_id_to_finger,
+            )
+            tip_world = fingertip_world_from_mujoco(model, data)
+            object_rotation = np.asarray(
+                data.xmat[object_body_id], dtype=np.float64
+            ).reshape(3, 3)
+            snapshot_contacts[frame] = contacts
+            snapshot_log1p_force[frame] = log1p_force
+            snapshot_tip_box_xyz[frame] = fingertips_in_collision_box_frame(
+                tip_world,
+                np.asarray(data.xpos[object_body_id], dtype=np.float64),
+                object_rotation,
+                object_name,
+            )
+
+        contact_mismatch = snapshot_contacts != contacts_expected
+        finite_features = bool(
+            np.all(np.isfinite(snapshot_log1p_force))
+            and np.all(np.isfinite(snapshot_tip_box_xyz))
+        )
+        diagnostics: dict[str, Any] = {
+            "derivation_mode": "accepted_pose_backward_qvel_snapshot_v1",
+            "status": "passed"
+            if not bool(np.any(contact_mismatch)) and finite_features
+            else "failed",
+            "object_name": object_name,
+            "trace_path": str(Path(trace_path).resolve()),
+            "trace_sha256": sha256_file(trace_path),
+            "frame_count": frame_count,
+            "source_dt_seconds": SOURCE_DT_SECONDS,
+            "mujoco_dt_seconds": float(physics.DT),
+            "contact_mismatch_frames": int(np.count_nonzero(np.any(contact_mismatch, axis=1))),
+            "contact_mismatch_values": int(np.count_nonzero(contact_mismatch)),
+            "force_nonzero_frames": int(
+                np.count_nonzero(np.any(snapshot_log1p_force > 0.0, axis=1))
+            ),
+            "force_nonzero_values": int(np.count_nonzero(snapshot_log1p_force > 0.0)),
+            "max_log1p_force": float(np.max(snapshot_log1p_force)),
+            "features_finite": finite_features,
+            "snapshot_state_source": "accepted_trace_qpos_object_pose",
+            "snapshot_qvel_source": "mj_differentiatePos_previous_to_current_5ms;frame0_zero",
+            "snapshot_ctrl_source": "accepted_trace_absolute_target_qpos",
+        }
+        arrays = {
+            "timestamp": trace["timestamp"],
+            "finger_contacts": snapshot_contacts,
+            "finger_log1p_force": snapshot_log1p_force,
+            "fingertip_collision_box_xyz": snapshot_tip_box_xyz,
+        }
+        return diagnostics, arrays
+    finally:
+        temporary.cleanup()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--trace", type=Path, required=True)
@@ -422,6 +558,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-npz", type=Path)
     parser.add_argument("--report", type=Path)
     parser.add_argument("--expected-trace-sha256")
+    parser.add_argument(
+        "--derivation-mode",
+        choices=("deterministic-replay", "snapshot-backward"),
+        default="deterministic-replay",
+    )
     parser.add_argument("--require-parity", action="store_true")
     return parser.parse_args()
 
@@ -433,7 +574,12 @@ def main() -> int:
         raise ValueError(
             f"trace SHA mismatch: expected {args.expected_trace_sha256.lower()}, got {actual_trace_sha}"
         )
-    report, arrays = replay_trace_state54_features(args.trace, object_name=args.object)
+    derive = (
+        replay_trace_state54_features
+        if args.derivation_mode == "deterministic-replay"
+        else snapshot_trace_state54_features
+    )
+    report, arrays = derive(args.trace, object_name=args.object)
     if args.output_npz is not None:
         atomic_npz(args.output_npz, **arrays)
         report["output_npz"] = str(args.output_npz.resolve())
