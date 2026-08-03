@@ -470,6 +470,7 @@ def release_schema():
                     [
                         ("fps", pa.int32()),
                         ("frames", pa.int32()),
+                        ("total_frames", pa.int32()),
                         ("transitions", pa.int32()),
                         ("object", pa.string()),
                         ("gesture", pa.string()),
@@ -727,8 +728,18 @@ def render_release_row(
     payload.update(sim_position.tobytes(order="C"))
     payload.update(sim_quaternion.tobytes(order="C"))
     image_bytes = sum(map(len, head_images)) + sum(map(len, wrist_images))
+    source_hands = source.get("hands") or []
+    source_slots = source_meta.get("hand_slots") or []
     source_shapes = source_meta.get("mano_hand_shapes") or []
-    right_shape = source_shapes[:1]
+    if (
+        not isinstance(source_slots, list)
+        or len(source_slots) != len(source_hands)
+        or source_slots.count("right") != 1
+        or len(source_shapes) != len(source_hands)
+    ):
+        raise ValueError("source hand slots/shapes cannot resolve exactly one right hand")
+    right_index = source_slots.index("right")
+    right_shape = [source_shapes[right_index]]
     source_identity = str(source_provenance.get("source_identity"))
     if source_identity != quality.get("source_identity"):
         raise ValueError("release source provenance identity mismatch")
@@ -795,6 +806,7 @@ def render_release_row(
         "episode_metadata": {
             "fps": 200,
             "frames": frame_count,
+            "total_frames": frame_count,
             "transitions": frame_count - 1,
             "object": entry["object"],
             "gesture": entry["gesture"],

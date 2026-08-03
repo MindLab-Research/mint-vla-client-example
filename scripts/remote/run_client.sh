@@ -72,6 +72,7 @@ fi
 
 ACTION_LORA_R16_MODEL=openpi/pi05-action-lora-r16-finetune
 ACTION_LORA_R16_STATE44_MODEL=openpi/pi05-action-lora-r16-state44-finetune
+ACTION_LORA_R16_STATE46_MODEL=openpi/pi05-action-lora-r16-state46-28dof-finetune
 SELECTED_MODEL=""
 CLIENT_ARGS=("$@")
 for ((i = 0; i < ${#CLIENT_ARGS[@]}; i++)); do
@@ -85,7 +86,8 @@ for ((i = 0; i < ${#CLIENT_ARGS[@]}; i++)); do
   esac
 done
 if [[ ( "${SELECTED_MODEL}" == "${ACTION_LORA_R16_MODEL}" || \
-        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE44_MODEL}" ) && \
+        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE44_MODEL}" || \
+        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE46_MODEL}" ) && \
       -z "${MINT_OPENPI_ROOT}" ]]; then
   echo "${SELECTED_MODEL} requires MINT_OPENPI_ROOT to select the isolated rank-16 OpenPI worktree" >&2
   exit 2

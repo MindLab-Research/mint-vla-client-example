@@ -293,15 +293,20 @@ class LanceViewpi05Dataset:
 
         `extended_state`: legacy alias for state_contract="state32".
         `state_contract`: None for legacy raw state, "state32" for contact/lift,
-        or "state44" for contact/lift + fingertip geometry/dynamics.
+        "state44" for derived 26D geometry/dynamics, or "state46" for the
+        persisted native-simulated 28D release.
         """
-        if state_contract not in {None, "state32", "state44"}:
+        if state_contract not in {None, "state32", "state44", "state46"}:
             raise ValueError(f"unsupported state_contract {state_contract!r}")
         if extended_state and state_contract not in {None, "state32"}:
-            raise ValueError("--extended-state cannot be combined with state_contract=state44")
+            raise ValueError(
+                "--extended-state cannot be combined with an explicit state44/state46 contract"
+            )
         self._state_contract = state_contract or ("state32" if extended_state else None)
         self._extended_state = self._state_contract is not None
-        self._state_dim = 44 if self._state_contract == "state44" else 32
+        self._state_dim = {"state44": 44, "state46": 46}.get(self._state_contract, 32)
+        if self._state_contract == "state46" and frame_window != "full":
+            raise ValueError("state46 qualified release requires frame_window='full'")
         self._dataset = lance.dataset(str(lance_dataset))
         self._dataset_path = Path(lance_dataset)
         # Metadata stays small; contact records are scanned separately and
@@ -422,7 +427,7 @@ class LanceViewpi05Dataset:
             self._row_cache.move_to_end(row_index)
             return cached
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
-        if self._extended_state:
+        if self._extended_state and self._state_contract != "state46":
             columns += ["contact", "objects"]
         if self._state_contract == "state44":
             columns.append("timestamp")
@@ -503,6 +508,10 @@ class LanceViewpi05Dataset:
             actions = np.concatenate([actions, pad], axis=0)
         if getattr(self, "_state_contract", None) == "state44":
             state = np.asarray(row["_state44_sequence"][frame], dtype=np.float32).copy()
+        elif getattr(self, "_state_contract", None) == "state46":
+            state = np.asarray(row["state"][frame], dtype=np.float32).copy()
+            if state.shape != (46,):
+                raise ValueError(f"persisted state46 frame has shape {state.shape}")
         elif self._extended_state:
             from scripts.mano_state_contract import build_extended_state
             objects = row["objects"]
@@ -588,6 +597,7 @@ def _make_data_config(
     norm_stats: dict[str, normalize.NormStats] | None,
     *,
     action_source: str | None = None,
+    delta_mask_segments: tuple[int, ...] | None = None,
 ) -> openpi_config.DataConfig:
     data_transforms = transforms.Group(
         inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
@@ -599,7 +609,13 @@ def _make_data_config(
     # data_transforms.inputs run BEFORE Normalize in _transform_sample, so the
     # subtraction is on raw physical values (required for correct delta).
     if action_source == URDF_TARGET_ABSOLUTE:
-        delta_action_mask = transforms.make_bool_mask(*MANO_DELTA_MASK_SEGMENTS)
+        segments = MANO_DELTA_MASK_SEGMENTS if delta_mask_segments is None else delta_mask_segments
+        delta_action_mask = transforms.make_bool_mask(*segments)
+        if len(delta_action_mask) != model_config.action_dim:
+            raise ValueError(
+                f"delta mask {segments} has width {len(delta_action_mask)}, "
+                f"expected action_dim={model_config.action_dim}"
+            )
         data_transforms = data_transforms.push(
             inputs=[transforms.DeltaActions(delta_action_mask)],
             outputs=[transforms.AbsoluteActions(delta_action_mask)],

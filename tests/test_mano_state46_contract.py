@@ -47,3 +47,22 @@ def test_state46_timestamp_contract_is_exact_200hz():
     state46.validate_timestamps(np.arange(5) * 0.005, 5)
     with pytest.raises(ValueError, match="5 ms"):
         state46.validate_timestamps(np.asarray([0.0, 0.006]), 2)
+
+
+def test_client_target_projection_accepts_target28_and_padding4():
+    from scripts.target_actions import (
+        MANO_28D_DELTA_MASK_SEGMENTS,
+        urdf_target_absolute_actions,
+    )
+
+    state = np.zeros((3, 46), dtype=np.float32)
+    target = np.arange(3 * 28, dtype=np.float32).reshape(3, 28)
+    row = {
+        "state": state,
+        "actions": np.zeros((3, 32), dtype=np.float32),
+        "hands": [{"hand_name": "right", "urdf_dof_target": target}],
+    }
+    actions = urdf_target_absolute_actions(row, action_dim=32)
+    np.testing.assert_array_equal(actions[:, :28], target)
+    np.testing.assert_array_equal(actions[:, 28:], 0.0)
+    assert MANO_28D_DELTA_MASK_SEGMENTS == (3, -3, 22, -4)

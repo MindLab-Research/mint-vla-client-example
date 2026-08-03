@@ -301,7 +301,16 @@ for a copy-paste command and the low-memory fallback.
   extracts state46/contact/object plus current-head/wrist 640x360 JPEG from the
   same `MjData`. Contiguous shards are balanced by measured object render cost,
   written by independent EGL workers, resumed by UUID prefix, and concatenated
-  deterministically into one immutable Lance release.
+  deterministically into one immutable Lance release. Release rows expose both
+  `episode_metadata.frames` and `episode_metadata.total_frames` for downstream
+  index compatibility.
+- `openpi/pi05-action-lora-r16-state46-28dof-finetune` binds the qualified
+  release to profile `pi05_action_lora_r16_state46_28dof_v1`: observation width
+  46, action width 32, horizon 10, and the target28 delta mask
+  `(3, -3, 22, -4)`. Training uses `--state-contract state46`,
+  `--action-source urdf_target_absolute`, and `--frame-window full`. StateAug is
+  disabled for this contract until noisy 28D qpos can be propagated through the
+  contact and object-geometry features without mixing inconsistent states.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,

@@ -77,6 +77,15 @@ def test_one_row_release_uses_same_native_mjdata_and_schema(monkeypatch):
     source = dataset.take(
         [entry["filtered_row_index"]], columns=release.SOURCE_COLUMNS
     ).to_pylist()[0]
+    # The right-hand shape must follow hand_slots, not an implicit slot-0 rule.
+    original_shape = source["trajectory_metadata"]["mano_hand_shapes"][0]
+    source["hands"] = [{"hand_name": "left"}, source["hands"][0]]
+    source["trajectory_metadata"]["hand_slots"] = ["left", "right"]
+    source["trajectory_metadata"]["hand_names"] = ["left", "right"]
+    source["trajectory_metadata"]["mano_hand_shapes"] = [
+        [99.0] * 10,
+        original_shape,
+    ]
     try:
         row = release.render_release_row(entry, source, plan_sha="a" * 64)
     finally:
@@ -92,6 +101,8 @@ def test_one_row_release_uses_same_native_mjdata_and_schema(monkeypatch):
     assert len(row["contact"]) == frames
     assert row["provenance"]["dynamics_steps_during_render"] == 0
     assert row["hands"][0]["hand_name"] == "right"
+    assert row["trajectory_metadata"]["mano_hand_shapes"] == [original_shape]
+    assert row["episode_metadata"]["total_frames"] == frames
     assert len(row["row_payload_sha256"]) == 64
     for encoded in (row["image"][0], row["wrist_image"][0]):
         with Image.open(BytesIO(encoded)) as image:
