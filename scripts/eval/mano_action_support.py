@@ -25,9 +25,9 @@ DEFAULT_OBJECTS_URDF_DIR = Path(
 HEAD_CAMERA_NAME = "dataset_b_head_camera"
 WRIST_CAMERA_NAME = "dataset_b_wrist_camera"
 HEAD_CAMERA = {
-    "position": (0.8, 0.0, 0.5),
-    "target": (0.3, 0.0, 0.1),
-    "horizontal_fov": 75.0,
+    "position": (0.0, -0.8, 0.5),
+    "target": (0.0, -0.1, 0.1),
+    "horizontal_fov": 50.0,
 }
 WRIST_CAMERA = {
     "position": (-0.08, 0.0, -0.08),

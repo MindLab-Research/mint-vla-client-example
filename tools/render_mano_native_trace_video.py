@@ -185,6 +185,9 @@ def render(
         "cover_sha256": _sha256(cover_path),
         "ffprobe": probe,
         "renderer_script_sha256": _sha256(Path(__file__)),
+        "camera_contract_source": str(Path(mano_action_support.__file__).resolve()),
+        "camera_contract_source_sha256": _sha256(Path(mano_action_support.__file__).resolve()),
+        "client_commit": os.environ.get("VLA_CLIENT_GIT_COMMIT", "unknown"),
         "manorl": physics.runtime_provenance(object_name),
     }
     temporary = manifest_path.with_name(manifest_path.name + f".tmp-{os.getpid()}")
