@@ -12,6 +12,7 @@ from scripts.mano_state54_contract import (
     aggregate_finger_contact_and_force,
     axis_angle_to_matrix,
     build_state54,
+    build_state54_window_from_features,
     contact_age_seconds,
     fingertips_in_collision_box_frame,
 )
@@ -78,6 +79,59 @@ def test_build_state54_requires_every_feature_and_preserves_layout():
             hand_qpos=np.zeros(26), finger_contacts=np.zeros(5), lift_height=0,
             fingertip_collision_box_xyz=np.zeros((5, 3)), finger_log1p_force=np.zeros(4),
             relative_vertical_velocity=0, multifinger_contact_age=0,
+        )
+
+
+def test_replay_feature_window_preserves_force_and_resets_temporal_state():
+    frames = 4
+    qpos = np.zeros((frames, 26), dtype=np.float32)
+    qpos[:, 2] = [0.0, 0.01, 0.02, 0.03]
+    positions = np.zeros((frames, 3), dtype=np.float32)
+    positions[:, 2] = [0.1, 0.12, 0.14, 0.16]
+    contacts = np.zeros((frames, 5), dtype=np.float32)
+    contacts[1:, :2] = 1
+    forces = np.arange(frames * 5, dtype=np.float32).reshape(frames, 5) / 10
+    tips = np.arange(frames * 15, dtype=np.float32).reshape(frames, 5, 3) / 10
+    state = build_state54_window_from_features(
+        hand_qpos=qpos,
+        finger_contacts=contacts,
+        finger_log1p_force=forces,
+        fingertip_collision_box_xyz=tips,
+        object_position_world=positions,
+        window_start=1,
+        window_end=3,
+    )
+    assert state.shape == (3, 54)
+    np.testing.assert_array_equal(state[0, FINGER_FORCE_SLICE], forces[1])
+    np.testing.assert_array_equal(state[0, FINGERTIP_OBJECT_SLICE], tips[1].reshape(-1))
+    assert state[0, RELATIVE_VERTICAL_VELOCITY_INDEX] == 0
+    assert state[0, MULTIFINGER_CONTACT_AGE_INDEX] == 0
+    assert state[1, RELATIVE_VERTICAL_VELOCITY_INDEX] == pytest.approx(2.0)
+    assert state[1, MULTIFINGER_CONTACT_AGE_INDEX] == pytest.approx(0.005)
+    assert state[0, 31] == pytest.approx(0.02)
+
+
+def test_replay_feature_window_rejects_missing_or_invalid_features():
+    with pytest.raises(ValueError, match="finger_log1p_force"):
+        build_state54_window_from_features(
+            hand_qpos=np.zeros((2, 26)),
+            finger_contacts=np.zeros((2, 5)),
+            finger_log1p_force=np.zeros((2, 4)),
+            fingertip_collision_box_xyz=np.zeros((2, 5, 3)),
+            object_position_world=np.zeros((2, 3)),
+            window_start=0,
+            window_end=1,
+        )
+    bad_contacts = np.zeros((2, 5)); bad_contacts[0, 0] = 0.5
+    with pytest.raises(ValueError, match="binary"):
+        build_state54_window_from_features(
+            hand_qpos=np.zeros((2, 26)),
+            finger_contacts=bad_contacts,
+            finger_log1p_force=np.zeros((2, 5)),
+            fingertip_collision_box_xyz=np.zeros((2, 5, 3)),
+            object_position_world=np.zeros((2, 3)),
+            window_start=0,
+            window_end=1,
         )
 
 

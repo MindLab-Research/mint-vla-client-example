@@ -483,6 +483,7 @@ class LanceViewpi05Dataset:
         from scripts.mano_state54_contract import (
             STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
             build_state54_window,
+            build_state54_window_from_features,
         )
 
         if getattr(self, "_state_contract", None) != STATE54_CONTRACT_ID:
@@ -501,16 +502,41 @@ class LanceViewpi05Dataset:
             raise ValueError(f"state54 requires exactly one object at local row {row_index}")
         window = self._row_windows[row_index]
         hand, obj = hands[0], objects[0]
-        state54 = build_state54_window(
-            hand_qpos=np.asarray(hand["urdf_dof"], dtype=np.float32),
-            mano_joint_pos=np.asarray(hand["mano_joint_pos"], dtype=np.float32),
-            frame_contacts=row["contact"],
-            object_name=object_names[0],
-            object_position_world=np.asarray(obj["pos"], dtype=np.float32),
-            object_rotation_aa=np.asarray(obj["rot_aa"], dtype=np.float32),
-            window_start=window.start_frame,
-            window_end=window.end_frame,
-        )
+        replay_store = getattr(self, "_state54_replay_feature_store", None)
+        if replay_store is None:
+            state54 = build_state54_window(
+                hand_qpos=np.asarray(hand["urdf_dof"], dtype=np.float32),
+                mano_joint_pos=np.asarray(hand["mano_joint_pos"], dtype=np.float32),
+                frame_contacts=row["contact"],
+                object_name=object_names[0],
+                object_position_world=np.asarray(obj["pos"], dtype=np.float32),
+                object_rotation_aa=np.asarray(obj["rot_aa"], dtype=np.float32),
+                window_start=window.start_frame,
+                window_end=window.end_frame,
+            )
+        else:
+            source_row = int(self._source_row_indices[row_index])
+            index = self._rows[row_index].get("index")
+            if not isinstance(index, dict) or not isinstance(index.get("uuid"), str):
+                raise ValueError(
+                    f"replay State54 requires authenticated row identity at source row {source_row}"
+                )
+            frame_count = int(self._rows[row_index]["episode_metadata"]["total_frames"])
+            features = replay_store.load(
+                source_row,
+                row_uuid=index["uuid"],
+                object_name=object_names[0],
+                frame_count=frame_count,
+            )
+            state54 = build_state54_window_from_features(
+                hand_qpos=np.asarray(hand["urdf_dof"], dtype=np.float32),
+                finger_contacts=features["finger_contacts"],
+                finger_log1p_force=features["finger_log1p_force"],
+                fingertip_collision_box_xyz=features["fingertip_collision_box_xyz"],
+                object_position_world=np.asarray(obj["pos"], dtype=np.float32),
+                window_start=window.start_frame,
+                window_end=window.end_frame,
+            )
         return {**row, "_state54_window": state54}
 
     def __getitem__(self, index: int) -> dict[str, Any]:

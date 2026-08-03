@@ -38,6 +38,130 @@ PHYSICS_SUBSTEPS = 2
 HAND_ATOL = 2e-6
 OBJECT_POSITION_ATOL = 2e-6
 OBJECT_QUATERNION_ATOL = 2e-6
+FEATURE_SCHEMA_ID = "state54_replay_features_v1"
+
+
+class ReplayState54FeatureStore:
+    """Fail-closed reader for an accepted replay feature release."""
+
+    def __init__(
+        self,
+        root: str | Path,
+        *,
+        source_dataset: str | Path,
+        expected_release_sha256: str | None = None,
+    ) -> None:
+        self.root = Path(root).expanduser().resolve()
+        self.release_path = self.root / "release.json"
+        if not self.release_path.is_file():
+            raise ValueError(f"replay State54 release is missing {self.release_path}")
+        self.release_sha256 = sha256_file(self.release_path)
+        if (
+            expected_release_sha256 is not None
+            and self.release_sha256 != str(expected_release_sha256).lower()
+        ):
+            raise ValueError(
+                f"replay State54 release SHA mismatch: {self.release_sha256} != "
+                f"{str(expected_release_sha256).lower()}"
+            )
+        release = json.loads(self.release_path.read_text(encoding="utf-8"))
+        if release.get("status") != "accepted":
+            raise ValueError("replay State54 feature release is not accepted")
+        if release.get("feature_schema_id") != FEATURE_SCHEMA_ID:
+            raise ValueError(
+                f"replay State54 feature schema mismatch: {release.get('feature_schema_id')!r}"
+            )
+        actual_source = Path(str(release.get("source_dataset", ""))).resolve()
+        expected_source = Path(source_dataset).expanduser().resolve()
+        if actual_source != expected_source:
+            raise ValueError(
+                f"replay feature source dataset mismatch: {actual_source} != {expected_source}"
+            )
+        entries = release.get("entries")
+        if not isinstance(entries, list) or len(entries) != int(release.get("row_count", -1)):
+            raise ValueError("replay State54 release entries do not cover its row count")
+        self._entries: dict[int, dict[str, Any]] = {}
+        for entry in entries:
+            row_index = int(entry["row_index"])
+            if row_index in self._entries:
+                raise ValueError(f"duplicate replay State54 row {row_index}")
+            self._entries[row_index] = entry
+        if len(self._entries) != int(release.get("entry_count", -1)):
+            raise ValueError("replay State54 entry count mismatch")
+        self._release = release
+
+    def provenance(self) -> dict[str, Any]:
+        return {
+            "feature_schema_id": FEATURE_SCHEMA_ID,
+            "root": str(self.root),
+            "release": str(self.release_path),
+            "release_sha256": self.release_sha256,
+            "source_release_sha256": self._release.get("source_release_sha256"),
+            "feature_manifest_sha256": self._release.get("feature_manifest_sha256"),
+            "population_sha256": self._release.get("population_sha256"),
+            "row_count": len(self._entries),
+        }
+
+    def load(
+        self,
+        row_index: int,
+        *,
+        row_uuid: str,
+        object_name: str,
+        frame_count: int,
+    ) -> dict[str, np.ndarray]:
+        entry = self._entries.get(int(row_index))
+        if entry is None:
+            raise ValueError(f"replay State54 release does not contain row {row_index}")
+        expected_identity = {
+            "row_uuid": str(row_uuid),
+            "object_name": str(object_name),
+            "frame_count": int(frame_count),
+        }
+        for key, expected in expected_identity.items():
+            if entry.get(key) != expected:
+                raise ValueError(
+                    f"replay State54 row{row_index} {key} mismatch: "
+                    f"{entry.get(key)!r} != {expected!r}"
+                )
+        feature_path = Path(str(entry["output_npz"])).resolve()
+        feature_root = (self.root / "features").resolve()
+        if feature_root not in feature_path.parents:
+            raise ValueError(f"replay State54 feature path escapes release root: {feature_path}")
+        if sha256_file(feature_path) != entry["output_npz_sha256"]:
+            raise ValueError(f"replay State54 row{row_index} feature SHA mismatch")
+        with np.load(feature_path) as archive:
+            required = {
+                "timestamp": (frame_count,),
+                "finger_contacts": (frame_count, 5),
+                "finger_log1p_force": (frame_count, 5),
+                "fingertip_collision_box_xyz": (frame_count, 5, 3),
+            }
+            result: dict[str, np.ndarray] = {}
+            for name, shape in required.items():
+                if name not in archive:
+                    raise ValueError(f"replay State54 row{row_index} is missing {name!r}")
+                value = np.asarray(
+                    archive[name], dtype=np.float64 if name == "timestamp" else np.float32
+                )
+                if value.shape != shape or not np.all(np.isfinite(value)):
+                    raise ValueError(
+                        f"replay State54 row{row_index} {name} must be finite {shape}, "
+                        f"got {value.shape}"
+                    )
+                result[name] = value
+        if not np.allclose(
+            np.diff(result["timestamp"].astype(np.float64)),
+            SOURCE_DT_SECONDS,
+            rtol=0,
+            atol=1e-10,
+        ):
+            raise ValueError(f"replay State54 row{row_index} timestamp clock mismatch")
+        if np.any((result["finger_contacts"] != 0) & (result["finger_contacts"] != 1)):
+            raise ValueError(f"replay State54 row{row_index} contacts are not binary")
+        if np.any(result["finger_log1p_force"] < 0):
+            raise ValueError(f"replay State54 row{row_index} force is negative")
+        return result
 
 
 def sha256_file(path: str | Path) -> str:

@@ -166,6 +166,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         target_lance_dataset: Path | None = None,
         extended_state: bool = False,
         state_contract: str | None = None,
+        state54_replay_feature_release: Path | None = None,
+        state54_replay_feature_release_sha256: str | None = None,
     ) -> None:
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
@@ -182,6 +184,14 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             raise ValueError(f"unsupported state contract {state_contract!r}")
         if extended_state and state_contract is not None:
             raise ValueError("--extended-state and --state-contract are mutually exclusive")
+        if state54_replay_feature_release is not None and state_contract != STATE54_CONTRACT_ID:
+            raise ValueError("replay State54 features require the State54 contract")
+        if (state54_replay_feature_release is None) != (
+            state54_replay_feature_release_sha256 is None
+        ):
+            raise ValueError(
+                "replay State54 feature release and expected SHA must be supplied together"
+            )
         self._action_source = action_source
         self._state_contract = state_contract
         self._extended_state = bool(extended_state or state_contract is not None)
@@ -202,6 +212,15 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             self._gesture_index.sha256 if self._gesture_index is not None else None
         )
         self._dataset_path = Path(lance_dataset).expanduser().resolve()
+        self._state54_replay_feature_store = None
+        if state54_replay_feature_release is not None:
+            from scripts.replay_state54_data import ReplayState54FeatureStore
+
+            self._state54_replay_feature_store = ReplayState54FeatureStore(
+                state54_replay_feature_release,
+                source_dataset=self._dataset_path,
+                expected_release_sha256=state54_replay_feature_release_sha256,
+            )
         self._target_dataset_path = (
             Path(target_lance_dataset).expanduser().resolve()
             if target_lance_dataset is not None
@@ -1835,6 +1854,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--state54-replay-feature-release",
+        type=Path,
+        default=None,
+        help="accepted replay-derived State54 feature release for Lance rows lacking force/joints",
+    )
+    parser.add_argument(
+        "--state54-replay-feature-release-sha256",
+        default=None,
+        help="exact SHA256 of the accepted replay feature release.json",
+    )
+    parser.add_argument(
         "--target-noise-std",
         type=float,
         default=0.0,
@@ -2071,6 +2101,12 @@ def main() -> int:
         target_lance_dataset=args.target_lance_dataset,
         extended_state=args.extended_state,
         state_contract=args.state_contract,
+        state54_replay_feature_release=args.state54_replay_feature_release,
+        state54_replay_feature_release_sha256=(
+            args.state54_replay_feature_release_sha256.lower()
+            if args.state54_replay_feature_release_sha256 is not None
+            else None
+        ),
     )
     if args.row_cache_size:
         dataset.set_row_cache_capacity_rows(args.row_cache_size)
@@ -2159,6 +2195,11 @@ def main() -> int:
         "extended_state": bool(args.extended_state),
         "state_contract": (
             (STATE_CONTRACT_ID if args.extended_state else args.state_contract)
+        ),
+        "state54_replay_features": (
+            dataset._state54_replay_feature_store.provenance()
+            if dataset._state54_replay_feature_store is not None
+            else None
         ),
         "contact_semantics": (
             (
@@ -2577,6 +2618,11 @@ def main() -> int:
             "extended_state": bool(args.extended_state),
             "state_contract": (
                 (STATE_CONTRACT_ID if args.extended_state else args.state_contract)
+            ),
+            "state54_replay_features": (
+                dataset._state54_replay_feature_store.provenance()
+                if dataset._state54_replay_feature_store is not None
+                else None
             ),
             "contact_semantics": (
                 (

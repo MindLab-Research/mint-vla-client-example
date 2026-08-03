@@ -352,7 +352,6 @@ def build_state54_window(
     if start < 0 or end < start or end >= frame_count:
         raise ValueError(f"invalid inclusive window [{start},{end}] for {frame_count} frames")
     sl = slice(start, end + 1)
-    count = end - start + 1
     object_rotations = axis_angle_to_matrix(rotations_aa[sl])
     tip_world = joints[sl][:, FINGERTIP_JOINT_INDICES, :]
     tip_features = np.empty((count, 5, 3), dtype=np.float32)
@@ -365,23 +364,84 @@ def build_state54_window(
         contact_features[local_index], force_features[local_index] = aggregate_finger_contact_and_force(
             frame_contacts[source_index], object_name
         )
-    lift = positions[sl, 2] - positions[0, 2]
-    # Palm is the qpos root translation in both training and Mode4.  The shared
-    # tracker resets at selected-window start.
+    return build_state54_window_from_features(
+        hand_qpos=qpos,
+        finger_contacts=contact_features,
+        finger_log1p_force=force_features,
+        fingertip_collision_box_xyz=tip_features,
+        object_position_world=positions,
+        window_start=start,
+        window_end=end,
+    )
+
+
+def build_state54_window_from_features(
+    *,
+    hand_qpos: np.ndarray,
+    finger_contacts: np.ndarray,
+    finger_log1p_force: np.ndarray,
+    fingertip_collision_box_xyz: np.ndarray,
+    object_position_world: np.ndarray,
+    window_start: int,
+    window_end: int,
+) -> np.ndarray:
+    """Build a State54 window from authenticated replay-derived features.
+
+    Replay-matched releases omit MANO joints and contact-pair forces.  Their
+    sidecar release reconstructs fingertip XYZ and normal loads through the
+    exact Mode4 MuJoCo mechanism.  This function accepts only complete,
+    frame-aligned features; it never pads or substitutes missing values.
+    """
+    qpos = np.asarray(hand_qpos, dtype=np.float32)
+    contacts = np.asarray(finger_contacts, dtype=np.float32)
+    forces = np.asarray(finger_log1p_force, dtype=np.float32)
+    tips = np.asarray(fingertip_collision_box_xyz, dtype=np.float32)
+    positions = np.asarray(object_position_world, dtype=np.float64)
+    frame_count = qpos.shape[0]
+    expected = {
+        "hand_qpos": (frame_count, 26),
+        "finger_contacts": (frame_count, 5),
+        "finger_log1p_force": (frame_count, 5),
+        "fingertip_collision_box_xyz": (frame_count, 5, 3),
+        "object_position_world": (frame_count, 3),
+    }
+    actual = {
+        "hand_qpos": qpos.shape,
+        "finger_contacts": contacts.shape,
+        "finger_log1p_force": forces.shape,
+        "fingertip_collision_box_xyz": tips.shape,
+        "object_position_world": positions.shape,
+    }
+    for name, expected_shape in expected.items():
+        if actual[name] != expected_shape:
+            raise ValueError(
+                f"replay State54 {name} must have shape {expected_shape}, got {actual[name]}"
+            )
+    if not all(np.all(np.isfinite(value)) for value in (qpos, contacts, forces, tips, positions)):
+        raise ValueError("replay State54 features must all be finite")
+    if np.any((contacts != 0.0) & (contacts != 1.0)):
+        raise ValueError("replay State54 contacts must be binary")
+    if np.any(forces < 0.0):
+        raise ValueError("replay State54 log1p forces must be non-negative")
+    start, end = int(window_start), int(window_end)
+    if start < 0 or end < start or end >= frame_count:
+        raise ValueError(f"invalid inclusive window [{start},{end}] for {frame_count} frames")
+
+    lift = positions[start : end + 1, 2] - positions[0, 2]
     tracker = State54TemporalTracker()
-    states = np.empty((count, STATE_DIM), dtype=np.float32)
-    for index in range(count):
+    states = np.empty((end - start + 1, STATE_DIM), dtype=np.float32)
+    for local_index, source_index in enumerate(range(start, end + 1)):
         velocity, age = tracker.update(
-            object_z=positions[start + index, 2],
-            palm_z=qpos[start + index, 2],
-            finger_contacts=contact_features[index],
+            object_z=positions[source_index, 2],
+            palm_z=qpos[source_index, 2],
+            finger_contacts=contacts[source_index],
         )
-        states[index] = build_state54(
-            hand_qpos=qpos[start + index],
-            finger_contacts=contact_features[index],
-            lift_height=lift[index],
-            fingertip_collision_box_xyz=tip_features[index],
-            finger_log1p_force=force_features[index],
+        states[local_index] = build_state54(
+            hand_qpos=qpos[source_index],
+            finger_contacts=contacts[source_index],
+            lift_height=lift[local_index],
+            fingertip_collision_box_xyz=tips[source_index],
+            finger_log1p_force=forces[source_index],
             relative_vertical_velocity=velocity,
             multifinger_contact_age=age,
         )
