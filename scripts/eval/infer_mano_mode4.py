@@ -13,6 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from io import BytesIO
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -222,6 +223,53 @@ def initialize_replay_snapshot_window(
     }
 
 
+def load_state54_eval_data_contract(args) -> tuple[dict | None, dict | None]:
+    path = getattr(args, "state54_data_contract", None)
+    expected_sha = getattr(args, "state54_data_contract_sha256", None)
+    if (path is None) != (expected_sha is None):
+        raise ValueError("State54 data contract and expected SHA must be supplied together")
+    initialization_mode = str(getattr(args, "initialization_mode", "source-window"))
+    if path is None:
+        if initialization_mode == "replay-snapshot-window":
+            raise ValueError("replay-snapshot-window requires --state54-data-contract")
+        return None, None
+    contract_path = Path(path).expanduser().resolve()
+    actual_sha = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+    if actual_sha != str(expected_sha).lower():
+        raise ValueError(f"State54 data contract SHA mismatch: {actual_sha} != {expected_sha}")
+    contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    required = {
+        "status": "accepted",
+        "state_contract": STATE54_CONTRACT_ID,
+        "state_dim": 54,
+        "action_dim": 32,
+        "action_horizon": HORIZON,
+        "max_token_len": 256,
+        "dataset": str(Path(args.lance_dataset).expanduser().resolve()),
+        "mode4_initialization": "accepted_pose_backward_qvel_current_target_snapshot_window_v1",
+        "mode4_temporal_reset": "at_policy_takeover_window_start",
+    }
+    for key, value in required.items():
+        if contract.get(key) != value:
+            raise ValueError(
+                f"State54 eval data contract {key!r} mismatch: {contract.get(key)!r} != {value!r}"
+            )
+    if initialization_mode != "replay-snapshot-window":
+        raise ValueError("replay State54 data contract requires replay-snapshot-window")
+    if args.contact_window_manifest is None:
+        raise ValueError("replay State54 data contract requires contact-window manifest")
+    manifest_sha = hashlib.sha256(Path(args.contact_window_manifest).read_bytes()).hexdigest()
+    if manifest_sha != contract.get("contact_window_manifest_sha256"):
+        raise ValueError("State54 eval contact-window manifest SHA mismatch")
+    provenance = {
+        "path": str(contract_path),
+        "sha256": actual_sha,
+        "contract_id": contract.get("contract_id"),
+        "norm_stats_sha256": contract.get("norm_stats_sha256"),
+    }
+    return contract, provenance
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", default="http://127.0.0.1:30530")
@@ -277,6 +325,8 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="population-specific expected SHA256 of norm_stats.json",
     )
+    parser.add_argument("--state54-data-contract", type=Path, default=None)
+    parser.add_argument("--state54-data-contract-sha256", default=None)
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -1171,6 +1221,7 @@ def run_variant(
         "client_commit": getattr(args, "client_commit", None),
         "backend_commit": getattr(args, "backend_commit", None),
         "model_commit": getattr(args, "model_commit", None),
+        "state54_data_contract": getattr(args, "state54_data_contract_provenance", None),
         "physics_dynamics": True,
         "closed_loop": True,
         "observation_feedback": True,
@@ -1354,13 +1405,30 @@ def main() -> int:
     # formal CLI defaults new evaluations to contact-window initialization.
     args.frame_window = getattr(args, "frame_window", "full")
     args.state_contract = getattr(args, "state_contract", None)
+    args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
+    args.initialization_mode = str(getattr(args, "initialization_mode", "source-window"))
+    state54_data_contract, state54_data_contract_provenance = (
+        load_state54_eval_data_contract(args)
+    )
+    args.state54_data_contract_payload = state54_data_contract
+    args.state54_data_contract_provenance = state54_data_contract_provenance
+    contract_norm_sha = (
+        state54_data_contract.get("norm_stats_sha256")
+        if state54_data_contract is not None
+        else None
+    )
+    if getattr(args, "norm_sha_expected", "") and contract_norm_sha is not None:
+        if args.norm_sha_expected.lower() != contract_norm_sha:
+            raise ValueError("Mode4 norm SHA does not match State54 data contract")
     if not getattr(args, "norm_sha_expected", ""):
         args.norm_sha_expected = (
-            STATE54_NORM_SHA256
-            if args.state_contract == STATE54_CONTRACT_ID
-            else EXPECTED_NORM_SHA256
+            contract_norm_sha
+            or (
+                STATE54_NORM_SHA256
+                if args.state_contract == STATE54_CONTRACT_ID
+                else EXPECTED_NORM_SHA256
+            )
         )
-    args.contact_window_manifest = getattr(args, "contact_window_manifest", None)
     args.contact_context_frames = int(getattr(args, "contact_context_frames", 0))
     args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
     args.row_execution = str(getattr(args, "row_execution", "sequential"))
@@ -1370,6 +1438,11 @@ def main() -> int:
         if args.language_conditioning == GESTURE_LANGUAGE
         else None
     )
+    if state54_data_contract is not None:
+        if args._gesture_index is None:
+            raise ValueError("replay State54 data contract requires gesture language")
+        if args._gesture_index.sha256 != state54_data_contract.get("gesture_index_sha256"):
+            raise ValueError("Mode4 gesture-index SHA does not match State54 data contract")
     if not 1 <= args.chunk_stride < HORIZON:
         raise ValueError(f"--chunk-stride must be between 1 and {HORIZON - 1}")
     if not 0 < args.temporal_decay <= 1:
