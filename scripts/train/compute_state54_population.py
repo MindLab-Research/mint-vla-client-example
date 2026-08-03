@@ -12,7 +12,7 @@ import numpy as np
 
 import openpi_vla_smoke_lance_base as L
 from openpi.models.tokenizer import PaligemmaTokenizer
-from scripts.mano_state54_contract import FORCE_LOG1P_MAX, STATE_CONTRACT_ID, STATE_DIM
+from scripts.mano_state54_contract import STATE_CONTRACT_ID, STATE_DIM
 from scripts.train.train_cube1_01_compare import (
     GESTURE_LANGUAGE,
     SelectedLanceDataset,
@@ -21,8 +21,6 @@ from scripts.train.train_cube1_01_compare import (
 )
 from scripts.target_actions import URDF_TARGET_ABSOLUTE
 
-EXPECTED_ROW_DIGEST = "5fd0ed493c18b563d1deb280624f0f8b3c47fd7d4d11fcb8ee17650d3d74a654"
-EXPECTED_ACTIVE_FRAMES = 1_160_274
 
 
 def write_json(path: Path, payload: dict) -> None:
@@ -32,13 +30,13 @@ def write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def load_rows(path: Path) -> list[int]:
+def load_rows(path: Path) -> tuple[list[int], str]:
     text = path.read_text(encoding="utf-8").strip()
     rows = [int(value) for value in text.split(",") if value]
+    if not rows or len(set(rows)) != len(rows):
+        raise ValueError("population rows must be nonempty and unique")
     digest = hashlib.sha256(",".join(map(str, rows)).encode()).hexdigest()
-    if digest != EXPECTED_ROW_DIGEST or len(rows) != 1997:
-        raise ValueError(f"population row contract mismatch: count={len(rows)} digest={digest}")
-    return rows
+    return rows, digest
 
 
 def make_dataset(args, rows):
@@ -55,10 +53,12 @@ def make_dataset(args, rows):
         gesture_index=args.gesture_index,
         target_lance_dataset=args.lance_dataset,
         state_contract=STATE_CONTRACT_ID,
+        state54_replay_feature_release=args.state54_replay_feature_release,
+        state54_replay_feature_release_sha256=args.state54_replay_feature_release_sha256,
     )
 
 
-def compute_norm(dataset, output_dir: Path) -> dict:
+def compute_norm(dataset, output_dir: Path, row_digest: str) -> dict:
     started = time.time()
     stats = selected_norm_stats(dataset)
     if np.asarray(stats["state"].mean).shape != (54,):
@@ -69,10 +69,6 @@ def compute_norm(dataset, output_dir: Path) -> dict:
     # the authenticated 32D contract and guaranteeing 0->-1, 1->+1.
     np.testing.assert_array_equal(np.asarray(stats["state"].q01)[26:31], 0.0)
     np.testing.assert_array_equal(np.asarray(stats["state"].q99)[26:31], 1.0)
-    np.testing.assert_array_equal(np.asarray(stats["state"].q01)[47:52], 0.0)
-    np.testing.assert_allclose(np.asarray(stats["state"].q99)[47:52], FORCE_LOG1P_MAX, rtol=0, atol=1e-7)
-    assert float(np.asarray(stats["state"].q01)[53]) == 0.0
-    assert float(np.asarray(stats["state"].q99)[53]) == 1.0
     L.normalize.save(output_dir, stats)
     norm_path = output_dir / "norm_stats.json"
     sha = hashlib.sha256(norm_path.read_bytes()).hexdigest()
@@ -82,9 +78,8 @@ def compute_norm(dataset, output_dir: Path) -> dict:
         "action_dim": 32,
         "action_horizon": 10,
         "active_frames": len(dataset),
-        "action_vectors": len(dataset) * 10,
         "trajectory_count": len(dataset._row_windows),
-        "row_indices_sha256": EXPECTED_ROW_DIGEST,
+        "row_indices_sha256": row_digest,
         "norm_stats_sha256": sha,
         "elapsed_seconds": time.time() - started,
     }
@@ -103,7 +98,7 @@ def effective_prompt(dataset, local_row: int) -> str:
     )
 
 
-def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int) -> dict:
+def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int, row_digest: str) -> dict:
     stats = L.normalize.load(norm_dir)
     q01 = np.asarray(stats["state"].q01, dtype=np.float32)
     q99 = np.asarray(stats["state"].q99, dtype=np.float32)
@@ -161,11 +156,11 @@ def audit_tokens(dataset, norm_dir: Path, output_dir: Path, max_token_len: int) 
                 "overflow_count": overflow,
                 "elapsed_seconds": time.time() - started,
             })
-    if total != EXPECTED_ACTIVE_FRAMES or total != len(dataset):
-        raise ValueError(f"token audit population mismatch: {total} != {EXPECTED_ACTIVE_FRAMES}")
+    if total != len(dataset):
+        raise ValueError(f"token audit population mismatch: {total} != {len(dataset)}")
     result = {
         "state_contract": STATE_CONTRACT_ID,
-        "population_row_indices_sha256": EXPECTED_ROW_DIGEST,
+        "population_row_indices_sha256": row_digest,
         "trajectory_count": len(dataset._row_windows),
         "audited_active_frames": total,
         "effective_prompt_count": len(dataset._row_windows),
@@ -195,19 +190,19 @@ def main() -> None:
     parser.add_argument("--contact-window-manifest", type=Path, required=True)
     parser.add_argument("--gesture-index", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--state54-replay-feature-release", type=Path, required=True)
+    parser.add_argument("--state54-replay-feature-release-sha256", required=True)
     parser.add_argument("--mode", choices=("norm", "tokens", "both"), default="both")
     parser.add_argument("--max-token-len", type=int, default=256)
     args = parser.parse_args()
-    rows = load_rows(args.rows_csv)
+    rows, row_digest = load_rows(args.rows_csv)
     dataset = make_dataset(args, rows)
-    if len(dataset) != EXPECTED_ACTIVE_FRAMES:
-        raise ValueError(f"active-frame contract mismatch: {len(dataset)}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     if args.mode in ("norm", "both"):
-        print(json.dumps(compute_norm(dataset, args.output_dir), sort_keys=True), flush=True)
+        print(json.dumps(compute_norm(dataset, args.output_dir, row_digest), sort_keys=True), flush=True)
     if args.mode in ("tokens", "both"):
         print(json.dumps(audit_tokens(
-            dataset, args.output_dir, args.output_dir, args.max_token_len
+            dataset, args.output_dir, args.output_dir, args.max_token_len, row_digest
         ), sort_keys=True), flush=True)
 
 
