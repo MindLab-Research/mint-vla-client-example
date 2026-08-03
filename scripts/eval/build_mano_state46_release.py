@@ -51,6 +51,23 @@ WIDTH = 640
 HEIGHT = 360
 JPEG_QUALITY = 90
 HEAD_CAMERA_PRESET = "current"
+# Measured on the 128-row, 16-env native EGL benchmark at Client 2dcd479.
+# Signed-distance cost scales with object collision complexity, so frame count
+# alone creates 3.5x shard stragglers. These conservative seconds/frame weights
+# drive contiguous, object-aware load balancing; they do not affect row data.
+OBJECT_SECONDS_PER_FRAME = {
+    "banana": 0.0045,
+    "bowl": 0.0200,
+    "cube1": 0.0045,
+    "cube2": 0.0045,
+    "cylinder3": 0.0045,
+    "cylinder4": 0.0045,
+    "cylinder7": 0.0045,
+    "iphone": 0.0055,
+    "largeclamp": 0.0175,
+    "mayonnaisebottle": 0.0047,
+    "powerdrill": 0.0175,
+}
 SOURCE_COLUMNS = [
     "index", "trajectory_metadata", "hands", "reference", "provenance"
 ]
@@ -177,6 +194,15 @@ def representative_subset(
     return selected
 
 
+def estimated_render_seconds(record: dict[str, Any]) -> float:
+    object_name = str(record.get("object"))
+    try:
+        coefficient = OBJECT_SECONDS_PER_FRAME[object_name]
+    except KeyError as exc:
+        raise ValueError(f"no measured render cost for object {object_name!r}") from exc
+    return int(record["frames"]) * coefficient
+
+
 def contiguous_weighted_shards(
     records: list[dict[str, Any]], shard_count: int
 ) -> list[list[dict[str, Any]]]:
@@ -184,7 +210,7 @@ def contiguous_weighted_shards(
         raise ValueError(f"invalid shard count {shard_count}")
     shards: list[list[dict[str, Any]]] = []
     cursor = 0
-    remaining_weight = sum(int(value["frames"]) for value in records)
+    remaining_weight = sum(estimated_render_seconds(value) for value in records)
     for shard_index in range(shard_count):
         shards_left = shard_count - shard_index
         rows_left = len(records) - cursor
@@ -198,7 +224,7 @@ def contiguous_weighted_shards(
         max_take = rows_left - (shards_left - 1)
         while len(shard) < max_take:
             candidate = records[cursor]
-            candidate_weight = int(candidate["frames"])
+            candidate_weight = estimated_render_seconds(candidate)
             if shard and abs(weight - target) <= abs(weight + candidate_weight - target):
                 break
             shard.append(candidate)
@@ -207,7 +233,7 @@ def contiguous_weighted_shards(
         if not shard:
             shard.append(records[cursor])
             cursor += 1
-            weight = int(shard[0]["frames"])
+            weight = estimated_render_seconds(shard[0])
         shards.append(shard)
         remaining_weight -= weight
     if [record["row_uuid"] for shard in shards for record in shard] != [
@@ -242,6 +268,10 @@ def write_plan(
         "population": {
             "rows": len(records),
             "frames": sum(int(value["frames"]) for value in records),
+            "estimated_render_seconds": sum(
+                estimated_render_seconds(value) for value in records
+            ),
+            "render_cost_contract": "measured_object_seconds_per_frame_128row_16env_v1",
             "benchmark_rows": benchmark_rows,
             "qualified_grades": ["A", "B"],
         },
@@ -287,6 +317,9 @@ def write_plan(
                 "shard_index": shard_index,
                 "rows": len(entries),
                 "frames": sum(value["frames"] for value in entries),
+                "estimated_render_seconds": sum(
+                    estimated_render_seconds(value) for value in entries
+                ),
                 "filtered_row_min": entries[0]["filtered_row_index"],
                 "filtered_row_max": entries[-1]["filtered_row_index"],
                 "object_counts": dict(Counter(value["object"] for value in entries)),

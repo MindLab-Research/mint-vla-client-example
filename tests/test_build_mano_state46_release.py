@@ -37,7 +37,7 @@ def _entry(record):
 
 def test_contiguous_weighted_shards_preserve_global_order():
     records = [
-        {"row_uuid": f"u{i}", "frames": frames}
+        {"row_uuid": f"u{i}", "frames": frames, "object": "banana"}
         for i, frames in enumerate([10, 20, 40, 80, 10, 30, 50])
     ]
     shards = release.contiguous_weighted_shards(records, 3)
