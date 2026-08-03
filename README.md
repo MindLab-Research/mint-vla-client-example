@@ -296,6 +296,12 @@ for a copy-paste command and the low-memory fallback.
   multiprocessing, and Lance aggregation. Its production population is the
   verified 5,425-row filtered Lance; startup binds every filtered UUID to the
   accepted-row manifest and records both filtered and original merged indices.
+- `scripts/eval/build_mano_state46_release.py`: qualified Grade A/B native-trace
+  release producer. It restores full qpos/qvel, calls only `mj_forward`, and
+  extracts state46/contact/object plus current-head/wrist 640x360 JPEG from the
+  same `MjData`. Contiguous shards are balanced by measured object render cost,
+  written by independent EGL workers, resumed by UUID prefix, and concatenated
+  deterministically into one immutable Lance release.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,
