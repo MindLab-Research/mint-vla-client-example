@@ -315,6 +315,16 @@ for a copy-paste command and the low-memory fallback.
   release contact stream (for example, contact ±100 frames). StateAug is
   disabled until noisy 28D qpos can be propagated through contact and
   object-geometry features without mixing inconsistent states.
+- `scripts/train/prepare_mano_state41_profile.py` deterministically selects an
+  object/gesture population from the immutable release, freezes contact windows,
+  computes normalization over the exact query/action-horizon population, and
+  rejects any raw discrete-state prompt above 200 tokens before atomically
+  publishing the norm and profile report.
+- `scripts/remote/run_state41_cube1_gesture03_20k.sh` consumes that authenticated
+  profile report and launches the fixed cube1/gesture03 Action-LoRA experiment:
+  B-schema target28, contact ±100, 20,000 steps, and sampler checkpoints at
+  4K/8K/12K/16K plus the final 20K save. Set `STATE41_TRAIN_DRY_RUN=1` to exercise
+  the complete data/normalization/token payload without contacting a server.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,
