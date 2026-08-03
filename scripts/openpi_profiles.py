@@ -64,6 +64,7 @@ ACTION_LORA_R16_STATE46_PROFILE = OpenPIClientProfile(
     paligemma_variant="gemma_2b",
     action_expert_variant="gemma_300m_lora_r16",
     state_dim=46,
+    max_tokens=208,
     fail_on_token_truncation=True,
     state_contract_id="mano_state46_native_sim_28d_v1",
     delta_mask_segments=(3, -3, 22, -4),

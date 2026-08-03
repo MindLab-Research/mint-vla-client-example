@@ -306,8 +306,9 @@ for a copy-paste command and the low-memory fallback.
   index compatibility.
 - `openpi/pi05-action-lora-r16-state46-28dof-finetune` binds the qualified
   release to profile `pi05_action_lora_r16_state46_28dof_v1`: observation width
-  46, action width 32, horizon 10, and the target28 delta mask
-  `(3, -3, 22, -4)`. Training uses `--state-contract state46`,
+  46, action width 32, horizon 10, a fail-closed 208-token input budget,
+  and the target28 delta mask `(3, -3, 22, -4)`. Training uses
+  `--state-contract state46`,
   `--action-source urdf_target_absolute`, and `--frame-window full`. StateAug is
   disabled for this contract until noisy 28D qpos can be propagated through the
   contact and object-geometry features without mixing inconsistent states.
