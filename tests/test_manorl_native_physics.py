@@ -72,6 +72,35 @@ def test_object_body_resolution_uses_authoritative_runtime_name():
     assert floor_geom >= 0
 
 
+def test_state46_features_use_visual_measurement_spheres_without_new_collisions():
+    import mujoco
+
+    _, model, data, renderer, object_addr, _, hand_addr, _, _ = physics.make_scene(
+        "cube1", 64, 36, physics=True, create_renderer=True
+    )
+    try:
+        data.qpos[:] = 0.0
+        data.qvel[:] = 0.0
+        data.qpos[object_addr : object_addr + 3] = [0.1, 0.0, 0.1]
+        data.qpos[object_addr + 3 : object_addr + 7] = [1.0, 0.0, 0.0, 0.0]
+        data.qpos[hand_addr] = 0.0
+        mujoco.mj_forward(model, data)
+        ids = physics.resolve_state46_feature_ids(model, "cube1")
+        contacts, surface, radial, floor, pairs = physics.state46_features_from_mujoco(
+            model, data, "cube1", feature_ids=ids
+        )
+    finally:
+        renderer.close()
+
+    assert len(ids.hand_geom_ids) == 16
+    assert len(ids.fingertip_measurement_geom_ids) == 5
+    assert all(model.geom_contype[value] == 0 for value in ids.fingertip_measurement_geom_ids)
+    assert contacts.shape == surface.shape == radial.shape == (5,)
+    assert np.isfinite(surface).all() and np.isfinite(radial).all()
+    assert floor in (0.0, 1.0)
+    assert isinstance(pairs, list)
+
+
 def test_head_camera_preset_registry_has_two_versions_and_current_default():
     from scripts.eval import mano_action_support as legacy
 

@@ -8,6 +8,7 @@ exposes the small scene/step ABI already consumed by the historical replay.
 from __future__ import annotations
 
 import copy
+from dataclasses import dataclass
 import hashlib
 import os
 from pathlib import Path
@@ -27,6 +28,33 @@ DEFAULT_MANORL_REPO_ROOT = Path(
 _RUNTIME: dict[str, Any] | None = None
 _CONTACT_IDS: dict[int, tuple[set[int], set[int], int]] = {}
 _VISUAL_INVARIANCE: dict[int, dict[str, Any]] = {}
+_STATE46_IDS: dict[int, "State46FeatureIds"] = {}
+
+_STATE46_KEYPOINT_LINKS = (
+    "thumb_cmc", "thumb_mcp", "thumb_ip",
+    "index_mcp", "index_pip", "index_dip",
+    "middle_mcp", "middle_pip", "middle_dip",
+    "ring_mcp", "ring_pip", "ring_dip",
+    "pinky_mcp", "pinky_pip", "pinky_dip",
+    "palm",
+)
+_STATE46_FINGERTIP_LINKS = {
+    "index": "index_dip",
+    "thumb": "thumb_ip",
+    "ring": "ring_dip",
+    "middle": "middle_dip",
+    "pinky": "pinky_dip",
+}
+
+
+@dataclass(frozen=True)
+class State46FeatureIds:
+    hand_geom_ids: frozenset[int]
+    object_geom_ids: tuple[int, ...]
+    geom_id_to_finger: dict[int, str]
+    fingertip_measurement_geom_ids: tuple[int, ...]
+    palm_body_id: int
+    floor_geom_id: int
 
 
 def _sha256(path: Path) -> str:
@@ -350,6 +378,152 @@ def _contact_ids(model: Any, object_name: str) -> tuple[set[int], set[int], int]
     cached = hand_geoms, object_geoms, int(floor_geom)
     _CONTACT_IDS[key] = cached
     return cached
+
+
+def resolve_state46_feature_ids(model: Any, object_name: str) -> State46FeatureIds:
+    """Resolve contact and non-colliding measurement geometry for state46."""
+    key = id(model)
+    cached = _STATE46_IDS.get(key)
+    if cached is not None:
+        return cached
+    import mujoco
+    from scripts import mano_state46_contract as contract
+
+    hand_geoms, object_geoms, floor_geom = _contact_ids(model, object_name)
+    geom_id_to_finger: dict[int, str] = {}
+    keypoint_bodies: set[str] = set()
+    for geom_id in hand_geoms:
+        body_id = int(model.geom_bodyid[geom_id])
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+        if body_name not in _STATE46_KEYPOINT_LINKS:
+            raise ValueError(
+                f"state46 hand collision geom has unexpected body {body_name!r}"
+            )
+        keypoint_bodies.add(body_name)
+        for finger in contract.FINGER_NAMES:
+            if body_name.startswith(finger):
+                geom_id_to_finger[int(geom_id)] = finger
+                break
+    if keypoint_bodies != set(_STATE46_KEYPOINT_LINKS):
+        raise ValueError(
+            "state46 keypoint body mismatch: "
+            f"missing={sorted(set(_STATE46_KEYPOINT_LINKS)-keypoint_bodies)} "
+            f"extra={sorted(keypoint_bodies-set(_STATE46_KEYPOINT_LINKS))}"
+        )
+
+    tip_geoms: list[int] = []
+    for finger in contract.FINGER_NAMES:
+        body_name = _STATE46_FINGERTIP_LINKS[finger]
+        body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            raise ValueError(f"state46 missing fingertip body {body_name!r}")
+        candidates = [
+            geom_id
+            for geom_id in range(model.ngeom)
+            if int(model.geom_bodyid[geom_id]) == body_id
+            and int(model.geom_type[geom_id]) == int(mujoco.mjtGeom.mjGEOM_SPHERE)
+            and int(model.geom_contype[geom_id]) == 0
+            and int(model.geom_conaffinity[geom_id]) == 0
+        ]
+        if len(candidates) != 1:
+            names = [
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, value)
+                for value in candidates
+            ]
+            raise ValueError(
+                f"state46 expected one non-colliding sphere on {body_name}, got {names}"
+            )
+        tip_geoms.append(int(candidates[0]))
+    palm_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "palm")
+    if palm_body_id < 0:
+        raise ValueError("state46 missing palm body")
+    result = State46FeatureIds(
+        hand_geom_ids=frozenset(int(value) for value in hand_geoms),
+        object_geom_ids=tuple(sorted(int(value) for value in object_geoms)),
+        geom_id_to_finger=geom_id_to_finger,
+        fingertip_measurement_geom_ids=tuple(tip_geoms),
+        palm_body_id=int(palm_body_id),
+        floor_geom_id=int(floor_geom),
+    )
+    _STATE46_IDS[key] = result
+    return result
+
+
+def state46_features_from_mujoco(
+    model: Any,
+    data: Any,
+    object_name: str,
+    *,
+    feature_ids: State46FeatureIds | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.float32, list[dict[str, Any]]]:
+    """Return simulated contact5, distance5, radial5, floor support and pairs."""
+    import mujoco
+    from scripts import mano_state46_contract as contract
+
+    ids = feature_ids or resolve_state46_feature_ids(model, object_name)
+    contacts = np.zeros(len(contract.FINGER_NAMES), dtype=np.float32)
+    object_floor = False
+    pair_records: list[dict[str, Any]] = []
+    for contact_index in range(int(data.ncon)):
+        contact = data.contact[contact_index]
+        first, second = int(contact.geom1), int(contact.geom2)
+        if ids.floor_geom_id in (first, second) and (
+            first in ids.object_geom_ids or second in ids.object_geom_ids
+        ):
+            object_floor = True
+        if first in ids.hand_geom_ids and second in ids.object_geom_ids:
+            hand_geom, object_geom, normal_sign = first, second, 1.0
+        elif second in ids.hand_geom_ids and first in ids.object_geom_ids:
+            hand_geom, object_geom, normal_sign = second, first, -1.0
+        else:
+            continue
+        finger = ids.geom_id_to_finger.get(hand_geom)
+        if finger is not None:
+            contacts[contract.FINGER_NAMES.index(finger)] = 1.0
+        force = np.zeros(6, dtype=np.float64)
+        mujoco.mj_contactForce(model, data, contact_index, force)
+        normal = normal_sign * np.asarray(contact.frame[:3], dtype=np.float64)
+        magnitude = abs(float(force[0]))
+        force_world = normal * magnitude
+        pair_records.append(
+            {
+                "finger": finger or "palm",
+                "hand_geom": mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_GEOM, hand_geom
+                ) or str(hand_geom),
+                "object_geom": mujoco.mj_id2name(
+                    model, mujoco.mjtObj.mjOBJ_GEOM, object_geom
+                ) or str(object_geom),
+                "position_world": np.asarray(contact.pos, dtype=np.float32).tolist(),
+                "normal_force_world": force_world.astype(np.float32).tolist(),
+                "normal_force_norm": np.float32(magnitude).item(),
+                "signed_distance_m": np.float32(contact.dist).item(),
+            }
+        )
+
+    signed = np.empty(len(ids.fingertip_measurement_geom_ids), dtype=np.float32)
+    radial = np.empty_like(signed)
+    palm_position = np.asarray(data.xpos[ids.palm_body_id], dtype=np.float64)
+    fromto = np.zeros(6, dtype=np.float64)
+    for finger_index, tip_geom in enumerate(ids.fingertip_measurement_geom_ids):
+        distances = [
+            float(
+                mujoco.mj_geomDistance(
+                    model, data, tip_geom, object_geom, 1.0, fromto
+                )
+            )
+            for object_geom in ids.object_geom_ids
+        ]
+        distance = min(distances)
+        if not np.isfinite(distance) or distance >= 1.0:
+            raise FloatingPointError(
+                f"invalid state46 fingertip/object distance for geom {tip_geom}: {distance}"
+            )
+        signed[finger_index] = np.float32(distance)
+        radial[finger_index] = np.float32(
+            np.linalg.norm(np.asarray(data.geom_xpos[tip_geom]) - palm_position)
+        )
+    return contacts, signed, radial, np.float32(object_floor), pair_records
 
 
 def contact_types(model: Any, data: Any, object_name: str) -> set[str]:
