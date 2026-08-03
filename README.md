@@ -296,22 +296,25 @@ for a copy-paste command and the low-memory fallback.
   multiprocessing, and Lance aggregation. Its production population is the
   verified 5,425-row filtered Lance; startup binds every filtered UUID to the
   accepted-row manifest and records both filtered and original merged indices.
-- `scripts/eval/build_mano_state46_release.py`: qualified Grade A/B native-trace
+- `scripts/eval/build_mano_state41_release.py`: qualified Grade A/B native-trace
   release producer. It restores full qpos/qvel, calls only `mj_forward`, and
-  extracts state46/contact/object plus current-head/wrist 640x360 JPEG from the
+  extracts state41/contact/object plus current-head/wrist 640x360 JPEG from the
   same `MjData`. Contiguous shards are balanced by measured object render cost,
   written by independent EGL workers, resumed by UUID prefix, and concatenated
-  deterministically into one immutable Lance release. Release rows expose both
-  `episode_metadata.frames` and `episode_metadata.total_frames` for downstream
-  index compatibility.
-- `openpi/pi05-action-lora-r16-state46-28dof-finetune` binds the qualified
-  release to profile `pi05_action_lora_r16_state46_28dof_v1`: observation width
-  46, action width 32, horizon 10, a fail-closed 208-token input budget,
-  and the target28 delta mask `(3, -3, 22, -4)`. Training uses
-  `--state-contract state46`,
-  `--action-source urdf_target_absolute`, and `--frame-window full`. StateAug is
-  disabled for this contract until noisy 28D qpos can be propagated through the
-  contact and object-geometry features without mixing inconsistent states.
+  deterministically into one atomically published Lance release. Release rows
+  expose both `episode_metadata.frames` and `episode_metadata.total_frames` for
+  downstream index compatibility.
+- `openpi/pi05-action-lora-r16-state41-28dof-finetune` binds the qualified
+  release to profile `pi05_action_lora_r16_state41_28dof_v1`: observation width
+  41, action width 32, horizon 10, a fail-closed 200-token input budget, and the
+  target28 delta mask `(3, -3, 22, -4)`. State41 is qpos28 + contact5 + lift +
+  signed fingertip/object distance5 + floor contact + multi-contact duration;
+  it deliberately omits the five causal fingertip-to-palm radial-rate fields.
+  Training uses `--state-contract state41` and
+  `--action-source urdf_target_absolute`; the frame window is selected from the
+  release contact stream (for example, contact ±100 frames). StateAug is
+  disabled until noisy 28D qpos can be propagated through contact and
+  object-geometry features without mixing inconsistent states.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,

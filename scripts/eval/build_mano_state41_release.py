@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Build the qualified native MANO state46/action32 RGB release.
+"""Build the qualified native MANO state41/action32 RGB release.
 
 Each worker restores a qualified native qpos/qvel trace into one visual model,
-calls ``mj_forward`` exactly once per frame, and extracts state46/contact/object
+calls ``mj_forward`` exactly once per frame, and extracts state41/contact/object
 plus Head/Wrist JPEG from that same ``MjData``. Workers own independent Lance
 shards; a deterministic final pass concatenates contiguous shards in filtered
 row order. Source Lance and quality traces are read-only.
@@ -28,19 +28,19 @@ import uuid
 
 import numpy as np
 
-from scripts import mano_state46_contract as state46
+from scripts import mano_state41_contract as state41
 from scripts.eval import mano_action_support as cameras
 from scripts.eval import manorl_native_physics as physics
 from scripts.eval import replay_mano_target_physics as replay_quality
 
-RELEASE_CONTRACT = "mano_28d_native_replay_state46_rgb_v1"
+RELEASE_CONTRACT = "mano_28d_native_replay_state41_rgb_v1"
 DEFAULT_QUALITY_ROOT = Path(
     "/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/quality/"
     "native_target_replay_28d_v2"
 )
 DEFAULT_OUTPUT_ROOT = Path(
     "/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/"
-    "mano_28d_native_replay_state46_rgb_v1"
+    "mano_28d_native_replay_state41_rgb_v1"
 )
 EXPECTED_QUALITY_SUMMARY_SHA256 = (
     "9d293d3bf1f86a682bb61deee686a103f7e77906769b942d5fc43da69d65bf78"
@@ -81,7 +81,7 @@ class RenderScene:
     object_addr: int
     hand_addresses: np.ndarray
     object_body_id: int
-    feature_ids: physics.State46FeatureIds
+    feature_ids: physics.State41FeatureIds
 
 
 _SCENES: dict[str, RenderScene] = {}
@@ -109,7 +109,7 @@ def release_code_identity() -> dict[str, str]:
         ).strip(),
         "release_script_sha256": sha256(Path(__file__).resolve()),
         "state_contract_sha256": sha256(
-            repo / "scripts" / "mano_state46_contract.py"
+            repo / "scripts" / "mano_state41_contract.py"
         ),
         "physics_adapter_sha256": sha256(
             repo / "scripts" / "eval" / "manorl_native_physics.py"
@@ -284,8 +284,8 @@ def write_plan(
             "wrist_camera": cameras.WRIST_CAMERA,
             "dynamics_steps_during_render": 0,
         },
-        "state_contract": state46.STATE46_CONTRACT_ID,
-        "action_contract": state46.ACTION32_CONTRACT_ID,
+        "state_contract": state41.STATE41_CONTRACT_ID,
+        "action_contract": state41.ACTION32_CONTRACT_ID,
         "code": release_code_identity(),
         "shards": [],
     }
@@ -339,13 +339,13 @@ def write_plan(
 def _vector32():
     import pyarrow as pa
 
-    return pa.list_(pa.float32(), state46.ACTION_DIM)
+    return pa.list_(pa.float32(), state41.ACTION_DIM)
 
 
 def _vector46():
     import pyarrow as pa
 
-    return pa.list_(pa.float32(), state46.STATE_DIM)
+    return pa.list_(pa.float32(), state41.STATE_DIM)
 
 
 def release_schema():
@@ -545,7 +545,7 @@ def scene(object_name: str) -> RenderScene:
         object_addr=int(object_addr),
         hand_addresses=np.asarray(hand_addresses, dtype=np.int64),
         object_body_id=physics.object_body_id(model, object_name),
-        feature_ids=physics.resolve_state46_feature_ids(model, object_name),
+        feature_ids=physics.resolve_state41_feature_ids(model, object_name),
     )
     _SCENES[object_name] = result
     return result
@@ -632,13 +632,12 @@ def render_release_row(
             raise ValueError(f"trace {name} shape mismatch: {getattr(arrays.get(name), 'shape', None)}")
         if not np.isfinite(arrays[name]).all():
             raise FloatingPointError(f"trace {name} is non-finite")
-    state46.validate_timestamps(arrays["timestamp"], frame_count)
-    actions = state46.absolute_target_actions32(arrays["source_target_qpos"])
+    state41.validate_timestamps(arrays["timestamp"], frame_count)
+    actions = state41.absolute_target_actions32(arrays["source_target_qpos"])
     visual = scene(entry["object"])
     data = visual.data
     contacts = np.empty((frame_count, 5), dtype=np.float32)
     surface = np.empty_like(contacts)
-    radial = np.empty_like(contacts)
     floor = np.empty(frame_count, dtype=np.float32)
     sim_position = np.empty((frame_count, 3), dtype=np.float32)
     sim_quaternion = np.empty((frame_count, 4), dtype=np.float32)
@@ -673,8 +672,8 @@ def render_release_row(
                 f"quaternion_dot={quaternion_dot}"
             )
         (
-            contacts[frame], surface[frame], radial[frame], floor[frame], pairs
-        ) = physics.state46_features_from_mujoco(
+            contacts[frame], surface[frame], floor[frame], pairs
+        ) = physics.state41_features_from_mujoco(
             visual.model, data, entry["object"], feature_ids=visual.feature_ids
         )
         contact_frames.append(
@@ -715,12 +714,11 @@ def render_release_row(
         float(np.max(forward_object_error[1:]))
     )
     lift = sim_position[:, 2] - sim_position[0, 2]
-    state = state46.assemble_state46_sequence(
+    state = state41.assemble_state41_sequence(
         hand_qpos=arrays["simulated_hand_qpos"],
         contacts=contacts,
         object_lift=lift,
         signed_surface_distances=surface,
-        radial_distances=radial,
         floor_support=floor,
     )
     payload.update(state.tobytes(order="C"))
@@ -823,8 +821,8 @@ def render_release_row(
         },
         "provenance": {
             "contract": RELEASE_CONTRACT,
-            "state_contract": state46.STATE46_CONTRACT_ID,
-            "action_contract": state46.ACTION32_CONTRACT_ID,
+            "state_contract": state41.STATE41_CONTRACT_ID,
+            "action_contract": state41.ACTION32_CONTRACT_ID,
             "replay_contract": replay_quality.CONTRACT,
             "client_commit": release_code["client_commit"],
             "replay_client_commit": provenance["client_commit"],
@@ -1016,37 +1014,66 @@ def aggregate_release(plan_path: Path, overwrite: bool) -> Path:
 
     plan, plan_sha = _load_plan(plan_path)
     output_root = plan_path.parent
-    target = output_root / "mano_28d_native_replay_state46_rgb_v1.lance"
-    if target.exists():
-        if not overwrite:
-            raise FileExistsError(f"final release exists: {target}")
-        shutil.rmtree(target)
+    target = output_root / "mano_28d_native_replay_state41_rgb_v1.lance"
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"final release exists: {target}")
+    staging = output_root / f".{target.name}.incoming-{uuid.uuid4().hex}"
+    backup = output_root / f".{target.name}.backup-{uuid.uuid4().hex}"
     all_entries = [entry for shard in plan["shards"] for entry in shard["entries"]]
-    mode = "create"
-    shard_verifications = []
-    for shard in plan["shards"]:
-        index = int(shard["shard_index"])
-        shard_verifications.append(verify_shard(plan_path, index))
-        source = lance.dataset(str(_shard_path(output_root, index)))
-        lance.write_dataset(source.scanner().to_reader(), str(target), mode=mode)
-        mode = "append"
-    dataset = lance.dataset(str(target))
-    light = dataset.to_table(
-        columns=["index", "provenance", "frame_count", "image_count", "image_bytes"]
-    ).to_pylist()
-    expected_uuid = [entry["row_uuid"] for entry in all_entries]
-    if [row["index"]["uuid"] for row in light] != expected_uuid:
-        raise ValueError("final release UUID order mismatch")
-    if any(row["provenance"]["release_plan_sha256"] != plan_sha for row in light):
-        raise ValueError("final release provenance mismatch")
-    totals = {
-        "rows": len(light),
-        "frames": sum(int(row["frame_count"]) for row in light),
-        "images": sum(int(row["image_count"]) for row in light),
-        "image_bytes": sum(int(row["image_bytes"]) for row in light),
-    }
-    if totals["rows"] != int(plan["population"]["rows"]) or totals["frames"] != int(plan["population"]["frames"]):
-        raise ValueError(f"final release population mismatch: {totals}")
+    try:
+        mode = "create"
+        for shard in plan["shards"]:
+            index = int(shard["shard_index"])
+            verify_shard(plan_path, index)
+            source = lance.dataset(str(_shard_path(output_root, index)))
+            lance.write_dataset(
+                source.scanner().to_reader(), str(staging), mode=mode
+            )
+            mode = "append"
+        dataset = lance.dataset(str(staging))
+        light = dataset.to_table(
+            columns=[
+                "index",
+                "provenance",
+                "frame_count",
+                "image_count",
+                "image_bytes",
+            ]
+        ).to_pylist()
+        expected_uuid = [entry["row_uuid"] for entry in all_entries]
+        if [row["index"]["uuid"] for row in light] != expected_uuid:
+            raise ValueError("final release UUID order mismatch")
+        if any(
+            row["provenance"]["release_plan_sha256"] != plan_sha
+            for row in light
+        ):
+            raise ValueError("final release provenance mismatch")
+        totals = {
+            "rows": len(light),
+            "frames": sum(int(row["frame_count"]) for row in light),
+            "images": sum(int(row["image_count"]) for row in light),
+            "image_bytes": sum(int(row["image_bytes"]) for row in light),
+        }
+        if (
+            totals["rows"] != int(plan["population"]["rows"])
+            or totals["frames"] != int(plan["population"]["frames"])
+        ):
+            raise ValueError(f"final release population mismatch: {totals}")
+
+        if target.exists():
+            os.replace(target, backup)
+        try:
+            os.replace(staging, target)
+        except Exception:
+            if backup.exists() and not target.exists():
+                os.replace(backup, target)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
     verification = {
         "contract": RELEASE_CONTRACT,
         "verified_at": datetime.now(timezone.utc).isoformat(),
@@ -1054,11 +1081,12 @@ def aggregate_release(plan_path: Path, overwrite: bool) -> Path:
         "release_plan": str(plan_path),
         "release_plan_sha256": plan_sha,
         "uuid_order_verified": True,
+        "atomic_publish": True,
         "shards": len(plan["shards"]),
         **totals,
         "client_commit": plan["code"]["client_commit"],
-        "state_contract": state46.STATE46_CONTRACT_ID,
-        "action_contract": state46.ACTION32_CONTRACT_ID,
+        "state_contract": state41.STATE41_CONTRACT_ID,
+        "action_contract": state41.ACTION32_CONTRACT_ID,
     }
     atomic_json(output_root / "release_verification.json", verification)
     print(json.dumps(verification, indent=2, sort_keys=True))

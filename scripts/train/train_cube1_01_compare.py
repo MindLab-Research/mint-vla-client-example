@@ -35,7 +35,7 @@ from scripts.gesture_language import (
     format_gesture_prompt,
 )
 from scripts.mano_state44_contract import STATE44_CONTRACT_ID
-from scripts.mano_state46_contract import STATE46_CONTRACT_ID
+from scripts.mano_state41_contract import STATE41_CONTRACT_ID
 from scripts.mano_state_contract import (
     CONTACT_RULE,
     CONTACT_SEMANTICS,
@@ -74,8 +74,8 @@ LANGUAGE_CONDITIONING_CHOICES = (
 
 
 def resolved_state_contract_id(state_contract: str | None) -> str | None:
-    if state_contract == "state46":
-        return STATE46_CONTRACT_ID
+    if state_contract == "state41":
+        return STATE41_CONTRACT_ID
     if state_contract == "state44":
         return STATE44_CONTRACT_ID
     if state_contract == "state32":
@@ -192,7 +192,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
         if action_source != MEASURED_DELTA and target_lance_dataset is None:
-            if state_contract == "state46":
+            if state_contract == "state41":
                 # Native release rows carry aligned simulated qpos and target28.
                 target_lance_dataset = lance_dataset
             else:
@@ -205,17 +205,15 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 f"expected one of {LANGUAGE_CONDITIONING_CHOICES}"
             )
         self._action_source = action_source
-        if state_contract not in {None, "state32", "state44", "state46"}:
+        if state_contract not in {None, "state32", "state44", "state41"}:
             raise ValueError(f"unsupported state_contract {state_contract!r}")
         if extended_state and state_contract not in {None, "state32"}:
             raise ValueError(
-                "--extended-state cannot be combined with an explicit state44/state46 contract"
+                "--extended-state cannot be combined with an explicit state44/state41 contract"
             )
         self._state_contract = state_contract or ("state32" if extended_state else None)
         self._extended_state = self._state_contract is not None
-        self._state_dim = {"state44": 44, "state46": 46}.get(self._state_contract, 32)
-        if self._state_contract == "state46" and frame_window != "full":
-            raise ValueError("state46 qualified release requires frame_window='full'")
+        self._state_dim = {"state44": 44, "state41": 41}.get(self._state_contract, 32)
         self._language_conditioning = language_conditioning
         self._gesture_index = (
             GestureIndex.load(gesture_index)
@@ -366,7 +364,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
     def _load_row_uncached(self, row_index: int) -> dict[str, Any]:
         source_row = self._source_row_indices[row_index]
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
-        if self._extended_state and getattr(self, "_state_contract", None) != "state46":
+        if self._extended_state and getattr(self, "_state_contract", None) != "state41":
             columns += ["contact", "objects"]
         if getattr(self, "_state_contract", None) == "state44":
             columns.append("timestamp")
@@ -381,7 +379,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                     [source_row], columns=["hands"]
                 ).to_pylist()[0]
                 target_hands = target_row["hands"]
-            active_dim = 28 if getattr(self, "_state_contract", None) == "state46" else 26
+            active_dim = 28 if getattr(self, "_state_contract", None) == "state41" else 26
             target_q = np.asarray(target_hands[0]["urdf_dof"], dtype=np.float32)
             image_q = np.asarray(row["state"], dtype=np.float32)[:, :active_dim]
             if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
@@ -552,7 +550,7 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
             [source_row], columns=["state", "actions"]
         ).to_pylist()[0]
         target_row = dataset._target_dataset.take([source_row], columns=["hands"]).to_pylist()[0]
-        active_dim = 28 if getattr(dataset, "_state_contract", None) == "state46" else 26
+        active_dim = 28 if getattr(dataset, "_state_contract", None) == "state41" else 26
         target_q = np.asarray(target_row["hands"][0]["urdf_dof"], dtype=np.float32)
         image_q = np.asarray(image_row["state"], dtype=np.float32)[:, :active_dim]
         if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
@@ -597,13 +595,13 @@ def selected_norm_stats(dataset: SelectedLanceDataset) -> dict[str, Any]:
         _q01 = np.asarray(state_result.q01, dtype=np.float32).copy()
         _q99 = np.asarray(state_result.q99, dtype=np.float32).copy()
         state_contract = getattr(dataset, "_state_contract", None)
-        contact_slice = slice(28, 33) if state_contract == "state46" else slice(26, 31)
+        contact_slice = slice(28, 33) if state_contract == "state41" else slice(26, 31)
         _m[contact_slice] = 0.5
         _s[contact_slice] = 0.5
         _q01[contact_slice] = 0.0
         _q99[contact_slice] = 1.0
-        if state_contract in {"state44", "state46"}:
-            floor_index = 44 if state_contract == "state46" else 42
+        if state_contract in {"state44", "state41"}:
+            floor_index = 39 if state_contract == "state41" else 42
             _m[floor_index] = 0.5
             _s[floor_index] = 0.5
             _q01[floor_index] = 0.0
@@ -675,8 +673,8 @@ def load_or_compute_norm_stats(
         state_q01 = np.asarray(stats["state"].q01, dtype=np.float32)
         state_q99 = np.asarray(stats["state"].q99, dtype=np.float32)
         state_contract = getattr(dataset, "_state_contract", None)
-        contact_slice = slice(28, 33) if state_contract == "state46" else slice(26, 31)
-        lift_index = 33 if state_contract == "state46" else 31
+        contact_slice = slice(28, 33) if state_contract == "state41" else slice(26, 31)
+        lift_index = 33 if state_contract == "state41" else 31
         if not np.allclose(state_q01[contact_slice], 0.0):
             raise ValueError(
                 f"{state_contract} norm cache contact q01 must be 0, "
@@ -692,9 +690,9 @@ def load_or_compute_norm_stats(
             raise ValueError(
                 f"extended-state norm cache lift range must be > 1e-4, got {lift_range}: {path}"
             )
-        if state_contract in {"state44", "state46"}:
-            floor_index = 44 if state_contract == "state46" else 42
-            continuous_slice = slice(34, 44) if state_contract == "state46" else slice(32, 42)
+        if state_contract in {"state44", "state41"}:
+            floor_index = 39 if state_contract == "state41" else 42
+            continuous_slice = slice(34, 39) if state_contract == "state41" else slice(32, 42)
             if not np.isclose(state_q01[floor_index], 0.0) or not np.isclose(state_q99[floor_index], 1.0):
                 raise ValueError(
                     f"{state_contract} norm cache floor support q01/q99 must be 0/1, got "
@@ -1830,9 +1828,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--state-contract",
-        choices=("state32", "state44", "state46"),
+        choices=("state32", "state44", "state41"),
         default=None,
-        help="versioned MANO observation contract; state46 consumes the persisted native release",
+        help="versioned MANO observation contract; state41 consumes the persisted native release",
     )
     parser.add_argument(
         "--target-noise-std",
@@ -1957,30 +1955,28 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.extended_state and args.state_contract not in {None, "state32"}:
         raise ValueError(
-            "--extended-state cannot be combined with an explicit state44/state46 contract"
+            "--extended-state cannot be combined with an explicit state44/state41 contract"
         )
     if args.extended_state:
         args.state_contract = "state32"
     profile = resolve_profile(args.model)
-    expected_contract = {44: "state44", 46: "state46"}.get(profile.state_dim)
+    expected_contract = {44: "state44", 41: "state41"}.get(profile.state_dim)
     if expected_contract is not None and args.state_contract != expected_contract:
         raise ValueError(f"{args.model} requires --state-contract {expected_contract}")
-    if args.state_contract in {"state44", "state46"} and profile.state_dim != {"state44": 44, "state46": 46}[args.state_contract]:
+    if args.state_contract in {"state44", "state41"} and profile.state_dim != {"state44": 44, "state41": 41}[args.state_contract]:
         raise ValueError(
             f"--state-contract {args.state_contract} requires its matching model identity"
         )
-    if args.state_contract == "state46":
-        if args.frame_window != "full":
-            raise ValueError("state46 requires --frame-window full")
+    if args.state_contract == "state41":
         if args.language_conditioning != OBJECT_ONLY_LANGUAGE:
             raise ValueError(
-                "state46 release persists its gesture prompt; use --language-conditioning object_only"
+                "state41 release persists its gesture prompt; use --language-conditioning object_only"
             )
     args.extended_state = args.state_contract is not None
     if (
         args.action_source != MEASURED_DELTA
         and args.target_lance_dataset is None
-        and args.state_contract != "state46"
+        and args.state_contract != "state41"
     ):
         args.target_lance_dataset = mano_dataset_release.resolve_role("target_dataset")
     return args
@@ -2011,9 +2007,9 @@ from scripts.deadline import parse_stop_at
 def main() -> int:
     args = parse_args()
     validate_state_noise(args.model, args.state_noise_std)
-    if args.state_contract == "state46" and args.state_noise_std > 0:
+    if args.state_contract == "state41" and args.state_noise_std > 0:
         raise ValueError(
-            "state46 StateAug is disabled until noisy 28D geometry recomputation is implemented"
+            "state41 StateAug is disabled until noisy 28D geometry recomputation is implemented"
         )
     if args.extended_state:
         expected_norm_sha = str(args.norm_sha_expected).lower()

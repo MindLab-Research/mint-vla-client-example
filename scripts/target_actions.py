@@ -18,7 +18,7 @@ ACTION_SOURCES = (MEASURED_DELTA, PD_TARGET_DELTA, URDF_TARGET_ABSOLUTE)
 
 # B-schema masks. Euler XYZ is absolute; translation and finger joints are
 # delta-eligible; tail dimensions are physical zero padding. State32/state44
-# retain the 26D contract while state46 uses the authoritative 28D ManoRL order.
+# retain the 26D contract while state41 uses the authoritative 28D ManoRL order.
 MANO_26D_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 20, -6)
 MANO_28D_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 22, -4)
 # Compatibility name retained for existing 26D callers.

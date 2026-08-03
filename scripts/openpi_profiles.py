@@ -11,8 +11,8 @@ from dataclasses import dataclass
 LEGACY_L_LORA_MODEL = "openpi/pi05-libero-low-mem-finetune"
 ACTION_LORA_R16_MODEL = "openpi/pi05-action-lora-r16-finetune"
 ACTION_LORA_R16_STATE44_MODEL = "openpi/pi05-action-lora-r16-state44-finetune"
-ACTION_LORA_R16_STATE46_MODEL = (
-    "openpi/pi05-action-lora-r16-state46-28dof-finetune"
+ACTION_LORA_R16_STATE41_MODEL = (
+    "openpi/pi05-action-lora-r16-state41-28dof-finetune"
 )
 
 
@@ -57,16 +57,15 @@ ACTION_LORA_R16_STATE44_PROFILE = OpenPIClientProfile(
     fail_on_token_truncation=True,
     state_contract_id="mano_five_finger_contact_geom_rate_v2",
 )
-ACTION_LORA_R16_STATE46_PROFILE = OpenPIClientProfile(
-    profile_id="pi05_action_lora_r16_state46_28dof_v1",
-    base_model=ACTION_LORA_R16_STATE46_MODEL,
+ACTION_LORA_R16_STATE41_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state41_28dof_v1",
+    base_model=ACTION_LORA_R16_STATE41_MODEL,
     discrete_state_input=True,
     paligemma_variant="gemma_2b",
     action_expert_variant="gemma_300m_lora_r16",
-    state_dim=46,
-    max_tokens=208,
+    state_dim=41,
     fail_on_token_truncation=True,
-    state_contract_id="mano_state46_native_sim_28d_v1",
+    state_contract_id="mano_state41_native_sim_28d_v1",
     delta_mask_segments=(3, -3, 22, -4),
 )
 
@@ -76,7 +75,7 @@ MODEL_PROFILES = {
         LEGACY_L_LORA_PROFILE,
         ACTION_LORA_R16_PROFILE,
         ACTION_LORA_R16_STATE44_PROFILE,
-        ACTION_LORA_R16_STATE46_PROFILE,
+        ACTION_LORA_R16_STATE41_PROFILE,
     )
 }
 PROFILE_IDS = {profile.profile_id: profile for profile in MODEL_PROFILES.values()}

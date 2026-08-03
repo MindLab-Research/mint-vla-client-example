@@ -72,7 +72,7 @@ def test_object_body_resolution_uses_authoritative_runtime_name():
     assert floor_geom >= 0
 
 
-def test_state46_features_use_visual_measurement_spheres_without_new_collisions():
+def test_state41_features_use_visual_measurement_spheres_without_new_collisions():
     import mujoco
 
     _, model, data, renderer, object_addr, _, hand_addr, _, _ = physics.make_scene(
@@ -85,8 +85,8 @@ def test_state46_features_use_visual_measurement_spheres_without_new_collisions(
         data.qpos[object_addr + 3 : object_addr + 7] = [1.0, 0.0, 0.0, 0.0]
         data.qpos[hand_addr] = 0.0
         mujoco.mj_forward(model, data)
-        ids = physics.resolve_state46_feature_ids(model, "cube1")
-        contacts, surface, radial, floor, pairs = physics.state46_features_from_mujoco(
+        ids = physics.resolve_state41_feature_ids(model, "cube1")
+        contacts, surface, floor, pairs = physics.state41_features_from_mujoco(
             model, data, "cube1", feature_ids=ids
         )
     finally:
@@ -95,8 +95,8 @@ def test_state46_features_use_visual_measurement_spheres_without_new_collisions(
     assert len(ids.hand_geom_ids) == 16
     assert len(ids.fingertip_measurement_geom_ids) == 5
     assert all(model.geom_contype[value] == 0 for value in ids.fingertip_measurement_geom_ids)
-    assert contacts.shape == surface.shape == radial.shape == (5,)
-    assert np.isfinite(surface).all() and np.isfinite(radial).all()
+    assert contacts.shape == surface.shape == (5,)
+    assert np.isfinite(surface).all()
     assert floor in (0.0, 1.0)
     assert isinstance(pairs, list)
 

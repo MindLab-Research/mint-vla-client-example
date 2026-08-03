@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from scripts.eval import build_mano_state46_release as release
+from scripts.eval import build_mano_state41_release as release
 
 
 pytestmark = pytest.mark.skipif(
@@ -94,7 +94,7 @@ def test_one_row_release_uses_same_native_mjdata_and_schema(monkeypatch):
     frames = entry["frames"]
     state = np.asarray(row["state"])
     actions = np.asarray(row["actions"])
-    assert state.shape == (frames, 46)
+    assert state.shape == (frames, 41)
     assert actions.shape == (frames, 32)
     np.testing.assert_array_equal(actions[:, 28:], 0.0)
     assert len(row["image"]) == len(row["wrist_image"]) == frames
@@ -110,5 +110,5 @@ def test_one_row_release_uses_same_native_mjdata_and_schema(monkeypatch):
             assert image.format == "JPEG"
     table = pa.Table.from_pylist([row], schema=release.release_schema())
     assert table.num_rows == 1
-    assert table.schema.field("state").type.value_type.list_size == 46
+    assert table.schema.field("state").type.value_type.list_size == 41
     assert table.schema.field("actions").type.value_type.list_size == 32

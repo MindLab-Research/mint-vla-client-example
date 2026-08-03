@@ -24,7 +24,11 @@ def _load_compare_module() -> types.ModuleType:
     fake_base.LanceViewpi05Dataset = object
     fake_base.contact_windows_lib = types.SimpleNamespace(DEFAULT_CONTACT_CONTEXT_FRAMES=100)
     fake_base.PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"
-    fake_base.MODEL_CHOICES = (fake_base.PI05_MODEL, "openpi/pi05-action-lora-r16-finetune")
+    fake_base.MODEL_CHOICES = (
+        fake_base.PI05_MODEL,
+        "openpi/pi05-action-lora-r16-finetune",
+        "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+    )
     fake_base._transform_sample = lambda sample, _: sample
     fake_base._pi05_datum_from_transformed = lambda _, sample: sample
     fake_base.normalize = types.SimpleNamespace(load=lambda _path: {})
@@ -152,6 +156,26 @@ class CompareTrainingCliTests(unittest.TestCase):
         expected = compare.mano_dataset_release.resolve_role("training_dataset")
         self.assertEqual(args.lance_dataset, expected)
         self.assertEqual(args.target_lance_dataset, expected)
+
+    def test_state41_b_schema_accepts_contact_pm100(self) -> None:
+        compare = _load_compare_module()
+        model = "openpi/pi05-action-lora-r16-state41-28dof-finetune"
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--model", model,
+            "--lance-dataset", "state41.lance",
+            "--state-contract", "state41",
+            "--action-source", "urdf_target_absolute",
+            "--language-conditioning", "object_only",
+            "--frame-window", "contact",
+            "--contact-context-frames", "100",
+            "--save-path", "save", "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertEqual(args.model, model)
+        self.assertEqual(args.state_contract, "state41")
+        self.assertEqual(args.frame_window, "contact")
+        self.assertEqual(args.contact_context_frames, 100)
+        self.assertIsNone(args.target_lance_dataset)
 
     def test_parallel_worker_option_propagates_from_cli(self) -> None:
         compare = _load_compare_module()
