@@ -284,9 +284,16 @@ for a copy-paste command and the low-memory fallback.
 - `scripts/eval/infer_mano_mode3.py`: dedicated historical kinematic Mode3
   diagnostic; it is intentionally not a Mode4 alternative or a generic
   numbered-mode multiplexer.
-- `scripts/eval/mano_physics_core.py`: MuJoCo scene, collision, five-finger
-  pair-presence contact, servo, and timing.
-- `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target physics-quality producer; historical result-root code is immutable provenance only.
+- `scripts/eval/mano_physics_core.py`: historical 26D MuJoCo contract retained for
+  pre-migration evidence only.
+- `scripts/eval/manorl_native_physics.py`: pinned ManoRL 28D native-model adapter.
+  Physics comes from `compile_model(...)`; render models reuse the previous Client
+  head/wrist cameras, floor, background, lights, and hand color treatment, and
+  are rejected if those visual additions change collision or dynamics arrays.
+- `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target
+  physics-quality producer, migrated in place to metadata-resolved right-hand
+  28D targets while preserving object locking, resume checksums, grading,
+  multiprocessing, and Lance aggregation.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
   and norm SHA verifier.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.
