@@ -126,7 +126,10 @@ def servo_parameters() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
 
-def _legacy_visual_model(object_name: str, width: int, height: int):
+def _legacy_visual_model(
+    object_name: str, width: int, height: int, *,
+    head_camera_preset: str | None = None,
+):
     """Add the unchanged Client camera/floor/light contract to ManoRL physics."""
     runtime = _runtime()
     assets = runtime["assets"]
@@ -138,6 +141,9 @@ def _legacy_visual_model(object_name: str, width: int, height: int):
     from scripts.eval import mano_action_support as legacy
     from sim.manorl.native_trace_video import assert_visual_physics_invariant
 
+    if head_camera_preset is None:
+        head_camera_preset = legacy.DEFAULT_HEAD_CAMERA_PRESET
+    head_camera = legacy.head_camera_config(head_camera_preset)
     mujoco, physics_model = assets.compile_model(
         contracts.ServoConfig(), object_type=object_name, visual_meshes=False,
         hand_side="right",
@@ -198,7 +204,7 @@ def _legacy_visual_model(object_name: str, width: int, height: int):
             "fovy": f"{horizontal_to_vertical_fov(spec['horizontal_fov'], width, height):.9g}",
         })
 
-    add_camera(legacy.HEAD_CAMERA_NAME, legacy.HEAD_CAMERA, worldbody)
+    add_camera(legacy.HEAD_CAMERA_NAME, head_camera, worldbody)
     wrist = next((body for body in worldbody.iter("body") if body.get("name") == legacy.WRIST_CAMERA["parent_body"]), None)
     if wrist is None:
         raise ValueError(f"missing legacy wrist camera parent {legacy.WRIST_CAMERA['parent_body']}")
@@ -207,7 +213,8 @@ def _legacy_visual_model(object_name: str, width: int, height: int):
     assets.validate_compiled_model(mujoco, model, contracts.ServoConfig(), object_type=object_name, hand_side="right")
     invariance = assert_visual_physics_invariant(mujoco, physics_model, model)
     invariance["legacy_visual_contract"] = {
-        "head_camera": legacy.HEAD_CAMERA, "wrist_camera": legacy.WRIST_CAMERA,
+        "head_camera_preset": head_camera_preset,
+        "head_camera": head_camera, "wrist_camera": legacy.WRIST_CAMERA,
         "floor_texture": "floor_checker",
         "skybox": next((node.get("name") for node in legacy_asset if node.tag == "texture" and node.get("type") == "skybox"), None),
         "light_names": [node.get("name") for node in legacy_worldbody.findall("light")],
@@ -231,6 +238,7 @@ def make_scene(
     physics: bool = True,
     physics_timestep: float = DT,
     create_renderer: bool = False,
+    head_camera_preset: str | None = None,
 ):
     """Return the historical scene tuple backed by ManoRL ``compile_model``."""
     if not physics:
@@ -241,7 +249,10 @@ def make_scene(
     assets = runtime["assets"]
     contracts = runtime["contracts"]
     if create_renderer:
-        mujoco, model, invariance = _legacy_visual_model(object_name, width, height)
+        mujoco, model, invariance = _legacy_visual_model(
+            object_name, width, height,
+            head_camera_preset=head_camera_preset,
+        )
         _VISUAL_INVARIANCE[id(model)] = invariance
     else:
         mujoco, model = assets.compile_model(

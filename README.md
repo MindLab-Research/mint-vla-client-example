@@ -294,10 +294,11 @@ for a copy-paste command and the low-memory fallback.
   physics-quality producer, migrated in place to metadata-resolved right-hand
   28D targets while preserving object locking, resume checksums, grading,
   multiprocessing, and Lance aggregation.
-- `tools/render_mano_native_trace_video.py`: renders saved native traces through
-  the unchanged Client head/wrist visual contract without dynamics steps, then
-  verifies codec, pixel format, size, rate, exact frame count, and duration
-  before atomically publishing the MP4.
+- `tools/render_mano_native_trace_video.py`: renders saved native traces without
+  dynamics steps and verifies the MP4 before publication. Head rendering accepts
+  `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,
+  while `legacy` preserves the original 75° view. The selected preset and its
+  expanded camera parameters are recorded in the video manifest.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
   and norm SHA verifier.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.

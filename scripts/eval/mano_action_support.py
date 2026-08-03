@@ -24,11 +24,32 @@ DEFAULT_OBJECTS_URDF_DIR = Path(
 )
 HEAD_CAMERA_NAME = "dataset_b_head_camera"
 WRIST_CAMERA_NAME = "dataset_b_wrist_camera"
-HEAD_CAMERA = {
-    "position": (0.0, -1.2, 0.8),
-    "target": (0.0, -0.1, 0.1),
-    "horizontal_fov": 65.0,
+HEAD_CAMERA_PRESETS = {
+    "current": {
+        "position": (0.0, -1.2, 0.8),
+        "target": (0.0, -0.1, 0.1),
+        "horizontal_fov": 65.0,
+    },
+    "legacy": {
+        "position": (0.8, 0.0, 0.5),
+        "target": (0.3, 0.0, 0.1),
+        "horizontal_fov": 75.0,
+    },
 }
+DEFAULT_HEAD_CAMERA_PRESET = "current"
+
+
+def head_camera_config(preset: str = DEFAULT_HEAD_CAMERA_PRESET) -> dict:
+    try:
+        return dict(HEAD_CAMERA_PRESETS[preset])
+    except KeyError as exc:
+        raise ValueError(
+            f"unknown head camera preset {preset!r}; "
+            f"choose one of {tuple(HEAD_CAMERA_PRESETS)}"
+        ) from exc
+
+
+HEAD_CAMERA = head_camera_config()
 WRIST_CAMERA = {
     "position": (-0.08, 0.0, -0.08),
     "target": (0.06, 0.0, -0.05),
@@ -65,15 +86,20 @@ def axis_angle_to_wxyz(rot_aa: np.ndarray) -> np.ndarray:
     return np.asarray([np.cos(angle / 2.0), *xyz], dtype=np.float64)
 
 
-def build_scene(*, hand_urdf: Path, object_urdf: Path, object_code: str, width: int, height: int):
+def build_scene(
+    *, hand_urdf: Path, object_urdf: Path, object_code: str,
+    width: int, height: int,
+    head_camera_preset: str = DEFAULT_HEAD_CAMERA_PRESET,
+):
     builder = MjcfBuilder(offwidth=width, offheight=height, show_debug_frames=False)
+    head_camera = head_camera_config(head_camera_preset)
     object_freejoint = add_object(builder, object_urdf, object_code)
     hand_joints = add_urdf_hand(builder, hand_urdf)
     builder.add_camera(
         name=HEAD_CAMERA_NAME,
-        position=HEAD_CAMERA["position"],
-        target=HEAD_CAMERA["target"],
-        horizontal_fov=HEAD_CAMERA["horizontal_fov"],
+        position=head_camera["position"],
+        target=head_camera["target"],
+        horizontal_fov=head_camera["horizontal_fov"],
     )
     builder.add_camera(
         name=WRIST_CAMERA_NAME,

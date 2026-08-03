@@ -98,6 +98,7 @@ def render(
     manifest_path: Path,
     object_name: str,
     camera_name: str,
+    head_camera_preset: str,
     width: int,
     height: int,
     fps: int,
@@ -122,7 +123,8 @@ def render(
         "wrist": mano_action_support.WRIST_CAMERA_NAME,
     }[camera_name]
     _, model, data, renderer, *_ = physics.make_scene(
-        object_name, width, height, physics=True, create_renderer=True
+        object_name, width, height, physics=True, create_renderer=True,
+        head_camera_preset=head_camera_preset,
     )
     if (model.nq, model.nv, model.nu) != (35, 34, 28):
         raise ValueError("visual model does not match the 28D native ABI")
@@ -164,6 +166,7 @@ def render(
         "source_identity": report.get("source_identity"),
         "camera": camera_name,
         "camera_name": camera,
+        "head_camera_preset": head_camera_preset,
         "camera_position": model.cam_pos[camera_id].tolist(),
         "camera_fovy": float(model.cam_fovy[camera_id]),
         "width": width,
@@ -205,6 +208,12 @@ def main() -> None:
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--object", default="cube1")
     parser.add_argument("--camera", choices=("head", "wrist"), default="head")
+    parser.add_argument(
+        "--head-camera-preset",
+        choices=tuple(mano_action_support.HEAD_CAMERA_PRESETS),
+        default=mano_action_support.DEFAULT_HEAD_CAMERA_PRESET,
+        help="Head camera geometry; default is the current elevated 65-degree view",
+    )
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--fps", type=int, default=50)
@@ -214,7 +223,8 @@ def main() -> None:
         trace_path=Path(args.trace).resolve(), report_path=Path(args.report).resolve(),
         output_path=Path(args.output).resolve(), cover_path=Path(args.cover).resolve(),
         manifest_path=Path(args.manifest).resolve(), object_name=args.object,
-        camera_name=args.camera, width=args.width, height=args.height,
+        camera_name=args.camera, head_camera_preset=args.head_camera_preset,
+        width=args.width, height=args.height,
         fps=args.fps, cover_frame=args.cover_frame,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
