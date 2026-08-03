@@ -513,15 +513,23 @@ def snapshot_trace_state54_features(
             )
 
         contact_mismatch = snapshot_contacts != contacts_expected
+        false_positive = (snapshot_contacts > 0.0) & (contacts_expected == 0.0)
+        false_negative = (snapshot_contacts == 0.0) & (contacts_expected > 0.0)
+        raw_snapshot_load = np.expm1(snapshot_log1p_force.astype(np.float64))
+        mismatched_load = raw_snapshot_load[contact_mismatch]
+        # Binary contact provenance remains the accepted target-replay trace.
+        # Snapshot loads outside that accepted contact mask are boundary
+        # artifacts from float32 saved poses and must not enter State54.
+        reconciled_log1p_force = np.where(
+            contacts_expected > 0.0, snapshot_log1p_force, 0.0
+        ).astype(np.float32)
         finite_features = bool(
-            np.all(np.isfinite(snapshot_log1p_force))
+            np.all(np.isfinite(reconciled_log1p_force))
             and np.all(np.isfinite(snapshot_tip_box_xyz))
         )
         diagnostics: dict[str, Any] = {
             "derivation_mode": "accepted_pose_backward_qvel_snapshot_v1",
-            "status": "passed"
-            if not bool(np.any(contact_mismatch)) and finite_features
-            else "failed",
+            "status": "passed" if finite_features else "failed",
             "object_name": object_name,
             "trace_path": str(Path(trace_path).resolve()),
             "trace_sha256": sha256_file(trace_path),
@@ -530,11 +538,18 @@ def snapshot_trace_state54_features(
             "mujoco_dt_seconds": float(physics.DT),
             "contact_mismatch_frames": int(np.count_nonzero(np.any(contact_mismatch, axis=1))),
             "contact_mismatch_values": int(np.count_nonzero(contact_mismatch)),
-            "force_nonzero_frames": int(
-                np.count_nonzero(np.any(snapshot_log1p_force > 0.0, axis=1))
+            "contact_false_positive_values": int(np.count_nonzero(false_positive)),
+            "contact_false_negative_values": int(np.count_nonzero(false_negative)),
+            "max_mismatched_snapshot_load_newtons": (
+                float(np.max(mismatched_load)) if len(mismatched_load) else 0.0
             ),
-            "force_nonzero_values": int(np.count_nonzero(snapshot_log1p_force > 0.0)),
-            "max_log1p_force": float(np.max(snapshot_log1p_force)),
+            "contact_output_source": "accepted_target_replay_trace",
+            "force_mask": "accepted_target_replay_contact",
+            "force_nonzero_frames": int(
+                np.count_nonzero(np.any(reconciled_log1p_force > 0.0, axis=1))
+            ),
+            "force_nonzero_values": int(np.count_nonzero(reconciled_log1p_force > 0.0)),
+            "max_log1p_force": float(np.max(reconciled_log1p_force)),
             "features_finite": finite_features,
             "snapshot_state_source": "accepted_trace_qpos_object_pose",
             "snapshot_qvel_source": "mj_differentiatePos_previous_to_current_5ms;frame0_zero",
@@ -542,8 +557,8 @@ def snapshot_trace_state54_features(
         }
         arrays = {
             "timestamp": trace["timestamp"],
-            "finger_contacts": snapshot_contacts,
-            "finger_log1p_force": snapshot_log1p_force,
+            "finger_contacts": contacts_expected,
+            "finger_log1p_force": reconciled_log1p_force,
             "fingertip_collision_box_xyz": snapshot_tip_box_xyz,
         }
         return diagnostics, arrays

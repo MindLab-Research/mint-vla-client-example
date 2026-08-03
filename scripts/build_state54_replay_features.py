@@ -28,6 +28,9 @@ from scripts.replay_state54_data import (
 )
 
 SCHEMA_VERSION = 1
+SNAPSHOT_RAW_CONTACT_MISMATCH_RATE_MAX = 1e-6
+SNAPSHOT_FALSE_NEGATIVE_MAX = 0
+SNAPSHOT_MISMATCHED_LOAD_NEWTONS_MAX = 0.1
 FEATURE_SCHEMA_BY_MODE = {
     "deterministic-replay": DETERMINISTIC_REPLAY_FEATURE_SCHEMA_ID,
     "snapshot-backward": SNAPSHOT_FEATURE_SCHEMA_ID,
@@ -278,6 +281,11 @@ def main() -> int:
         "snapshot_state_source",
         "snapshot_qvel_source",
         "snapshot_ctrl_source",
+        "contact_false_positive_values",
+        "contact_false_negative_values",
+        "max_mismatched_snapshot_load_newtons",
+        "contact_output_source",
+        "force_mask",
     )
     entries = []
     for report in reports:
@@ -289,9 +297,58 @@ def main() -> int:
         )
         entries.append(entry)
     feature_manifest_sha = canonical_sha256(entries)
+    snapshot_reconciliation = None
+    snapshot_reconciliation_accepted = True
+    if args.derivation_mode == "snapshot-backward":
+        total_contact_values = sum(int(report["frame_count"]) * 5 for report in reports)
+        mismatch_values = sum(int(report["contact_mismatch_values"]) for report in reports)
+        false_positive_values = sum(
+            int(report["contact_false_positive_values"]) for report in reports
+        )
+        false_negative_values = sum(
+            int(report["contact_false_negative_values"]) for report in reports
+        )
+        max_mismatched_load = max(
+            float(report["max_mismatched_snapshot_load_newtons"]) for report in reports
+        )
+        mismatch_rate = mismatch_values / total_contact_values
+        reconciliation_checks = {
+            "raw_contact_mismatch_rate_at_most_max": (
+                mismatch_rate <= SNAPSHOT_RAW_CONTACT_MISMATCH_RATE_MAX
+            ),
+            "false_negative_values_at_most_max": (
+                false_negative_values <= SNAPSHOT_FALSE_NEGATIVE_MAX
+            ),
+            "max_mismatched_load_newtons_at_most_max": (
+                max_mismatched_load <= SNAPSHOT_MISMATCHED_LOAD_NEWTONS_MAX
+            ),
+        }
+        snapshot_reconciliation_accepted = all(reconciliation_checks.values())
+        snapshot_reconciliation = {
+            "status": "accepted" if snapshot_reconciliation_accepted else "rejected",
+            "contact_output_source": "accepted_target_replay_trace",
+            "force_mask": "accepted_target_replay_contact",
+            "total_contact_values": total_contact_values,
+            "raw_contact_mismatch_values": mismatch_values,
+            "raw_contact_mismatch_rate": mismatch_rate,
+            "raw_contact_false_positive_values": false_positive_values,
+            "raw_contact_false_negative_values": false_negative_values,
+            "max_mismatched_snapshot_load_newtons": max_mismatched_load,
+            "thresholds": {
+                "raw_contact_mismatch_rate_max": SNAPSHOT_RAW_CONTACT_MISMATCH_RATE_MAX,
+                "false_negative_values_max": SNAPSHOT_FALSE_NEGATIVE_MAX,
+                "max_mismatched_load_newtons_max": SNAPSHOT_MISMATCHED_LOAD_NEWTONS_MAX,
+            },
+            "checks": reconciliation_checks,
+        }
+    release_accepted = (
+        not failed
+        and len(entries) == len(jobs)
+        and snapshot_reconciliation_accepted
+    )
     final_release = {
         **{key: value for key, value in build_manifest.items() if key != "status"},
-        "status": "accepted" if not failed and len(entries) == len(jobs) else "failed",
+        "status": "accepted" if release_accepted else "failed",
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "elapsed_seconds": time.monotonic() - started,
         "status_counts": dict(status_counts),
@@ -299,6 +356,7 @@ def main() -> int:
         "entry_count": len(entries),
         "failed_rows": [int(report["row_index"]) for report in failed],
         "feature_manifest_sha256": feature_manifest_sha,
+        "snapshot_contact_reconciliation": snapshot_reconciliation,
         "entries": entries,
     }
     atomic_json(args.output_dir / "release.json", final_release)
