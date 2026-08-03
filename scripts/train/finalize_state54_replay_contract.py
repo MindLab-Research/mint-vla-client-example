@@ -111,6 +111,7 @@ def main() -> int:
 
     contract = {
         "contract_version": 1,
+        "status": "accepted",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "contract_id": "state44_replay_cube1_cube2_state54_action32_v1",
         "state_contract": STATE_CONTRACT_ID,
@@ -142,6 +143,7 @@ def main() -> int:
         "action_vector_count": int(data["active_frames"]) * 10,
         "data_release": str(args.data_release.resolve()),
         "data_release_sha256": data_sha,
+        "dataset": data["dataset"],
         "source_release": data["source_release"],
         "source_release_sha256": data["source_release_sha256"],
         "source_lance_file_manifest_sha256": data["source_lance_file_manifest_sha256"],

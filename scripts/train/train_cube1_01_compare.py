@@ -168,6 +168,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         state_contract: str | None = None,
         state54_replay_feature_release: Path | None = None,
         state54_replay_feature_release_sha256: str | None = None,
+        state54_data_contract: Path | None = None,
+        state54_data_contract_sha256: str | None = None,
     ) -> None:
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
@@ -192,6 +194,10 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             raise ValueError(
                 "replay State54 feature release and expected SHA must be supplied together"
             )
+        if (state54_data_contract is None) != (state54_data_contract_sha256 is None):
+            raise ValueError("State54 data contract and expected SHA must be supplied together")
+        if state54_data_contract is not None and state_contract != STATE54_CONTRACT_ID:
+            raise ValueError("State54 data contract requires the State54 contract")
         self._action_source = action_source
         self._state_contract = state_contract
         self._extended_state = bool(extended_state or state_contract is not None)
@@ -213,6 +219,9 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         )
         self._dataset_path = Path(lance_dataset).expanduser().resolve()
         self._state54_replay_feature_store = None
+        self._state54_data_contract = None
+        self._state54_data_contract_path = None
+        self._state54_data_contract_sha256 = None
         if state54_replay_feature_release is not None:
             from scripts.replay_state54_data import ReplayState54FeatureStore
 
@@ -221,6 +230,37 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 source_dataset=self._dataset_path,
                 expected_release_sha256=state54_replay_feature_release_sha256,
             )
+        if state54_data_contract is not None:
+            contract_path = Path(state54_data_contract).expanduser().resolve()
+            actual_contract_sha = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            expected_contract_sha = str(state54_data_contract_sha256).lower()
+            if actual_contract_sha != expected_contract_sha:
+                raise ValueError(
+                    f"State54 data contract SHA mismatch: {actual_contract_sha} != {expected_contract_sha}"
+                )
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            required_contract = {
+                "status": "accepted",
+                "state_contract": STATE54_CONTRACT_ID,
+                "state_dim": 54,
+                "action_dim": 32,
+                "action_horizon": action_horizon,
+                "max_token_len": 256,
+                "dataset": str(self._dataset_path),
+                "gesture_index_sha256": self._gesture_index_sha256,
+            }
+            for key, value in required_contract.items():
+                if contract.get(key) != value:
+                    raise ValueError(
+                        f"State54 data contract {key!r} mismatch: {contract.get(key)!r} != {value!r}"
+                    )
+            if self._state54_replay_feature_store is not None and contract.get(
+                "feature_release_sha256"
+            ) != self._state54_replay_feature_store.release_sha256:
+                raise ValueError("State54 data contract feature-release SHA mismatch")
+            self._state54_data_contract = contract
+            self._state54_data_contract_path = contract_path
+            self._state54_data_contract_sha256 = actual_contract_sha
         self._target_dataset_path = (
             Path(target_lance_dataset).expanduser().resolve()
             if target_lance_dataset is not None
@@ -347,6 +387,23 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             )
         if not self._index:
             raise ValueError(f"No samples available in selected rows from {lance_dataset}")
+        if self._state54_data_contract is not None:
+            selected_digest = hashlib.sha256(
+                ",".join(map(str, self._source_row_indices)).encode()
+            ).hexdigest()
+            contract = self._state54_data_contract
+            expected_population = {
+                "row_indices_sha256": selected_digest,
+                "trajectory_count": len(self._row_windows),
+                "active_frame_count": len(self._index),
+                "action_vector_count": len(self._index) * action_horizon,
+            }
+            for key, value in expected_population.items():
+                if contract.get(key) != value:
+                    raise ValueError(
+                        f"State54 selected population {key!r} mismatch: "
+                        f"{contract.get(key)!r} != {value!r}"
+                    )
         self._slate_size = min(16, len(self._row_start_offset))
         self._row_cache_capacity_rows: int | None = None
         self._slate_rotate_every = 250
@@ -644,7 +701,14 @@ def load_or_compute_norm_stats(
         }
     path = norm_stats_dir / "norm_stats.json"
     if state54:
-        path, actual_sha = verify_locked_state54_norm_stats(norm_stats_dir)
+        expected_norm_sha = (
+            dataset._state54_data_contract.get("norm_stats_sha256")
+            if dataset._state54_data_contract is not None
+            else None
+        )
+        path, actual_sha = verify_locked_state54_norm_stats(
+            norm_stats_dir, expected_sha256=expected_norm_sha
+        )
     elif extended_state:
         path, actual_sha = verify_locked_norm_stats(norm_stats_dir)
     else:
@@ -1865,6 +1929,17 @@ def parse_args() -> argparse.Namespace:
         help="exact SHA256 of the accepted replay feature release.json",
     )
     parser.add_argument(
+        "--state54-data-contract",
+        type=Path,
+        default=None,
+        help="accepted population/norm/token/data contract for replay State54 training",
+    )
+    parser.add_argument(
+        "--state54-data-contract-sha256",
+        default=None,
+        help="exact SHA256 of --state54-data-contract",
+    )
+    parser.add_argument(
         "--target-noise-std",
         type=float,
         default=0.0,
@@ -2083,6 +2158,8 @@ def main() -> int:
         raise ValueError(
             f"{STATE54_CONTRACT_ID} requires the dedicated state54 model identity"
         )
+    if args.state54_replay_feature_release is not None and args.state54_data_contract is None:
+        raise ValueError("replay State54 training requires --state54-data-contract")
     row_count = int(lance.dataset(str(args.lance_dataset)).count_rows())
     row_indices, row_selection = parse_row_indices(args.row_indices, row_count)
     dataset = SelectedLanceDataset(
@@ -2105,6 +2182,12 @@ def main() -> int:
         state54_replay_feature_release_sha256=(
             args.state54_replay_feature_release_sha256.lower()
             if args.state54_replay_feature_release_sha256 is not None
+            else None
+        ),
+        state54_data_contract=args.state54_data_contract,
+        state54_data_contract_sha256=(
+            args.state54_data_contract_sha256.lower()
+            if args.state54_data_contract_sha256 is not None
             else None
         ),
     )
@@ -2199,6 +2282,15 @@ def main() -> int:
         "state54_replay_features": (
             dataset._state54_replay_feature_store.provenance()
             if dataset._state54_replay_feature_store is not None
+            else None
+        ),
+        "state54_data_contract": (
+            {
+                "path": str(dataset._state54_data_contract_path),
+                "sha256": dataset._state54_data_contract_sha256,
+                "contract_id": dataset._state54_data_contract.get("contract_id"),
+            }
+            if dataset._state54_data_contract is not None
             else None
         ),
         "contact_semantics": (
@@ -2622,6 +2714,15 @@ def main() -> int:
             "state54_replay_features": (
                 dataset._state54_replay_feature_store.provenance()
                 if dataset._state54_replay_feature_store is not None
+                else None
+            ),
+            "state54_data_contract": (
+                {
+                    "path": str(dataset._state54_data_contract_path),
+                    "sha256": dataset._state54_data_contract_sha256,
+                    "contract_id": dataset._state54_data_contract.get("contract_id"),
+                }
+                if dataset._state54_data_contract is not None
                 else None
             ),
             "contact_semantics": (

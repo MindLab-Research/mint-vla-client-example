@@ -108,8 +108,8 @@ def verify_locked_state54_norm_stats(
         raise ValueError(f"state54 requires norm_stats.json at {norm_path}")
     actual_sha = hashlib.sha256(norm_path.read_bytes()).hexdigest()
     expected = STATE54_NORM_SHA256 if expected_sha256 is None else str(expected_sha256).lower()
-    if expected != STATE54_NORM_SHA256:
-        raise ValueError(f"state54 expected norm SHA is not allowlisted: {expected}")
+    if len(expected) != 64 or any(character not in "0123456789abcdef" for character in expected):
+        raise ValueError(f"invalid state54 expected norm SHA: {expected!r}")
     if actual_sha != expected:
         raise ValueError(f"state54 norm SHA mismatch: expected {expected}, got {actual_sha}")
 
@@ -117,6 +117,17 @@ def verify_locked_state54_norm_stats(
     if not contract_path.is_file():
         raise ValueError(f"state54 norm requires data_contract.json at {contract_path}")
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    legacy = expected == STATE54_NORM_SHA256
+    expected_population = (
+        {
+            "row_indices_sha256": POPULATION_ROW_INDICES_SHA256,
+            "trajectory_count": POPULATION_TRAJECTORIES,
+            "active_frame_count": POPULATION_ACTIVE_FRAMES,
+            "action_vector_count": POPULATION_ACTIVE_FRAMES * 10,
+        }
+        if legacy
+        else {}
+    )
     required = {
         "norm_stats_sha256": actual_sha,
         "state_contract": STATE_CONTRACT_ID,
@@ -124,14 +135,11 @@ def verify_locked_state54_norm_stats(
         "action_dim": ACTION_DIM,
         "action_horizon": 10,
         "action_source": "urdf_target_absolute",
-        "row_indices_sha256": POPULATION_ROW_INDICES_SHA256,
-        "trajectory_count": POPULATION_TRAJECTORIES,
-        "active_frame_count": POPULATION_ACTIVE_FRAMES,
-        "action_vector_count": POPULATION_ACTIVE_FRAMES * 10,
         "force_reference_newtons": FORCE_REFERENCE_NEWTONS,
         "source_interval_seconds": SOURCE_INTERVAL_SECONDS,
         "contact_age_clip_seconds": CONTACT_AGE_CLIP_SECONDS,
         "max_token_len": PROFILE_MAX_TOKEN_LEN,
+        **expected_population,
     }
     for key, value in required.items():
         if contract.get(key) != value:
@@ -139,6 +147,15 @@ def verify_locked_state54_norm_stats(
                 f"state54 data contract {key!r} mismatch: expected {value!r}, "
                 f"got {contract.get(key)!r}: {contract_path}"
             )
+    trajectory_count = int(contract.get("trajectory_count", 0))
+    active_frames = int(contract.get("active_frame_count", 0))
+    population_sha = str(contract.get("row_indices_sha256", ""))
+    if trajectory_count <= 0 or active_frames <= 0:
+        raise ValueError("state54 data contract population counts must be positive")
+    if contract.get("action_vector_count") != active_frames * 10:
+        raise ValueError("state54 data contract action-vector count mismatch")
+    if len(population_sha) != 64:
+        raise ValueError("state54 data contract population SHA is invalid")
 
     audit_path = directory / "token_audit.json"
     if not audit_path.is_file():
@@ -150,14 +167,23 @@ def verify_locked_state54_norm_stats(
     if not (
         audit.get("zero_truncation") is True
         and audit.get("overflow_count") == 0
-        and audit.get("audited_active_frames") == POPULATION_ACTIVE_FRAMES
+        and audit.get("audited_active_frames") == active_frames
         and audit.get("profile_max_token_len") == PROFILE_MAX_TOKEN_LEN
         and int(audit.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1))
         <= PROFILE_MAX_TOKEN_LEN
         and audit.get("norm_stats_sha256") == actual_sha
-        and audit.get("population_row_indices_sha256") == POPULATION_ROW_INDICES_SHA256
+        and audit.get("population_row_indices_sha256") == population_sha
     ):
         raise ValueError(f"state54 token audit contract is invalid: {audit_path}")
+    augmentation = audit.get("augmentation")
+    if not legacy and not (
+        isinstance(augmentation, dict)
+        and augmentation.get("zero_truncation") is True
+        and augmentation.get("overflow_count") == 0
+        and int(augmentation.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1))
+        <= PROFILE_MAX_TOKEN_LEN
+    ):
+        raise ValueError(f"replay state54 augmented token audit is invalid: {audit_path}")
     return norm_path, actual_sha
 
 
