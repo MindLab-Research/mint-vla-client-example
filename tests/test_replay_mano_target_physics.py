@@ -17,6 +17,35 @@ def test_grade_boundaries_are_contractual():
     assert replay.grade_from_max_error(0.08) == "C"
 
 
+def test_resume_valid_uses_current_trace_keys(tmp_path):
+    frames = 3
+    run_id = {"contract": "resume-test"}
+    trace = tmp_path / "row.npz"
+    report = tmp_path / "row.json"
+    np.savez_compressed(
+        trace,
+        object_position_error=np.zeros(frames, dtype=np.float32),
+        simulated_full_qpos=np.zeros((frames, 35), dtype=np.float32),
+        simulated_hand_qpos=np.zeros((frames, 28), dtype=np.float32),
+        source_target_qpos=np.zeros((frames, 28), dtype=np.float32),
+    )
+    replay.atomic_json(report, {
+        "status": "ok", "row_index": 4, "frames": frames,
+        "provenance": run_id, "trace_sha256": replay.sha256(trace),
+    })
+
+    assert replay.resume_valid(report, trace, 4, run_id) is True
+
+    with np.load(trace) as values:
+        old = {name: values[name] for name in values.files if name != "object_position_error"}
+    np.savez_compressed(trace, position_error_m=np.zeros(frames), **old)
+    replay.atomic_json(report, {
+        "status": "ok", "row_index": 4, "frames": frames,
+        "provenance": run_id, "trace_sha256": replay.sha256(trace),
+    })
+    assert replay.resume_valid(report, trace, 4, run_id) is False
+
+
 def test_parse_rows_uses_end_exclusive_ranges_and_deduplicates():
     assert replay.parse_rows("2,4:7,5", 10) == [2, 4, 5, 6]
     with pytest.raises(ValueError, match="outside"):

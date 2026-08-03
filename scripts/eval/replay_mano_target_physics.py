@@ -161,7 +161,7 @@ def resume_valid(js,npz,row_index,run_id):
     try:
         r=json.loads(js.read_text())
         if r.get('status')!='ok' or int(r.get('row_index',-1))!=row_index or r.get('provenance')!=run_id or r.get('trace_sha256')!=sha256(npz): return False
-        T=int(r['frames']); required={'position_error_m':(T,),'simulated_full_qpos':(T,HAND_DIM+7),'simulated_hand_qpos':(T,HAND_DIM),'source_target_qpos':(T,HAND_DIM)}
+        T=int(r['frames']); required={'object_position_error':(T,),'simulated_full_qpos':(T,HAND_DIM+7),'simulated_hand_qpos':(T,HAND_DIM),'source_target_qpos':(T,HAND_DIM)}
         with np.load(npz) as z: return all(name in z and z[name].shape==shape and np.isfinite(z[name]).all() for name,shape in required.items())
     except Exception: return False
 
