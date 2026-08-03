@@ -5,9 +5,10 @@ PORT=30532
 GPU_IDS=0,1,2,3,4,5,6,7
 RUNTIME_ROOT=
 CACHE_DIR=
-MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16}
-OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16}
+MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof}
+OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof}
 PYTHON_BIN=${MINT_PYTHON_BIN:-/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}
+MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
 ENABLE_JAX_PERSISTENT_CACHE=0
 PRINT_CONFIG=0
 while (($#)); do
@@ -19,6 +20,7 @@ while (($#)); do
     --mint-root) MINT_ROOT=${2:?}; shift 2 ;;
     --openpi-root) OPENPI_ROOT=${2:?}; shift 2 ;;
     --python-bin) PYTHON_BIN=${2:?}; shift 2 ;;
+    --model) MODEL=${2:?}; shift 2 ;;
     --enable-jax-persistent-cache) ENABLE_JAX_PERSISTENT_CACHE=1; shift ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     -h|--help)
@@ -32,6 +34,7 @@ Options:
   --mint-root PATH     MINT checkout (default: MINT_CODE_ROOT or project path)
   --openpi-root PATH   paired OpenPI checkout (default: MINT_OPENPI_ROOT or project path)
   --python-bin PATH    GPU runtime Python (default: MINT_PYTHON_BIN or project path)
+  --model ID           enabled Action-LoRA model identity (default: state41 28DoF)
   --enable-jax-persistent-cache
                      opt in to JAX persistent executable serialization
   --print-config       validate and print configuration without starting
@@ -53,14 +56,13 @@ done
 GPU_COMMAS=${GPU_IDS//[^,]/}
 GPU_COUNT=$((1 + ${#GPU_COMMAS}))
 if [[ -z "$CACHE_DIR" ]]; then
-  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_a800_${GPU_COUNT}gpu"
+  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_state41_a800_${GPU_COUNT}gpu"
 fi
 [[ "$CACHE_DIR" = /* ]] || { echo "--cache-dir must be absolute" >&2; exit 64; }
 
 [[ "$MINT_ROOT" = /* && "$OPENPI_ROOT" = /* && "$PYTHON_BIN" = /* ]] || {
   echo "--mint-root, --openpi-root, and --python-bin must be absolute" >&2; exit 64;
 }
-MODEL=openpi/pi05-action-lora-r16-finetune
 for path in "$MINT_ROOT" "$OPENPI_ROOT"; do
   [[ -e "$path" ]] || { echo "required path missing: $path" >&2; exit 2; }
 done
@@ -78,6 +80,7 @@ mint_action_lora_server:
   jax_persistent_executable_cache=$ENABLE_JAX_PERSISTENT_CACHE
   jax_compilation_cache=$([[ "$ENABLE_JAX_PERSISTENT_CACHE" == 1 ]] && printf '%s' "$CACHE_DIR" || printf 'disabled')
   visible_gpus=$GPU_IDS
+  model=$MODEL
   port=$PORT
 EOF
 if ((PRINT_CONFIG)); then

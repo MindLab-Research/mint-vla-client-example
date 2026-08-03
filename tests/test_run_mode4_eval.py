@@ -554,6 +554,10 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("jax_persistent_executable_cache=0", completed.stderr)
             self.assertIn("jax_compilation_cache=disabled", completed.stderr)
+            self.assertIn(
+                "model=openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                completed.stderr,
+            )
 
 
 if __name__ == "__main__":
