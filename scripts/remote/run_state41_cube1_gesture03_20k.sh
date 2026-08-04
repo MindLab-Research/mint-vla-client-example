@@ -47,8 +47,18 @@ if [[ -e "$RESULT_JSON" || -e "$METRICS_JSONL" ]]; then
 fi
 
 MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
+STEPS=${STATE41_STEPS:-20000}
+BATCH_SIZE=${STATE41_BATCH_SIZE:-8}
+LEARNING_RATE=${STATE41_LEARNING_RATE:-1e-4}
+CHECKPOINT_EVERY=${STATE41_CHECKPOINT_EVERY:-4000}
+SLATE_SIZE=${STATE41_SLATE_SIZE:-15}
+ROW_CACHE_SIZE=${STATE41_ROW_CACHE_SIZE:-15}
+DATUM_CACHE_SIZE=${STATE41_DATUM_CACHE_SIZE:-4096}
+PREFETCH_BATCHES=${STATE41_PREFETCH_BATCHES:-2}
+BATCH_PRODUCERS=${STATE41_BATCH_PRODUCERS:-1}
+BATCH_BUILD_WORKERS=${STATE41_BATCH_BUILD_WORKERS:-4}
 STATE_NOISE_STD=${STATE41_STATE_NOISE_STD:-0}
-FINAL_PATH="${RUN_ID}_step20000"
+FINAL_PATH="${RUN_ID}_step${STEPS}"
 CHECKPOINT_TEMPLATE="${RUN_ID}_step{step}"
 EXTRA_ARGS=()
 if [[ "${STATE41_TRAIN_DRY_RUN:-0}" == "1" ]]; then
@@ -58,7 +68,7 @@ fi
   printf 'started=%s\n' "$(date -Is)"
   printf 'profile_report=%s\n' "$(realpath "$PROFILE_REPORT")"
   printf 'dataset=%s\nrows=%s\nnorm_sha256=%s\n' "$DATASET" "$ROW_INDICES" "$NORM_SHA"
-  printf 'model=%s\nsteps=20000\ncheckpoint_every=4000\nstate_noise_std=%s\n' "$MODEL" "$STATE_NOISE_STD"
+  printf 'model=%s\nsteps=%s\ncheckpoint_every=%s\nstate_noise_std=%s\nbatch_size=%s\nlearning_rate=%s\nbatch_producers=%s\nprefetch_batches=%s\nbatch_build_workers=%s\ndatum_cache_size=%s\n' "$MODEL" "$STEPS" "$CHECKPOINT_EVERY" "$STATE_NOISE_STD" "$BATCH_SIZE" "$LEARNING_RATE" "$BATCH_PRODUCERS" "$PREFETCH_BATCHES" "$BATCH_BUILD_WORKERS" "$DATUM_CACHE_SIZE"
 } | tee "$DRIVER_LOG"
 
 exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
@@ -76,20 +86,21 @@ exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
   --missing-contact-policy error \
   --norm-stats-dir "$NORM_DIR" \
   --norm-sha-expected "$NORM_SHA" \
-  --steps 20000 \
-  --learning-rate 1e-4 \
-  --batch-size 8 \
+  --steps "$STEPS" \
+  --learning-rate "$LEARNING_RATE" \
+  --batch-size "$BATCH_SIZE" \
   --sampling-strategy coverage \
-  --slate-size 15 \
+  --slate-size "$SLATE_SIZE" \
   --coverage-anchors-per-row 8 \
-  --row-cache-size 15 \
+  --row-cache-size "$ROW_CACHE_SIZE" \
   --preload-selected-rows \
-  --prefetch-batches 2 \
-  --batch-producers 1 \
-  --batch-build-workers 4 \
+  --datum-cache-size "$DATUM_CACHE_SIZE" \
+  --prefetch-batches "$PREFETCH_BATCHES" \
+  --batch-producers "$BATCH_PRODUCERS" \
+  --batch-build-workers "$BATCH_BUILD_WORKERS" \
   --state-noise-std "$STATE_NOISE_STD" \
   --target-noise-std 0 \
-  --checkpoint-every 4000 \
+  --checkpoint-every "$CHECKPOINT_EVERY" \
   --checkpoint-save-path-template "$CHECKPOINT_TEMPLATE" \
   --save-path "$FINAL_PATH" \
   --metrics-jsonl "$METRICS_JSONL" \
