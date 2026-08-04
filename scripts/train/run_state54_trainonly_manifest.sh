@@ -25,7 +25,7 @@ if m.get("seed") not in (42,43,44): raise ValueError("invalid seed")
 if m.get("steps") not in (20,150000): raise ValueError("steps must be smoke20 or formal150000")
 if m["steps"]==150000 and m.get("checkpoint_every")!=25000: raise ValueError("formal checkpoint schedule mismatch")
 if m["steps"]==20 and m.get("checkpoint_every")!=0: raise ValueError("smoke must not use periodic checkpoints")
-keys=("run_id","output_root","client_commit","mint_commit","openpi_commit","data_contract","data_contract_sha256","formal_protocol","formal_protocol_sha256","coverage_schedule","coverage_schedule_sha256","train_rows_csv","train_rows_csv_sha256","dataset","gesture_index","contact_window_manifest","feature_release","feature_release_sha256","norm_dir","norm_sha256","seed","augmentation_seed","steps","checkpoint_every","base_url")
+keys=("run_id","output_root","client_commit","mint_commit","openpi_commit","data_contract","data_contract_sha256","formal_protocol","formal_protocol_sha256","coverage_schedule","coverage_schedule_sha256","train_rows_csv","train_rows_csv_sha256","dataset","gesture_index","contact_window_manifest","feature_release","feature_release_sha256","norm_dir","norm_sha256","seed","augmentation_seed","state_noise_std","target_noise_std","steps","checkpoint_every","base_url")
 for k in keys:
  if k not in m: raise ValueError(f"manifest missing {k}")
 for k in keys:
