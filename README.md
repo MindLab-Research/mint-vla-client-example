@@ -312,19 +312,28 @@ for a copy-paste command and the low-memory fallback.
   it deliberately omits the five causal fingertip-to-palm radial-rate fields.
   Training uses `--state-contract state41` and
   `--action-source urdf_target_absolute`; the frame window is selected from the
-  release contact stream (for example, contact ±100 frames). StateAug is
-  disabled until noisy 28D qpos can be propagated through contact and
-  object-geometry features without mixing inconsistent states.
-- `scripts/train/prepare_mano_state41_profile.py` deterministically selects an
-  object/gesture population from the immutable release, freezes contact windows,
-  computes normalization over the exact query/action-horizon population, and
-  rejects any raw discrete-state prompt above 200 tokens before atomically
-  publishing the norm and profile report.
-- `scripts/remote/run_state41_cube1_gesture03_20k.sh` consumes that authenticated
-  profile report and launches the fixed cube1/gesture03 Action-LoRA experiment:
-  B-schema target28, contact ±100, 20,000 steps, and sampler checkpoints at
-  4K/8K/12K/16K plus the final 20K save. Set `STATE41_TRAIN_DRY_RUN=1` to exercise
-  the complete data/normalization/token payload without contacting a server.
+  release contact stream (for example, contact ±100 frames). Qpos-only StateAug
+  perturbs normalized state `[0:28]`; contact/object fields `[28:41]`, target28,
+  action supervision, and physical pad4 remain clean.
+- `scripts/train/prepare_mano_state41_profile.py` preserves the historical
+  cube1/gesture03 profile. `prepare_mano_state41_gradea_profile.py` publishes the
+  production profile atomically: Grade-A only, exact 95/5 UUID split stratified
+  by formal-release `index.object` + two-digit `index.gesture`, train-only norm,
+  split-specific contact±100 manifests, and an exhaustive fail-closed 200-token
+  audit using `pick up the {object} using gesture {gesture}`. Singleton strata
+  remain train-only; every other stratum retains at least one training row.
+- `scripts/remote/run_state41_cube1_gesture03_20k.sh` preserves the historical
+  15-row smoke experiment. `run_state41_gradea_100k.sh` accepts only the passed
+  Grade-A profile and locks the production run to fresh state41 Action-LoRA,
+  four-way sharded global batch64, constant `5e-5`, qpos StateAug0.1,
+  sqrt-tempered object row slates with eight anchors, 100K continuous steps, and
+  sampler checkpoints every5K. Training metrics must prove device_count4 and
+  per-device batch16; no Mode4 or optimizer-state pause is inserted.
+- `scripts/notify/state41_checkpoint_loss_notifier.py` consumes only checkpoint
+  events emitted after both a successful sampler save and matching exact-step
+  loss. It validates 5K boundaries, loss equality, and checkpoint suffixes,
+  sends an idempotent Feishu direct message under an explicitly selected user or
+  bot identity, and atomically records sent steps so reruns skip them.
 - `tools/render_mano_native_trace_video.py`: renders saved native traces without
   dynamics steps and verifies the MP4 before publication. Head rendering accepts
   `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,

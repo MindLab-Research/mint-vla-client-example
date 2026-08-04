@@ -145,6 +145,8 @@ class CompareTrainingCliTests(unittest.TestCase):
             )
             self.assertEqual(args.checkpoint_every, 0)
             self.assertEqual(args.checkpoint_save_path_template, "")
+            self.assertEqual(args.expected_device_count, 0)
+            self.assertIsNone(args.checkpoint_events_jsonl)
 
     def test_b_schema_defaults_both_datasets_from_release(self) -> None:
         compare = _load_compare_module()
@@ -176,6 +178,23 @@ class CompareTrainingCliTests(unittest.TestCase):
         self.assertEqual(args.frame_window, "contact")
         self.assertEqual(args.contact_context_frames, 100)
         self.assertIsNone(args.target_lance_dataset)
+
+    def test_state41_accepts_formal_release_gesture_conditioning(self) -> None:
+        compare = _load_compare_module()
+        model = "openpi/pi05-action-lora-r16-state41-28dof-finetune"
+        with patch.object(sys, "argv", [
+            str(SCRIPT), "--model", model,
+            "--lance-dataset", "state41.lance",
+            "--state-contract", "state41",
+            "--action-source", "urdf_target_absolute",
+            "--language-conditioning", "gesture",
+            "--frame-window", "contact",
+            "--contact-context-frames", "100",
+            "--save-path", "save", "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertEqual(args.language_conditioning, "gesture")
+        self.assertEqual(args.state_contract, "state41")
 
     def test_parallel_worker_option_propagates_from_cli(self) -> None:
         compare = _load_compare_module()
@@ -248,6 +267,51 @@ class CompareTrainingCliTests(unittest.TestCase):
 
 
 class CompareTrainingCheckpointTests(unittest.TestCase):
+    def test_checkpoint_event_requires_matching_finite_exact_step_loss(self) -> None:
+        compare = _load_compare_module()
+        entry = {"step": 5000, "loss": 0.125, "metrics": {"loss:mean": 0.125}}
+        event = compare.checkpoint_loss_event(
+            step=5000,
+            checkpoint_path="run_step5000",
+            sampler_result={"path": "mint://run_step5000"},
+            metrics_entry=entry,
+            checkpoint_kind="periodic_sampler",
+        )
+        self.assertTrue(event["ready_for_notification"])
+        self.assertEqual(event["step"], 5000)
+        self.assertEqual(event["loss"], 0.125)
+        with self.assertRaisesRegex(RuntimeError, "step mismatch"):
+            compare.checkpoint_loss_event(
+                step=5000, checkpoint_path="x", sampler_result={"ok": True},
+                metrics_entry={**entry, "step": 4999}, checkpoint_kind="periodic_sampler",
+            )
+        with self.assertRaisesRegex(RuntimeError, "invalid loss"):
+            compare.checkpoint_loss_event(
+                step=5000, checkpoint_path="x", sampler_result={"ok": True},
+                metrics_entry={**entry, "loss": float("nan")}, checkpoint_kind="periodic_sampler",
+            )
+
+    def test_device_metrics_enforce_four_way_batch64_sharding(self) -> None:
+        compare = _load_compare_module()
+        valid = {
+            "device_count:sum": 4.0,
+            "used_data_sharding:mean": 1.0,
+            "per_device_batch_size:mean": 16.0,
+        }
+        compare.validate_training_device_metrics(
+            valid, batch_size=64, expected_device_count=4
+        )
+        with self.assertRaisesRegex(RuntimeError, "device count mismatch"):
+            compare.validate_training_device_metrics(
+                {**valid, "device_count:sum": 8.0},
+                batch_size=64, expected_device_count=4,
+            )
+        with self.assertRaisesRegex(RuntimeError, "per-device batch mismatch"):
+            compare.validate_training_device_metrics(
+                {**valid, "per_device_batch_size:mean": 8.0},
+                batch_size=64, expected_device_count=4,
+            )
+
     def test_periodic_checkpoint_uses_global_step_and_skips_final(self) -> None:
         compare = _load_compare_module()
         kwargs = {
@@ -846,6 +910,80 @@ class CompareTrainingPopulationTests(unittest.TestCase):
         self.assertEqual(first.summary()["cumulative_visited_rows"], 5)
         self.assertEqual(first.summary()["current_epoch_visited_rows"], 1)
 
+    def test_sqrt_tempered_sampler_is_deterministic_and_tracks_sqrt_weights(self) -> None:
+        compare = _load_compare_module()
+        objects = ["large"] * 16 + ["small"] * 4
+        dataset = types.SimpleNamespace(
+            _row_start_offset={i: i for i in range(len(objects))},
+            _source_row_indices=list(range(len(objects))),
+            _rows=[{"index": {"object": name}} for name in objects],
+            _row_windows={
+                i: types.SimpleNamespace(start_frame=0, end_frame=4)
+                for i in range(len(objects))
+            },
+            flat_index=lambda row, frame: row * 10 + frame,
+        )
+        first = compare.SqrtTemperedObjectSampler(
+            dataset, np.random.default_rng(42), slate_size=8, anchors_per_row=2
+        )
+        second = compare.SqrtTemperedObjectSampler(
+            dataset, np.random.default_rng(42), slate_size=8, anchors_per_row=2
+        )
+        first_indices = first.sample_indices(20_000)
+        self.assertEqual(first_indices, second.sample_indices(20_000))
+        summary = first.summary()
+        self.assertEqual(summary["strategy"], "sqrt_tempered")
+        self.assertEqual(summary["cumulative_visited_rows"], 20)
+        large = summary["objects"]["large"]
+        small = summary["objects"]["small"]
+        # sqrt(16):sqrt(4) = 2:1, not the natural 4:1 row ratio.
+        observed_ratio = large["samples"] / small["samples"]
+        self.assertAlmostEqual(observed_ratio, 2.0, delta=0.15)
+        self.assertAlmostEqual(
+            large["target_probability"] / small["target_probability"], 2.0
+        )
+        self.assertEqual(len(summary["schedule_hash"]), 64)
+
+    def test_sqrt_tempered_resume_replays_sample_and_noise_streams(self) -> None:
+        compare = _load_compare_module()
+        objects = ["cube1"] * 6 + ["banana"] * 2
+        dataset = types.SimpleNamespace(
+            _row_start_offset={i: i for i in range(len(objects))},
+            _source_row_indices=list(range(len(objects))),
+            _rows=[{"index": {"object": name}} for name in objects],
+            _row_windows={
+                i: types.SimpleNamespace(start_frame=0, end_frame=4)
+                for i in range(len(objects))
+            },
+            flat_index=lambda row, frame: row * 10 + frame,
+        )
+        sample_a, noise_a, _ = compare.make_rngs(42, 43)
+        sampler_a = compare.SqrtTemperedObjectSampler(
+            dataset, sample_a, slate_size=4, anchors_per_row=2
+        )
+        for _ in range(7):
+            sampler_a.sample_indices(4)
+            for _ in range(4):
+                noise_a.normal(0.0, 0.05, size=(41,))
+        expected_indices = sampler_a.sample_indices(4)
+        expected_noise = [noise_a.normal(0.0, 0.05, size=(41,)) for _ in range(4)]
+
+        sample_b, noise_b, _ = compare.make_rngs(42, 43)
+        sampler_b = compare.SqrtTemperedObjectSampler(
+            dataset, sample_b, slate_size=4, anchors_per_row=2
+        )
+        compare.advance_coverage_rngs(
+            sampler_b, noise_b, completed_steps=7, batch_size=4,
+            action_horizon=10, state_dim=41, state_noise_std=0.05,
+            target_noise_std=0.0,
+        )
+        self.assertEqual(sampler_b.sample_indices(4), expected_indices)
+        for actual, expected in zip(
+            [noise_b.normal(0.0, 0.05, size=(41,)) for _ in range(4)],
+            expected_noise, strict=True,
+        ):
+            np.testing.assert_array_equal(actual, expected)
+
     def test_coverage_resume_replays_sample_and_noise_streams_exactly(self) -> None:
         compare = _load_compare_module()
         dataset = types.SimpleNamespace(
@@ -1029,6 +1167,12 @@ class CompareTrainingPlannedMultiProducerTests(unittest.TestCase):
             "outstanding_samples": 128,
             "coverage_slate_samples": 128,
         })
+        tempered = compare.validate_multi_producer_prefetch_span(
+            batch_size=64, batch_producers=2, prefetch_batches=2,
+            slate_rows=16, anchors_per_row=8,
+            sampling_strategy="sqrt_tempered",
+        )
+        self.assertEqual(tempered["status"], "ok")
         single = compare.validate_multi_producer_prefetch_span(
             batch_size=128,
             batch_producers=1,
@@ -1290,6 +1434,35 @@ class CompareResidentRowCacheTests(unittest.TestCase):
         self.assertEqual(sorted(calls), list(range(5)))
         self.assertEqual(summary["cache_resident_rows"], 5)
         self.assertEqual(dataset.row_cache_capacity_rows(), 5)
+
+    def test_state41_release_gesture_prompt_replaces_persisted_prompt(self) -> None:
+        compare = _load_compare_module()
+        row = {
+            "state": [[0.0] * 41],
+            "actions": [[0.0] * 32],
+            "prompt": "legacy prompt",
+            "image": [[]],
+            "wrist_image": [[]],
+        }
+        class Taken:
+            def to_pylist(self): return [row]
+        class FakeDataset:
+            def take(self, indices, columns): return Taken()
+        dataset = object.__new__(compare.SelectedLanceDataset)
+        dataset._source_row_indices = [7]
+        dataset._extended_state = True
+        dataset._state_contract = "state41"
+        dataset._action_source = "measured_delta"
+        dataset._target_is_image_dataset = False
+        dataset._dataset = FakeDataset()
+        dataset._rows = [{"trajectory_metadata": {"object_names": ["cube1"]}}]
+        dataset._language_conditioning = "gesture"
+        dataset._uses_release_gesture = True
+        dataset._release_gesture_prompts = {0: "pick up the cube1 using gesture 03"}
+        dataset._gesture_records = {}
+        with patch.object(compare, "project_row_actions", side_effect=lambda value, _: value):
+            loaded = dataset._load_row_uncached(0)
+        self.assertEqual(loaded["prompt"], "pick up the cube1 using gesture 03")
 
     def test_same_lance_row_fuses_hands_read(self) -> None:
         compare = _load_compare_module()

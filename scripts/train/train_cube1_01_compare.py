@@ -51,6 +51,7 @@ from scripts.target_actions import (
     URDF_TARGET_ABSOLUTE,
     project_row_actions,
 )
+from scripts.train.state41_gradea_contract import canonical_release_gesture_prompt
 
 
 # Historical 12-row cube1 comparison population. The canonical gesture index
@@ -215,9 +216,14 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._extended_state = self._state_contract is not None
         self._state_dim = {"state44": 44, "state41": 41}.get(self._state_contract, 32)
         self._language_conditioning = language_conditioning
+        self._uses_release_gesture = (
+            self._state_contract == "state41"
+            and language_conditioning == GESTURE_LANGUAGE
+        )
         self._gesture_index = (
             GestureIndex.load(gesture_index)
             if language_conditioning == GESTURE_LANGUAGE
+            and not self._uses_release_gesture
             else None
         )
         self._gesture_index_path = (
@@ -252,7 +258,22 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._source_row_indices = [int(x) for x in row_indices]
         self._rows = [all_rows[i] for i in self._source_row_indices]
         self._gesture_records: dict[int, Any] = {}
-        if self._gesture_index is not None:
+        self._release_gesture_prompts: dict[int, str] = {}
+        if self._uses_release_gesture:
+            for local_row, (source_row, row) in enumerate(
+                zip(self._source_row_indices, self._rows, strict=True)
+            ):
+                try:
+                    self._release_gesture_prompts[local_row] = (
+                        canonical_release_gesture_prompt(
+                            row["index"], row["trajectory_metadata"]
+                        )
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"invalid formal-release gesture metadata at row {source_row}: {error}"
+                    ) from error
+        elif self._gesture_index is not None:
             if len(self._gesture_index) != len(all_rows):
                 raise ValueError(
                     "gesture/Lance row-count mismatch: "
@@ -391,9 +412,10 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         row = project_row_actions(row, self._action_source)
         if getattr(self, "_state_contract", None) == "state44":
             row["_state44_sequence"] = self._get_state44_sequence(row_index, row)
-        return {
-            **row,
-            "prompt": format_language_prompt(
+        if getattr(self, "_uses_release_gesture", False):
+            conditioned_prompt = self._release_gesture_prompts[row_index]
+        else:
+            conditioned_prompt = format_language_prompt(
                 row["prompt"],
                 self._rows[row_index]["trajectory_metadata"],
                 self._language_conditioning,
@@ -402,8 +424,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                     if self._language_conditioning == GESTURE_LANGUAGE
                     else None
                 ),
-            ),
-        }
+            )
+        return {**row, "prompt": conditioned_prompt}
 
     def _get_state44_sequence(
         self, row_index: int, loaded_row: dict[str, Any] | None = None
@@ -1581,7 +1603,7 @@ def validate_multi_producer_prefetch_span(
     outstanding_samples = batch_size * prefetch_batches
     slate_samples = slate_rows * anchors_per_row
     status = "not_applicable"
-    if sampling_strategy == "coverage" and batch_producers > 1:
+    if sampling_strategy in {"coverage", "sqrt_tempered"} and batch_producers > 1:
         status = "ok"
         if outstanding_samples > slate_samples:
             if resident_population:
@@ -1693,6 +1715,152 @@ class CoverageSampler:
         }
 
 
+class SqrtTemperedObjectSampler:
+    """Cache-friendly object-tempered coverage over trajectory rows.
+
+    Row slots are drawn with P(object) proportional to sqrt(object row count).
+    Rows within each object rotate without replacement. Every selected row slot
+    supplies `anchors_per_row` samples before the next slate is built.
+    """
+
+    def __init__(
+        self,
+        dataset: SelectedLanceDataset,
+        rng: np.random.Generator,
+        *,
+        slate_size: int,
+        anchors_per_row: int,
+    ) -> None:
+        if slate_size <= 0 or anchors_per_row <= 0:
+            raise ValueError("sqrt-tempered slate size and anchors must be positive")
+        self.dataset = dataset
+        self.rng = rng
+        self.slate_size = int(slate_size)
+        self.anchors_per_row = int(anchors_per_row)
+        rows_by_object: dict[str, list[int]] = {}
+        for local_row in sorted(dataset._row_start_offset):
+            index = dataset._rows[local_row].get("index") or {}
+            object_name = index.get("object")
+            if not isinstance(object_name, str) or not object_name.strip():
+                raise ValueError(
+                    f"sqrt-tempered sampling requires index.object at local row {local_row}"
+                )
+            rows_by_object.setdefault(object_name.strip(), []).append(int(local_row))
+        if not rows_by_object:
+            raise ValueError("sqrt-tempered sampling has no valid trajectory rows")
+        self._rows_by_object = {
+            name: tuple(rows) for name, rows in sorted(rows_by_object.items())
+        }
+        self._objects = tuple(self._rows_by_object)
+        weights = np.sqrt(
+            np.asarray(
+                [len(self._rows_by_object[name]) for name in self._objects],
+                dtype=np.float64,
+            )
+        )
+        self._object_probabilities = weights / weights.sum()
+        self._row_orders: dict[str, list[int]] = {}
+        self._row_positions: dict[str, int] = {}
+        self._object_epochs = {name: 0 for name in self._objects}
+        self._slate: list[tuple[str, int]] = []
+        self._round = 0
+        self._row_cursor = 0
+        self.slate_count = 0
+        self.all_visited_rows: set[int] = set()
+        self.anchor_counts: dict[int, int] = {}
+        self.object_sample_counts = {name: 0 for name in self._objects}
+        self.object_slot_counts = {name: 0 for name in self._objects}
+        self.schedule_digest = hashlib.sha256()
+
+    def _next_object_row(self, object_name: str) -> int:
+        order = self._row_orders.get(object_name)
+        position = self._row_positions.get(object_name, 0)
+        if order is None or position >= len(order):
+            order = list(self._rows_by_object[object_name])
+            self.rng.shuffle(order)
+            self._row_orders[object_name] = order
+            self._row_positions[object_name] = 0
+            self._object_epochs[object_name] += 1
+            position = 0
+        row = int(order[position])
+        self._row_positions[object_name] = position + 1
+        return row
+
+    def _new_slate(self) -> None:
+        selected_objects = self.rng.choice(
+            self._objects,
+            size=self.slate_size,
+            replace=True,
+            p=self._object_probabilities,
+        )
+        self._slate = []
+        for value in selected_objects.tolist():
+            object_name = str(value)
+            row = self._next_object_row(object_name)
+            self._slate.append((object_name, row))
+            self.object_slot_counts[object_name] += 1
+        self._round = 0
+        self._row_cursor = 0
+        self.slate_count += 1
+
+    def _next_row(self) -> tuple[str, int]:
+        if not self._slate:
+            self._new_slate()
+        value = self._slate[self._row_cursor]
+        self._row_cursor += 1
+        if self._row_cursor == len(self._slate):
+            self._row_cursor = 0
+            self._round += 1
+            if self._round == self.anchors_per_row:
+                self._slate = []
+        return value
+
+    def _source_row(self, local_row: int) -> int:
+        return int(self.dataset._source_row_indices[local_row])
+
+    def sample_indices(self, n: int) -> list[int]:
+        result: list[int] = []
+        for _ in range(n):
+            object_name, row = self._next_row()
+            window = self.dataset._row_windows[row]
+            frame = int(self.rng.integers(window.start_frame, window.end_frame + 1))
+            result.append(self.dataset.flat_index(row, frame))
+            self.all_visited_rows.add(row)
+            self.anchor_counts[row] = self.anchor_counts.get(row, 0) + 1
+            self.object_sample_counts[object_name] += 1
+            self.schedule_digest.update(
+                f"{self.slate_count}:{object_name}:{self._source_row(row)}:{frame};".encode()
+            )
+        return result
+
+    def summary(self) -> dict[str, Any]:
+        counts = [self.anchor_counts.get(row, 0) for row in self.dataset._row_start_offset] or [0]
+        objects = {}
+        for index, name in enumerate(self._objects):
+            rows = self._rows_by_object[name]
+            objects[name] = {
+                "population_rows": len(rows),
+                "target_probability": float(self._object_probabilities[index]),
+                "row_slots": self.object_slot_counts[name],
+                "samples": self.object_sample_counts[name],
+                "visited_rows": sum(row in self.all_visited_rows for row in rows),
+                "within_object_epoch": self._object_epochs[name],
+            }
+        return {
+            "strategy": "sqrt_tempered",
+            "weighting": "sqrt_object_row_count",
+            "slate_size": self.slate_size,
+            "slates_created": self.slate_count,
+            "anchors_per_row_slot": self.anchors_per_row,
+            "valid_rows": len(self.dataset._row_start_offset),
+            "cumulative_visited_rows": len(self.all_visited_rows),
+            "anchor_min": min(counts),
+            "anchor_max": max(counts),
+            "objects": objects,
+            "schedule_hash": self.schedule_digest.hexdigest(),
+        }
+
+
 def parse_row_indices(value: str, row_count: int) -> tuple[list[int], dict[str, Any]]:
     if value.strip().lower() == "all":
         rows = list(range(row_count))
@@ -1731,6 +1899,69 @@ def vla_train_step_payload(
             "beta2": 0.95,
             "eps": 1e-12,
         },
+    }
+
+
+def validate_training_device_metrics(
+    metrics: dict[str, Any], *, batch_size: int, expected_device_count: int
+) -> None:
+    if expected_device_count <= 0:
+        return
+    observed = metrics.get("device_count:sum")
+    if observed is None or not math.isclose(
+        float(observed), float(expected_device_count), rel_tol=0.0, abs_tol=1e-6
+    ):
+        raise RuntimeError(
+            f"training device count mismatch: {observed!r} != {expected_device_count}"
+        )
+    used_sharding = metrics.get("used_data_sharding:mean")
+    if used_sharding is None or not math.isclose(float(used_sharding), 1.0):
+        raise RuntimeError(
+            f"training batch is not data-sharded across {expected_device_count} devices"
+        )
+    expected_per_device = float(batch_size) / expected_device_count
+    observed_per_device = metrics.get("per_device_batch_size:mean")
+    if observed_per_device is None or not math.isclose(
+        float(observed_per_device), expected_per_device
+    ):
+        raise RuntimeError(
+            "per-device batch mismatch: "
+            f"{observed_per_device!r} != {expected_per_device}"
+        )
+
+
+def checkpoint_loss_event(
+    *,
+    step: int,
+    checkpoint_path: str,
+    sampler_result: dict[str, Any],
+    metrics_entry: dict[str, Any],
+    checkpoint_kind: str,
+) -> dict[str, Any]:
+    if int(metrics_entry.get("step", -1)) != int(step):
+        raise RuntimeError(
+            f"checkpoint/metrics step mismatch: {step} != {metrics_entry.get('step')}"
+        )
+    loss = metrics_entry.get("loss")
+    if isinstance(loss, bool) or not isinstance(loss, (int, float)) or not math.isfinite(float(loss)):
+        raise RuntimeError(f"checkpoint step {step} has invalid loss {loss!r}")
+    if not isinstance(sampler_result, dict) or not sampler_result:
+        raise RuntimeError(f"checkpoint step {step} has no sampler result")
+    metrics = metrics_entry.get("metrics")
+    if not isinstance(metrics, dict) or "loss:mean" not in metrics or not math.isclose(
+        float(metrics["loss:mean"]), float(loss), rel_tol=0.0, abs_tol=0.0
+    ):
+        raise RuntimeError(f"checkpoint step {step} lacks matching exact-step metrics loss")
+    return {
+        "contract": "state41_checkpoint_loss_event_v1",
+        "ready_for_notification": True,
+        "step": int(step),
+        "loss": float(loss),
+        "checkpoint_kind": checkpoint_kind,
+        "checkpoint_path": str(checkpoint_path),
+        "sampler": sampler_result,
+        "metrics": metrics_entry.get("metrics", {}),
+        "created_unix_seconds": time.time(),
     }
 
 
@@ -1814,6 +2045,12 @@ def parse_args() -> argparse.Namespace:
         help="completed coverage steps whose sample/noise RNG streams are replayed before this phase",
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--expected-device-count",
+        type=int,
+        default=0,
+        help="fail when training metrics do not report this exact sharded device count",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--augmentation-seed",
@@ -1839,7 +2076,11 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Gaussian sigma on quantile-normalized pd_target_delta supervision",
     )
-    parser.add_argument("--sampling-strategy", choices=("legacy", "coverage"), default="legacy")
+    parser.add_argument(
+        "--sampling-strategy",
+        choices=("legacy", "coverage", "sqrt_tempered"),
+        default="legacy",
+    )
     parser.add_argument(
         "--stop-at",
         default=None,
@@ -1947,6 +2188,12 @@ def parse_args() -> argparse.Namespace:
         help="exclusive per-step JSONL metrics stream for long-running monitoring",
     )
     parser.add_argument(
+        "--checkpoint-events-jsonl",
+        type=Path,
+        default=None,
+        help="exclusive JSONL events emitted only after checkpoint save and exact-step loss",
+    )
+    parser.add_argument(
         "--augmentation-audit-samples",
         type=int,
         default=0,
@@ -1968,11 +2215,14 @@ def parse_args() -> argparse.Namespace:
         raise ValueError(
             f"--state-contract {args.state_contract} requires its matching model identity"
         )
-    if args.state_contract == "state41":
-        if args.language_conditioning != OBJECT_ONLY_LANGUAGE:
-            raise ValueError(
-                "state41 release persists its gesture prompt; use --language-conditioning object_only"
-            )
+    if args.state_contract == "state41" and args.language_conditioning not in {
+        GESTURE_LANGUAGE,
+        OBJECT_ONLY_LANGUAGE,
+    }:
+        raise ValueError(
+            "state41 supports canonical formal-release gesture conditioning or "
+            "historical object_only reproduction"
+        )
     args.extended_state = args.state_contract is not None
     if (
         args.action_source != MEASURED_DELTA
@@ -2025,6 +2275,8 @@ def main() -> int:
         raise ValueError("state and target augmentation are mutually exclusive")
     if args.global_step_offset < 0:
         raise ValueError("global_step_offset must be non-negative")
+    if args.expected_device_count < 0:
+        raise ValueError("expected_device_count must be non-negative")
     stop_at_ts = None
     if args.stop_at:
         stop_at_ts = parse_stop_at(args.stop_at)
@@ -2055,6 +2307,11 @@ def main() -> int:
         raise ValueError("checkpoint_poll_seconds must be positive")
     if args.checkpoint_resume_timeout_seconds < 0:
         raise ValueError("checkpoint_resume_timeout_seconds must be non-negative")
+    if args.checkpoint_events_jsonl is not None:
+        if args.checkpoint_every <= 0:
+            raise ValueError("checkpoint events require --checkpoint-every")
+        if args.metrics_jsonl is None:
+            raise ValueError("checkpoint events require --metrics-jsonl")
     if args.datum_cache_size < 0:
         raise ValueError("datum_cache_size must be non-negative")
     if args.row_cache_size < 0:
@@ -2146,16 +2403,22 @@ def main() -> int:
         if args.batch_producers == 1 and args.batch_build_workers > 1
         else None
     )
-    coverage_sampler = (
-        CoverageSampler(
+    if args.sampling_strategy == "coverage":
+        coverage_sampler = CoverageSampler(
             dataset,
             sample_rng,
             slate_size=args.slate_size,
             anchors_per_row=args.coverage_anchors_per_row,
         )
-        if args.sampling_strategy == "coverage"
-        else None
-    )
+    elif args.sampling_strategy == "sqrt_tempered":
+        coverage_sampler = SqrtTemperedObjectSampler(
+            dataset,
+            sample_rng,
+            slate_size=args.slate_size,
+            anchors_per_row=args.coverage_anchors_per_row,
+        )
+    else:
+        coverage_sampler = None
     prefetch_contract = validate_multi_producer_prefetch_span(
         batch_size=args.batch_size,
         batch_producers=args.batch_producers,
@@ -2170,7 +2433,9 @@ def main() -> int:
     )
     if args.global_step_offset:
         if coverage_sampler is None:
-            raise ValueError("global_step_offset currently requires coverage sampling")
+            raise ValueError(
+                "global_step_offset requires coverage or sqrt_tempered sampling"
+            )
         advance_coverage_rngs(
             coverage_sampler,
             augmentation_rng,
@@ -2399,6 +2664,8 @@ def main() -> int:
     periodic_checkpoints: list[dict[str, Any]] = []
     prefetcher: BatchPrefetcher | PlannedMultiProducerPrefetcher | None = None
     metrics_stream = None
+    checkpoint_events_stream = None
+    checkpoint_event_count = 0
     batch_build_seconds = 0.0
     batch_ready_wait_seconds = 0.0
     request_seconds = 0.0
@@ -2408,6 +2675,11 @@ def main() -> int:
     if args.metrics_jsonl is not None:
         args.metrics_jsonl.parent.mkdir(parents=True, exist_ok=True)
         metrics_stream = args.metrics_jsonl.open("x", encoding="utf-8", buffering=1)
+    if args.checkpoint_events_jsonl is not None:
+        args.checkpoint_events_jsonl.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint_events_stream = args.checkpoint_events_jsonl.open(
+            "x", encoding="utf-8", buffering=1
+        )
     try:
         model_id, create_result = L._create_model(base_url, headers, base_model=args.model)
         if args.batch_producers > 1:
@@ -2458,6 +2730,11 @@ def main() -> int:
             train_request_seconds = time.perf_counter() - request_started_at
             request_seconds += train_request_seconds
             metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+            validate_training_device_metrics(
+                metrics,
+                batch_size=args.batch_size,
+                expected_device_count=args.expected_device_count,
+            )
             entry = {
                 "step": global_step,
                 "phase_step": step,
@@ -2498,6 +2775,22 @@ def main() -> int:
                     json.dumps({"periodic_checkpoint": periodic_checkpoint}, indent=2),
                     flush=True,
                 )
+                if checkpoint_events_stream is not None:
+                    if metrics_stream is not None:
+                        metrics_stream.flush()
+                    checkpoint_event = checkpoint_loss_event(
+                        step=checkpoint_global_step,
+                        checkpoint_path=checkpoint_path,
+                        sampler_result=periodic_checkpoint["sampler"],
+                        metrics_entry=entry,
+                        checkpoint_kind="periodic_sampler",
+                    )
+                    checkpoint_events_stream.write(
+                        json.dumps(checkpoint_event, separators=(",", ":")) + "\n"
+                    )
+                    checkpoint_events_stream.flush()
+                    checkpoint_event_count += 1
+                    print(json.dumps({"checkpoint_loss_event": checkpoint_event}), flush=True)
                 # Check deadline after periodic checkpoint save.
                 if stop_at_ts is not None and time.time() >= stop_at_ts:
                     stop_reason = "deadline"
@@ -2588,6 +2881,30 @@ def main() -> int:
                 base_url, "/api/v1/save_weights_for_sampler", headers,
                 {"model_id": model_id, "path": args.save_path},
             ))
+            if (
+                checkpoint_events_stream is not None
+                and steps_log
+                and int(steps_log[-1]["step"]) % args.checkpoint_every == 0
+                and not any(
+                    item["step"] == int(steps_log[-1]["step"])
+                    for item in periodic_checkpoints
+                )
+            ):
+                if metrics_stream is not None:
+                    metrics_stream.flush()
+                final_event = checkpoint_loss_event(
+                    step=int(steps_log[-1]["step"]),
+                    checkpoint_path=args.save_path,
+                    sampler_result=save_result,
+                    metrics_entry=steps_log[-1],
+                    checkpoint_kind="final_sampler",
+                )
+                checkpoint_events_stream.write(
+                    json.dumps(final_event, separators=(",", ":")) + "\n"
+                )
+                checkpoint_events_stream.flush()
+                checkpoint_event_count += 1
+                print(json.dumps({"checkpoint_loss_event": final_event}), flush=True)
         payload = {
             "experiment": (
                 f"all_rows_{len(row_indices)}_state_aug"
@@ -2647,6 +2964,11 @@ def main() -> int:
             "norm_stats": norm_stats_provenance,
             "steps": steps_log,
             "metrics_jsonl": str(args.metrics_jsonl) if args.metrics_jsonl else None,
+            "checkpoint_events_jsonl": (
+                str(args.checkpoint_events_jsonl) if args.checkpoint_events_jsonl else None
+            ),
+            "checkpoint_event_count": checkpoint_event_count,
+            "expected_device_count": args.expected_device_count,
             "state_noise_std_normalized": args.state_noise_std,
             "target_noise_std_normalized": args.target_noise_std,
             "augmentation": augmentation_diagnostics.summary(args.state_noise_std),
@@ -2690,6 +3012,8 @@ def main() -> int:
     finally:
         if metrics_stream is not None:
             metrics_stream.close()
+        if checkpoint_events_stream is not None:
+            checkpoint_events_stream.close()
         if prefetcher is not None:
             prefetcher.close()
         for executor in producer_executors:
