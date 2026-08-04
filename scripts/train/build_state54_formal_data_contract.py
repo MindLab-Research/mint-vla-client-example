@@ -167,6 +167,7 @@ def main() -> None:
         "formal_protocol_sha256": args.formal_protocol_sha256,
         "coverage_schedule_sha256": args.coverage_schedule_sha256,
         "mode4_initialization": "accepted_pose_backward_qvel_current_target_snapshot_window_v1",
+        "mode4_temporal_reset": "at_policy_takeover_window_start",
         "runtime_commits": {"client": args.client_commit, "mint": args.mint_commit, "openpi": args.openpi_commit},
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
