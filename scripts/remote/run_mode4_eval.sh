@@ -108,7 +108,7 @@ Endpoint selection (choose exactly one):
 
 Evaluation options:
   --model NAME                model identity (default: action-LoRA rank 16)
-  --state-contract state32|state44 (default: state32)
+  --state-contract state32|state41|state44 (default: state32)
   --chunk-stride N            query stride, 1..9 (default: 5)
   --temporal-decay FLOAT      ensemble decay in (0, 1] (default: 0.4)
   --act-mode batch|single     action endpoint mode (default: batch)
@@ -392,13 +392,17 @@ fi
 [[ "$ACT_MODE" == batch || "$ACT_MODE" == single ]] || fail "--act-mode must be batch or single"
 [[ "$ROW_EXECUTION" == lockstep || "$ROW_EXECUTION" == sequential ]] || \
   fail "--row-execution must be lockstep or sequential"
-[[ "$STATE_CONTRACT" == state32 || "$STATE_CONTRACT" == state44 ]] || \
-  fail "--state-contract must be state32 or state44"
-if [[ "$STATE_CONTRACT" == state44 ]]; then
+[[ "$STATE_CONTRACT" == state32 || "$STATE_CONTRACT" == state41 || "$STATE_CONTRACT" == state44 ]] || \
+  fail "--state-contract must be state32, state41, or state44"
+if [[ "$STATE_CONTRACT" == state41 ]]; then
+  [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune ]] || \
+    fail "state41 requires model openpi/pi05-action-lora-r16-state41-28dof-finetune"
+elif [[ "$STATE_CONTRACT" == state44 ]]; then
   [[ "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]] || \
     fail "state44 requires model openpi/pi05-action-lora-r16-state44-finetune"
-elif [[ "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]]; then
-  fail "state44 model identity requires --state-contract state44"
+elif [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune || \
+        "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]]; then
+  fail "selected model identity requires its matching --state-contract"
 fi
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
@@ -542,7 +546,7 @@ payload={
         'model': model,
         'model_path': model_path,
         'state_contract': state_contract,
-        'state_dim': 44 if state_contract == 'state44' else 32,
+        'state_dim': 41 if state_contract == 'state41' else (44 if state_contract == 'state44' else 32),
         'action_dim': 32,
         'lance_dataset': dataset,
         'row_indices': row_ids,
@@ -767,11 +771,15 @@ if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
 fi
 
+EVAL_SCRIPT=scripts/eval/infer_mano_mode4.py
+if [[ "$STATE_CONTRACT" == state41 ]]; then
+  EVAL_SCRIPT=scripts/eval/infer_mano_mode4_state41.py
+fi
 VLA_CLIENT_CONFIG=/dev/null MINT_CODE_ROOT="$MINT_CODE_ROOT" \
 MINT_OPENPI_ROOT="$MINT_OPENPI_ROOT" MINT_PYTHON_BIN="$MINT_PYTHON_BIN" \
 MINT_BASE_URL="$BASE_URL" \
 MINT_API_KEY="$MINT_API_KEY" \
-  "$SCRIPT_DIR/run_client.sh" scripts/eval/infer_mano_mode4.py "${EVAL_ARGS[@]}" \
+  "$SCRIPT_DIR/run_client.sh" "$EVAL_SCRIPT" "${EVAL_ARGS[@]}" \
   > "$OUTPUT_DIR/eval.log" 2>&1
 
 SUMMARY_PATH="$OUTPUT_DIR/artifacts/summary.json"

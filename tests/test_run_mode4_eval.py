@@ -206,6 +206,32 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(evaluation["state_dim"], 44)
             self.assertEqual(evaluation["action_dim"], 32)
 
+    def test_state41_config_records_native_28dof_state_and_action_widths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "object_only",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["state_contract"], "state41")
+            self.assertEqual(evaluation["state_dim"], 41)
+            self.assertEqual(evaluation["action_dim"], 32)
+            self.assertEqual(evaluation["language_conditioning"], "object_only")
+
     def test_state44_model_and_contract_must_be_selected_together(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

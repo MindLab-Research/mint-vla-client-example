@@ -328,7 +328,9 @@ def make_scene(
     )
     if actuator_names != tuple(contracts.JOINT_NAMES_28):
         raise ValueError(f"compiled actuator order mismatch: {actuator_names}")
-    limits = np.asarray(model.actuator_ctrlrange, dtype=np.float64).copy()
+    from scripts.eval.mano_joint_limits import compiled_hand_joint_limits
+
+    limits = compiled_hand_joint_limits(model, contracts.JOINT_NAMES_28, joint_ids)
     renderer = None
     if create_renderer:
         model.vis.global_.offwidth = int(width)
@@ -514,6 +516,37 @@ def state41_features_from_mujoco(
             )
         signed[finger_index] = np.float32(distance)
     return contacts, signed, np.float32(object_floor), pair_records
+
+
+def render_current_state(model: Any, data: Any, renderer: Any) -> tuple[np.ndarray, np.ndarray]:
+    """Render Head/Wrist from the current native MjData without stepping."""
+    from scripts.eval import mano_action_support as visual
+
+    renderer.update_scene(data, camera=visual.HEAD_CAMERA_NAME)
+    head = renderer.render().copy()
+    renderer.update_scene(data, camera=visual.WRIST_CAMERA_NAME)
+    wrist = renderer.render().copy()
+    return head, wrist
+
+
+def nearest_wrapped_position_target(
+    current: np.ndarray, command: np.ndarray, limits: np.ndarray
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Apply the inherited nearest-Euler wrapping and compiled limit diagnostics."""
+    from scripts.eval.mano_joint_limits import clip_hand_state
+
+    current_array = np.asarray(current, dtype=np.float64)
+    command_array = np.asarray(command, dtype=np.float64)
+    if current_array.shape != (HAND_DIM,) or command_array.shape != (HAND_DIM,):
+        raise ValueError(
+            f"position target requires {(HAND_DIM,)} current/command, got "
+            f"{current_array.shape}/{command_array.shape}"
+        )
+    target = current_array + command_array
+    target[3:6] = current_array[3:6] + (
+        target[3:6] - current_array[3:6] + np.pi
+    ) % (2 * np.pi) - np.pi
+    return clip_hand_state(target, limits)
 
 
 def contact_types(model: Any, data: Any, object_name: str) -> set[str]:
