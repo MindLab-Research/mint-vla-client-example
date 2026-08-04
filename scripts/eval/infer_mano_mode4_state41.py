@@ -223,7 +223,11 @@ def run(args: argparse.Namespace) -> dict:
     )
 
     headers = base.L._headers(args.api_key)
-    session_id = args.action_session_id or base.create_session(args, headers)
+    try:
+        session_id = args.action_session_id or base.create_session(args, headers)
+    except BaseException:
+        renderer.close()
+        raise
     owns_session = args.action_session_id is None
     candidates: list[dict] = []
     query_timings: list[dict] = []
