@@ -14,6 +14,7 @@ import numpy as np
 from scripts.eval import mano_physics_core as physics
 from scripts.eval import infer_mano_mode4 as mode4
 from scripts.eval import infer_mano_mode4_state41 as state41_mode4
+from scripts.eval import infer_mano_mode4_state41_batch as state41_batch_mode4
 from scripts.eval.infer_mano_mode4 import (
     MANORL_PHYSICS_SUBSTEPS,
     MANORL_PHYSICS_TIMESTEP,
@@ -138,6 +139,112 @@ class State41LanguageContractTests(unittest.TestCase):
         }
         conditioned = state41_mode4.condition_state41_language(row, "object_only")
         self.assertEqual(conditioned["prompt"], row["prompt"])
+
+
+class State41BatchResidencyTests(unittest.TestCase):
+    def test_row_batch_size_can_bound_more_rows_than_policy_batch(self):
+        argv = [
+            "infer_mano_mode4_state41_batch.py",
+            "--base-url", "http://127.0.0.1:1",
+            "--model", state41_batch_mode4.MODEL,
+            "--model-path", "mint://model/sampler_weights/checkpoint",
+            "--owner-id", "owner",
+            "--lance-dataset", "/dataset.lance",
+            "--row-indices", "1,2",
+            "--normalization-row-indices", "0",
+            "--state-contract", "state41",
+            "--norm-stats-dir", "/norm",
+            "--norm-sha-expected", "sha",
+            "--output-dir", "/output",
+            "--language-conditioning", "gesture",
+            "--contact-window-manifest", "/contact.json",
+            "--act-batch-size", "4",
+            "--row-batch-size", "16",
+            "--video-mode", "none",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = state41_batch_mode4.parse_args()
+        self.assertEqual(args.act_batch_size, 4)
+        self.assertEqual(args.row_batch_size, 16)
+
+    def test_run_bounds_native_contexts_and_reuses_one_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            args = types.SimpleNamespace(
+                video_mode="none",
+                model="model",
+                model_path="mint://model/sampler_weights/checkpoint",
+                norm_stats_dir=Path("/norm"),
+                norm_sha_expected="norm-sha",
+                contact_window_manifest=Path("/contact.json"),
+                lance_dataset=Path("/dataset.lance"),
+                output_dir=output,
+                row_indices_list=[1, 2, 3, 4, 5],
+                row_batch_size=2,
+                act_batch_size=4,
+                chunk_stride=5,
+                temporal_decay=0.4,
+                api_key="key",
+            )
+            live = 0
+            max_live = 0
+            closed = []
+            initialized = []
+
+            class Renderer:
+                def __init__(self, row_index):
+                    self.row_index = row_index
+
+                def close(self):
+                    nonlocal live
+                    live -= 1
+                    closed.append(self.row_index)
+
+            def initialize(_args, row_index, _config, _entries):
+                nonlocal live, max_live
+                initialized.append(row_index)
+                live += 1
+                max_live = max(max_live, live)
+                return {
+                    "row_index": row_index,
+                    "frame_count": 1,
+                    "renderer": Renderer(row_index),
+                }
+
+            def finalize(context, _output_dir, _args):
+                return {"row_index": context["row_index"]}
+
+            profile = types.SimpleNamespace(
+                state_dim=41, action_dim=32, delta_mask_segments=()
+            )
+            patches = (
+                mock.patch.object(state41_batch_mode4.base.L, "resolve_profile", return_value=profile),
+                mock.patch.object(state41_batch_mode4.base, "verify_locked_norm_stats", return_value=(object(), "norm-sha")),
+                mock.patch.object(state41_batch_mode4.base.L.normalize, "load", return_value={}),
+                mock.patch.object(state41_batch_mode4.full, "build_model_config", return_value=object()),
+                mock.patch.object(state41_batch_mode4.base.L, "_make_data_config", return_value=object()),
+                mock.patch.object(state41_batch_mode4.contact_windows, "load_manifest", return_value=({"dataset": str(args.lance_dataset)}, {})),
+                mock.patch.object(state41_batch_mode4.base.L, "_headers", return_value={}),
+                mock.patch.object(state41_batch_mode4.base, "create_session", return_value="session"),
+                mock.patch.object(state41_batch_mode4.base, "delete_session"),
+                mock.patch.object(state41_batch_mode4, "_initialize_context", side_effect=initialize),
+                mock.patch.object(state41_batch_mode4, "_finalize_context", side_effect=finalize),
+            )
+            with ExitStack() as stack:
+                entered = [stack.enter_context(patch) for patch in patches]
+                result = state41_batch_mode4.run(args)
+            self.assertEqual(initialized, [1, 2, 3, 4, 5])
+            self.assertEqual(max_live, 2)
+            self.assertEqual(live, 0)
+            self.assertCountEqual(closed, [1, 2, 3, 4, 5])
+            self.assertEqual(result["row_batch_size"], 2)
+            self.assertEqual(result["row_batch_count"], 3)
+            self.assertEqual(result["row_count"], 5)
+            entered[7].assert_called_once()
+            entered[8].assert_called_once_with(args, {}, "session")
+            progress = json.loads((output / "progress.json").read_text())
+            self.assertEqual(progress["status"], "completed")
+            self.assertEqual(progress["completed_row_indices"], [1, 2, 3, 4, 5])
 
 
 class Mode4SessionLifecycleTests(unittest.TestCase):

@@ -83,8 +83,6 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--chunk-stride must be in [1,9]")
     if args.act_batch_size < 1 or args.row_batch_size < 1:
         raise ValueError("batch sizes must be positive")
-    if args.row_batch_size > args.act_batch_size:
-        raise ValueError("--row-batch-size must be <= --act-batch-size")
     if args.max_frames not in (0,) and args.max_frames < 2:
         raise ValueError("--max-frames must be zero or at least two")
     return args
@@ -411,6 +409,12 @@ def _finalize_context(context: dict, output_root: Path, args: argparse.Namespace
     return result
 
 
+def _write_progress(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(payload, indent=2) + "\n")
+    temporary.replace(path)
+
+
 def run(args: argparse.Namespace) -> dict:
     if args.video_mode != "none":
         raise ValueError("batch state41 inference requires video-mode none; encode rows sequentially afterward")
@@ -431,85 +435,157 @@ def run(args: argparse.Namespace) -> dict:
     if manifest_raw.get("dataset") not in (None, str(args.lance_dataset)):
         raise ValueError("contact manifest dataset mismatch")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    contexts = [
-        _initialize_context(args, row_index, data_config, manifest_entries)
-        for row_index in args.row_indices_list
-    ]
+    progress_path = args.output_dir / "progress.json"
     headers = base.L._headers(args.api_key)
-    session_id = base.create_session(args, headers)
+    session_id: str | None = None
     global_batch_count = 0
     global_observation_count = 0
+    results: list[dict] = []
+    completed_rows: list[int] = []
+    row_count = len(args.row_indices_list)
+    row_batch_count = (row_count + args.row_batch_size - 1) // args.row_batch_size
     started = time.perf_counter()
+    _write_progress(
+        progress_path,
+        {
+            "status": "running",
+            "row_count": row_count,
+            "row_batch_size": args.row_batch_size,
+            "row_batch_count": row_batch_count,
+            "completed_row_count": 0,
+            "completed_row_indices": [],
+            "policy_batch_requests": 0,
+            "policy_real_observations": 0,
+            "elapsed_seconds": 0.0,
+        },
+    )
     try:
-        max_steps = max(context["frame_count"] - 1 for context in contexts)
-        for relative_frame in range(max_steps):
-            active = [
-                context
-                for context in contexts
-                if relative_frame < context["frame_count"] - 1
+        session_id = base.create_session(args, headers)
+        for row_batch_index, row_start in enumerate(
+            range(0, row_count, args.row_batch_size)
+        ):
+            row_indices = args.row_indices_list[
+                row_start : row_start + args.row_batch_size
             ]
-            due: list[tuple[dict, dict]] = []
-            for context in active:
-                state, current_q = _observe(context)
-                context["pending"] = (state, current_q)
-                if relative_frame % args.chunk_stride == 0:
-                    head, wrist = physics.render_current_state(
-                        context["model"], context["data"], context["renderer"]
+            contexts: list[dict] = []
+            with ExitStack() as stack:
+                for row_index in row_indices:
+                    context = _initialize_context(
+                        args, row_index, data_config, manifest_entries
                     )
-                    datum = base.build_datum(
-                        context["row"],
-                        frame=context["window_start"] + relative_frame,
-                        state_input=state,
-                        head_image=head,
-                        wrist_image=wrist,
-                        data_config=data_config,
-                        base_model=args.model,
-                        window_end=context["window_end"],
-                    )
-                    datum["data_config"] = data_config
-                    due.append((context, datum))
-            for group_start in range(0, len(due), args.act_batch_size):
-                group = due[group_start : group_start + args.act_batch_size]
-                results = base.query_action_group(
-                    args=args,
-                    headers=headers,
-                    session_id=session_id,
-                    datums=[datum for _context, datum in group],
+                    contexts.append(context)
+                    stack.callback(context["renderer"].close)
+                max_steps = max(
+                    context["frame_count"] - 1 for context in contexts
                 )
-                global_batch_count += 1
-                global_observation_count += len(group)
-                for (context, _datum), (pred_norm, pred_phys, _gt_norm, timing) in zip(
-                    group, results, strict=True
-                ):
-                    context["query_timings"].append(
-                        {
-                            "relative_frame": relative_frame,
-                            "source_frame": context["window_start"] + relative_frame,
-                            "batch_index": global_batch_count - 1,
-                            **timing,
-                        }
-                    )
-                    query_q = context["pending"][1]
-                    context["candidates"].append(
-                        {
-                            "start": relative_frame,
-                            "pred_norm": pred_norm,
-                            "pred_phys": pred_phys,
-                            "target_hand": single.reconstruct_absolute_target_chunk(
-                                query_q, pred_phys[:HORIZON]
-                            ),
-                        }
-                    )
-            for context in active:
-                context["chunk_stride"] = args.chunk_stride
-                _record_action_and_step(context, relative_frame, args.temporal_decay)
+                for relative_frame in range(max_steps):
+                    active = [
+                        context
+                        for context in contexts
+                        if relative_frame < context["frame_count"] - 1
+                    ]
+                    due: list[tuple[dict, dict]] = []
+                    for context in active:
+                        state, current_q = _observe(context)
+                        context["pending"] = (state, current_q)
+                        if relative_frame % args.chunk_stride == 0:
+                            head, wrist = physics.render_current_state(
+                                context["model"], context["data"], context["renderer"]
+                            )
+                            datum = base.build_datum(
+                                context["row"],
+                                frame=context["window_start"] + relative_frame,
+                                state_input=state,
+                                head_image=head,
+                                wrist_image=wrist,
+                                data_config=data_config,
+                                base_model=args.model,
+                                window_end=context["window_end"],
+                            )
+                            datum["data_config"] = data_config
+                            due.append((context, datum))
+                    for group_start in range(0, len(due), args.act_batch_size):
+                        group = due[group_start : group_start + args.act_batch_size]
+                        group_results = base.query_action_group(
+                            args=args,
+                            headers=headers,
+                            session_id=session_id,
+                            datums=[datum for _context, datum in group],
+                        )
+                        global_batch_count += 1
+                        global_observation_count += len(group)
+                        for (context, _datum), (
+                            pred_norm,
+                            pred_phys,
+                            _gt_norm,
+                            timing,
+                        ) in zip(group, group_results, strict=True):
+                            context["query_timings"].append(
+                                {
+                                    "relative_frame": relative_frame,
+                                    "source_frame": context["window_start"]
+                                    + relative_frame,
+                                    "batch_index": global_batch_count - 1,
+                                    **timing,
+                                }
+                            )
+                            query_q = context["pending"][1]
+                            context["candidates"].append(
+                                {
+                                    "start": relative_frame,
+                                    "pred_norm": pred_norm,
+                                    "pred_phys": pred_phys,
+                                    "target_hand": single.reconstruct_absolute_target_chunk(
+                                        query_q, pred_phys[:HORIZON]
+                                    ),
+                                }
+                            )
+                    for context in active:
+                        context["chunk_stride"] = args.chunk_stride
+                        _record_action_and_step(
+                            context, relative_frame, args.temporal_decay
+                        )
+                results.extend(
+                    _finalize_context(context, args.output_dir, args)
+                    for context in contexts
+                )
+            completed_rows.extend(row_indices)
+            _write_progress(
+                progress_path,
+                {
+                    "status": "running",
+                    "row_count": row_count,
+                    "row_batch_size": args.row_batch_size,
+                    "row_batch_count": row_batch_count,
+                    "last_completed_row_batch_index": row_batch_index,
+                    "completed_row_count": len(completed_rows),
+                    "completed_row_indices": completed_rows,
+                    "policy_batch_requests": global_batch_count,
+                    "policy_real_observations": global_observation_count,
+                    "elapsed_seconds": time.perf_counter() - started,
+                },
+            )
+    except BaseException as exc:
+        _write_progress(
+            progress_path,
+            {
+                "status": "failed",
+                "row_count": row_count,
+                "row_batch_size": args.row_batch_size,
+                "row_batch_count": row_batch_count,
+                "completed_row_count": len(completed_rows),
+                "completed_row_indices": completed_rows,
+                "policy_batch_requests": global_batch_count,
+                "policy_real_observations": global_observation_count,
+                "elapsed_seconds": time.perf_counter() - started,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        raise
     finally:
-        try:
+        if session_id is not None:
             base.delete_session(args, headers, session_id)
-        finally:
-            for context in contexts:
-                context["renderer"].close()
-    results = [_finalize_context(context, args.output_dir, args) for context in contexts]
     aggregate = {
         "mode": "mode4_state41_28dof_native_batch",
         "model": args.model,
@@ -520,6 +596,8 @@ def run(args: argparse.Namespace) -> dict:
         "action_horizon": HORIZON,
         "row_indices": args.row_indices_list,
         "row_count": len(results),
+        "row_batch_size": args.row_batch_size,
+        "row_batch_count": row_batch_count,
         "act_batch_size": args.act_batch_size,
         "policy_batch_requests": global_batch_count,
         "policy_real_observations": global_observation_count,
@@ -529,6 +607,21 @@ def run(args: argparse.Namespace) -> dict:
         "elapsed_seconds": time.perf_counter() - started,
     }
     (args.output_dir / "summary.json").write_text(json.dumps(aggregate, indent=2) + "\n")
+    _write_progress(
+        progress_path,
+        {
+            "status": "completed",
+            "row_count": row_count,
+            "row_batch_size": args.row_batch_size,
+            "row_batch_count": row_batch_count,
+            "completed_row_count": len(completed_rows),
+            "completed_row_indices": completed_rows,
+            "policy_batch_requests": global_batch_count,
+            "policy_real_observations": global_observation_count,
+            "elapsed_seconds": aggregate["elapsed_seconds"],
+            "summary": str(args.output_dir / "summary.json"),
+        },
+    )
     return aggregate
 
 

@@ -230,10 +230,15 @@ initialization using the canonical ctx100 manifest. `dataset_reference.mp4`
 keeps the full demonstration, while head/wrist physics-comparison videos and
 all rollout arrays cover only the synchronized contact window. Use
 `--frame-window full` only for an explicitly named full-trajectory stress test.
-Multi-row Mode4 defaults to `--row-execution lockstep --row-batch-size 4`:
-four independent MuJoCo trajectories contribute four real observations to each
-fixed-shape `act_batch`, while only the final partial group/window tail is
-padded:
+Multi-row State41 Mode4 defaults to `--row-execution lockstep
+--row-batch-size 4 --act-batch-size 4`. `row_batch_size` bounds resident native
+MuJoCo models/renderers; each completed residency group is finalized and closed
+before the next group starts, while one action session is reused for the whole
+run. Due observations inside a residency group are dispatched in independent
+`act_batch_size` groups, so large sweeps may use (for example) row batch16 with
+policy batch4 without changing the compiled policy shape. `progress.json` is
+atomically updated after each completed row group, and only the final partial
+policy group/window tail is padded:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help
