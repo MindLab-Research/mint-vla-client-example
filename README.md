@@ -347,6 +347,9 @@ for a copy-paste command and the low-memory fallback.
   records effective configuration, source/normalization provenance, phase
   timings, and supports explicit `--video-mode none` diagnostic sweeps and
   retained action-session reuse through `--keep-server` / `--reuse-server-info`.
+  State41 gesture evaluation reconstructs the same canonical prompt as training
+  from formal-release `index.object` and `index.gesture`; the pre-release raw-row
+  gesture index is neither required nor accepted as the State41 language source.
 - `scripts/remote/stop_owned_mode4_server.sh`: ownership-checked retained-session
   cleanup and graceful stop for a server handed off with `--keep-server`.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server

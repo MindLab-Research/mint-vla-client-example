@@ -34,6 +34,7 @@ from scripts.mano_state41_contract import (
     SURFACE_DISTANCE_SLICE,
 )
 from scripts.target_actions import URDF_TARGET_ABSOLUTE, project_row_actions
+from scripts.train.state41_gradea_contract import canonical_release_gesture_prompt
 
 MODEL = "openpi/pi05-action-lora-r16-state41-28dof-finetune"
 HORIZON = 10
@@ -53,7 +54,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm-stats-dir", type=Path, required=True)
     parser.add_argument("--norm-sha-expected", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--language-conditioning", choices=("object_only",), required=True)
+    parser.add_argument(
+        "--language-conditioning", choices=("gesture", "object_only"), required=True
+    )
     parser.add_argument("--contact-window-manifest", type=Path, required=True)
     parser.add_argument("--contact-context-frames", type=int, default=100)
     parser.add_argument("--missing-contact-policy", choices=("error",), default="error")
@@ -126,6 +129,18 @@ def update_multicontact_run(run_frames: int, contacts: np.ndarray) -> tuple[int,
     return 0, np.float32(0.0)
 
 
+def condition_state41_language(row: dict, language_conditioning: str) -> dict:
+    """Apply the same formal-release prompt contract used by State41 training."""
+    if language_conditioning == "gesture":
+        prompt = canonical_release_gesture_prompt(
+            row["index"], row["trajectory_metadata"]
+        )
+        return {**row, "prompt": prompt}
+    return base.condition_row_language(
+        row, language_conditioning, row_index=-1, gesture_index=None
+    )
+
+
 def load_row(args: argparse.Namespace) -> tuple[dict, dict]:
     source = lance.dataset(str(args.lance_dataset))
     if not 0 <= args.row_index < source.count_rows():
@@ -145,9 +160,7 @@ def load_row(args: argparse.Namespace) -> tuple[dict, dict]:
         raise ValueError(f"right-hand target mismatch: {target.shape}/{qpos.shape}")
     row = {**row, "hands": [right_hand]}
     row = project_row_actions(row, URDF_TARGET_ABSOLUTE, action_dim=ACTION_DIM)
-    row = base.condition_row_language(
-        row, args.language_conditioning, row_index=args.row_index, gesture_index=None
-    )
+    row = condition_state41_language(row, args.language_conditioning)
     return row, source
 
 

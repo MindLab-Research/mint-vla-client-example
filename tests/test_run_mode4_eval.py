@@ -232,6 +232,33 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(evaluation["action_dim"], 32)
             self.assertEqual(evaluation["language_conditioning"], "object_only")
 
+    def test_state41_gesture_uses_formal_release_metadata_not_raw_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-gesture-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "gesture",
+                    "--gesture-index",
+                    str(root / "missing-and-intentionally-unused.json"),
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["language_conditioning"], "gesture")
+            self.assertEqual(evaluation["language_source"], "formal_release_metadata")
+            self.assertIsNone(evaluation["gesture_index"])
+
     def test_state44_model_and_contract_must_be_selected_together(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

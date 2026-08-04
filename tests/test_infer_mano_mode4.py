@@ -13,6 +13,7 @@ import mujoco
 import numpy as np
 from scripts.eval import mano_physics_core as physics
 from scripts.eval import infer_mano_mode4 as mode4
+from scripts.eval import infer_mano_mode4_state41 as state41_mode4
 from scripts.eval.infer_mano_mode4 import (
     MANORL_PHYSICS_SUBSTEPS,
     MANORL_PHYSICS_TIMESTEP,
@@ -106,6 +107,37 @@ class Mode4ContractTests(unittest.TestCase):
             self.assertAlmostEqual(data.time, 0.005)
         finally:
             tmp.cleanup()
+
+
+class State41LanguageContractTests(unittest.TestCase):
+    def test_gesture_prompt_uses_formal_release_metadata(self):
+        row = {
+            "prompt": "stale prompt that must not be trusted",
+            "index": {"object": "banana", "gesture": "03"},
+            "trajectory_metadata": {"object_names": ["banana"]},
+        }
+        conditioned = state41_mode4.condition_state41_language(row, "gesture")
+        self.assertEqual(
+            conditioned["prompt"], "pick up the banana using gesture 03"
+        )
+
+    def test_gesture_prompt_rejects_release_object_mismatch(self):
+        row = {
+            "prompt": "pick up the banana",
+            "index": {"object": "banana", "gesture": "03"},
+            "trajectory_metadata": {"object_names": ["cube1"]},
+        }
+        with self.assertRaisesRegex(ValueError, "object mismatch"):
+            state41_mode4.condition_state41_language(row, "gesture")
+
+    def test_object_only_preserves_existing_prompt(self):
+        row = {
+            "prompt": "pick up the cube1",
+            "index": {},
+            "trajectory_metadata": {"object_names": ["cube1"]},
+        }
+        conditioned = state41_mode4.condition_state41_language(row, "object_only")
+        self.assertEqual(conditioned["prompt"], row["prompt"])
 
 
 class Mode4SessionLifecycleTests(unittest.TestCase):

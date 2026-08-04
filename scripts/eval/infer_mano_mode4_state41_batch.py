@@ -51,7 +51,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--norm-stats-dir", type=Path, required=True)
     parser.add_argument("--norm-sha-expected", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--language-conditioning", choices=("object_only",), required=True)
+    parser.add_argument(
+        "--language-conditioning", choices=("gesture", "object_only"), required=True
+    )
     parser.add_argument("--contact-window-manifest", type=Path, required=True)
     parser.add_argument("--contact-context-frames", type=int, default=100)
     parser.add_argument("--missing-contact-policy", choices=("error",), default="error")

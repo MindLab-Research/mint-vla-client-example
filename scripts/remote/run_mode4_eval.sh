@@ -130,6 +130,7 @@ Evaluation options:
   --missing-contact-policy full|skip|error (default: error)
   --language-conditioning gesture|motion_variant|object_only
   --gesture-index PATH        canonical gesture index; required for gesture
+                              except State41, which uses formal-release metadata
   --api-key KEY               MINT API key (default: MINT_API_KEY)
 
 Dedicated-server options:
@@ -379,7 +380,7 @@ case "$LANGUAGE_CONDITIONING" in
   gesture|motion_variant|object_only) ;;
   *) fail "invalid --language-conditioning: $LANGUAGE_CONDITIONING" ;;
 esac
-if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
+if [[ "$LANGUAGE_CONDITIONING" == gesture && "$STATE_CONTRACT" != state41 ]]; then
   [[ -f "$GESTURE_INDEX" ]] || fail "gesture index does not exist: $GESTURE_INDEX"
 fi
 [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && ((10#$SERVER_PORT > 0 && 10#$SERVER_PORT < 65536)) || \
@@ -574,7 +575,16 @@ payload={
         'dataset_reference_video_window': 'full',
         'physics_comparison_video_window': frame_window,
         'language_conditioning': language,
-        'gesture_index': gesture_index if language == 'gesture' else None,
+        'language_source': (
+            'formal_release_metadata'
+            if language == 'gesture' and state_contract == 'state41'
+            else ('canonical_gesture_index' if language == 'gesture' else None)
+        ),
+        'gesture_index': (
+            gesture_index
+            if language == 'gesture' and state_contract != 'state41'
+            else None
+        ),
         'extended_state': True,
     },
     'dedicated_server': {
@@ -767,7 +777,7 @@ fi
 if [[ "$FRAME_WINDOW" == contact ]]; then
   EVAL_ARGS+=(--contact-window-manifest "$CONTACT_WINDOW_MANIFEST")
 fi
-if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
+if [[ "$LANGUAGE_CONDITIONING" == gesture && "$STATE_CONTRACT" != state41 ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
 fi
 
