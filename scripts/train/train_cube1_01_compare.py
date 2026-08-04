@@ -707,7 +707,13 @@ def load_or_compute_norm_stats(
             else None
         )
         path, actual_sha = verify_locked_state54_norm_stats(
-            norm_stats_dir, expected_sha256=expected_norm_sha
+            norm_stats_dir,
+            expected_sha256=expected_norm_sha,
+            data_contract_path=(
+                dataset._state54_data_contract_path
+                if dataset._state54_data_contract is not None
+                else None
+            ),
         )
     elif extended_state:
         path, actual_sha = verify_locked_norm_stats(norm_stats_dir)

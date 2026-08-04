@@ -99,9 +99,18 @@ OBJECT_COLLISION_BOXES: Mapping[str, ObjectCollisionBox] = {
 
 
 def verify_locked_state54_norm_stats(
-    norm_stats_dir: Path, *, expected_sha256: str | None = None
+    norm_stats_dir: Path,
+    *,
+    expected_sha256: str | None = None,
+    data_contract_path: Path | None = None,
 ) -> tuple[Path, str]:
-    """Authenticate norm bytes, population/data contract, and zero-truncation audit."""
+    """Authenticate norm bytes against one explicit data/token contract.
+
+    ``data_contract_path`` is mandatory for non-legacy formal populations so the
+    caller cannot validate the dataset with one contract while silently reading
+    a stale co-located norm contract. Legacy callers retain the historical
+    ``norm_dir/data_contract.json`` behavior.
+    """
     directory = Path(norm_stats_dir)
     norm_path = directory / "norm_stats.json"
     if not norm_path.is_file():
@@ -113,11 +122,19 @@ def verify_locked_state54_norm_stats(
     if actual_sha != expected:
         raise ValueError(f"state54 norm SHA mismatch: expected {expected}, got {actual_sha}")
 
-    contract_path = directory / "data_contract.json"
+    legacy = expected == STATE54_NORM_SHA256
+    if not legacy and data_contract_path is None:
+        raise ValueError(
+            "non-legacy State54 norm verification requires explicit data_contract_path"
+        )
+    contract_path = (
+        Path(data_contract_path).expanduser().resolve()
+        if data_contract_path is not None
+        else directory / "data_contract.json"
+    )
     if not contract_path.is_file():
         raise ValueError(f"state54 norm requires data_contract.json at {contract_path}")
     contract = json.loads(contract_path.read_text(encoding="utf-8"))
-    legacy = expected == STATE54_NORM_SHA256
     expected_population = (
         {
             "row_indices_sha256": POPULATION_ROW_INDICES_SHA256,
@@ -157,7 +174,11 @@ def verify_locked_state54_norm_stats(
     if len(population_sha) != 64:
         raise ValueError("state54 data contract population SHA is invalid")
 
-    audit_path = directory / "token_audit.json"
+    audit_path = (
+        Path(contract["token_audit"]).expanduser().resolve()
+        if contract.get("token_audit")
+        else directory / "token_audit.json"
+    )
     if not audit_path.is_file():
         raise ValueError(f"state54 norm requires token_audit.json at {audit_path}")
     audit_sha = hashlib.sha256(audit_path.read_bytes()).hexdigest()
@@ -176,7 +197,10 @@ def verify_locked_state54_norm_stats(
     ):
         raise ValueError(f"state54 token audit contract is invalid: {audit_path}")
     augmentation = audit.get("augmentation")
-    if not legacy and not (
+    requested_state_noise = float(
+        (contract.get("augmentation") or {}).get("state_noise_std", 0.0)
+    )
+    if not legacy and requested_state_noise > 0 and not (
         isinstance(augmentation, dict)
         and augmentation.get("zero_truncation") is True
         and augmentation.get("overflow_count") == 0

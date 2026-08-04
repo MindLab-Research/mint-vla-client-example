@@ -166,6 +166,60 @@ def test_augmentation_diagnostics_support_state54_width():
     assert summary["causal_derived_rms_delta_normalized"] == pytest.approx(0.05)
 
 
+def test_formal_state54_norm_uses_explicit_contract_without_augmented_audit(tmp_path):
+    import hashlib, json
+    import scripts.mano_state54_contract as contract
+
+    norm_dir = tmp_path / "norm"
+    norm_dir.mkdir()
+    norm = norm_dir / "norm_stats.json"
+    norm.write_text("formal-norm-bytes")
+    norm_sha = hashlib.sha256(norm.read_bytes()).hexdigest()
+    population_sha = "a" * 64
+    audit_payload = {
+        "zero_truncation": True,
+        "overflow_count": 0,
+        "audited_active_frames": 423450,
+        "profile_max_token_len": 256,
+        "maximum_token_length": 227,
+        "norm_stats_sha256": norm_sha,
+        "population_row_indices_sha256": population_sha,
+        "augmentation": None,
+    }
+    audit = tmp_path / "formal_token_audit.json"
+    audit.write_text(json.dumps(audit_payload, sort_keys=True))
+    contract_payload = {
+        "norm_stats_sha256": norm_sha,
+        "state_contract": contract.STATE_CONTRACT_ID,
+        "state_dim": 54,
+        "action_dim": 32,
+        "action_horizon": 10,
+        "action_source": "urdf_target_absolute",
+        "row_indices_sha256": population_sha,
+        "trajectory_count": 813,
+        "active_frame_count": 423450,
+        "action_vector_count": 4234500,
+        "force_reference_newtons": contract.FORCE_REFERENCE_NEWTONS,
+        "source_interval_seconds": contract.SOURCE_INTERVAL_SECONDS,
+        "contact_age_clip_seconds": contract.CONTACT_AGE_CLIP_SECONDS,
+        "max_token_len": 256,
+        "token_audit": str(audit),
+        "token_audit_sha256": hashlib.sha256(audit.read_bytes()).hexdigest(),
+        "augmentation": {"state_noise_std": 0.0, "target_noise_std": 0.0},
+    }
+    explicit_contract = tmp_path / "formal_contract.json"
+    explicit_contract.write_text(json.dumps(contract_payload))
+    assert contract.verify_locked_state54_norm_stats(
+        norm_dir,
+        expected_sha256=norm_sha,
+        data_contract_path=explicit_contract,
+    ) == (norm, norm_sha)
+    with pytest.raises(ValueError, match="requires explicit data_contract_path"):
+        contract.verify_locked_state54_norm_stats(
+            norm_dir, expected_sha256=norm_sha
+        )
+
+
 def test_state54_norm_verifier_authenticates_token_audit(tmp_path, monkeypatch):
     import hashlib, json
     import scripts.mano_state54_contract as contract

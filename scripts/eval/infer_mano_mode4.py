@@ -1537,6 +1537,7 @@ def main() -> int:
         _, actual_sha = verify_locked_state54_norm_stats(
             args.norm_stats_dir,
             expected_sha256=args.norm_sha_expected,
+            data_contract_path=args.state54_data_contract,
         )
         args.norm_sha_actual = actual_sha
     elif args.extended_state:
