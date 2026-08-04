@@ -74,6 +74,8 @@ def test_print_config_exposes_locked_full_a_defaults(tmp_path: Path) -> None:
     assert config["per_device_batch_size"] == 16
     assert config["expected_device_count"] == 4
     assert config["learning_rate"] == 5e-5
+    assert config["sample_seed"] == 42
+    assert config["augmentation_seed"] == 43
     assert config["state_noise_std"] == 0.1
     assert config["target_noise_std"] == 0.0
     assert config["sampling_strategy"] == "sqrt_tempered"
