@@ -29,14 +29,16 @@ description: 纯 HTTP 多卡 LoRA 微调 OpenPI pi0.5 — 不 import mint_server
 - 这曾被误诊为 "client HTTP 往返瓶颈", 实测证伪: mint driver 与 client **共用同一份 HTTP 代码** (driver 第 105-107 行 `_post_json = _smoke._post_json` import 的就是 client 的 helper), 两者发请求逐字节相同, HTTP 不可能是 client 独有瓶颈。
 - **看到 client 吞吐低于 driver 时, 第一反应是重启 server, 不是改 client 代码。**
 
-如果你没有 fresh server, 先用 mint skill `mint-vla-openpi-finetune` 的 `PI05lance_local_norray.sh` 启动模式起一个 (ununused port), 或确认用户已有的 server 端口 + `MINT_SUPPORTED_MODELS`。
+如果你没有 fresh server, **必须用 mint skill `mint-vla-openpi-finetune` 的参考启动器起 server, 不要自己写启动脚本** (用户明确要求)。参考: `mint` 仓库 `scripts/vla/PI05lance_local_norray.sh` (env 见其第 56-75 行)。client 侧只需 `--num-gpus N` 自动匹配 producers=N/bs=128, 但 **server 必须只看 N 张 GPU** —— 数据并行分片数由 server 进程的 `CUDA_VISIBLE_DEVICES` 决定, client 无法单方面限制。用 mint 参考启动器时设 `MINT_CUDA_DEVICES=0,1,...,N-1` (该脚本第 74 行 `CUDA_VISIBLE_DEVICES="${MINT_CUDA_DEVICES:-3,4,5,6}"`) 和 `MINT_PORT=<unused>` 即可起一个真 N 卡 fresh server。验证真 N 卡: 模型加载后 `nvidia-smi` 应只有 GPU 0..N-1 占用 (~62GB), 其余全空。或确认用户已有的 server 端口 + `MINT_SUPPORTED_MODELS`。
+
+> 起纯 server (不跑 mint driver) 的薄封装: `mint-vla-client-example-wenxi/scripts/sweep500/start_server_mint.sh <ngpu> <port>` —— env 逐行照搬 `PI05lance_local_norray.sh:56-75`, 只起 `_run_local_openpi_server.py` 进程 (driver 用 client 侧 `run_client.sh`)。
 
 ## 输入 (向用户确认, 一次性问清)
 
 | 问题 | 建议默认 | 说明 |
 |---|---|---|
 | Lance 数据集路径 | (必填) | `image/wrist_image/state/actions/prompt` schema |
-| 训练步数 | 400 | |
+| 训练步数 | 400 | 测性能/SM 用 500 步 (见"实测水位"主表, 短跑 <50 步会低估 throughput、SM 测不准, 见 §4/§8) |
 | **server GPU 数** | **必填** | **传 `--num-gpus N`, client 自动匹配最优参数**: producers=N (实测 1/2/4/8 卡甜点), bs=128 (所有卡数通用)。**生产者数必须等于卡数**, 否则 4 卡用 >4 生产者会静默退出 |
 | batch size | 128 | bs=128 是 1/2/4/8 卡通用甜点; 若改, 必须是 num_gpus 的倍数 (否则数据并行不分片) |
 | checkpoint 名 | 省略→自动 | 省略则不存 checkpoint (仅 probe) |
@@ -61,7 +63,7 @@ MINT_BASE_URL=http://localhost:<port> \
 bash scripts/remote/run_client.sh scripts/train/train_http_multiprod.py \
   --base-url http://localhost:<port> \
   --lance-dataset <lance-path> \
-  --steps 400 --num-gpus 8 \      # 8 卡 server; 4 卡传 4, 2 卡传 2, 1 卡传 1
+  --steps 500 --num-gpus 8 \      # 8 卡 server; 4 卡传 4, 2 卡传 2, 1 卡传 1; 测性能用 500 步
   --save-checkpoint-name <name>   # 省略则不存 checkpoint
   --output-json results/logs/<run>.json
 ```
@@ -145,7 +147,7 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 | 768 | 192 | — | — | — | — | ❌ OOM (优雅, alloc 56.7GB) |
 
 **服务化选型**:
-- 要**吞吐**: bs=128 (8 卡/4 卡都 52 samples/s, 最优)。
+- 要**吞吐**: bs=128 (8 卡 ~59 / 4 卡 ~40 / 2 卡 ~24 / 1 卡 ~13 samples/s, 见 500 步主表; bs=128 是吞吐甜点)。注: 本 §5b 4 卡甜点行 (2.16s/52) 是 100 步大-batch 实验里的单点, 500 步同口径复测降到 3.20s/40, 以 500 步主表为准。
 - 要**GPU 占用率** (如按 GPU 时计费、或想让单卡算满): 8 卡 bs=1024 (busy 91.5%, 57.7 samples/s, 仍安全); 4 卡 bs=512 (busy 94.5%, 但吞吐反降到 36.7 — 4 卡大 batch 不划算)。
 - **触顶点与卡数无关, 由每卡样本数决定**: 每卡 ≤128 安全、每卡 192 OOM (alloc 56.7GB)、每卡 ~160 崩溃区。8 卡安全上限 bs=1024, 4 卡安全上限 bs=512。
 - **4 卡 server 起法陷阱**: `_start_pi05_server_8gpu.sh:24` 硬编码 `CUDA_VISIBLE_DEVICES=0-7`, 会覆盖命令行传的 4 卡限制 → 假 4 卡 (8 卡都占, 每卡 79.6GB)。4 卡必须 inline 起 server (不经过该脚本), 见下文"跑 4 卡"。
@@ -164,6 +166,29 @@ client 早期 `_compute_norm_stats` 纯 Python `for` 循环遍历 686 万 frame,
 - 只采 server 实际可见的卡 (4 卡 server 采 0-3, 别采全部 8 张把空闲卡拉低均值)。
 - `gpu_busy_mean` = 仅在"任一卡 >5% busy"的样本上求均值 (排除 HTTP 空闲间隙); 另报"忙窗均值" (样本 >5% busy 时) 看纯计算阶段 (~90%)。
 - **跑 ≥60 步**, 且 server 必须 fresh。30 步的 33% 是错的。
+
+### 9. server 持久化退化 (sm%/吞吐随 server 跑久了掉) — 根因 + 缓解
+
+**现象**: 一个 fresh server 跑十几小时后, 同样配置 sm% 从 ~71% 掉到 ~23%, 吞吐腰斩 (~25 samples/s)。重启 server 即恢复。**这是 server 进程老化, 不是模型权重退化** (梯度/参数一直正确, 训练中途不会"学坏", 只是变慢)。
+
+**根因 (基于 `openpi_pi05_worker.py` 代码)**:
+1. **JAX 编译缓存无限堆积 (主因)**: worker 的 `_get_flow_matching_grad_fn` 自身 cache 只存 1 个 (覆盖式), 但 **JAX 全局编译缓存不是覆盖式** —— 每个不同 `(batch_size, use_data_sharding, shape)` 组合编译一个新 XLA graph, 累积在 JAX 全局缓存里, **进程不重启不清**。跑久了 batch_size 抖动多次, 缓存堆到几 GB 挤占显存 + bookkeeping 变慢。action worker shutdown 会 `jax.clear_caches()` (`openpi_pi05_action_worker.py:652`), **但训练 worker 的 shutdown 只清 `_pending_grads` (worker.py:1429), 不清 JAX 缓存** —— 训练 worker 的 JAX 编译缓存从不清。
+2. **每步 `nnx.merge` 造 Python 对象 (worker.py:620,657,814,882)**: 每步 `model = self._nnx.merge(self._state.model_def, self._state.params)` 重建 model 对象, 引用链上的 JAX tracing metadata 累积 → Python 端内存涨、GC 压力大 → 每步 Python 开销↑ (与 GPU 算力无关)。
+3. **JAX prealloc 默认 75% 不释放**: 启动脚本未设 `XLA_PYTHON_CLIENT_MEM_FRACTION`, JAX 默认预占 75% 显存给 BFC allocator, 进程不退出不还给系统。BFC 在那 75% 里反复编译不同 shape 会碎片化, 找空间越来越难 → 不必要重分配 → 慢。
+
+**保证持久化不掉的方案 (按可行性排序)**:
+
+| 方案 | 改什么 | 风险 | 收益 |
+|---|---|---|---|
+| **R1. 固定 bs 白名单** | 服务化只允许一组 bs (如 128/256/512), 禁任意 bs, 避免新 shape 触发新编译 | 零 (运营约束) | 消除缓存堆积主因 |
+| **R2. prealloc 上限** | 启动加 `XLA_PYTHON_CLIENT_MEM_FRACTION=0.90` | 低 | 给 BFC 更多空间减碎片 |
+| R3. 每 N 步清缓存 | 训练 worker 加"每 ~1000 步 `jax.clear_caches()`" | 中 (清后下一 bs 重编译 ~80s 卡顿; 仅 shape 固定场景安全) | 中途清冗余旧编译 |
+| R4. nnx.merge 复用 | 每步 `nnx.merge` 改 session 级缓存一次 | 中 (nnx 可变性, 须对比 loss 收敛) | 省 Python GC |
+| R5. shutdown 加 clear_caches | 训练 worker shutdown 仿 action worker 加 `jax.clear_caches()`+`gc.collect()` | 低 (仅 session 结束时清) | 不解决中途退化 |
+
+**最低成本组合 (推荐)**: R1 (固定 bs 白名单) + R2 (prealloc=0.90) + **定期重启 server** (已验证有效, 是当前唯一已验证的"不掉"手段)。要彻底不重启需 R3/R4 (碰 `mint_server` 源码, 违背"不伸手进 mint", 需授权)。
+
+**如何判断 server 是否已退化**: 跑稳态 step_time, 若从 ~2.14s 涨到 ~4.9s 且 sm% 掉, 即退化 → 重启 server。别误诊为 client 问题 (见 §1)。
 
 ## 跑 4 卡 (限 server 可见 GPU)
 
@@ -194,16 +219,16 @@ nohup "$GRB/host-venv/bin/python" -u "$REPO/scripts/wip/_run_local_openpi_server
 curl -s http://127.0.0.1:30540/openapi.json >/dev/null && echo ready   # 200 即就绪
 ```
 
-4 卡推荐参数 (2026-07-31 实测, fresh server, bs 必须是 4 的倍数):
+4 卡推荐参数 (2026-08-03 500 步复测主数据, fresh server, bs 必须是 4 的倍数):
 
 | 配置 | step_time | throughput | SM% busy_mean | 备注 |
 |---|---|---|---|---|
-| **bs=128 + 4 生产者** | 2.16s | 52.2 samples/s | **74.5%** (忙窗 ~90%) | 4 卡最优; loss 1.01→0.089 |
-| bs=128 + 8 生产者 | ~2.13s | ~53 | — | ⚠️ step~221 静默退出 (生产者多于卡数), **4 卡别用 >4 生产者** |
-| bs=256 + 8 生产者 | 6.3s | 40.6 | ~48 | **4 卡不 OOM 但 step_time 翻倍, 无收益, 别用** |
+| **bs=128 + 4 生产者** | 3.20s | 40.0 samples/s | **90.9%** (忙窗 ~99%) | 4 卡最优; loss 1.01→0.109 (500 步) |
+| bs=128 + 8 生产者 | — | — | — | ⚠️ step~221 静默退出 (生产者多于卡数), **4 卡别用 >4 生产者** |
+| bs=256 + 8 生产者 | 6.3s | 40.6 | ~48 | (旧 100 步数据) 4 卡不 OOM 但 step_time 翻倍, 无收益, 别用 |
 
 - **生产者数 = 卡数** (4 生产者 ↔ 4 卡); >4 生产者会撞静默退出, <4 会饿队列。
-- 4 卡吞吐 ~52 samples/s (≈ 8 卡 52, 因 4 卡每步算 2× 样本但卡数减半), busy_mean 74.5% / 忙窗 ~90% —— 与 8 卡同形态 (HTTP-bound), 全样本均值 50% (HTTP 往返 + optim Python 遍历空转)。
+- 4 卡吞吐 ~40 samples/s (500 步复测; 旧 400 步表是 52, 复测降到 40, 见主表说明), busy_mean 90.9% / 忙窗 ~99% —— 卡少单卡吃得更满, 全样本均值 70% (HTTP 往返 + optim Python 遍历空转占比低于 8 卡的 49%)。
 
 ## 关键脚本
 
@@ -211,24 +236,42 @@ curl -s http://127.0.0.1:30540/openapi.json >/dev/null && echo ready   # 200 即
 - `scripts/train/openpi_vla_smoke_lance_base.py` — HTTP/dataset/transform helper (L 模块); `train_http_multiprod` import 它。mint driver 也 import 同一份。
 - `scripts/remote/run_client.sh` — 启动器, 配 PYTHONPATH (含 openpi) + 预检 server。
 
-## 实测水位 (fresh server, 8×A800, mano lance, 同口径 400 步 + 0.2s 采样, 2026-07-31)
+## 实测水位 — 500 步同口径复测 (fresh server, 8×A800, mano lance, 500 步 + 0.2s 采样, 2026-08-03)
+
+**这是当前主表 (500 步, client 侧 `--num-gpus N` 自动匹配 producers=N/bs=128)**。server 用 mint skill `mint-vla-openpi-finetune` 的参考启动器 `PI05lance_local_norray.sh` 的 env 起新鲜 server (按 `MINT_CUDA_DEVICES=0..N-1` 限卡数), client 侧 `--num-gpus N` 自动给出 producers=N、bs=128、per_card=128/N。
 
 两个 SM 口径都要看:
 - **busy_mean**: 仅在"任一卡 >5% busy"的样本上求均值 (排除 HTTP 空闲间隙) = GPU 真在算时的利用率。
 - **全样本均值**: 含 HTTP 往返 + optim Python 遍历的空闲间隙 (GPU 空转) = 整体占空比。
+- **稳态 throughput = 128 / median(step_time)** (跳过前 3 步 JIT 编译), 不受首步 ~80s 编译摊销污染; 末行 `throughput_amortized` 把首步摊进每步, 500 步下两者接近。
+
+| 配置 (--num-gpus N, 自动 producers=N, bs=128) | step_time (中位) | throughput (稳态) | throughput (摊销) | SM% busy_mean | SM% 全样本 | 忙窗峰值 | 每卡显存 | loss (首→末) | elapsed |
+|---|---|---|---|---|---|---|---|---|---|
+| **8 卡** (8 生产者, per_card=16) | 2.18s | **58.9** samples/s | 53.4 | **78.8%** | 49.4% | ~99% | 61.9 GB | 0.96→0.095 | 1199s |
+| **4 卡** (4 生产者, per_card=32) | 3.20s | **40.0** samples/s | 37.3 | **90.9%** | 70.0% | ~99% | 61.9 GB | 1.01→0.109 | 1718s |
+| **2 卡** (2 生产者, per_card=64) | 5.44s | **23.5** samples/s | 22.5 | **95.8%** | 82.6% | ~99% | 61.9 GB | 1.01→0.14 | 2842s |
+| **1 卡** (1 生产者, per_card=128) | 10.07s | **12.7** samples/s | 12.4 | **98.1%** | 91.7% | ~99% | 61.4 GB | 0.98→0.084 | 5162s |
+
+**与旧 400 步表 (2026-07-31) 的差异 — 注意, 4 卡变了**: 旧表 4 卡是 2.16s/52 (与 8 卡持平), 新 500 步复测 4 卡是 3.20s/40。8/2/1 卡的新旧数据基本一致 (8 卡 2.14→2.18、2 卡 5.43→5.44、1 卡 10.03→10.07), 只有 4 卡 step_time 从 2.16s 涨到 3.20s。推测 7-31 那次 4 卡 server 处于编译缓存命中/负载更空的偶发状态, 复测应以 500 步新表为准 (3.20s/40)。**结论修正: 4 卡吞吐不再等于 8 卡** —— 4 卡 40 < 8 卡 59, 4→8 卡翻倍卡数吞吐 +47%。
+
+**卡数规律 (500 步复测, bs=128)**:
+- bs=128 适用于所有卡数 (每卡样本 128/64/32/16, 都在每卡 ≤128 安全上限内)。
+- **GPU 越少, 单卡 busy_mean 越高但吞吐越低**: 1 卡 busy_mean 98.1% 但吞吐仅 12.7; 8 卡 busy_mean 78.8% 但吞吐 58.9 (4.6×)。原因: 卡少 → 每卡算的样本多 → GPU 计算段长、HTTP 空闲占比低 → busy_mean 高; 但总算力受卡数限, 吞吐仍随卡数涨。
+- **吞吐随卡数单调涨 (无持平)**: 1→2→4→8 卡 = 12.7→23.5→40.0→58.9, 翻倍卡数吞吐约 +85%/+70%/+47% (边际递减, 因大卡数下 HTTP 往返 + optim Python 遍历的固定开销占比上升)。
+- **推荐**: 卡多选 8 卡 (吞吐最高 59); 卡少时 1 卡也能跑 (单卡算满 98.1%), 吞吐按卡数近线性降。2 卡是 1 卡的 1.85×, 4 卡是 2 卡的 1.7×。
+
+**GPU 已打满到实用区**: 忙窗峰值 ~99% (8 卡同步涨跌, 数据并行 `PartitionSpec(DATA_AXIS)` 真分片), busy_mean 79-98% (卡越多越低, 因固定 HTTP/optim 空闲摊到更短的 GPU 段)。全样本均值 49-92% 随卡数反向变化: 8 卡 49% (每步 HTTP 往返 + optim_step Python pytree 遍历占 ~一半, GPU 空等), 1 卡 92% (单卡长计算段几乎没空闲间隙) —— 这是同步 HTTP 训练的结构性上限, 不是数据并行没生效。要继续提升需把 optim Python 遍历挪进 jit (碰 `mint_server` 源码, 越界, 需授权)。
+
+**queue_wait ≈0**: 所有卡数 queue_wait 都 <0.003s (生产者喂得及), 证明 producers=卡数 这个自动匹配在 1/2/4/8 卡都正确, 无饥饿。
+
+### 旧 400 步表 (存档, 2026-07-31, 同口径 400 步 + 0.2s 采样)
 
 | 配置 | step_time | throughput | SM% busy_mean | SM% 全样本 | 忙窗峰值 | 备注 |
 |---|---|---|---|---|---|---|
-| 8 卡 bs=128 + 8 生产者 (同步) | 2.14s | 51.6 samples/s | **71.2%** | 50.0% | ~90% | 8 卡; loss 1.05→0.097 |
-| 4 卡 bs=128 + 4 生产者 | 2.16s | 52.2 samples/s | **74.5%** | 50.0% | ~90% | 4 卡; loss 1.01→0.089 |
-| 2 卡 bs=128 + 2 生产者 | 5.43s | 19.5 samples/s | **92.4%** | 62.4% | ~90% | 2 卡; loss 1.01→0.14 |
-| 1 卡 bs=128 + 1 生产者 | 10.03s | 11.3 samples/s | **97.9%** | 80.7% | ~90% | 1 卡; loss 0.98→0.18 |
+| 8 卡 bs=128 + 8 生产者 (同步) | 2.14s | 51.6 samples/s | 71.2% | 50.0% | ~90% | 8 卡; loss 1.05→0.097 |
+| 4 卡 bs=128 + 4 生产者 | 2.16s | 52.2 samples/s | 74.5% | 50.0% | ~90% | 4 卡 (⚠️ 500 步复测降到 3.20s/40, 见上表) |
+| 2 卡 bs=128 + 2 生产者 | 5.43s | 19.5 samples/s | 92.4% | 62.4% | ~90% | 2 卡 |
+| 1 卡 bs=128 + 1 生产者 | 10.03s | 11.3 samples/s | 97.9% | 80.7% | ~90% | 1 卡 |
 | 8 卡 bs=128 + 8 生产者 (旧 server) | ~4.9s | ~25 | ~23% | — | — | stale-server 误诊, 非瓶颈 |
 
-**卡数规律 (实测 1/2/4/8 卡, bs=128)**: bs=128 适用于所有卡数 (每卡样本 128/64/32/16, 都在安全上限内)。**GPU 越少, 单卡 busy_mean 越高但吞吐越低**: 1 卡 busy_mean 97.9% 但吞吐仅 11.3; 8 卡 busy_mean 71.2% 但吞吐 52 (4.6×)。原因: 卡少 → 每卡算的样本多 → GPU 计算段长、HTTP 空闲占比低 → busy_mean 高; 但总算力受卡数限, 吞吐仍随卡数涨。**4 卡与 8 卡吞吐相同 (都 52)**: 4 卡每卡算 32 (8 卡 2 倍) 但 step_time 没翻倍 (2.16s ≈ 2.14s), 故吞吐持平 —— 4→8 卡翻倍卡数吞吐几乎不变。**推荐**: 卡多选 8 卡 (吞吐最高); 卡少时 1 卡也能跑 (单卡算满 97.9%), 只是吞吐按卡数线性降。
-
-对照 mint driver (同 fresh 8 卡 server): 2.1s/57 — 一致。
-
-**GPU 已打满到实用区**: 忙窗峰值 ~90% (8 卡同步涨跌, 数据并行 `PartitionSpec(DATA_AXIS)` 真分片), busy_mean 71-75%。全样本均值 50% 是因为每步有约一半时间在 **HTTP 往返 + optim_step 的 Python pytree 遍历** (server 端 `_run_inline` 同步执行, GPU 空等) —— 这是同步 HTTP 训练的结构性上限, 不是数据并行没生效。要继续提升需把 optim Python 遍历挪进 jit (碰 `mint_server` 源码, 越界, 需授权)。
-
-**4 卡 SM 略高于 8 卡 (74.5% vs 71.2%)**: 4 卡每卡算 bs/4=32、8 卡每卡算 bs/8=16, 4 卡单卡负载更满、空闲间隙更少。但 4 卡吞吐与 8 卡相当 (52 vs 52, 因 4 卡 step_time 2.16s ≈ 8 卡 2.14s) —— 4 卡每步算 2 倍样本但卡数减半, 总吞吐持平。8 卡吞吐上限更高 (能加大 batch); 4 卡单卡吃得更满。
+对照 mint driver (同 fresh 8 卡 server, 400 步): 2.1s/57 — 与 500 步 client 复测 (2.18s/59) 一致。
