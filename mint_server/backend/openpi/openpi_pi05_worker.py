@@ -5,6 +5,7 @@ import contextlib
 import dataclasses
 import io
 import json
+import hashlib
 import logging
 import structlog
 
@@ -53,11 +54,15 @@ def _reply(message: dict[str, Any]) -> None:
 class OpenPIPi05RuntimeInitOverrides:
     weights_path: str | None = None
     random_init: bool = False
+    checkpoint_norm_stats_dir: str | None = None
     seed: int | None = None
 
     @classmethod
     def from_env(cls) -> "OpenPIPi05RuntimeInitOverrides":
         weights_path = (os.environ.get("MINT_OPENPI_PI05_WEIGHTS_PATH") or "").strip() or None
+        checkpoint_norm_stats_dir = (
+            os.environ.get("MINT_OPENPI_PI05_CHECKPOINT_NORM_STATS_DIR") or ""
+        ).strip() or None
         seed_text = (os.environ.get("MINT_OPENPI_PI05_SEED") or "").strip()
         seed = None if not seed_text else int(seed_text)
         if seed is not None and seed < 0:
@@ -74,7 +79,18 @@ class OpenPIPi05RuntimeInitOverrides:
             )
         if weights_path is not None:
             weights_path = str(Path(weights_path).resolve())
-        return cls(weights_path=weights_path, random_init=random_init, seed=seed)
+        if checkpoint_norm_stats_dir is not None:
+            norm_dir = Path(checkpoint_norm_stats_dir).expanduser().resolve()
+            if not (norm_dir / "norm_stats.json").is_file():
+                raise FileNotFoundError(
+                    "MINT_OPENPI_PI05_CHECKPOINT_NORM_STATS_DIR must contain norm_stats.json: "
+                    f"{norm_dir}"
+                )
+            checkpoint_norm_stats_dir = str(norm_dir)
+        return cls(
+            weights_path=weights_path, random_init=random_init,
+            checkpoint_norm_stats_dir=checkpoint_norm_stats_dir, seed=seed,
+        )
 
 
 def _float_scalar(value: Any) -> float:
@@ -313,6 +329,25 @@ class OpenPIPi05WorkerSession:
         self._data_loader = _StaticDataLoader(
             self._config.data.create(self._config.assets_dirs, self._config.model)
         )
+        self._checkpoint_norm_stats_dir = (
+            Path(overrides.checkpoint_norm_stats_dir)
+            if overrides.checkpoint_norm_stats_dir is not None else None
+        )
+        if self._checkpoint_norm_stats_dir is not None:
+            checkpoint_norm_stats = checkpoints._normalize.load(
+                self._checkpoint_norm_stats_dir
+            )
+            for key, expected_width in {"state": self._state_dim, "actions": self._action_dim}.items():
+                stats = checkpoint_norm_stats.get(key)
+                if stats is None:
+                    raise ValueError(f"checkpoint normalization is missing {key!r} statistics")
+                for field in ("mean", "std", "q01", "q99"):
+                    values = np.asarray(getattr(stats, field, None))
+                    if values.shape != (expected_width,) or not np.isfinite(values).all():
+                        raise ValueError(
+                            f"checkpoint normalization {key}.{field} expected "
+                            f"{(expected_width,)}, got {values.shape}"
+                        )
         self._session_state_manager = OpenPISessionStateManager(
             Path(checkpoint_base_dir) / "_mint_session_state"
         )
@@ -1148,6 +1183,17 @@ class OpenPIPi05WorkerSession:
     def _write_profile_manifest(self, root: Path) -> None:
         if self._profile is not None:
             write_profile_manifest(root, self._profile)
+        norm_dir = getattr(self, "_checkpoint_norm_stats_dir", None)
+        if norm_dir is not None:
+            norm_path = Path(norm_dir) / "norm_stats.json"
+            (root / "mint_pi05_norm_provenance.json").write_text(
+                json.dumps({
+                    "sha256": hashlib.sha256(norm_path.read_bytes()).hexdigest(),
+                    "state_dim": self._state_dim,
+                    "action_dim": self._action_dim,
+                    "profile_id": self._profile.profile_id if self._profile is not None else None,
+                }, indent=2) + "\n"
+            )
 
     def _validate_profile_manifest(self, root: Path) -> None:
         if self._profile is not None:
@@ -1180,6 +1226,17 @@ class OpenPIPi05WorkerSession:
 
     def _save_checkpoint_assets(self, directory: Path) -> None:
         data_config = self._data_loader.data_config()
+        checkpoint_norm_stats_dir = getattr(self, "_checkpoint_norm_stats_dir", None)
+        if checkpoint_norm_stats_dir is not None:
+            if data_config.asset_id is None:
+                raise ValueError("explicit checkpoint normalization requires a data_config asset_id")
+            seed_assets_dir = getattr(self, "_seed_assets_dir", None)
+            if seed_assets_dir is not None and Path(seed_assets_dir).is_dir():
+                shutil.copytree(Path(seed_assets_dir), directory, dirs_exist_ok=True)
+            target = directory / data_config.asset_id / "norm_stats.json"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(Path(checkpoint_norm_stats_dir) / "norm_stats.json", target)
+            return
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
             self._checkpoints._normalize.save(directory / data_config.asset_id, norm_stats)
