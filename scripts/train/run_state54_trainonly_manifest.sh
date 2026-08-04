@@ -14,8 +14,9 @@ import json,shlex,sys
 m=json.load(open(sys.argv[1]))
 required={
  "status":"frozen_not_launched", "state_contract":"mano_object_dynamics_state54_v1",
- "batch_size":8, "learning_rate":5e-5, "state_noise_std":0.0, "target_noise_std":0.0,
+ "batch_size":8, "learning_rate":5e-5, "state_noise_std":0.05, "target_noise_std":0.0,
  "sampling_strategy":"coverage", "slate_size":16, "anchors_per_row":8,
+ "augmentation_seed":43,
  "train_rows":813, "train_active_frames":423450,
 }
 for k,v in required.items():
@@ -24,7 +25,7 @@ if m.get("seed") not in (42,43,44): raise ValueError("invalid seed")
 if m.get("steps") not in (20,150000): raise ValueError("steps must be smoke20 or formal150000")
 if m["steps"]==150000 and m.get("checkpoint_every")!=25000: raise ValueError("formal checkpoint schedule mismatch")
 if m["steps"]==20 and m.get("checkpoint_every")!=0: raise ValueError("smoke must not use periodic checkpoints")
-keys=("run_id","output_root","client_commit","mint_commit","openpi_commit","data_contract","data_contract_sha256","formal_protocol","formal_protocol_sha256","coverage_schedule","coverage_schedule_sha256","train_rows_csv","train_rows_csv_sha256","dataset","gesture_index","contact_window_manifest","feature_release","feature_release_sha256","norm_dir","norm_sha256","seed","steps","checkpoint_every","base_url")
+keys=("run_id","output_root","client_commit","mint_commit","openpi_commit","data_contract","data_contract_sha256","formal_protocol","formal_protocol_sha256","coverage_schedule","coverage_schedule_sha256","train_rows_csv","train_rows_csv_sha256","dataset","gesture_index","contact_window_manifest","feature_release","feature_release_sha256","norm_dir","norm_sha256","seed","augmentation_seed","steps","checkpoint_every","base_url")
 for k in keys:
  if k not in m: raise ValueError(f"manifest missing {k}")
 for k in keys:
@@ -69,7 +70,7 @@ ARGS=(
   --state54-replay-feature-release-sha256 "$FEATURE_RELEASE_SHA256"
   --state54-data-contract "$DATA_CONTRACT" --state54-data-contract-sha256 "$DATA_CONTRACT_SHA256"
   --steps "$STEPS" --batch-size 8 --learning-rate 5e-5
-  --seed "$SEED" --augmentation-seed "$((SEED+1))" --state-noise-std 0 --target-noise-std 0
+  --seed "$SEED" --augmentation-seed "$AUGMENTATION_SEED" --state-noise-std "$STATE_NOISE_STD" --target-noise-std "$TARGET_NOISE_STD"
   --sampling-strategy coverage --coverage-anchors-per-row 8 --slate-size 16
   --datum-cache-size 4096 --row-cache-size 813 --preload-selected-rows
   --batch-producers 2 --batch-build-workers 4 --prefetch-batches 2

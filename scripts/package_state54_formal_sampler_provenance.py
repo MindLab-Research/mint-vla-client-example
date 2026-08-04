@@ -80,10 +80,11 @@ def main() -> None:
         if profile.get(key) != value:
             raise ValueError(f"sampler profile {key} mismatch: {profile.get(key)!r} != {value!r}")
     contract, contract_sha = authenticated_json(args.data_contract.resolve(), args.data_contract_sha256, "data contract")
-    if contract.get("status") != "accepted" or contract.get("contract_id") != "state54_replay_train_only_noaug_v1" or contract.get("state_contract") != "mano_object_dynamics_state54_v1":
-        raise ValueError("data contract is not formal train-only State54")
-    if contract.get("augmentation") != {"state_noise_std": 0.0, "target_noise_std": 0.0}:
-        raise ValueError("formal State54 contract is not no-augmentation")
+    if contract.get("status") != "accepted" or contract.get("contract_id") != "state54_replay_train_stateaug005_v1" or contract.get("state_contract") != "mano_object_dynamics_state54_v1":
+        raise ValueError("data contract is not formal StateAug0.05 State54")
+    augmentation = contract.get("augmentation") or {}
+    if augmentation.get("state_noise_std") != 0.05 or augmentation.get("target_noise_std") != 0.0 or augmentation.get("causal_recomputation") != "qpos26_noise_then_MuJoCo_FK_tipXYZ15;other_features_clean":
+        raise ValueError("formal State54 contract is not authenticated StateAug0.05")
     data_release, data_release_sha = authenticated_json(args.data_release.resolve(), args.data_release_sha256, "data release")
     feature_release, feature_release_sha = authenticated_json(args.feature_release.resolve(), args.feature_release_sha256, "feature release")
     if data_release.get("status") != "accepted" or feature_release.get("status") != "accepted":
@@ -91,7 +92,7 @@ def main() -> None:
     if contract.get("data_release_sha256") != data_release_sha or contract.get("feature_release_sha256") != feature_release_sha or data_release.get("feature_release_sha256") != feature_release_sha:
         raise ValueError("contract/data/feature release binding mismatch")
     protocol, protocol_sha = authenticated_json(args.formal_protocol.resolve(), args.formal_protocol_sha256, "formal protocol")
-    if protocol.get("protocol_id") != "state54_replay_train_only_v1" or protocol.get("status") != "frozen_not_launched":
+    if protocol.get("protocol_id") != "state54_replay_train_stateaug005_v1" or protocol.get("status") != "frozen_not_launched":
         raise ValueError("wrong State54-only formal protocol")
     schedule, schedule_sha = authenticated_json(args.coverage_schedule.resolve(), args.coverage_schedule_sha256, "coverage schedule")
     schedules = {int(item["seed"]): item for item in schedule.get("schedules", [])}
@@ -110,13 +111,13 @@ def main() -> None:
     if sha256(files["embedded_norm"]) != norm_sha:
         raise ValueError("sampler embedded norm bytes mismatch")
     validation, validation_sha = authenticated_json(args.mode4_validation.resolve(), args.mode4_validation_sha256, "Mode4 validation")
-    if validation.get("status") != "accepted" or validation.get("protocol") != "state54_replay_train_only_mode4_gate_v1":
+    if validation.get("status") != "accepted" or validation.get("protocol") != "state54_replay_train_stateaug005_mode4_gate_v1":
         raise ValueError("Mode4 validation is not the formal State54 gate")
     if validation.get("state54_data_contract_sha256") != contract_sha or validation.get("row_count") != 4 or validation.get("first_observation_matches_training_state54") is not True or validation.get("all_arrays_finite") is not True or validation.get("all_queries_fixed_batch4_sharded") is not True or validation.get("action_session_released") is not True:
         raise ValueError("Mode4 validation gates or data-contract binding failed")
     provenance = {
         "schema_version": 1,
-        "provenance_id": "state54_replay_train_only_sampler_companion_v1",
+        "provenance_id": "state54_replay_train_stateaug005_sampler_companion_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "accepted",
         "training_seed": args.training_seed,

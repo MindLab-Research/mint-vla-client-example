@@ -61,6 +61,7 @@ def main() -> None:
     parser.add_argument("--formal-protocol-sha256", required=True)
     parser.add_argument("--coverage-schedule", type=Path, required=True)
     parser.add_argument("--coverage-schedule-sha256", required=True)
+    parser.add_argument("--state-noise-std", type=float, required=True)
     parser.add_argument("--client-commit", required=True)
     parser.add_argument("--mint-commit", required=True)
     parser.add_argument("--openpi-commit", required=True)
@@ -104,15 +105,20 @@ def main() -> None:
     token = load_json(args.token_audit)
     if token.get("state_contract") != "mano_object_dynamics_state54_v1" or token.get("population_row_indices_sha256") != row_digest or token.get("audited_active_frames") != active_frames or token.get("overflow_count") != 0 or token.get("zero_truncation") is not True or int(token.get("maximum_token_length", 10**9)) > 256:
         raise ValueError("State54 token audit failed")
+    if args.state_noise_std != 0.05:
+        raise ValueError("State54 mainline formal contract requires StateAug0.05")
+    augmented = token.get("augmentation")
+    if not isinstance(augmented, dict) or augmented.get("requested_sigma") != 0.05 or augmented.get("samples") != active_frames or augmented.get("zero_truncation") is not True or augmented.get("overflow_count") != 0 or int(augmented.get("maximum_token_length", 10**9)) > 256 or augmented.get("causal_recomputation") != "qpos26_noise_then_MuJoCo_FK_tipXYZ15;other_features_clean":
+        raise ValueError("State54 StateAug0.05 token audit failed")
     protocol = load_json(args.formal_protocol)
-    if protocol.get("protocol_id") != "state54_replay_train_only_v1" or protocol.get("status") != "frozen_not_launched":
+    if protocol.get("protocol_id") != "state54_replay_train_stateaug005_v1" or protocol.get("status") != "frozen_not_launched":
         raise ValueError("wrong State54-only formal protocol")
     schedule = load_json(args.coverage_schedule)
     if schedule.get("status") != "accepted" or schedule.get("row_count") != 813 or schedule.get("sampling", {}).get("samples_per_run") != 1_200_000:
         raise ValueError("coverage schedule mismatch")
     contract = {
         "schema_version": 2,
-        "contract_id": "state54_replay_train_only_noaug_v1",
+        "contract_id": "state54_replay_train_stateaug005_v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "accepted",
         "state_contract": "mano_object_dynamics_state54_v1",
@@ -145,7 +151,15 @@ def main() -> None:
         "token_audit": str(args.token_audit.resolve()),
         "token_audit_sha256": token_sha,
         "token_overflow_count": 0,
-        "augmentation": {"state_noise_std": 0.0, "target_noise_std": 0.0},
+        "augmentation": {
+            "state_noise_std": 0.05,
+            "target_noise_std": 0.0,
+            "augmentation_seed": int(augmented["seed"]),
+            "realized_sigma": float(augmented["realized_sigma"]),
+            "augmented_token_min": int(augmented["minimum_token_length"]),
+            "augmented_token_max": int(augmented["maximum_token_length"]),
+            "causal_recomputation": augmented["causal_recomputation"],
+        },
         "profile_id": "pi05_action_lora_r16_state54_v1",
         "model": "openpi/pi05-action-lora-r16-state54-finetune",
         "action_lora_rank": 16,

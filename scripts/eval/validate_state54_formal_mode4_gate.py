@@ -43,7 +43,7 @@ def main() -> None:
     if sha256(args.train_rows_csv) != args.train_rows_csv_sha256:
         raise ValueError("train rows SHA mismatch")
     contract = json.loads(args.data_contract.read_text())
-    if contract.get("status") != "accepted" or contract.get("contract_id") != "state54_replay_train_only_noaug_v1" or contract.get("norm_stats_sha256") != args.norm_sha256 or contract.get("feature_release_sha256") != args.feature_release_sha256:
+    if contract.get("status") != "accepted" or contract.get("contract_id") != "state54_replay_train_stateaug005_v1" or contract.get("norm_stats_sha256") != args.norm_sha256 or contract.get("feature_release_sha256") != args.feature_release_sha256:
         raise ValueError("wrong formal State54 data contract")
     train_rows = [int(value) for value in args.train_rows_csv.read_text().strip().split(",") if value]
     if len(train_rows) != 813:
@@ -116,7 +116,7 @@ def main() -> None:
         })
     report = {
         "schema_version": 1,
-        "protocol": "state54_replay_train_only_mode4_gate_v1",
+        "protocol": "state54_replay_train_stateaug005_mode4_gate_v1",
         "status": "accepted",
         "summary": str(args.summary.resolve()),
         "summary_sha256": sha256(args.summary),
