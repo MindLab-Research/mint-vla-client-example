@@ -773,7 +773,7 @@ fi
 
 EVAL_SCRIPT=scripts/eval/infer_mano_mode4.py
 if [[ "$STATE_CONTRACT" == state41 ]]; then
-  EVAL_SCRIPT=scripts/eval/infer_mano_mode4_state41.py
+  EVAL_SCRIPT=scripts/eval/infer_mano_mode4_state41_batch.py
 fi
 VLA_CLIENT_CONFIG=/dev/null MINT_CODE_ROOT="$MINT_CODE_ROOT" \
 MINT_OPENPI_ROOT="$MINT_OPENPI_ROOT" MINT_PYTHON_BIN="$MINT_PYTHON_BIN" \
