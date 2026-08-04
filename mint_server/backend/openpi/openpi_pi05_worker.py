@@ -53,10 +53,15 @@ def _reply(message: dict[str, Any]) -> None:
 class OpenPIPi05RuntimeInitOverrides:
     weights_path: str | None = None
     random_init: bool = False
+    seed: int | None = None
 
     @classmethod
     def from_env(cls) -> "OpenPIPi05RuntimeInitOverrides":
         weights_path = (os.environ.get("MINT_OPENPI_PI05_WEIGHTS_PATH") or "").strip() or None
+        seed_text = (os.environ.get("MINT_OPENPI_PI05_SEED") or "").strip()
+        seed = None if not seed_text else int(seed_text)
+        if seed is not None and seed < 0:
+            raise ValueError("MINT_OPENPI_PI05_SEED must be a non-negative integer")
         random_init = (os.environ.get("MINT_OPENPI_PI05_RANDOM_INIT") or "").strip().lower() in {
             "1",
             "true",
@@ -69,7 +74,7 @@ class OpenPIPi05RuntimeInitOverrides:
             )
         if weights_path is not None:
             weights_path = str(Path(weights_path).resolve())
-        return cls(weights_path=weights_path, random_init=random_init)
+        return cls(weights_path=weights_path, random_init=random_init, seed=seed)
 
 
 def _float_scalar(value: Any) -> float:
@@ -284,6 +289,8 @@ class OpenPIPi05WorkerSession:
             ema_decay=None,
         )
         overrides = OpenPIPi05RuntimeInitOverrides.from_env()
+        if overrides.seed is not None:
+            self._config = dataclasses.replace(self._config, seed=overrides.seed)
         self._seed_assets_dir: Path | None = None
         if overrides.weights_path is not None:
             logger.info("openpi_pi0_5_worker_using_explicit_weights_path___s")
