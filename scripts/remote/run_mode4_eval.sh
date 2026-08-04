@@ -408,8 +408,8 @@ fi
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
 require_positive_int --row-batch-size "$ROW_BATCH_SIZE"
-((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
-  fail "--row-batch-size must be <= --act-batch-size"
+[[ "$STATE_CONTRACT" == state41 ]] || ((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
+  fail "--row-batch-size must be <= --act-batch-size outside state41"
 [[ "$ROW_EXECUTION" != lockstep || "$ACT_MODE" == batch ]] || \
   fail "--row-execution lockstep requires --act-mode batch"
 require_nonnegative_int --max-frames "$MAX_FRAMES"

@@ -232,6 +232,34 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(evaluation["action_dim"], 32)
             self.assertEqual(evaluation["language_conditioning"], "object_only")
 
+    def test_state41_row_residency_can_exceed_policy_batch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-residency-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "object_only",
+                    "--act-batch-size",
+                    "4",
+                    "--row-batch-size",
+                    "16",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["act_batch_size"], 4)
+            self.assertEqual(evaluation["row_batch_size"], 16)
+
     def test_state41_gesture_uses_formal_release_metadata_not_raw_index(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
