@@ -26,9 +26,8 @@ EXPECTED_DEVICE_COUNT=${STATE45_EXPECTED_DEVICE_COUNT:-4}
 PREFETCH_BATCHES=${STATE45_PREFETCH_BATCHES:-2}
 STATE45_OBJECT_FILTER=${STATE45_OBJECT:-}
 STATE45_GESTURE_FILTER=${STATE45_GESTURE:-}
-if [[ -n "$STATE45_OBJECT_FILTER" && -z "$STATE45_GESTURE_FILTER" || \
-      -z "$STATE45_OBJECT_FILTER" && -n "$STATE45_GESTURE_FILTER" ]]; then
-  echo 'STATE45_OBJECT and STATE45_GESTURE must be set together' >&2
+if [[ -z "$STATE45_OBJECT_FILTER" && -n "$STATE45_GESTURE_FILTER" ]]; then
+  echo 'STATE45_GESTURE requires STATE45_OBJECT' >&2
   exit 64
 fi
 
@@ -83,10 +82,12 @@ if any(row.get('prompt') != expected_prompt.format(object=row['object'],gesture=
   raise SystemExit('State45 train selection prompt mismatch')
 object_filter=os.environ.get('STATE45_OBJECT_FILTER','')
 gesture_filter=os.environ.get('STATE45_GESTURE_FILTER','')
+if gesture_filter and (not gesture_filter.isdigit() or len(gesture_filter)!=2):
+  raise SystemExit('STATE45_GESTURE must be a two-digit formal gesture')
 if object_filter:
-  if not gesture_filter.isdigit() or len(gesture_filter)!=2:
-    raise SystemExit('STATE45_GESTURE must be a two-digit formal gesture')
-  rows=[row for row in all_rows if row.get('object')==object_filter and row.get('gesture')==gesture_filter]
+  rows=[row for row in all_rows if row.get('object')==object_filter]
+  if gesture_filter:
+    rows=[row for row in rows if row.get('gesture')==gesture_filter]
 else:
   rows=all_rows
 if not rows:

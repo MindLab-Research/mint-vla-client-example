@@ -19,15 +19,26 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
         "contract": "mano_state45_grade_a_selection_v1",
         "split": "train",
         "split_contract": "mano_state45_grade_a_object_gesture_split_v1",
-        "rows": [{
-            "release_row_index": 1,
-            "object": "cube1",
-            "gesture": "03",
-            "grade": "A",
-            "prompt": (
-                "pick up the cube1 using gesture 03, then place it back on the table"
-            ),
-        }],
+        "rows": [
+            {
+                "release_row_index": 1,
+                "object": "cube1",
+                "gesture": "03",
+                "grade": "A",
+                "prompt": (
+                    "pick up the cube1 using gesture 03, then place it back on the table"
+                ),
+            },
+            {
+                "release_row_index": 2,
+                "object": "cube1",
+                "gesture": "01",
+                "grade": "A",
+                "prompt": (
+                    "pick up the cube1 using gesture 01, then place it back on the table"
+                ),
+            },
+        ],
     }))
     windows = tmp_path / "train_contact_windows.json"
     windows.write_text("{}\n")
@@ -36,7 +47,7 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
         "status": "passed",
         "population": "grade_a",
         "population_rows": 4856,
-        "train_rows": 1,
+        "train_rows": 2,
         "state_contract": "mano_state45_phase_native_sim_28d_v1",
         "source_state_contract": "mano_state41_native_sim_28d_v1",
         "state_dim": 45,
@@ -94,6 +105,27 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
     assert config["row_filter"]["object"] == "cube1"
     assert config["row_filter"]["gesture"] == "03"
     assert config["row_filter"]["row_count"] == 1
+
+    object_only_env = {
+        **env,
+        "STATE45_GESTURE": "",
+    }
+    object_only = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/remote/run_state45_gradea_train.sh"),
+            str(report_path),
+            "state45-object-test",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+        env=object_only_env,
+    )
+    object_config = json.loads(object_only.stdout)
+    assert object_config["row_filter"]["object"] == "cube1"
+    assert object_config["row_filter"]["gesture"] == ""
+    assert object_config["row_filter"]["row_count"] == 2
 
 
 def test_state45_server_launcher_requires_norm_and_uses_own_cache_namespace(tmp_path) -> None:
