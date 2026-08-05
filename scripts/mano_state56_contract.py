@@ -46,9 +46,10 @@ FINGER_FORCE_SLICE = slice(49, 54)
 RELATIVE_VERTICAL_VELOCITY_INDEX = 54
 MULTIFINGER_CONTACT_AGE_INDEX = 55
 GEOMETRY_CONTRACT_FILENAME = "state56_native28_geometry_contract.json"
-GEOMETRY_CONTRACT_SHA256 = "e2b029d9adc24925b387c3773f513e4c8fafbf08b2d7ffa997aa76875de2f07c"
+GEOMETRY_CONTRACT_SHA256 = "03dd6917c265144194033b4cd9f0d466c92aa85d98d55e1511416d7d0603562e"
 EXPECTED_MANORL_COMMIT = "e17f0122decddffc348ec10d0ed42552a0540e1b"
-EXPECTED_ASSET_SOURCE_COMMIT = "e7910212e54367008ecb7484e5e9354e822de03e"
+EXPECTED_ALL_ASSETS_COMMIT = "e7910212e54367008ecb7484e5e9354e822de03e"
+EXPECTED_CURATED_ASSET_SOURCE_COMMIT = "033b358b73c57e5f437f6582b6a9b0d4add7f9ee"
 CONTACT_SEMANTICS = "state41_native_replay_pair_presence_and_normal_force_norm_v1"
 
 
@@ -71,7 +72,8 @@ def _load_geometry_contract() -> tuple[Mapping[str, ObjectCollisionBox], tuple[s
     required = {
         "contract": "mano_native28_collision_aabb_v1",
         "manorl_commit": EXPECTED_MANORL_COMMIT,
-        "asset_source_commit": EXPECTED_ASSET_SOURCE_COMMIT,
+        "all_assets_commit": EXPECTED_ALL_ASSETS_COMMIT,
+        "curated_asset_source_commit": EXPECTED_CURATED_ASSET_SOURCE_COMMIT,
     }
     for key, expected in required.items():
         if payload.get(key) != expected:
