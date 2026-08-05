@@ -914,27 +914,36 @@ def load_or_compute_norm_stats(
         # Structural validation after the exact v1 norm bytes are authenticated.
         state_q01 = np.asarray(stats["state"].q01, dtype=np.float32)
         state_q99 = np.asarray(stats["state"].q99, dtype=np.float32)
-        if not np.allclose(state_q01[26:31], 0.0):
-            raise ValueError(
-                f"extended-state norm cache q01[26:31] must be 0, got {state_q01[26:31]}: {path}"
-            )
-        if not np.allclose(state_q99[26:31], 1.0):
-            raise ValueError(
-                f"extended-state norm cache q99[26:31] must be 1, got {state_q99[26:31]}: {path}"
-            )
-        lift_range = state_q99[31] - state_q01[31]
+        if state56:
+            if not np.allclose(state_q01[28:33], 0.0) or not np.allclose(state_q99[28:33], 1.0):
+                raise ValueError("state56 contact norm must use fixed 0..1")
+            lift_index, force_slice, age_index = 33, slice(49, 54), 55
+            force_max = __import__("scripts.mano_state56_contract", fromlist=["FORCE_LOG1P_MAX"]).FORCE_LOG1P_MAX
+        else:
+            if not np.allclose(state_q01[26:31], 0.0):
+                raise ValueError(
+                    f"extended-state norm cache q01[26:31] must be 0, got {state_q01[26:31]}: {path}"
+                )
+            if not np.allclose(state_q99[26:31], 1.0):
+                raise ValueError(
+                    f"extended-state norm cache q99[26:31] must be 1, got {state_q99[26:31]}: {path}"
+                )
+            lift_index, force_slice, age_index = 31, slice(47, 52), 53
+            force_max = __import__("scripts.mano_state54_contract", fromlist=["FORCE_LOG1P_MAX"]).FORCE_LOG1P_MAX
+        lift_range = state_q99[lift_index] - state_q01[lift_index]
         if lift_range < 1e-4:
             raise ValueError(
                 f"extended-state norm cache lift range must be > 1e-4, got {lift_range}: {path}"
             )
-        if state54:
-            from scripts.mano_state54_contract import FORCE_LOG1P_MAX
-
-            if not np.allclose(state_q01[47:52], 0.0) or not np.allclose(
-                state_q99[47:52], FORCE_LOG1P_MAX
-            ):
+        if state56:
+            if not np.allclose(state_q01[force_slice], 0.0) or not np.allclose(state_q99[force_slice], force_max):
+                raise ValueError("state56 force norm must use fixed 0..log1p(50N)")
+            if not np.isclose(state_q01[age_index], 0.0) or not np.isclose(state_q99[age_index], 1.0):
+                raise ValueError("state56 contact-age norm must use fixed 0..1s")
+        elif state54:
+            if not np.allclose(state_q01[force_slice], 0.0) or not np.allclose(state_q99[force_slice], force_max):
                 raise ValueError("state54 force norm must use fixed 0..log1p(50N)")
-            if not np.isclose(state_q01[53], 0.0) or not np.isclose(state_q99[53], 1.0):
+            if not np.isclose(state_q01[age_index], 0.0) or not np.isclose(state_q99[age_index], 1.0):
                 raise ValueError("state54 contact-age norm must use fixed 0..1s")
     return stats, {
         "source": "loaded",
