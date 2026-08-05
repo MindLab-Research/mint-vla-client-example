@@ -22,6 +22,7 @@ import numpy as np
 HAND_DIM = 28
 DT = 0.0025
 NATIVE_SUBSTEPS = 2
+STATE41_DISTANCE_SENSOR_MAX_METERS = 1.0
 DEFAULT_MANORL_REPO_ROOT = Path(
     "/vePFS-Mindverse/user/intern/wenxi/manorl-native-28d"
 )
@@ -504,16 +505,29 @@ def state41_features_from_mujoco(
         distances = [
             float(
                 mujoco.mj_geomDistance(
-                    model, data, tip_geom, object_geom, 1.0, fromto
+                    model,
+                    data,
+                    tip_geom,
+                    object_geom,
+                    STATE41_DISTANCE_SENSOR_MAX_METERS,
+                    fromto,
                 )
             )
             for object_geom in ids.object_geom_ids
         ]
         distance = min(distances)
-        if not np.isfinite(distance) or distance >= 1.0:
+        if (
+            not np.isfinite(distance)
+            or distance > STATE41_DISTANCE_SENSOR_MAX_METERS
+        ):
             raise FloatingPointError(
                 f"invalid state41 fingertip/object distance for geom {tip_geom}: {distance}"
             )
+        # MuJoCo returns distmax when the pair is farther apart than the search
+        # range. That is a finite, observable non-contact state rather than a
+        # geometry failure. Preserve the 1 m sensor saturation in the raw
+        # rollout; quantile normalization already maps such far distances to
+        # its upper bound.
         signed[finger_index] = np.float32(distance)
     return contacts, signed, np.float32(object_floor), pair_records
 

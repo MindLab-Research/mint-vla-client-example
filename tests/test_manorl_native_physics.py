@@ -101,6 +101,36 @@ def test_state41_features_use_visual_measurement_spheres_without_new_collisions(
     assert isinstance(pairs, list)
 
 
+def test_state41_surface_distance_preserves_finite_far_sensor_saturation():
+    import mujoco
+
+    _, model, data, renderer, object_addr, _, hand_addr, _, _ = physics.make_scene(
+        "cube1", 64, 36, physics=True, create_renderer=True
+    )
+    try:
+        data.qpos[:] = 0.0
+        data.qvel[:] = 0.0
+        data.qpos[object_addr : object_addr + 3] = [2.0, 0.0, 0.1]
+        data.qpos[object_addr + 3 : object_addr + 7] = [1.0, 0.0, 0.0, 0.0]
+        data.qpos[hand_addr] = 0.0
+        mujoco.mj_forward(model, data)
+        ids = physics.resolve_state41_feature_ids(model, "cube1")
+        contacts, surface, _floor, pairs = physics.state41_features_from_mujoco(
+            model, data, "cube1", feature_ids=ids
+        )
+    finally:
+        renderer.close()
+
+    np.testing.assert_array_equal(contacts, np.zeros(5, dtype=np.float32))
+    np.testing.assert_array_equal(
+        surface,
+        np.full(
+            5, physics.STATE41_DISTANCE_SENSOR_MAX_METERS, dtype=np.float32
+        ),
+    )
+    assert pairs == []
+
+
 def test_head_camera_preset_registry_has_two_versions_and_current_default():
     from scripts.eval import mano_action_support as legacy
 
