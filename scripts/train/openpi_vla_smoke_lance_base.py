@@ -551,10 +551,12 @@ class LanceViewpi05Dataset:
         if actions.shape[0] < self._action_horizon:
             pad = np.repeat(actions[-1:], self._action_horizon - actions.shape[0], axis=0)
             actions = np.concatenate([actions, pad], axis=0)
-        if getattr(self, "_state_contract", None) is not None:
+        if getattr(self, "_state_contract", None) == "mano_object_dynamics_state54_v1":
             state = np.asarray(
                 row["_state54_window"][frame - window.start_frame], dtype=np.float32
             )
+        elif getattr(self, "_state_contract", None) == "mano_object_dynamics_state56_native28_v1":
+            state = np.asarray(row["state"][frame], dtype=np.float32)
         elif self._extended_state:
             from scripts.mano_state_contract import build_extended_state
             objects = row["objects"]
