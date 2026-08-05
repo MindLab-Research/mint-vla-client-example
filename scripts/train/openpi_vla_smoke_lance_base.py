@@ -293,18 +293,21 @@ class LanceViewpi05Dataset:
 
         `extended_state`: legacy alias for state_contract="state32".
         `state_contract`: None for legacy raw state, "state32" for contact/lift,
-        "state44" for derived 26D geometry/dynamics, or "state41" for the
-        persisted native-simulated 28D release.
+        "state44" for derived 26D geometry/dynamics, "state41" for the
+        persisted native-simulated 28D release, or "state45" for the causal
+        phase features appended to that persisted State41 sequence.
         """
-        if state_contract not in {None, "state32", "state44", "state41"}:
+        if state_contract not in {None, "state32", "state44", "state41", "state45"}:
             raise ValueError(f"unsupported state_contract {state_contract!r}")
         if extended_state and state_contract not in {None, "state32"}:
             raise ValueError(
-                "--extended-state cannot be combined with an explicit state44/state41 contract"
+                "--extended-state cannot be combined with an explicit state44/state41/state45 contract"
             )
         self._state_contract = state_contract or ("state32" if extended_state else None)
         self._extended_state = self._state_contract is not None
-        self._state_dim = {"state44": 44, "state41": 41}.get(self._state_contract, 32)
+        self._state_dim = {"state44": 44, "state41": 41, "state45": 45}.get(
+            self._state_contract, 32
+        )
         self._dataset = lance.dataset(str(lance_dataset))
         self._dataset_path = Path(lance_dataset)
         # Metadata stays small; contact records are scanned separately and
@@ -425,7 +428,7 @@ class LanceViewpi05Dataset:
             self._row_cache.move_to_end(row_index)
             return cached
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
-        if self._extended_state and self._state_contract != "state41":
+        if self._extended_state and self._state_contract not in {"state41", "state45"}:
             columns += ["contact", "objects"]
         if self._state_contract == "state44":
             columns.append("timestamp")
@@ -440,6 +443,12 @@ class LanceViewpi05Dataset:
                 raise ValueError(f"state44 requires exactly one object name, got {object_names!r}")
             row["_state44_sequence"] = compute_source_state44_sequence(
                 {**row, "trajectory_metadata": metadata}, object_names[0]
+            )
+        elif self._state_contract == "state45":
+            from scripts.mano_state45_contract import append_phase_to_state41_sequence
+
+            row["_state45_sequence"] = append_phase_to_state41_sequence(
+                np.asarray(row["state"], dtype=np.float32)
             )
         self._row_cache[row_index] = row
         self._row_cache.move_to_end(row_index)
@@ -506,6 +515,10 @@ class LanceViewpi05Dataset:
             actions = np.concatenate([actions, pad], axis=0)
         if getattr(self, "_state_contract", None) == "state44":
             state = np.asarray(row["_state44_sequence"][frame], dtype=np.float32).copy()
+        elif getattr(self, "_state_contract", None) == "state45":
+            state = np.asarray(row["_state45_sequence"][frame], dtype=np.float32).copy()
+            if state.shape != (45,):
+                raise ValueError(f"derived State45 frame has shape {state.shape}")
         elif getattr(self, "_state_contract", None) == "state41":
             state = np.asarray(row["state"][frame], dtype=np.float32).copy()
             if state.shape != (41,):

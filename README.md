@@ -85,6 +85,40 @@ arrays therefore contain `frame_count - 1` intervals. Strict rollout success is
 maximum object lift above 5 cm followed by object-floor contact after the lift
 peak.
 
+## State45-Phase/Action32 implementation branch
+
+State45 is an additive, isolated candidate. It does not alter the historical
+State41 contract or its 200-token profile. The three implementation branches
+are `feature/mano-state45-phase-v1`, `feature/pi05-state45-phase-v1`, and
+`feature/pi05-state45-phase-v1` (Client, MINT, and OpenPI respectively).
+
+```text
+observation: State45
+  State41[0:41]
+  + peak_lift_so_far[41]
+  + stable_lift_achieved[42]
+  + filtered object vertical velocity[43]
+  + task_phase[44]  # 0=ACQUIRE, 1=PLACE, 2=DONE
+policy action: [10,32]
+physical hand target: 28D
+B-mask segments: (3, -3, 22, -4)
+prompt: pick up the {object} using gesture {gesture}, then place it back on the table
+phase source: shared causal ManoTaskPhaseTracker, never a model-predicted label
+StateAug: qpos[0:28] only; phase/history dimensions are unchanged
+persistent rollout: DONE termination, 15-second timeout, query stride 1
+```
+
+State45 uses `max_token_len=224` and fail-closed tokenization. The full Grade-A
+train audit covers 2,560,614 frames with maximum raw length 198; validation
+covers 134,518 frames with maximum 197. A legal repeated-bin audit reaches 209
+tokens, so a 200-token profile would accept the observed dataset while failing
+on reachable normalized online states. The State45 profile must retain 224
+until a narrower state representation is deliberately designed and re-audited.
+
+No State45 training, checkpoint evaluation, or GPU server launch is implicit.
+The training launcher requires an explicit `STATE45_STEPS`; the persistent
+rollout launcher only runs against an already selected server/checkpoint.
+
 ### Internal checkout
 
 Until the feature branches are merged and tagged, use dedicated worktrees at

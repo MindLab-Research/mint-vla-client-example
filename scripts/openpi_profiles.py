@@ -14,6 +14,9 @@ ACTION_LORA_R16_STATE44_MODEL = "openpi/pi05-action-lora-r16-state44-finetune"
 ACTION_LORA_R16_STATE41_MODEL = (
     "openpi/pi05-action-lora-r16-state41-28dof-finetune"
 )
+ACTION_LORA_R16_STATE45_MODEL = (
+    "openpi/pi05-action-lora-r16-state45-phase-28dof-finetune"
+)
 
 
 @dataclass(frozen=True)
@@ -68,6 +71,18 @@ ACTION_LORA_R16_STATE41_PROFILE = OpenPIClientProfile(
     state_contract_id="mano_state41_native_sim_28d_v1",
     delta_mask_segments=(3, -3, 22, -4),
 )
+ACTION_LORA_R16_STATE45_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state45_phase_28dof_v1",
+    base_model=ACTION_LORA_R16_STATE45_MODEL,
+    discrete_state_input=True,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    state_dim=45,
+    max_tokens=224,
+    fail_on_token_truncation=True,
+    state_contract_id="mano_state45_phase_native_sim_28d_v1",
+    delta_mask_segments=(3, -3, 22, -4),
+)
 
 MODEL_PROFILES = {
     profile.base_model: profile
@@ -76,6 +91,7 @@ MODEL_PROFILES = {
         ACTION_LORA_R16_PROFILE,
         ACTION_LORA_R16_STATE44_PROFILE,
         ACTION_LORA_R16_STATE41_PROFILE,
+        ACTION_LORA_R16_STATE45_PROFILE,
     )
 }
 PROFILE_IDS = {profile.profile_id: profile for profile in MODEL_PROFILES.values()}

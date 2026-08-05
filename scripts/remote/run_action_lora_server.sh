@@ -59,7 +59,11 @@ done
 GPU_COMMAS=${GPU_IDS//[^,]/}
 GPU_COUNT=$((1 + ${#GPU_COMMAS}))
 if [[ -z "$CACHE_DIR" ]]; then
-  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_state41_a800_${GPU_COUNT}gpu"
+  CACHE_PROFILE=state41
+  if [[ "$MODEL" == openpi/pi05-action-lora-r16-state45-phase-28dof-finetune ]]; then
+    CACHE_PROFILE=state45_phase
+  fi
+  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_${CACHE_PROFILE}_a800_${GPU_COUNT}gpu"
 fi
 [[ "$CACHE_DIR" = /* ]] || { echo "--cache-dir must be absolute" >&2; exit 64; }
 
@@ -72,8 +76,12 @@ done
 [[ -x "$PYTHON_BIN" ]] || { echo "runtime Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 mkdir -p "$RUNTIME_ROOT"/{openpi_checkpoint_base,runtime_checkpoints,tmp,action_state}
 ASSETS_BASE_DIR=${MINT_OPENPI_PI05_ASSETS_BASE_DIR:-/vePFS-Mindverse/share/code/conley/openpi/assets}
-if [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune ]]; then
-  [[ -n "$NORM_STATS_PATH" ]] || { echo "--norm-stats is required for the state41 Action-LoRA server" >&2; exit 64; }
+if [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune || \
+      "$MODEL" == openpi/pi05-action-lora-r16-state45-phase-28dof-finetune ]]; then
+  [[ -n "$NORM_STATS_PATH" ]] || {
+    echo "--norm-stats is required for State41/State45 Action-LoRA servers" >&2
+    exit 64
+  }
 fi
 if [[ -n "$NORM_STATS_PATH" ]]; then
   [[ "$NORM_STATS_PATH" = /* ]] || { echo "--norm-stats must be absolute" >&2; exit 64; }
