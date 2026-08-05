@@ -92,7 +92,7 @@ the pinned commits:
 
 ```bash
 # Client
-git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state46-28dof \
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state41-28dof \
   switch feature/mano-state41-28dof-v1
 
 # MINT server
@@ -123,7 +123,7 @@ with seed 42 into 4,613 train rows and 243 validation rows. Print and validate
 the immutable 100K training configuration without contacting the server:
 
 ```bash
-cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state46-28dof
+cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state41-28dof
 PROFILE=/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/\
 mano_28d_native_replay_state41_rgb_v1/profiles/\
 grade_a_train95_object_gesture_seed42_contact_pm100_v1/profile_report.json
