@@ -23,6 +23,7 @@ LEARNING_RATE=${STATE45_LEARNING_RATE:-5e-5}
 CHECKPOINT_EVERY=${STATE45_CHECKPOINT_EVERY:-5000}
 STATE_NOISE_STD=${STATE45_STATE_NOISE_STD:-0.1}
 EXPECTED_DEVICE_COUNT=${STATE45_EXPECTED_DEVICE_COUNT:-4}
+PREFETCH_BATCHES=${STATE45_PREFETCH_BATCHES:-2}
 STATE45_OBJECT_FILTER=${STATE45_OBJECT:-}
 STATE45_GESTURE_FILTER=${STATE45_GESTURE:-}
 if [[ -n "$STATE45_OBJECT_FILTER" && -z "$STATE45_GESTURE_FILTER" || \
@@ -118,6 +119,7 @@ FILTER_ROWS_SHA=${CONTRACT[9]}
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_STEPS must be a positive integer" >&2; exit 64; }
 [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_BATCH_SIZE must be positive" >&2; exit 64; }
 [[ "$CHECKPOINT_EVERY" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_CHECKPOINT_EVERY must be positive" >&2; exit 64; }
+[[ "$PREFETCH_BATCHES" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_PREFETCH_BATCHES must be positive" >&2; exit 64; }
 
 OUT_ROOT=${VLA_CLIENT_RESULTS_ROOT:-${REPO_ROOT}/results}/training/${RUN_ID}
 RESULT_JSON="$OUT_ROOT/result.json"
@@ -129,7 +131,7 @@ CHECKPOINT_TEMPLATE="${RUN_ID}_step{step}"
 if [[ "${STATE45_PRINT_CONFIG:-0}" == 1 ]]; then
   python3 - <<PY
 import json
-print(json.dumps({'run_id':'$RUN_ID','profile_sha256':'$PROFILE_SHA','model':'$MODEL','steps':int('$STEPS'),'batch_size':int('$BATCH_SIZE'),'learning_rate':float('$LEARNING_RATE'),'checkpoint_every':int('$CHECKPOINT_EVERY'),'state_noise_std':float('$STATE_NOISE_STD'),'expected_device_count':int('$EXPECTED_DEVICE_COUNT'),'row_filter':{'object':'$FILTER_OBJECT','gesture':'$FILTER_GESTURE','row_count':int('$FILTER_ROW_COUNT'),'rows_sha256':'$FILTER_ROWS_SHA'}},indent=2,sort_keys=True))
+print(json.dumps({'run_id':'$RUN_ID','profile_sha256':'$PROFILE_SHA','model':'$MODEL','steps':int('$STEPS'),'batch_size':int('$BATCH_SIZE'),'learning_rate':float('$LEARNING_RATE'),'checkpoint_every':int('$CHECKPOINT_EVERY'),'state_noise_std':float('$STATE_NOISE_STD'),'expected_device_count':int('$EXPECTED_DEVICE_COUNT'),'prefetch_batches':int('$PREFETCH_BATCHES'),'row_filter':{'object':'$FILTER_OBJECT','gesture':'$FILTER_GESTURE','row_count':int('$FILTER_ROW_COUNT'),'rows_sha256':'$FILTER_ROWS_SHA'}},indent=2,sort_keys=True))
 PY
   exit 0
 fi
@@ -140,7 +142,7 @@ if [[ -e "$RESULT_JSON" || -e "$METRICS_JSONL" || -e "$CHECKPOINT_EVENTS_JSONL" 
 fi
 {
   printf 'started=%s\nrun_id=%s\nprofile_report=%s\nprofile_sha256=%s\n' "$(date -Is)" "$RUN_ID" "$(realpath "$PROFILE_REPORT")" "$PROFILE_SHA"
-  printf 'model=%s\nsteps=%s\nbatch_size=%s\nlearning_rate=%s\nstate_noise_std=%s\n' "$MODEL" "$STEPS" "$BATCH_SIZE" "$LEARNING_RATE" "$STATE_NOISE_STD"
+  printf 'model=%s\nsteps=%s\nbatch_size=%s\nlearning_rate=%s\nstate_noise_std=%s\nprefetch_batches=%s\n' "$MODEL" "$STEPS" "$BATCH_SIZE" "$LEARNING_RATE" "$STATE_NOISE_STD" "$PREFETCH_BATCHES"
   printf 'row_filter_object=%s\nrow_filter_gesture=%s\nrow_filter_count=%s\nrow_filter_rows_sha256=%s\n' "$FILTER_OBJECT" "$FILTER_GESTURE" "$FILTER_ROW_COUNT" "$FILTER_ROWS_SHA"
 } | tee "$DRIVER_LOG"
 
@@ -155,7 +157,7 @@ exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
   --learning-rate "$LEARNING_RATE" --seed 42 --augmentation-seed 43 \
   --batch-size "$BATCH_SIZE" --expected-device-count "$EXPECTED_DEVICE_COUNT" \
   --sampling-strategy sqrt_tempered --slate-size 16 --coverage-anchors-per-row 8 \
-  --row-cache-size 16 --datum-cache-size 256 --prefetch-batches 2 \
+  --row-cache-size 16 --datum-cache-size 256 --prefetch-batches "$PREFETCH_BATCHES" \
   --batch-producers 2 --batch-build-workers 16 \
   --state-noise-std "$STATE_NOISE_STD" --target-noise-std 0 \
   --checkpoint-every "$CHECKPOINT_EVERY" \

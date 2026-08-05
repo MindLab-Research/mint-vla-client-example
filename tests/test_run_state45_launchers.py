@@ -90,6 +90,7 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
     assert config["model"].endswith("state45-phase-28dof-finetune")
     assert config["steps"] == 123
     assert config["state_noise_std"] == 0.1
+    assert config["prefetch_batches"] == 2
     assert config["row_filter"]["object"] == "cube1"
     assert config["row_filter"]["gesture"] == "03"
     assert config["row_filter"]["row_count"] == 1
