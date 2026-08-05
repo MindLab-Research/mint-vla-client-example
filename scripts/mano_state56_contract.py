@@ -419,7 +419,11 @@ def verify_locked_state56_norm_stats(
     ):
         raise ValueError("State56 clean token audit is invalid")
     augmentation = audit.get("augmentation")
-    expected_augmentation = contract.get("augmentation") or {}
+    expected_augmentation = (
+        contract.get("augmentation") or {}
+        if contract_id == "mano_state56_native28_experiment_data_v1"
+        else {"augmentation_seed": 43, "state_noise_std": 0.05, "target_noise_std": 0.0}
+    )
     if not (
         isinstance(augmentation, dict)
         and augmentation.get("zero_truncation") is True
