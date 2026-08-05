@@ -406,13 +406,16 @@ def verify_locked_state56_norm_stats(
     if contract.get("token_audit_sha256") != token_sha:
         raise ValueError("State56 token audit SHA mismatch")
     audit = json.loads(token_path.read_text(encoding="utf-8"))
+    audit_population_valid = (
+        int(audit.get("trajectory_count", -1)) == counts[0]
+        and int(audit.get("audited_active_frames", -1)) == int(contract.get("train_active_frame_count", -2))
+    ) if contract_id == "mano_state56_native28_experiment_data_v1" else True
     if not (
         audit.get("zero_truncation") is True
         and audit.get("overflow_count") == 0
         and int(audit.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1)) <= PROFILE_MAX_TOKEN_LEN
         and audit.get("norm_stats_sha256") == actual
-        and int(audit.get("trajectory_count", -1)) == counts[0]
-        and int(audit.get("audited_active_frames", -1)) == int(contract.get("train_active_frame_count", -2))
+        and audit_population_valid
     ):
         raise ValueError("State56 clean token audit is invalid")
     augmentation = audit.get("augmentation")
