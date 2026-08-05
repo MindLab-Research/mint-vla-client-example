@@ -328,8 +328,6 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 "action_delta_mask": [3, -3, 22, -4],
                 "max_token_len": 256,
                 "dataset": str(self._dataset_path),
-                "train_trajectory_count": 4613,
-                "validation_trajectory_count": 243,
                 "held_out_trajectory_count": 0,
                 "sidecar_verification_sha256": self._state56_sidecar_store.verification_sha256,
             }
@@ -338,6 +336,21 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                     raise ValueError(
                         f"State56 data contract {key!r} mismatch: {contract.get(key)!r} != {value!r}"
                     )
+            counts = (
+                contract.get("train_trajectory_count"),
+                contract.get("validation_trajectory_count"),
+            )
+            if (
+                not all(isinstance(value, int) for value in counts)
+                or counts[0] <= 0
+                or counts[1] < 0
+                or contract.get("contract_id")
+                not in {
+                    "mano_state56_native28_scheme_a_data_v1",
+                    "mano_state56_native28_experiment_data_v1",
+                }
+            ):
+                raise ValueError(f"State56 data contract population is invalid: {counts}")
             self._state56_data_contract = contract
             self._state56_data_contract_path = contract_path
             self._state56_data_contract_sha256 = actual_contract_sha
@@ -489,24 +502,44 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             selected_digest = hashlib.sha256(
                 json.dumps(self._source_row_indices, separators=(",", ":")).encode()
             ).hexdigest()
-            population = (
-                ("train", 4613, 2560614, contract["train_row_indices_sha256"])
-                if len(self._source_row_indices) == 4613
-                else ("validation", 243, 134518, contract["validation_row_indices_sha256"])
-                if len(self._source_row_indices) == 243
-                else None
+            candidates = [
+                (
+                    "train",
+                    int(contract["train_trajectory_count"]),
+                    int(contract["train_active_frame_count"]),
+                    contract["train_row_indices_sha256"],
+                ),
+                (
+                    "validation",
+                    int(contract["validation_trajectory_count"]),
+                    int(contract["validation_active_frame_count"]),
+                    contract["validation_row_indices_sha256"],
+                ),
+            ]
+            population = next(
+                (
+                    item
+                    for item in candidates
+                    if len(self._source_row_indices) == item[1]
+                    and selected_digest == item[3]
+                ),
+                None,
             )
             if population is None:
-                raise ValueError("State56 selection must be the exact train or validation manifest")
+                raise ValueError("State56 selection must match the exact contracted train or validation manifest")
             split, trajectories, frames, expected_digest = population
+            scheme_a_sidecar_split = (
+                contract.get("contract_id") == "mano_state56_native28_scheme_a_data_v1"
+                and any(
+                    self._state56_sidecar_store.split_for_source_row(source_row) != split
+                    for source_row in self._source_row_indices
+                )
+            )
             if (
                 len(self._row_windows) != trajectories
                 or len(self._index) != frames
                 or selected_digest != expected_digest
-                or any(
-                    self._state56_sidecar_store.split_for_source_row(source_row) != split
-                    for source_row in self._source_row_indices
-                )
+                or scheme_a_sidecar_split
             ):
                 raise ValueError(
                     f"State56 selected {split} population identity mismatch: "

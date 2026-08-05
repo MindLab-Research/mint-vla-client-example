@@ -374,15 +374,28 @@ def verify_locked_state56_norm_stats(
         "source_interval_seconds": SOURCE_INTERVAL_SECONDS,
         "contact_age_clip_seconds": CONTACT_AGE_CLIP_SECONDS,
         "max_token_len": PROFILE_MAX_TOKEN_LEN,
-        "train_trajectory_count": 4613,
-        "validation_trajectory_count": 243,
-        "held_out_trajectory_count": 0,
     }
     for key, value in required.items():
         if contract.get(key) != value:
             raise ValueError(
                 f"State56 data contract {key!r} mismatch: expected {value!r}, got {contract.get(key)!r}"
             )
+    counts = (
+        contract.get("train_trajectory_count"),
+        contract.get("validation_trajectory_count"),
+        contract.get("held_out_trajectory_count"),
+    )
+    if not all(isinstance(value, int) for value in counts) or counts[0] <= 0 or counts[1] < 0 or counts[2] != 0:
+        raise ValueError(f"State56 data contract population counts are invalid: {counts}")
+    contract_id = contract.get("contract_id")
+    if contract_id == "mano_state56_native28_scheme_a_data_v1":
+        if counts != (4613, 243, 0):
+            raise ValueError("State56 Scheme-A population counts changed")
+    elif contract_id is None:
+        if counts != (4613, 243, 0):
+            raise ValueError("legacy State56 population counts changed")
+    elif contract_id != "mano_state56_native28_experiment_data_v1":
+        raise ValueError(f"unsupported State56 data contract identity: {contract_id!r}")
     token_path_value = contract.get("token_audit")
     if not token_path_value:
         raise ValueError("State56 data contract must name token_audit")
@@ -398,17 +411,28 @@ def verify_locked_state56_norm_stats(
         and audit.get("overflow_count") == 0
         and int(audit.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1)) <= PROFILE_MAX_TOKEN_LEN
         and audit.get("norm_stats_sha256") == actual
+        and int(audit.get("trajectory_count", -1)) == counts[0]
+        and int(audit.get("audited_active_frames", -1)) == int(contract.get("train_active_frame_count", -2))
     ):
         raise ValueError("State56 clean token audit is invalid")
     augmentation = audit.get("augmentation")
+    expected_augmentation = contract.get("augmentation") or {}
     if not (
         isinstance(augmentation, dict)
         and augmentation.get("zero_truncation") is True
         and augmentation.get("overflow_count") == 0
         and int(augmentation.get("maximum_token_length", PROFILE_MAX_TOKEN_LEN + 1)) <= PROFILE_MAX_TOKEN_LEN
-        and augmentation.get("seed") == 43
-        and float(augmentation.get("state_noise_std", -1.0)) == 0.05
-        and float(augmentation.get("target_noise_std", -1.0)) == 0.0
+        and augmentation.get("seed") == expected_augmentation.get("augmentation_seed")
+        and float(augmentation.get("state_noise_std", -1.0)) == float(expected_augmentation.get("state_noise_std", -2.0))
+        and float(augmentation.get("target_noise_std", -1.0)) == float(expected_augmentation.get("target_noise_std", -2.0))
     ):
         raise ValueError("State56 augmented token audit is invalid")
+    if contract_id == "mano_state56_native28_experiment_data_v1":
+        selection_path = Path(contract.get("train_selection", "")).expanduser().resolve()
+        if not selection_path.is_file() or hashlib.sha256(selection_path.read_bytes()).hexdigest() != contract.get("train_selection_sha256"):
+            raise ValueError("State56 experiment train selection identity mismatch")
+        if audit.get("selection_sha256") != contract.get("train_selection_sha256"):
+            raise ValueError("State56 experiment token audit selection mismatch")
+        if audit.get("task_id") != contract.get("task_id"):
+            raise ValueError("State56 experiment token audit task mismatch")
     return norm_path, actual
