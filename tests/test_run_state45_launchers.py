@@ -71,6 +71,8 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
         **os.environ,
         "STATE45_STEPS": "123",
         "STATE45_PRINT_CONFIG": "1",
+        "STATE45_OBJECT": "cube1",
+        "STATE45_GESTURE": "03",
     }
     completed = subprocess.run(
         [
@@ -88,6 +90,9 @@ def test_state45_training_launcher_is_explicit_and_profile_locked(tmp_path) -> N
     assert config["model"].endswith("state45-phase-28dof-finetune")
     assert config["steps"] == 123
     assert config["state_noise_std"] == 0.1
+    assert config["row_filter"]["object"] == "cube1"
+    assert config["row_filter"]["gesture"] == "03"
+    assert config["row_filter"]["row_count"] == 1
 
 
 def test_state45_server_launcher_requires_norm_and_uses_own_cache_namespace(tmp_path) -> None:

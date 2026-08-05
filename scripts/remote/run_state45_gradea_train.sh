@@ -23,9 +23,16 @@ LEARNING_RATE=${STATE45_LEARNING_RATE:-5e-5}
 CHECKPOINT_EVERY=${STATE45_CHECKPOINT_EVERY:-5000}
 STATE_NOISE_STD=${STATE45_STATE_NOISE_STD:-0.1}
 EXPECTED_DEVICE_COUNT=${STATE45_EXPECTED_DEVICE_COUNT:-4}
+STATE45_OBJECT_FILTER=${STATE45_OBJECT:-}
+STATE45_GESTURE_FILTER=${STATE45_GESTURE:-}
+if [[ -n "$STATE45_OBJECT_FILTER" && -z "$STATE45_GESTURE_FILTER" || \
+      -z "$STATE45_OBJECT_FILTER" && -n "$STATE45_GESTURE_FILTER" ]]; then
+  echo 'STATE45_OBJECT and STATE45_GESTURE must be set together' >&2
+  exit 64
+fi
 
-CONTRACT_RAW=$(python3 - "$PROFILE_REPORT" "$MODEL" <<'PY'
-import hashlib,json,sys
+CONTRACT_RAW=$(STATE45_OBJECT_FILTER="$STATE45_OBJECT_FILTER" STATE45_GESTURE_FILTER="$STATE45_GESTURE_FILTER" python3 - "$PROFILE_REPORT" "$MODEL" <<'PY'
+import hashlib,json,os,sys
 from pathlib import Path
 path=Path(sys.argv[1]).expanduser().resolve();model=sys.argv[2]
 report=json.loads(path.read_text())
@@ -67,18 +74,33 @@ if selection.get('contract')!='mano_state45_grade_a_selection_v1' or selection.g
   raise SystemExit('invalid State45 train selection contract')
 if selection.get('split_contract')!='mano_state45_grade_a_object_gesture_split_v1':
   raise SystemExit('invalid State45 object/gesture split provenance')
-rows=selection.get('rows') or []
-if len(rows)!=report.get('train_rows') or any(row.get('grade')!='A' for row in rows):
+all_rows=selection.get('rows') or []
+if len(all_rows)!=report.get('train_rows') or any(row.get('grade')!='A' for row in all_rows):
   raise SystemExit('invalid State45 train selection rows')
 expected_prompt='pick up the {object} using gesture {gesture}, then place it back on the table'
-if any(row.get('prompt') != expected_prompt.format(object=row['object'],gesture=row['gesture']) for row in rows):
+if any(row.get('prompt') != expected_prompt.format(object=row['object'],gesture=row['gesture']) for row in all_rows):
   raise SystemExit('State45 train selection prompt mismatch')
+object_filter=os.environ.get('STATE45_OBJECT_FILTER','')
+gesture_filter=os.environ.get('STATE45_GESTURE_FILTER','')
+if object_filter:
+  if not gesture_filter.isdigit() or len(gesture_filter)!=2:
+    raise SystemExit('STATE45_GESTURE must be a two-digit formal gesture')
+  rows=[row for row in all_rows if row.get('object')==object_filter and row.get('gesture')==gesture_filter]
+else:
+  rows=all_rows
+if not rows:
+  raise SystemExit(f'no State45 train rows match object={object_filter!r} gesture={gesture_filter!r}')
 print(report['dataset'])
 print(str(norm_path.parent))
 print(actual)
 print(str(Path(report['train_contact_window_manifest']).resolve()))
-print(','.join(str(int(row['release_row_index'])) for row in rows))
+row_indices=','.join(str(int(row['release_row_index'])) for row in rows)
+print(row_indices)
 print(hashlib.sha256(path.read_bytes()).hexdigest())
+print(len(rows))
+print(object_filter)
+print(gesture_filter)
+print(hashlib.sha256(row_indices.encode()).hexdigest())
 PY
 )
 readarray -t CONTRACT <<<"$CONTRACT_RAW"
@@ -88,6 +110,10 @@ NORM_SHA=${CONTRACT[2]}
 WINDOW_MANIFEST=${CONTRACT[3]}
 ROW_INDICES=${CONTRACT[4]}
 PROFILE_SHA=${CONTRACT[5]}
+FILTER_ROW_COUNT=${CONTRACT[6]}
+FILTER_OBJECT=${CONTRACT[7]}
+FILTER_GESTURE=${CONTRACT[8]}
+FILTER_ROWS_SHA=${CONTRACT[9]}
 
 [[ "$STEPS" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_STEPS must be a positive integer" >&2; exit 64; }
 [[ "$BATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || { echo "STATE45_BATCH_SIZE must be positive" >&2; exit 64; }
@@ -103,7 +129,7 @@ CHECKPOINT_TEMPLATE="${RUN_ID}_step{step}"
 if [[ "${STATE45_PRINT_CONFIG:-0}" == 1 ]]; then
   python3 - <<PY
 import json
-print(json.dumps({'run_id':'$RUN_ID','profile_sha256':'$PROFILE_SHA','model':'$MODEL','steps':int('$STEPS'),'batch_size':int('$BATCH_SIZE'),'learning_rate':float('$LEARNING_RATE'),'checkpoint_every':int('$CHECKPOINT_EVERY'),'state_noise_std':float('$STATE_NOISE_STD'),'expected_device_count':int('$EXPECTED_DEVICE_COUNT')},indent=2,sort_keys=True))
+print(json.dumps({'run_id':'$RUN_ID','profile_sha256':'$PROFILE_SHA','model':'$MODEL','steps':int('$STEPS'),'batch_size':int('$BATCH_SIZE'),'learning_rate':float('$LEARNING_RATE'),'checkpoint_every':int('$CHECKPOINT_EVERY'),'state_noise_std':float('$STATE_NOISE_STD'),'expected_device_count':int('$EXPECTED_DEVICE_COUNT'),'row_filter':{'object':'$FILTER_OBJECT','gesture':'$FILTER_GESTURE','row_count':int('$FILTER_ROW_COUNT'),'rows_sha256':'$FILTER_ROWS_SHA'}},indent=2,sort_keys=True))
 PY
   exit 0
 fi
@@ -115,6 +141,7 @@ fi
 {
   printf 'started=%s\nrun_id=%s\nprofile_report=%s\nprofile_sha256=%s\n' "$(date -Is)" "$RUN_ID" "$(realpath "$PROFILE_REPORT")" "$PROFILE_SHA"
   printf 'model=%s\nsteps=%s\nbatch_size=%s\nlearning_rate=%s\nstate_noise_std=%s\n' "$MODEL" "$STEPS" "$BATCH_SIZE" "$LEARNING_RATE" "$STATE_NOISE_STD"
+  printf 'row_filter_object=%s\nrow_filter_gesture=%s\nrow_filter_count=%s\nrow_filter_rows_sha256=%s\n' "$FILTER_OBJECT" "$FILTER_GESTURE" "$FILTER_ROW_COUNT" "$FILTER_ROWS_SHA"
 } | tee "$DRIVER_LOG"
 
 exec "${REPO_ROOT}/scripts/remote/run_client.sh" \
