@@ -1,0 +1,200 @@
+{
+  "aggregation": "Transform all compiled collision geom_aabb center/half corners through geom local pos/quat into object-body coordinates, then take the union AABB.",
+  "asset_source_commit": "e7910212e54367008ecb7484e5e9354e822de03e",
+  "contract": "mano_native28_collision_aabb_v1",
+  "fingertip_measurement": "centers of the unique non-colliding visual spheres on the five distal bodies; identical across all11 object models",
+  "fingertips": [
+    {
+      "body": "index_dip",
+      "finger": "index",
+      "local_offset": [
+        -0.0260560066,
+        0.000962143298,
+        -0.000523932278
+      ]
+    },
+    {
+      "body": "thumb_ip",
+      "finger": "thumb",
+      "local_offset": [
+        -0.0266503338,
+        -0.00300316885,
+        0.0244902819
+      ]
+    },
+    {
+      "body": "ring_dip",
+      "finger": "ring",
+      "local_offset": [
+        -0.0250933915,
+        0.00388110499,
+        -0.00751078501
+      ]
+    },
+    {
+      "body": "middle_dip",
+      "finger": "middle",
+      "local_offset": [
+        -0.0262673758,
+        0.00392891001,
+        -0.00421216805
+      ]
+    },
+    {
+      "body": "pinky_dip",
+      "finger": "pinky",
+      "local_offset": [
+        -0.0176626015,
+        0.0015621488,
+        -0.0103372559
+      ]
+    }
+  ],
+  "manorl_commit": "e17f0122decddffc348ec10d0ed42552a0540e1b",
+  "objects": {
+    "banana": {
+      "collision_geom_count": 3,
+      "half_extents": [
+        0.047463664778970266,
+        0.03438988087971475,
+        0.10997653782219484
+      ],
+      "local_center": [
+        -0.004500483945579902,
+        -0.0028504846461524028,
+        0.003876658420333537
+      ]
+    },
+    "bowl": {
+      "collision_geom_count": 28,
+      "half_extents": [
+        0.08453433590640652,
+        0.08514679272048434,
+        0.03560665947783165
+      ],
+      "local_center": [
+        -0.0018636213722900627,
+        -0.0005154001747012804,
+        0.002018003740548991
+      ]
+    },
+    "cube1": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.043363893508911136,
+        0.04366508674621582,
+        0.04060626220703125
+      ],
+      "local_center": [
+        0.005175592422485352,
+        -0.005187185287475582,
+        0.0015162773132324225
+      ]
+    },
+    "cube2": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.0263026999309659,
+        0.026124199852347374,
+        0.025697399862110615
+      ],
+      "local_center": [
+        -4.769954830408096e-05,
+        -0.0035724006593227386,
+        -0.0006304001435637474
+      ]
+    },
+    "cylinder3": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.017037536173871166,
+        0.017409613226820428,
+        0.05153421849976113
+      ],
+      "local_center": [
+        -0.002302198115383831,
+        -0.0014745014906086592,
+        -0.007503749907421985
+      ]
+    },
+    "cylinder4": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.006250774978822666,
+        0.006976254332067808,
+        0.07594076857717122
+      ],
+      "local_center": [
+        -2.045701446697643e-05,
+        0.0017144854191194657,
+        -0.011189764036600491
+      ]
+    },
+    "cylinder7": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.012332667129029086,
+        0.01986957797027359,
+        0.10070294437201396
+      ],
+      "local_center": [
+        -0.0008231450503486375,
+        -0.0011212791868807862,
+        -0.0024384492796390225
+      ]
+    },
+    "iphone": {
+      "collision_geom_count": 1,
+      "half_extents": [
+        0.042959188147734445,
+        0.08390712468722725,
+        0.0082891733075534
+      ],
+      "local_center": [
+        -0.002332448634910403,
+        0.0030199067101062405,
+        -0.002485145863834779
+      ]
+    },
+    "largeclamp": {
+      "collision_geom_count": 30,
+      "half_extents": [
+        0.06708306498779103,
+        0.026696400968788184,
+        0.09255080038655927
+      ],
+      "local_center": [
+        -0.007543207363580256,
+        0.001679826880485331,
+        0.006596986291466815
+      ]
+    },
+    "mayonnaisebottle": {
+      "collision_geom_count": 2,
+      "half_extents": [
+        0.05074908079326891,
+        0.03121620854418257,
+        0.0971198298911477
+      ],
+      "local_center": [
+        0.005471871167103608,
+        -0.00018152116449150074,
+        -0.0029315477780062146
+      ]
+    },
+    "powerdrill": {
+      "collision_geom_count": 5,
+      "half_extents": [
+        0.09476437007411684,
+        0.03371340420095262,
+        0.09873869882701877
+      ],
+      "local_center": [
+        -0.005618206376913092,
+        -0.0013721638712156613,
+        -0.03402821759115108
+      ]
+    }
+  },
+  "source_raw_geometry_sha256": "800ef03929811f512ab556335f27c2408e3a24b10facb6c88f90bb2aadc5ef21"
+}
