@@ -5,8 +5,8 @@
   "audience": "internal_vepfs",
   "integration_owner": "mint-vla-client-example",
   "distribution": {
-    "client_feature_branch_remote": "pending_push",
-    "mint_feature_branch_remote": "pending_push",
+    "client_feature_branch_remote": "published",
+    "mint_feature_branch_remote": "published",
     "openpi_feature_branch_remote": "blocked_on_internal_fork",
     "final_release_tag": "not_created",
     "note": "This candidate is runnable from the pinned internal worktrees. It is not a public or portable data release."
