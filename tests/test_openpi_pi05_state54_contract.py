@@ -3,6 +3,7 @@ import pytest
 from mint_server.backend.openpi.openpi_pi05_worker import OpenPIPi05WorkerSession
 from mint_server.backend.openpi.pi05_profiles import (
     PI05_ACTION_LORA_R16_STATE54_V1,
+    PI05_ACTION_LORA_R16_STATE56_28DOF_V1,
     PI05_ACTION_LORA_R16_V1,
 )
 
@@ -20,6 +21,19 @@ def test_state54_profile_keeps_action_projection_width_and_fails_closed():
     assert kwargs["action_dim"] == 32
     assert kwargs["max_token_len"] == 256
     assert kwargs["fail_on_token_truncation"] is True
+
+
+def test_state56_profile_authenticates_native28_action_semantics():
+    profile = PI05_ACTION_LORA_R16_STATE56_28DOF_V1
+    kwargs = profile.pi0_config_kwargs()
+    assert kwargs["state_dim"] == 56
+    assert kwargs["action_dim"] == 32
+    assert kwargs["max_token_len"] == 256
+    assert profile.expected_trainable_count == 13_224_992
+    assert profile.manifest()["state_schema"] == "mano_object_dynamics_state56_native28_v1"
+    assert profile.manifest()["action_physical_dim"] == 28
+    assert profile.manifest()["delta_mask_segments"] == [3, -3, 22, -4]
+    assert "state_schema" not in PI05_ACTION_LORA_R16_STATE54_V1.manifest()
 
 
 def test_training_worker_refuses_prompt_overflow_instead_of_truncating():

@@ -23,6 +23,7 @@ OPENPI_PI05_CONFIG_NAMES = {
     "openpi/pi05-libero-low-mem-finetune": "pi05_libero",
     "openpi/pi05-action-lora-r16-finetune": "pi05_libero",
     "openpi/pi05-action-lora-r16-state54-finetune": "pi05_libero",
+    "openpi/pi05-action-lora-r16-state56-28dof-finetune": "pi05_libero_state56_native28",
 }
 
 

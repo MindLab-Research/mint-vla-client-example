@@ -26,6 +26,24 @@ class Pi05Profile:
     expected_trainable_count: int
     state_dim: int | None = None
     fail_on_token_truncation: bool = False
+    state_schema: str | None = None
+    action_physical_dim: int | None = None
+    delta_mask_segments: tuple[int, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.action_dim <= 0 or self.action_horizon <= 0 or self.max_token_len <= 0:
+            raise ValueError("pi0.5 profile dimensions must be positive")
+        if self.state_dim is not None and self.state_dim <= 0:
+            raise ValueError("pi0.5 profile state_dim must be positive")
+        if self.state_schema is not None and self.state_dim is None:
+            raise ValueError("state_schema requires an explicit state_dim")
+        if self.action_physical_dim is not None and not (0 < self.action_physical_dim <= self.action_dim):
+            raise ValueError("action_physical_dim must be within action_dim")
+        if self.delta_mask_segments is not None:
+            if sum(abs(value) for value in self.delta_mask_segments) != self.action_dim:
+                raise ValueError("delta_mask_segments must cover action_dim exactly")
+            if self.action_physical_dim is None:
+                raise ValueError("delta_mask_segments requires action_physical_dim")
 
     def manifest(self) -> dict[str, Any]:
         manifest = {
@@ -44,6 +62,12 @@ class Pi05Profile:
             manifest["state_dim"] = self.resolved_state_dim
         if self.fail_on_token_truncation:
             manifest["fail_on_token_truncation"] = True
+        if self.state_schema is not None:
+            manifest["state_schema"] = self.state_schema
+        if self.action_physical_dim is not None:
+            manifest["action_physical_dim"] = self.action_physical_dim
+        if self.delta_mask_segments is not None:
+            manifest["delta_mask_segments"] = list(self.delta_mask_segments)
         return manifest
 
     @property
@@ -100,9 +124,29 @@ PI05_ACTION_LORA_R16_STATE54_V1 = Pi05Profile(
     fail_on_token_truncation=True,
 )
 
+PI05_ACTION_LORA_R16_STATE56_28DOF_V1 = Pi05Profile(
+    profile_id="pi05_action_lora_r16_state56_28dof_v1",
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    action_dim=32,
+    state_dim=56,
+    action_horizon=10,
+    max_token_len=256,
+    discrete_state_input=True,
+    expected_trainable_count=13_224_992,
+    fail_on_token_truncation=True,
+    state_schema="mano_object_dynamics_state56_native28_v1",
+    action_physical_dim=28,
+    delta_mask_segments=(3, -3, 22, -4),
+)
+
 _PROFILES = {
     profile.profile_id: profile
-    for profile in (PI05_ACTION_LORA_R16_V1, PI05_ACTION_LORA_R16_STATE54_V1)
+    for profile in (
+        PI05_ACTION_LORA_R16_V1,
+        PI05_ACTION_LORA_R16_STATE54_V1,
+        PI05_ACTION_LORA_R16_STATE56_28DOF_V1,
+    )
 }
 
 
@@ -137,6 +181,7 @@ def validate_profile_trainable_leaves(
     if profile.profile_id not in {
         PI05_ACTION_LORA_R16_V1.profile_id,
         PI05_ACTION_LORA_R16_STATE54_V1.profile_id,
+        PI05_ACTION_LORA_R16_STATE56_28DOF_V1.profile_id,
     }:
         return
 
