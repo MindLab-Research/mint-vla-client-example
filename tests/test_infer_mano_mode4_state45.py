@@ -35,6 +35,42 @@ def test_parse_defaults_to_persistent_15_seconds_and_stride1(monkeypatch) -> Non
     assert args.frame_window == "persistent_task"
     assert args.max_control_seconds == 15.0
     assert args.chunk_stride == 1
+    assert args.forced_first_failure is False
+    assert args.forced_retry_config.trigger_lift_m == 0.03
+    assert args.forced_retry_config.floor_contact_frames == 10
+    assert args.forced_retry_config.no_hand_contact_frames == 20
+    assert args.forced_retry_config.max_forced_release_frames == 150
+
+
+def test_parse_accepts_explicit_forced_first_failure_contract(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _required_argv()
+        + [
+            "--forced-first-failure",
+            "--forced-release-trigger-lift-m", "0.025",
+            "--forced-release-floor-frames", "8",
+            "--forced-release-no-contact-frames", "16",
+            "--forced-release-max-frames", "120",
+        ],
+    )
+    args = state45.parse_args()
+    assert args.forced_first_failure is True
+    assert args.forced_retry_config.trigger_lift_m == 0.025
+    assert args.forced_retry_config.floor_contact_frames == 8
+    assert args.forced_retry_config.no_hand_contact_frames == 16
+    assert args.forced_retry_config.max_forced_release_frames == 120
+
+
+def test_parse_rejects_forced_release_trigger_at_stable_lift(monkeypatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        _required_argv() + ["--forced-release-trigger-lift-m", "0.05"],
+    )
+    with np.testing.assert_raises_regex(ValueError, "below"):
+        state45.parse_args()
 
 
 def test_persistent_termination_prioritizes_done_then_timeout() -> None:

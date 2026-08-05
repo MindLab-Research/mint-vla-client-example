@@ -34,12 +34,18 @@ from scripts.mano_state41_contract import (
     SURFACE_DISTANCE_SLICE,
 )
 from scripts.mano_state45_contract import (
+    STABLE_LIFT_INDEX,
     STATE45_CONTRACT_ID,
     STATE_DIM,
     TASK_PHASE_INDEX,
     ManoTaskPhaseTracker,
     PhaseTrackerConfig,
     assemble_live_state45,
+)
+from scripts.mano_forced_grasp_retry import (
+    FORCED_GRASP_RETRY_CONTRACT_ID,
+    ForcedGraspRetryController,
+    ForcedRetryConfig,
 )
 from scripts.mano_task_phase import PHASE_TRACKER_CONTRACT_ID, TaskPhase
 from scripts.target_actions import URDF_TARGET_ABSOLUTE, project_row_actions
@@ -90,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-commit")
     parser.add_argument("--action-session-id")
     parser.add_argument("--keep-action-session", action="store_true")
+    parser.add_argument("--forced-first-failure", action="store_true")
+    parser.add_argument("--forced-release-trigger-lift-m", type=float, default=0.03)
+    parser.add_argument("--forced-release-floor-frames", type=int, default=10)
+    parser.add_argument("--forced-release-no-contact-frames", type=int, default=20)
+    parser.add_argument("--forced-release-max-frames", type=int, default=150)
     args = parser.parse_args()
     rows = base.parse_ordered_unique_csv(args.row_indices, option="--row-indices")
     if len(rows) != 1:
@@ -103,6 +114,12 @@ def parse_args() -> argparse.Namespace:
         raise ValueError("--max-control-seconds must be finite and positive")
     if args.action_session_id and args.keep_action_session:
         raise ValueError("external and retained action sessions are mutually exclusive")
+    args.forced_retry_config = ForcedRetryConfig(
+        trigger_lift_m=args.forced_release_trigger_lift_m,
+        floor_contact_frames=args.forced_release_floor_frames,
+        no_hand_contact_frames=args.forced_release_no_contact_frames,
+        max_forced_release_frames=args.forced_release_max_frames,
+    )
     return args
 
 
@@ -271,6 +288,22 @@ def run(args: argparse.Namespace) -> dict:
         object_rot_aa=object_rotations_source[window_start], object_addr=object_addr,
         hand_addrs=list(hand_addrs),
     )
+    forced_retry: ForcedGraspRetryController | None = None
+    forced_open_hand_qpos: np.ndarray | None = None
+    if args.forced_first_failure:
+        if window_start != 0:
+            raise ValueError(
+                "forced-first-failure requires frame0 initialization so the open pose and "
+                "first attempt share one causal episode"
+            )
+        forced_retry = ForcedGraspRetryController(args.forced_retry_config)
+        forced_open_hand_qpos = np.asarray(
+            source_state[0, :HAND_QPOS_DIM], dtype=np.float32
+        ).copy()
+        if forced_open_hand_qpos.shape != (HAND_QPOS_DIM,) or not np.isfinite(
+            forced_open_hand_qpos
+        ).all():
+            raise ValueError("forced-release source-frame0 open pose is invalid")
 
     headers = base.L._headers(args.api_key)
     try:
@@ -292,6 +325,14 @@ def run(args: argparse.Namespace) -> dict:
         "rollout_observation_phase_features": [], "physics_contact_flags": [],
         "step_max_contact_force": [],
     }
+    if forced_retry is not None:
+        arrays.update(
+            {
+                "policy_preintervention_absolute_targets": [],
+                "forced_release_target_correction": [],
+                "forced_release_active": [],
+            }
+        )
     hand_states = [np.asarray(data.qpos[hand_addrs], dtype=np.float32).copy()]
     object_states = [np.asarray(data.qpos[object_addr:object_addr + 3], dtype=np.float32).copy()]
     object_quaternions = [
@@ -348,6 +389,19 @@ def run(args: argparse.Namespace) -> dict:
                     object_floor_contact=float(floor_support),
                 )
                 state = assemble_live_state45(state41, phase_observation)
+                if forced_retry is not None:
+                    forced_retry.observe(
+                        control_frame=control_steps,
+                        object_lift_m=object_lift,
+                        hand_object_contact=bool(np.any(np.asarray(contacts) > 0.5)),
+                        object_floor_contact=float(floor_support),
+                        stable_lift_achieved=float(state[STABLE_LIFT_INDEX]),
+                        task_phase=float(state[TASK_PHASE_INDEX]),
+                    )
+                    if forced_retry.intervention_invalid:
+                        termination_reason = "intervention_invalid"
+                        terminal_state = state.copy()
+                        break
                 reason = persistent_termination_reason(
                     phase=phase_tracker.phase,
                     control_steps=control_steps,
@@ -430,10 +484,25 @@ def run(args: argparse.Namespace) -> dict:
                     for item in active
                 ], dtype=np.float64)
                 weights /= weights.sum()
-                absolute_target = sum(
-                    weight * item["target_hand"][control_frame - item["start"]]
-                    for weight, item in zip(weights, active, strict=True)
+                policy_absolute_target = np.asarray(
+                    sum(
+                        weight * item["target_hand"][control_frame - item["start"]]
+                        for weight, item in zip(weights, active, strict=True)
+                    ),
+                    dtype=np.float32,
                 )
+                absolute_target = policy_absolute_target
+                forced_release_correction = np.zeros(HAND_QPOS_DIM, dtype=np.float32)
+                forced_release_active = False
+                if forced_retry is not None:
+                    if forced_open_hand_qpos is None:
+                        raise RuntimeError("forced-retry open pose is missing")
+                    forced_release_active = forced_retry.override_active
+                    absolute_target, forced_release_correction = (
+                        forced_retry.apply_action_override(
+                            policy_absolute_target, forced_open_hand_qpos
+                        )
+                    )
                 target, clipping = physics.nearest_wrapped_position_target(
                     current_q, absolute_target - current_q, limits
                 )
@@ -443,6 +512,8 @@ def run(args: argparse.Namespace) -> dict:
                     substeps=physics.NATIVE_SUBSTEPS, object_name=object_name,
                 )
                 after = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
+                if forced_retry is not None and forced_release_active:
+                    forced_retry.record_override_action()
                 for key in contact_counts:
                     contact_counts[key] += int(diagnostics[f"{key}_contact"])
                 max_ncon = max(max_ncon, int(diagnostics["max_ncon"]))
@@ -464,6 +535,14 @@ def run(args: argparse.Namespace) -> dict:
                 applied = np.zeros(ACTION_DIM, dtype=np.float32)
                 applied[:HAND_QPOS_DIM] = after - before
                 arrays["actions_applied_physical"].append(applied)
+                if forced_retry is not None:
+                    arrays["policy_preintervention_absolute_targets"].append(
+                        policy_absolute_target.copy()
+                    )
+                    arrays["forced_release_target_correction"].append(
+                        forced_release_correction.copy()
+                    )
+                    arrays["forced_release_active"].append(forced_release_active)
                 arrays["physics_contact_flags"].append([
                     diagnostics["hand_object_contact"], diagnostics["object_floor_contact"],
                     diagnostics["hand_floor_contact"],
@@ -500,7 +579,7 @@ def run(args: argparse.Namespace) -> dict:
         # The state after the last permitted action is still an observation
         # frame.  Evaluate it before declaring timeout so a DONE transition
         # caused by that action wins at the exact 15-second boundary.
-        if termination_reason != "done":
+        if termination_reason not in {"done", "intervention_invalid"}:
             current_q = np.asarray(data.qpos[hand_addrs], dtype=np.float64).copy()
             contacts, surface, floor_support, _pairs = physics.state41_features_from_mujoco(
                 model, data, object_name, feature_ids=feature_ids
@@ -521,11 +600,23 @@ def run(args: argparse.Namespace) -> dict:
                 object_floor_contact=float(floor_support),
             )
             terminal_state = assemble_live_state45(state41, phase_observation)
-            termination_reason = persistent_termination_reason(
-                phase=phase_tracker.phase,
-                control_steps=control_steps,
-                max_control_frames=max_control_frames,
-            ) or "timeout"
+            if forced_retry is not None:
+                forced_retry.observe(
+                    control_frame=control_steps,
+                    object_lift_m=object_lift,
+                    hand_object_contact=bool(np.any(np.asarray(contacts) > 0.5)),
+                    object_floor_contact=float(floor_support),
+                    stable_lift_achieved=float(terminal_state[STABLE_LIFT_INDEX]),
+                    task_phase=float(terminal_state[TASK_PHASE_INDEX]),
+                )
+            if forced_retry is not None and forced_retry.intervention_invalid:
+                termination_reason = "intervention_invalid"
+            else:
+                termination_reason = persistent_termination_reason(
+                    phase=phase_tracker.phase,
+                    control_steps=control_steps,
+                    max_control_frames=max_control_frames,
+                ) or "timeout"
     finally:
         if owns_session and session_id and not args.keep_action_session:
             base.delete_session(args, headers, session_id)
@@ -536,12 +627,22 @@ def run(args: argparse.Namespace) -> dict:
         control_steps=control_steps,
         max_control_frames=max_control_frames,
     )
-    if termination_reason != "done":
+    if termination_reason == "intervention_invalid":
+        if forced_retry is None or not forced_retry.intervention_invalid:
+            raise RuntimeError("intervention-invalid termination lacks controller evidence")
+    elif termination_reason != "done":
         if final_reason != "timeout":
             raise RuntimeError(
                 "persistent rollout ended without causal DONE or exhausted timeout"
             )
         termination_reason = final_reason
+
+    forced_retry_ledger = None
+    if forced_retry is not None:
+        forced_retry_ledger = forced_retry.finalize(
+            termination_reason=termination_reason,
+            control_frame=control_steps,
+        )
 
     np_arrays = {name: np.asarray(values) for name, values in arrays.items()}
     np_arrays["hand_state_sim"] = np.asarray(hand_states, dtype=np.float32)
@@ -557,13 +658,22 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError("State45 hand-state/control length mismatch")
     if np_arrays.get("terminal_observation_state", np.empty(0)).shape != (STATE_DIM,):
         raise RuntimeError("State45 terminal observation is missing or malformed")
-    for name in (
+    control_array_names = [
         "actions_raw_pred_normalized",
         "actions_raw_pred_physical",
         "actions_commanded_physical",
         "actions_applied_physical",
         "rollout_observation_phase_features",
-    ):
+    ]
+    if forced_retry is not None:
+        control_array_names.extend(
+            [
+                "policy_preintervention_absolute_targets",
+                "forced_release_target_correction",
+                "forced_release_active",
+            ]
+        )
+    for name in control_array_names:
         if len(np_arrays[name]) != control_steps:
             raise RuntimeError(f"State45 control-array length mismatch for {name}")
     if not all(np.isfinite(value).all() for value in np_arrays.values() if value.dtype.kind == "f"):
@@ -602,6 +712,11 @@ def run(args: argparse.Namespace) -> dict:
             "terminal_phase": int(phase_tracker.phase),
             "done": termination_reason == "done",
         },
+        "forced_retry": forced_retry_ledger,
+        "forced_retry_contract": (
+            FORCED_GRASP_RETRY_CONTRACT_ID if forced_retry is not None else None
+        ),
+        "forced_release_open_pose_source_frame": 0 if forced_retry is not None else None,
         "physics": {
             "engine": "native MuJoCo", "controller": "manorl_native_position_servo",
             "timestep_seconds": physics.DT,

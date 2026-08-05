@@ -10,6 +10,11 @@ MAX_CONTROL_SECONDS=15
 CHUNK_STRIDE=1
 VIDEO_MODE=none
 PRINT_CONFIG=0
+FORCED_FIRST_FAILURE=0
+FORCED_RELEASE_TRIGGER_LIFT_M=0.03
+FORCED_RELEASE_FLOOR_FRAMES=10
+FORCED_RELEASE_NO_CONTACT_FRAMES=20
+FORCED_RELEASE_MAX_FRAMES=150
 DATASET=
 ROW=
 NORM_DIR=
@@ -33,6 +38,11 @@ while (($#)); do
     --max-control-seconds) MAX_CONTROL_SECONDS=${2:?}; shift 2 ;;
     --chunk-stride) CHUNK_STRIDE=${2:?}; shift 2 ;;
     --video-mode) VIDEO_MODE=${2:?}; shift 2 ;;
+    --forced-first-failure) FORCED_FIRST_FAILURE=1; shift ;;
+    --forced-release-trigger-lift-m) FORCED_RELEASE_TRIGGER_LIFT_M=${2:?}; shift 2 ;;
+    --forced-release-floor-frames) FORCED_RELEASE_FLOOR_FRAMES=${2:?}; shift 2 ;;
+    --forced-release-no-contact-frames) FORCED_RELEASE_NO_CONTACT_FRAMES=${2:?}; shift 2 ;;
+    --forced-release-max-frames) FORCED_RELEASE_MAX_FRAMES=${2:?}; shift 2 ;;
     --print-config) PRINT_CONFIG=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 64 ;;
   esac
@@ -43,10 +53,23 @@ done
 [[ "$ROW" =~ ^[0-9]+$ ]] || { echo "--row must be a non-negative integer" >&2; exit 64; }
 [[ "$CHUNK_STRIDE" =~ ^[1-9]$ ]] || { echo "--chunk-stride must be in [1,9]" >&2; exit 64; }
 [[ "$VIDEO_MODE" == none || "$VIDEO_MODE" == full ]] || { echo "invalid --video-mode" >&2; exit 64; }
-python3 - "$MAX_CONTROL_SECONDS" <<'PY'
+python3 - "$MAX_CONTROL_SECONDS" "$FORCED_RELEASE_TRIGGER_LIFT_M" \
+  "$FORCED_RELEASE_FLOOR_FRAMES" "$FORCED_RELEASE_NO_CONTACT_FRAMES" \
+  "$FORCED_RELEASE_MAX_FRAMES" <<'PY'
 import math,sys
-value=float(sys.argv[1])
-if not math.isfinite(value) or value<=0: raise SystemExit('--max-control-seconds must be finite and positive')
+max_seconds=float(sys.argv[1])
+trigger=float(sys.argv[2])
+if not math.isfinite(max_seconds) or max_seconds<=0:
+    raise SystemExit('--max-control-seconds must be finite and positive')
+if not math.isfinite(trigger) or not 0 < trigger < 0.05:
+    raise SystemExit('--forced-release-trigger-lift-m must be in (0,0.05)')
+for name, raw in zip(
+    ('--forced-release-floor-frames','--forced-release-no-contact-frames','--forced-release-max-frames'),
+    sys.argv[3:], strict=True,
+):
+    value=int(raw)
+    if str(value) != raw or value <= 0:
+        raise SystemExit(f'{name} must be a positive integer')
 PY
 if ((PRINT_CONFIG)); then
   python3 - <<PY
@@ -56,10 +79,27 @@ print(json.dumps({
   'action_dim':32,'action_horizon':10,'frame_window':'persistent_task',
   'max_control_seconds':float('$MAX_CONTROL_SECONDS'),
   'chunk_stride':int('$CHUNK_STRIDE'),'row':int('$ROW'),
-  'video_mode':'$VIDEO_MODE'
+  'video_mode':'$VIDEO_MODE','act_mode':'batch','act_batch_size':4,
+  'forced_first_failure':bool($FORCED_FIRST_FAILURE),
+  'forced_retry':{
+    'trigger_lift_m':float('$FORCED_RELEASE_TRIGGER_LIFT_M'),
+    'floor_contact_frames':int('$FORCED_RELEASE_FLOOR_FRAMES'),
+    'no_hand_contact_frames':int('$FORCED_RELEASE_NO_CONTACT_FRAMES'),
+    'max_forced_release_frames':int('$FORCED_RELEASE_MAX_FRAMES'),
+  }
 },indent=2,sort_keys=True))
 PY
   exit 0
+fi
+FORCED_RETRY_ARGS=()
+if ((FORCED_FIRST_FAILURE)); then
+  FORCED_RETRY_ARGS=(
+    --forced-first-failure
+    --forced-release-trigger-lift-m "$FORCED_RELEASE_TRIGGER_LIFT_M"
+    --forced-release-floor-frames "$FORCED_RELEASE_FLOOR_FRAMES"
+    --forced-release-no-contact-frames "$FORCED_RELEASE_NO_CONTACT_FRAMES"
+    --forced-release-max-frames "$FORCED_RELEASE_MAX_FRAMES"
+  )
 fi
 exec "$REPO_ROOT/scripts/remote/run_client.sh" \
   scripts/eval/infer_mano_mode4_state45.py \
@@ -72,5 +112,6 @@ exec "$REPO_ROOT/scripts/remote/run_client.sh" \
   --contact-window-manifest "$WINDOW_MANIFEST" --contact-context-frames 100 \
   --missing-contact-policy error --frame-window persistent_task \
   --max-control-seconds "$MAX_CONTROL_SECONDS" --chunk-stride "$CHUNK_STRIDE" \
-  --act-mode single --act-batch-size 1 --row-execution sequential \
-  --row-batch-size 1 --video-mode "$VIDEO_MODE"
+  --act-mode batch --act-batch-size 4 --row-execution sequential \
+  --row-batch-size 1 --video-mode "$VIDEO_MODE" \
+  "${FORCED_RETRY_ARGS[@]}"

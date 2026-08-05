@@ -148,9 +148,18 @@ def test_state45_persistent_launcher_prints_done_timeout_contract(tmp_path) -> N
     )
     config = json.loads(completed.stdout)
     assert config == {
+        "act_batch_size": 4,
+        "act_mode": "batch",
         "action_dim": 32,
         "action_horizon": 10,
         "chunk_stride": 1,
+        "forced_first_failure": False,
+        "forced_retry": {
+            "floor_contact_frames": 10,
+            "max_forced_release_frames": 150,
+            "no_hand_contact_frames": 20,
+            "trigger_lift_m": 0.03,
+        },
         "frame_window": "persistent_task",
         "max_control_seconds": 15.0,
         "model": "openpi/pi05-action-lora-r16-state45-phase-28dof-finetune",
@@ -158,4 +167,40 @@ def test_state45_persistent_launcher_prints_done_timeout_contract(tmp_path) -> N
         "state_contract": "state45",
         "state_dim": 45,
         "video_mode": "none",
+    }
+
+
+def test_state45_persistent_launcher_prints_forced_retry_contract(tmp_path) -> None:
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/remote/run_state45_mode4_eval.sh"),
+            "--lance-dataset", "/immutable/formal.lance",
+            "--row", "7",
+            "--norm-stats-dir", "/locked/norm",
+            "--norm-sha-expected", "0" * 64,
+            "--contact-window-manifest", "/locked/windows.json",
+            "--model-path", "mint://sampler",
+            "--owner-id", "owner",
+            "--output-dir", str(tmp_path / "out"),
+            "--forced-first-failure",
+            "--forced-release-trigger-lift-m", "0.025",
+            "--forced-release-floor-frames", "8",
+            "--forced-release-no-contact-frames", "16",
+            "--forced-release-max-frames", "120",
+            "--print-config",
+        ],
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    config = json.loads(completed.stdout)
+    assert config["act_mode"] == "batch"
+    assert config["act_batch_size"] == 4
+    assert config["forced_first_failure"] is True
+    assert config["forced_retry"] == {
+        "trigger_lift_m": 0.025,
+        "floor_contact_frames": 8,
+        "no_hand_contact_frames": 16,
+        "max_forced_release_frames": 120,
     }
