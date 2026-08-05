@@ -7,6 +7,8 @@ from scripts.openpi_profiles import (
     ACTION_LORA_R16_PROFILE,
     ACTION_LORA_R16_STATE54_MODEL,
     ACTION_LORA_R16_STATE54_PROFILE,
+    ACTION_LORA_R16_STATE56_28DOF_MODEL,
+    ACTION_LORA_R16_STATE56_28DOF_PROFILE,
     LEGACY_L_LORA_MODEL,
     LEGACY_L_LORA_PROFILE,
     resolve_profile,
@@ -39,6 +41,16 @@ class OpenPIProfileTests(unittest.TestCase):
         self.assertEqual(profile.action_horizon, 10)
         self.assertEqual(profile.max_tokens, 256)
         self.assertTrue(profile.fail_on_token_truncation)
+
+    def test_state56_native28_profile_is_additive_and_explicit(self) -> None:
+        profile = resolve_profile(ACTION_LORA_R16_STATE56_28DOF_MODEL)
+        self.assertEqual(profile, ACTION_LORA_R16_STATE56_28DOF_PROFILE)
+        self.assertEqual((profile.state_dim, profile.action_dim, profile.action_horizon), (56, 32, 10))
+        self.assertEqual(profile.max_tokens, 256)
+        self.assertTrue(profile.fail_on_token_truncation)
+        self.assertEqual(profile.state_contract_id, "mano_object_dynamics_state56_native28_v1")
+        self.assertEqual(profile.delta_mask_segments, (3, -3, 22, -4))
+        self.assertEqual(ACTION_LORA_R16_STATE54_PROFILE.delta_mask_segments, (3, -3, 20, -6))
 
     def test_rejects_conflicting_model_and_profile(self) -> None:
         with self.assertRaisesRegex(ValueError, "does not match profile"):
