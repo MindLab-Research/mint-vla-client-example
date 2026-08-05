@@ -145,6 +145,9 @@ def format_language_prompt(
     if language_conditioning == GESTURE_LANGUAGE:
         if gesture is None:
             raise ValueError("gesture language requires a canonical gesture label")
+        suffix = f" using gesture {gesture}"
+        if base_prompt.strip().endswith(suffix):
+            return base_prompt.strip()
         return format_gesture_prompt(base_prompt, gesture)
     return (
         f"{base_prompt.strip()} using motion variant "
@@ -244,6 +247,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         self._gesture_index = (
             GestureIndex.load(gesture_index)
             if language_conditioning == GESTURE_LANGUAGE
+            and state_contract != STATE56_CONTRACT_ID
             else None
         )
         self._gesture_index_path = (
@@ -567,7 +571,10 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 self._rows[row_index]["trajectory_metadata"],
                 self._language_conditioning,
                 gesture=(
-                    self._gesture_records[row_index].gesture
+                    row["index"]["gesture"]
+                    if self._language_conditioning == GESTURE_LANGUAGE
+                    and getattr(self, "_state_contract", None) == STATE56_CONTRACT_ID
+                    else self._gesture_records[row_index].gesture
                     if self._language_conditioning == GESTURE_LANGUAGE
                     else None
                 ),

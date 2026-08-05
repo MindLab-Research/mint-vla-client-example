@@ -271,6 +271,12 @@ class CompareTrainingLanguageTests(unittest.TestCase):
             ),
             "pick up the cube1 using gesture 02",
         )
+        self.assertEqual(
+            compare.format_language_prompt(
+                "pick up the cube1 using gesture 02", metadata, "gesture", gesture="02"
+            ),
+            "pick up the cube1 using gesture 02",
+        )
         with self.assertRaisesRegex(ValueError, "canonical gesture"):
             compare.format_language_prompt("pick up the cube1", metadata, "gesture")
 
