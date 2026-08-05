@@ -85,16 +85,22 @@ class LiberoInputs(transforms.DataTransformFn):
 
 @dataclasses.dataclass(frozen=True)
 class LiberoOutputs(transforms.DataTransformFn):
-    """
-    This class is used to convert outputs from the model back the the dataset specific format. It is
-    used for inference only.
+    """Return the configured physical action prefix from padded model actions.
 
-    For your own dataset, you can copy this class and modify the action dimension based on the comments below.
+    The default26 preserves every existing Libero/MANO26 config. Native28
+    profiles set ``physical_action_dim=28`` explicitly so pad4 never leaks into
+    the environment and the final two joints are not silently truncated.
     """
+
+    physical_action_dim: int = 26
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first N actions -- since we padded actions above to fit the model action
-        # dimension, we need to now parse out the correct number of actions in the return dict.
-        # For MANO hand, we return the first 26 actions (20 finger DOF + 6 base pose).
-        # For your own dataset, replace `26` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :26])}
+        actions = np.asarray(data["actions"])
+        if actions.ndim != 2:
+            raise ValueError(f"actions must have rank2, got {actions.shape}")
+        if not 0 < self.physical_action_dim <= actions.shape[-1]:
+            raise ValueError(
+                f"physical_action_dim {self.physical_action_dim} is outside model action width "
+                f"{actions.shape[-1]}"
+            )
+        return {"actions": actions[:, : self.physical_action_dim]}
