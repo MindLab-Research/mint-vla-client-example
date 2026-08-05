@@ -1,0 +1,142 @@
+{
+  "schema_version": 1,
+  "release_id": "state41_28dof_v1_rc1",
+  "status": "release_candidate",
+  "audience": "internal_vepfs",
+  "integration_owner": "mint-vla-client-example",
+  "distribution": {
+    "client_feature_branch_remote": "pending_push",
+    "mint_feature_branch_remote": "pending_push",
+    "openpi_feature_branch_remote": "blocked_on_internal_fork",
+    "final_release_tag": "not_created",
+    "note": "This candidate is runnable from the pinned internal worktrees. It is not a public or portable data release."
+  },
+  "repositories": {
+    "client": {
+      "repository": "MindLab-Research/mint-vla-client-example",
+      "branch": "feature/mano-state41-28dof-v1",
+      "validated_code_commit": "f0a4b69d784586d6695c1a8f1a53b835f067f6d1"
+    },
+    "mint": {
+      "repository": "MindLab-Research/mint",
+      "branch": "feature/pi05-state41-28dof-v1",
+      "commit": "9e1d5491fade1ace61ca464754d5928c511c20cf"
+    },
+    "openpi": {
+      "upstream_repository": "Physical-Intelligence/openpi",
+      "internal_fork": null,
+      "branch": "feature/pi05-state41-28dof-v1",
+      "commit": "33ccdae4dc08fa2ac1c4b0d7788634b1fb6d755f"
+    },
+    "manorl": {
+      "path": "/vePFS-Mindverse/user/intern/wenxi/manorl-native-28d",
+      "commit": "e17f0122decddffc348ec10d0ed42552a0540e1b",
+      "submodules": {
+        "assets/all_assets": "e7910212e54367008ecb7484e5e9354e822de03e",
+        "assets/mano_hand_s02": "d98a9423e297f155d6dfaa7e4d563e54c7d67cbb"
+      }
+    }
+  },
+  "runtime_contract": {
+    "profile_id": "pi05_action_lora_r16_state41_28dof_v1",
+    "model": "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+    "state_contract": "mano_state41_native_sim_28d_v1",
+    "state_dim": 41,
+    "action_dim": 32,
+    "physical_hand_target_dim": 28,
+    "action_horizon": 10,
+    "action_source": "urdf_target_absolute",
+    "delta_mask_segments": [3, -3, 22, -4],
+    "prompt_template": "pick up the {object} using gesture {gesture}",
+    "language_source": "formal_release_metadata",
+    "frame_count_semantics": "state frames; control/action/rollout-observation arrays have frame_count-1 intervals",
+    "contact_window": {
+      "frame_window": "contact",
+      "context_frames": 100,
+      "missing_policy": "error"
+    },
+    "strict_success": "maximum object lift > 0.05 m and object-floor contact after the lift peak",
+    "video_default": "none"
+  },
+  "dataset": {
+    "lance": "/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/mano_28d_native_replay_state41_rgb_v1/mano_28d_native_replay_state41_rgb_v1.lance",
+    "release_verification_sha256": "74737ff54ad567c38fc6b5da0f54b3b549d37b8c48f9b7a4fad9de23f78d67d8",
+    "grade_a_population_rows": 4856,
+    "split_seed": 42,
+    "split_strata": "object_x_gesture",
+    "train_rows": 4613,
+    "validation_rows": 243
+  },
+  "profile": {
+    "directory": "/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/mano_28d_native_replay_state41_rgb_v1/profiles/grade_a_train95_object_gesture_seed42_contact_pm100_v1",
+    "profile_report_sha256": "a3126e0acf712e9f3a54d4d833283429c4b5f2ebde70f3014c65d59210177d53",
+    "train_selection_sha256": "f76385f66161b99fee6ee52f3584d1ddbd130f37e24e843b41517dea19e154c0",
+    "validation_selection_sha256": "d26f5fc379005a8f860bd843dc7116dae6994c36111ac487fe26c701c207a2c6",
+    "train_contact_windows_sha256": "32d02642b06ac5f36006c9f5f4cd886829fe936ba30a70d9863cd59e02eb24e7",
+    "validation_contact_windows_sha256": "01aa43e8fe7091d101456863a199e72ecf1de5d16d11df8b8ba802729e171ffe",
+    "norm_population": "train_only_contact_window",
+    "norm_sha256": "c276e12682dca4cd6559bd1d8c201f4cc7e488da6ebdcc2a67c8f137458f28ec"
+  },
+  "validation_evidence": {
+    "cube1_gesture03_smoke": {
+      "status": "passed",
+      "training_checkpoint_step": 4000,
+      "training_run_reached_step": 4157,
+      "row_count": 15,
+      "strict_success_count": 15,
+      "video_count": 45,
+      "policy_batch_requests": 358,
+      "policy_real_observations": 1335,
+      "report": "results/inference/state41_aug01_bs64_step4000_mode4_all15_batch4_final/final_batch_mode4_verification.json",
+      "report_sha256": "54129d690ec5dd6191023d29f4fa7da20e3a4eff3a32ec2e5b3450d15a49c7db"
+    },
+    "grade_a_step20000_matched_mode4": {
+      "status": "passed",
+      "validation": {
+        "strict_success_count": 107,
+        "row_count": 243,
+        "strict_success_fraction": 0.4403292181069959
+      },
+      "matched_train": {
+        "strict_success_count": 113,
+        "row_count": 243,
+        "strict_success_fraction": 0.46502057613168724
+      },
+      "paired_outcomes": {
+        "both_success": 75,
+        "train_only": 38,
+        "validation_only": 32,
+        "neither": 98
+      },
+      "video_count": 0,
+      "report": "results/inference/state41_gradea_step20000_validation243_train243_matched_mode4_v1_merged/paired_mode4_verification.json",
+      "report_sha256": "07c82a816b1660672f5a8c6adf1367c0c6cd11034b90a177a63c6d84e3f8b1dc"
+    },
+    "matched_population": {
+      "selection": "results/eval_profiles/state41_gradea_validation243_train243_matched_v1/paired_selection.json",
+      "selection_sha256": "5e29fc048279b304fd6b5249a4271ea53175dcbe71563208fd80163eefb541d3",
+      "combined_contact_windows_sha256": "e4e924b095c0042e7be0e8879438d600979b04d676fb443c942b5375b0a4d54d",
+      "object_gesture_strata": 53,
+      "validation_train_row_overlap": 0,
+      "exact_frame_count_pairs": 239,
+      "pair_count": 243
+    },
+    "grade_a_100k_training": {
+      "status": "running_stably",
+      "global_batch_size": 64,
+      "device_count": 4,
+      "per_device_batch_size": 16,
+      "observed_beyond_step": 34000,
+      "checkpoint_interval": 5000,
+      "checkpoint_type": "sampler",
+      "optimizer_present": false
+    }
+  },
+  "boundaries": [
+    "The 243-row validation split has been used for checkpoint evaluation and is not an untouched final test set.",
+    "Sampler checkpoints restore policy/action inference but do not contain optimizer state.",
+    "The release data and validation artifacts are internal vePFS assets and are not distributed by Git.",
+    "The OpenPI feature branch requires an approved internal fork before other users can fetch it.",
+    "The final state41-28dof-v1 tag is created only after branch review and remote visibility checks."
+  ]
+}

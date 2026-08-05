@@ -30,7 +30,8 @@ physics state are computed here, before the request reaches MINT.
 
 ### Source-of-truth rule
 
-- `config/datasets/mano_dataset_release.json` is the sole machine-readable source of truth for MANO data, language/contact sidecars, producer commits, assets, runtime contracts, norms, and physics evidence. Launchers resolve canonical roles through `scripts/mano_dataset_release.py`; docs and local env files cannot redefine the release.
+- `config/datasets/mano_dataset_release.json` remains the machine-readable authority for the historical MANO State32/State44 release family. Launchers for that family resolve canonical roles through `scripts/mano_dataset_release.py`; docs and local env files cannot redefine it.
+- `config/releases/state41_28dof_v1.json` binds the internal State41/Action32 release candidate to its dataset/profile hashes, three repository commits, native-physics assets, and acceptance evidence. It does not silently replace the historical release.
 - This Git repository is the source of truth for client code.
 - The checkout at `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`
   is both a real Git checkout and the supported execution directory.
@@ -42,6 +43,119 @@ physics state are computed here, before the request reaches MINT.
   receive new work.
 - Never modify the shared legacy copy
   `/vePFS-Mindverse/user/intern/wenxi/vla_mint`.
+
+## State41/Action32 28DoF release candidate
+
+`config/releases/state41_28dof_v1.json` is the integration contract for the
+internal vePFS release candidate. Its validated source tuple is:
+
+| Component | Branch | Validated commit |
+| --- | --- | --- |
+| Client | `feature/mano-state41-28dof-v1` | `f0a4b69d784586d6695c1a8f1a53b835f067f6d1` |
+| MINT | `feature/pi05-state41-28dof-v1` | `9e1d5491fade1ace61ca464754d5928c511c20cf` |
+| OpenPI | `feature/pi05-state41-28dof-v1` | `33ccdae4dc08fa2ac1c4b0d7788634b1fb6d755f` |
+| ManoRL native | — | `e17f0122decddffc348ec10d0ed42552a0540e1b` |
+| `assets/all_assets` | — | `e7910212e54367008ecb7484e5e9354e822de03e` |
+
+This is an internal release candidate: the Lance data, profile, checkpoints,
+and acceptance reports live on vePFS and are not distributed by Git. The
+OpenPI feature branch also needs an approved internal fork before users can
+fetch the complete tuple remotely. Do not substitute an OpenPI upstream branch
+or a historical State32 norm.
+
+The runtime contract is:
+
+```text
+observation: State41
+  qpos28 + contact5 + lift1 + signed surface distance5
+  + object-floor support1 + causal >=2-finger contact duration1
+policy action: [10,32]
+physical hand target: 28D
+B-mask segments: (3, -3, 22, -4)
+action horizon: 10
+prompt: pick up the {object} using gesture {gesture}
+language source: formal release index.object / index.gesture
+window: contact ±100 frames; missing contact is an error
+norm: train-only contact-window population
+norm SHA256: c276e12682dca4cd6559bd1d8c201f4cc7e488da6ebdcc2a67c8f137458f28ec
+```
+
+`frame_count` counts physics states. Control, action, and rollout-observation
+arrays therefore contain `frame_count - 1` intervals. Strict rollout success is
+maximum object lift above 5 cm followed by object-floor contact after the lift
+peak.
+
+### Internal checkout
+
+Until the feature branches are merged and tagged, use dedicated worktrees at
+the pinned commits:
+
+```bash
+# Client
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state46-28dof \
+  switch feature/mano-state41-28dof-v1
+
+# MINT server
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof \
+  switch feature/pi05-state41-28dof-v1
+
+# OpenPI model implementation
+git -C /vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof \
+  switch feature/pi05-state41-28dof-v1
+```
+
+Keep each worktree clean. Allocate independent ports, GPUs, runtime roots, and
+checkpoint roots for concurrent users. A worktree isolates source; it does not
+isolate GPU processes or server state.
+
+### Grade-A profile and training preflight
+
+The internal Grade-A profile is:
+
+```text
+/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/
+mano_28d_native_replay_state41_rgb_v1/profiles/
+grade_a_train95_object_gesture_seed42_contact_pm100_v1/profile_report.json
+```
+
+It contains 4,856 Grade-A rows split deterministically by `object × gesture`
+with seed 42 into 4,613 train rows and 243 validation rows. Print and validate
+the immutable 100K training configuration without contacting the server:
+
+```bash
+cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state46-28dof
+PROFILE=/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/\
+mano_28d_native_replay_state41_rgb_v1/profiles/\
+grade_a_train95_object_gesture_seed42_contact_pm100_v1/profile_report.json
+
+STATE41_GRADEA_PRINT_CONFIG=1 \
+  ./scripts/remote/run_state41_gradea_100k.sh "$PROFILE"
+```
+
+The production launcher fixes global batch 64 on four GPUs, per-device batch
+16, learning rate `5e-5`, qpos-only normalized StateAug sigma 0.1, checkpoint
+interval 5,000, and no interleaved Mode4. Remove the print-only environment
+variable only after assigning a dedicated MINT server and confirming GPU
+ownership.
+
+### Acceptance evidence
+
+The release candidate reuses completed evidence; it does not require another
+GPU smoke run:
+
+- Cube1/gesture03 end-to-end smoke: step4000 sampler restored; all 15 selected
+  trajectories passed strict lift-then-release; 45 videos passed validation.
+  Report SHA256: `54129d690ec5dd6191023d29f4fa7da20e3a4eff3a32ec2e5b3450d15a49c7db`.
+- Grade-A step20000 fixed matched evaluation: validation `107/243` (44.03%),
+  matched train `113/243` (46.50%), with all 486 rows finite and contract-valid.
+  Report SHA256: `07c82a816b1660672f5a8c6adf1367c0c6cd11034b90a177a63c6d84e3f8b1dc`.
+- The batch64 Grade-A 100K run has trained stably beyond step34,000. Its 5K
+  interval artifacts are sampler checkpoints and do not contain optimizer
+  state.
+
+The 243-row validation split has already been used for checkpoint evaluation;
+it is not an untouched final test set. Exact artifact paths and hashes are in
+the release manifest.
 
 ## Current MANO 32D v1 contract
 
