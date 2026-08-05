@@ -66,6 +66,7 @@ class State56SidecarStore:
         if len(light) != 4856:
             raise ValueError(f"State56 sidecar row count mismatch: {len(light)}")
         positions: dict[int, int] = {}
+        splits: dict[int, str] = {}
         split_counts = {"train": 0, "validation": 0}
         frames = 0
         source_version: int | None = None
@@ -96,14 +97,22 @@ class State56SidecarStore:
             elif row_source_version != source_version:
                 raise ValueError("State56 sidecar source version varies by row")
             positions[source_row] = position
+            splits[source_row] = split
             frames += int(window["frame_count"])
         if split_counts != {"train": 4613, "validation": 243} or frames != 2695132:
             raise ValueError(f"State56 sidecar population mismatch: {split_counts}, frames={frames}")
         self.source_dataset_version = int(source_version)
         self._positions = positions
+        self._splits = splits
 
     def has_source_row(self, source_row: int) -> bool:
         return int(source_row) in self._positions
+
+    def split_for_source_row(self, source_row: int) -> str:
+        try:
+            return self._splits[int(source_row)]
+        except KeyError as exc:
+            raise ValueError(f"source row {source_row} is outside the Grade-A State56 sidecar") from exc
 
     def load(self, source_row: int, *, expected_uuid: str, expected_source_payload_sha256: str) -> dict[str, Any]:
         try:

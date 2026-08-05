@@ -484,6 +484,34 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                         f"State54 selected population {key!r} mismatch: "
                         f"{contract.get(key)!r} != {value!r}"
                     )
+        if self._state56_data_contract is not None:
+            contract = self._state56_data_contract
+            selected_digest = hashlib.sha256(
+                json.dumps(self._source_row_indices, separators=(",", ":")).encode()
+            ).hexdigest()
+            population = (
+                ("train", 4613, 2560614, contract["train_row_indices_sha256"])
+                if len(self._source_row_indices) == 4613
+                else ("validation", 243, 134518, contract["validation_row_indices_sha256"])
+                if len(self._source_row_indices) == 243
+                else None
+            )
+            if population is None:
+                raise ValueError("State56 selection must be the exact train or validation manifest")
+            split, trajectories, frames, expected_digest = population
+            if (
+                len(self._row_windows) != trajectories
+                or len(self._index) != frames
+                or selected_digest != expected_digest
+                or any(
+                    self._state56_sidecar_store.split_for_source_row(source_row) != split
+                    for source_row in self._source_row_indices
+                )
+            ):
+                raise ValueError(
+                    f"State56 selected {split} population identity mismatch: "
+                    f"rows={len(self._row_windows)} frames={len(self._index)} sha={selected_digest}"
+                )
         self._slate_size = min(16, len(self._row_start_offset))
         self._row_cache_capacity_rows: int | None = None
         self._slate_rotate_every = 250
@@ -2436,7 +2464,11 @@ def main() -> int:
     )
     norm_stats, norm_stats_provenance = load_or_compute_norm_stats(dataset, args.norm_stats_dir)
     data_config = L._make_data_config(
-        model_config, norm_stats, action_source=dataset._action_source
+        model_config,
+        norm_stats,
+        action_source=dataset._action_source,
+        delta_mask_segments=profile.delta_mask_segments,
+        physical_action_dim=profile.physical_action_dim,
     )
     sample_rng, augmentation_rng, augmentation_seed = make_rngs(
         args.seed, args.augmentation_seed
