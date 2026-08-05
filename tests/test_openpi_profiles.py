@@ -49,6 +49,7 @@ class OpenPIProfileTests(unittest.TestCase):
         self.assertEqual(profile.max_tokens, 256)
         self.assertTrue(profile.fail_on_token_truncation)
         self.assertEqual(profile.state_contract_id, "mano_object_dynamics_state56_native28_v1")
+        self.assertEqual(profile.physical_action_dim, 28)
         self.assertEqual(profile.delta_mask_segments, (3, -3, 22, -4))
         self.assertEqual(ACTION_LORA_R16_STATE54_PROFILE.delta_mask_segments, (3, -3, 20, -6))
 

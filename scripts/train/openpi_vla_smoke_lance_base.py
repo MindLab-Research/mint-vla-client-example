@@ -634,10 +634,20 @@ def _make_data_config(
     norm_stats: dict[str, normalize.NormStats] | None,
     *,
     action_source: str | None = None,
+    delta_mask_segments: tuple[int, ...] = MANO_DELTA_MASK_SEGMENTS,
+    physical_action_dim: int = 26,
 ) -> openpi_config.DataConfig:
+    if sum(abs(value) for value in delta_mask_segments) != model_config.action_dim:
+        raise ValueError(
+            f"delta mask {delta_mask_segments} does not cover action_dim={model_config.action_dim}"
+        )
+    if not 0 < physical_action_dim <= model_config.action_dim:
+        raise ValueError(
+            f"physical_action_dim {physical_action_dim} is outside action_dim={model_config.action_dim}"
+        )
     data_transforms = transforms.Group(
         inputs=[libero_policy.LiberoInputs(model_type=model_config.model_type)],
-        outputs=[libero_policy.LiberoOutputs()],
+        outputs=[libero_policy.LiberoOutputs(physical_action_dim=physical_action_dim)],
     )
     # B scheme: for the absolute urdf_dof_target label, let the framework convert
     # the delta-eligible dims (xyz + fingers) to `target - q[t]` before Normalize
@@ -645,7 +655,7 @@ def _make_data_config(
     # data_transforms.inputs run BEFORE Normalize in _transform_sample, so the
     # subtraction is on raw physical values (required for correct delta).
     if action_source == URDF_TARGET_ABSOLUTE:
-        delta_action_mask = transforms.make_bool_mask(*MANO_DELTA_MASK_SEGMENTS)
+        delta_action_mask = transforms.make_bool_mask(*delta_mask_segments)
         data_transforms = data_transforms.push(
             inputs=[transforms.DeltaActions(delta_action_mask)],
             outputs=[transforms.AbsoluteActions(delta_action_mask)],

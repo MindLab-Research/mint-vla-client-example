@@ -27,6 +27,7 @@ class OpenPIClientProfile:
     max_tokens: int = 200
     fail_on_token_truncation: bool = False
     state_contract_id: str | None = None
+    physical_action_dim: int = 26
     delta_mask_segments: tuple[int, ...] = (3, -3, 20, -6)
 
 
@@ -66,6 +67,7 @@ ACTION_LORA_R16_STATE56_28DOF_PROFILE = OpenPIClientProfile(
     max_tokens=256,
     fail_on_token_truncation=True,
     state_contract_id="mano_object_dynamics_state56_native28_v1",
+    physical_action_dim=28,
     delta_mask_segments=(3, -3, 22, -4),
 )
 
