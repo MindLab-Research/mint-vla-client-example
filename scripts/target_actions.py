@@ -29,7 +29,9 @@ ACTION_SOURCES = (MEASURED_DELTA, PD_TARGET_DELTA, URDF_TARGET_ABSOLUTE)
 MANO_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 20, -6)
 
 
-def urdf_target_absolute_actions(row: dict[str, Any], *, action_dim: int = 32) -> np.ndarray:
+def urdf_target_absolute_actions(
+    row: dict[str, Any], *, action_dim: int = 32, physical_dim: int = 26
+) -> np.ndarray:
     """Return the ABSOLUTE per-frame ``urdf_dof_target`` in the model action space.
 
     The framework's ``DeltaActions(mask)`` converts the delta-eligible dims
@@ -45,16 +47,16 @@ def urdf_target_absolute_actions(row: dict[str, Any], *, action_dim: int = 32) -
             f"{type(hands).__name__}:{len(hands) if isinstance(hands, list) else 'n/a'}"
         )
     target = np.asarray(hands[0].get("urdf_dof_target"), dtype=np.float32)
-    if state.ndim != 2 or state.shape[1] < 26:
-        raise ValueError(f"state must have shape [T,>=26], got {state.shape}")
-    if target.shape != (state.shape[0], 26):
+    if not 0 < physical_dim <= action_dim:
+        raise ValueError(f"physical_dim must be within action_dim, got {physical_dim}/{action_dim}")
+    if state.ndim != 2 or state.shape[1] < physical_dim:
+        raise ValueError(f"state must have shape [T,>={physical_dim}], got {state.shape}")
+    if target.shape != (state.shape[0], physical_dim):
         raise ValueError(
-            f"urdf_dof_target must have shape {(state.shape[0], 26)}, got {target.shape}"
+            f"urdf_dof_target must have shape {(state.shape[0], physical_dim)}, got {target.shape}"
         )
-    if action_dim < 26:
-        raise ValueError(f"action_dim must be at least 26, got {action_dim}")
     actions = np.zeros((state.shape[0], action_dim), dtype=np.float32)
-    actions[:, :26] = target
+    actions[:, :physical_dim] = target
     if not np.isfinite(actions).all():
         raise ValueError("urdf_target_absolute produced non-finite actions")
     return actions
@@ -89,7 +91,7 @@ def pd_target_delta_actions(row: dict[str, Any], *, action_dim: int = 32) -> np.
 
 
 def project_row_actions(
-    row: dict[str, Any], action_source: str, *, action_dim: int = 32
+    row: dict[str, Any], action_source: str, *, action_dim: int = 32, physical_dim: int = 26
 ) -> dict[str, Any]:
     """Return ``row`` with the selected action label, preserving other leaves."""
     if action_source == MEASURED_DELTA:
@@ -99,7 +101,9 @@ def project_row_actions(
     projected = dict(row)
     projected["measured_actions"] = np.asarray(row["actions"], dtype=np.float32)
     if action_source == URDF_TARGET_ABSOLUTE:
-        projected["actions"] = urdf_target_absolute_actions(row, action_dim=action_dim)
+        projected["actions"] = urdf_target_absolute_actions(
+            row, action_dim=action_dim, physical_dim=physical_dim
+        )
     else:
         projected["actions"] = pd_target_delta_actions(row, action_dim=action_dim)
     return projected

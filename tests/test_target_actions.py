@@ -7,6 +7,7 @@ import numpy as np
 from scripts.target_actions import (
     MEASURED_DELTA,
     PD_TARGET_DELTA,
+    URDF_TARGET_ABSOLUTE,
     fit_pd_response_gains,
     pd_target_delta_actions,
     project_row_actions,
@@ -31,6 +32,20 @@ class TargetActionsTests(unittest.TestCase):
         self.assertIs(projected["state"], row["state"])
         np.testing.assert_array_equal(projected["actions"], actions)
         np.testing.assert_array_equal(projected["measured_actions"], row["actions"])
+
+    def test_native28_absolute_target_uses_target28_plus_pad4(self) -> None:
+        state = np.zeros((3, 56), dtype=np.float32)
+        target = np.arange(3 * 28, dtype=np.float32).reshape(3, 28)
+        row = {
+            "state": state,
+            "actions": np.full((3, 32), 9.0, dtype=np.float32),
+            "hands": [{"urdf_dof_target": target}],
+        }
+        projected = project_row_actions(
+            row, URDF_TARGET_ABSOLUTE, action_dim=32, physical_dim=28
+        )
+        np.testing.assert_array_equal(projected["actions"][:, :28], target)
+        np.testing.assert_array_equal(projected["actions"][:, 28:], 0)
 
     def test_measured_delta_path_is_literal(self) -> None:
         row = {"actions": np.zeros((1, 32), dtype=np.float32)}
