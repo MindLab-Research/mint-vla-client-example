@@ -23,7 +23,11 @@ def _load_compare_module() -> types.ModuleType:
     fake_base.LanceViewpi05Dataset = object
     fake_base.contact_windows_lib = types.SimpleNamespace(DEFAULT_CONTACT_CONTEXT_FRAMES=100)
     fake_base.PI05_MODEL = "openpi/pi05-libero-low-mem-finetune"
-    fake_base.MODEL_CHOICES = (fake_base.PI05_MODEL, "openpi/pi05-action-lora-r16-finetune")
+    fake_base.MODEL_CHOICES = (
+        fake_base.PI05_MODEL,
+        "openpi/pi05-action-lora-r16-finetune",
+        "openpi/pi05-action-lora-r16-state56-28dof-finetune",
+    )
     fake_base._transform_sample = lambda sample, _: sample
     fake_base._pi05_datum_from_transformed = lambda _, sample: sample
     fake_base.normalize = types.SimpleNamespace(load=lambda _path: {})
@@ -88,7 +92,7 @@ class TokenizePrompt:
         data = dict(data)
         data.pop("prompt", None)
         data["tokenized_prompt"] = np.rint((state + 1.0) * 100).astype(np.int32)
-        data["tokenized_prompt_mask"] = np.ones(32, dtype=bool)
+        data["tokenized_prompt_mask"] = np.ones(state.shape[0], dtype=bool)
         return data
 
 
@@ -128,6 +132,26 @@ class CompareTrainingCliTests(unittest.TestCase):
             )
             self.assertEqual(args.checkpoint_every, 0)
             self.assertEqual(args.checkpoint_save_path_template, "")
+
+    def test_state56_contract_inputs_propagate_from_cli(self) -> None:
+        compare = _load_compare_module()
+        with patch.object(sys, "argv", [
+            str(SCRIPT),
+            "--model", "openpi/pi05-action-lora-r16-state56-28dof-finetune",
+            "--state-contract", "mano_object_dynamics_state56_native28_v1",
+            "--state56-sidecar-release", "sidecar.lance",
+            "--state56-sidecar-verification", "release_verification.json",
+            "--state56-sidecar-verification-sha256", "a" * 64,
+            "--state56-data-contract", "data_contract.json",
+            "--state56-data-contract-sha256", "b" * 64,
+            "--lance-dataset", "dataset.lance", "--save-path", "save",
+            "--output-json", "result.json",
+        ]):
+            args = compare.parse_args()
+        self.assertEqual(args.state_contract, "mano_object_dynamics_state56_native28_v1")
+        self.assertEqual(args.state56_sidecar_release, Path("sidecar.lance"))
+        self.assertEqual(args.state56_sidecar_verification_sha256, "a" * 64)
+        self.assertEqual(args.state56_data_contract_sha256, "b" * 64)
 
     def test_parallel_worker_option_propagates_from_cli(self) -> None:
         compare = _load_compare_module()
@@ -767,6 +791,71 @@ class CompareTrainingCacheAndBatchTests(unittest.TestCase):
             actual = compare.build_batch(dataset, object(), base_model="openpi/pi05-action-lora-r16-finetune", indices=[0], norm_stats=_norm_stats([1] * 32), state_noise_std=0, rng=rng, datum_cache=cache)
         self.assertEqual(actual, [_datum(0)])
         self.assertEqual(rng.normal(), expected)
+
+
+    def test_state56_augmentation_recomputes_tips_and_compensates_through_dim28(self) -> None:
+        compare = _load_compare_module()
+
+        class State56Dataset(_BatchDataset):
+            def __init__(self) -> None:
+                super().__init__()
+                self._action_source = "urdf_target_absolute"
+                self._extended_state = True
+                self._state_contract = "mano_object_dynamics_state56_native28_v1"
+                self.fk_qpos = None
+
+            def state56_fingertips_for_qpos(self, key, qpos):
+                self.fk_qpos = np.asarray(qpos, dtype=np.float32).copy()
+                return np.full((5, 3), self.fk_qpos[26], dtype=np.float32)
+
+        dataset = State56Dataset()
+        state = np.zeros(56, dtype=np.float32)
+        actions = np.zeros((10, 32), dtype=np.float32)
+        clean = _datum(0)
+        clean["observation"]["state"] = {"data": state.tolist(), "shape": [56]}
+        clean["supervision"]["actions"] = {
+            "data": actions.tolist(), "shape": [10, 32]
+        }
+        prepared = compare.PreparedDatum(
+            {"state": state, "prompt": "cube", "actions": actions},
+            TokenizePrompt(), (), clean,
+        )
+        state_stats = types.SimpleNamespace(
+            std=np.ones(56, dtype=np.float32),
+            q01=-np.ones(56, dtype=np.float32),
+            q99=np.ones(56, dtype=np.float32),
+        )
+        action_stats = types.SimpleNamespace(
+            std=np.ones(32, dtype=np.float32),
+            q01=-np.ones(32, dtype=np.float32),
+            q99=np.ones(32, dtype=np.float32),
+        )
+        noise = np.zeros(32, dtype=np.float32)
+        noise[4] = 0.3
+        noise[26] = 0.1
+        noise[27] = -0.2
+        noise[28] = 0.4
+        with patch.object(compare, "_prepare_discrete_datum", return_value=prepared):
+            datum = compare.build_batch(
+                dataset, object(),
+                base_model="openpi/pi05-action-lora-r16-state56-28dof-finetune",
+                indices=[0], norm_stats={"state": state_stats, "actions": action_stats},
+                state_noise_std=0.05, rng=np.random.default_rng(43),
+                planned_requests=[(0, noise, None)], datum_cache=compare.DatumCache(0),
+            )[0]
+        augmented_state = np.asarray(datum["observation"]["state"]["data"], dtype=np.float32)
+        action_meta = datum["supervision"]["actions"]
+        augmented_actions = np.asarray(action_meta["data"], dtype=np.float32).reshape(action_meta["shape"])
+        self.assertAlmostEqual(augmented_state[26], 0.1)
+        self.assertAlmostEqual(augmented_state[27], -0.2)
+        self.assertEqual(augmented_state[28], 0.0)
+        np.testing.assert_allclose(augmented_state[34:49], 0.1, atol=1e-7)
+        self.assertAlmostEqual(dataset.fk_qpos[26], 0.1, delta=1e-6)
+        self.assertAlmostEqual(dataset.fk_qpos[27], -0.2, delta=1e-6)
+        np.testing.assert_allclose(augmented_actions[:, 26], -0.1, atol=1e-7)
+        np.testing.assert_allclose(augmented_actions[:, 27], 0.2, atol=1e-7)
+        np.testing.assert_array_equal(augmented_actions[:, 4], 0.0)
+        np.testing.assert_array_equal(augmented_actions[:, 28:], 0.0)
 
 
 class CompareTrainingPopulationTests(unittest.TestCase):

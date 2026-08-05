@@ -45,7 +45,12 @@ from scripts.mano_state54_contract import (
     STATE_CONTRACT_ID as STATE54_CONTRACT_ID,
     verify_locked_state54_norm_stats,
 )
+from scripts.mano_state56_contract import (
+    STATE_CONTRACT_ID as STATE56_CONTRACT_ID,
+    verify_locked_state56_norm_stats,
+)
 from scripts.openpi_profiles import resolve_profile
+from scripts.state56_virtual_data import State56SidecarStore
 from scripts.target_actions import (
     ACTION_SOURCES,
     MEASURED_DELTA,
@@ -170,6 +175,11 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         state54_replay_feature_release_sha256: str | None = None,
         state54_data_contract: Path | None = None,
         state54_data_contract_sha256: str | None = None,
+        state56_sidecar_release: Path | None = None,
+        state56_sidecar_verification: Path | None = None,
+        state56_sidecar_verification_sha256: str | None = None,
+        state56_data_contract: Path | None = None,
+        state56_data_contract_sha256: str | None = None,
     ) -> None:
         if action_source not in ACTION_SOURCES:
             raise ValueError(f"unsupported action_source {action_source!r}; expected one of {ACTION_SOURCES}")
@@ -182,7 +192,7 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 f"unsupported language conditioning {language_conditioning!r}; "
                 f"expected one of {LANGUAGE_CONDITIONING_CHOICES}"
             )
-        if state_contract not in (None, STATE54_CONTRACT_ID):
+        if state_contract not in (None, STATE54_CONTRACT_ID, STATE56_CONTRACT_ID):
             raise ValueError(f"unsupported state contract {state_contract!r}")
         if extended_state and state_contract is not None:
             raise ValueError("--extended-state and --state-contract are mutually exclusive")
@@ -198,6 +208,27 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             raise ValueError("State54 data contract and expected SHA must be supplied together")
         if state54_data_contract is not None and state_contract != STATE54_CONTRACT_ID:
             raise ValueError("State54 data contract requires the State54 contract")
+        state56_sidecar_values = (
+            state56_sidecar_release,
+            state56_sidecar_verification,
+            state56_sidecar_verification_sha256,
+        )
+        if any(value is not None for value in state56_sidecar_values) and not all(
+            value is not None for value in state56_sidecar_values
+        ):
+            raise ValueError("State56 sidecar release, verification and SHA must be supplied together")
+        if state_contract == STATE56_CONTRACT_ID and not all(
+            value is not None for value in state56_sidecar_values
+        ):
+            raise ValueError("State56 contract requires an authenticated sidecar release")
+        if state56_sidecar_release is not None and state_contract != STATE56_CONTRACT_ID:
+            raise ValueError("State56 sidecar requires the State56 contract")
+        if (state56_data_contract is None) != (state56_data_contract_sha256 is None):
+            raise ValueError("State56 data contract and expected SHA must be supplied together")
+        if state56_data_contract is not None and state_contract != STATE56_CONTRACT_ID:
+            raise ValueError("State56 data contract requires the State56 contract")
+        if state_contract == STATE56_CONTRACT_ID and state56_data_contract is None:
+            raise ValueError("State56 contract requires an explicit authenticated data contract")
         self._action_source = action_source
         self._state_contract = state_contract
         self._extended_state = bool(extended_state or state_contract is not None)
@@ -205,6 +236,10 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             from scripts.mano_state54_contract import ManoFingertipFK
 
             self._state54_fk = ManoFingertipFK()
+        if state_contract == STATE56_CONTRACT_ID:
+            from scripts.eval.manorl_native28_physics import Native28FingertipFK
+
+            self._state56_fk = Native28FingertipFK()
         self._language_conditioning = language_conditioning
         self._gesture_index = (
             GestureIndex.load(gesture_index)
@@ -261,6 +296,47 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             self._state54_data_contract = contract
             self._state54_data_contract_path = contract_path
             self._state54_data_contract_sha256 = actual_contract_sha
+        self._state56_sidecar_store = None
+        self._state56_data_contract = None
+        self._state56_data_contract_path = None
+        self._state56_data_contract_sha256 = None
+        if state56_sidecar_release is not None:
+            self._state56_sidecar_store = State56SidecarStore(
+                state56_sidecar_release,
+                verification_path=state56_sidecar_verification,
+                expected_verification_sha256=state56_sidecar_verification_sha256,
+                source_dataset=self._dataset_path,
+            )
+        if state56_data_contract is not None:
+            contract_path = Path(state56_data_contract).expanduser().resolve()
+            actual_contract_sha = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            if actual_contract_sha != str(state56_data_contract_sha256).lower():
+                raise ValueError("State56 data contract SHA mismatch")
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+            required_contract = {
+                "status": "accepted",
+                "state_contract": STATE56_CONTRACT_ID,
+                "state_dim": 56,
+                "action_dim": 32,
+                "action_horizon": action_horizon,
+                "action_physical_dim": 28,
+                "action_padding_dim": 4,
+                "action_delta_mask": [3, -3, 22, -4],
+                "max_token_len": 256,
+                "dataset": str(self._dataset_path),
+                "train_trajectory_count": 4613,
+                "validation_trajectory_count": 243,
+                "held_out_trajectory_count": 0,
+                "sidecar_verification_sha256": self._state56_sidecar_store.verification_sha256,
+            }
+            for key, value in required_contract.items():
+                if contract.get(key) != value:
+                    raise ValueError(
+                        f"State56 data contract {key!r} mismatch: {contract.get(key)!r} != {value!r}"
+                    )
+            self._state56_data_contract = contract
+            self._state56_data_contract_path = contract_path
+            self._state56_data_contract_sha256 = actual_contract_sha
         self._target_dataset_path = (
             Path(target_lance_dataset).expanduser().resolve()
             if target_lance_dataset is not None
@@ -437,6 +513,8 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
         columns = ["state", "actions", "prompt", "image", "wrist_image"]
         if self._extended_state:
             columns += ["contact", "objects"]
+        if getattr(self, "_state_contract", None) == STATE56_CONTRACT_ID:
+            columns += ["index", "row_payload_sha256"]
         if (
             getattr(self, "_state_contract", None) is not None
             or (self._action_source != MEASURED_DELTA and self._target_is_image_dataset)
@@ -452,16 +530,36 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
                 ).to_pylist()[0]
                 target_hands = target_row["hands"]
             target_q = np.asarray(target_hands[0]["urdf_dof"], dtype=np.float32)
-            image_q = np.asarray(row["state"], dtype=np.float32)[:, :26]
+            qpos_width = 28 if getattr(self, "_state_contract", None) == STATE56_CONTRACT_ID else 26
+            image_q = np.asarray(row["state"], dtype=np.float32)[:, :qpos_width]
             if target_q.shape != image_q.shape or not np.array_equal(target_q, image_q):
                 raise ValueError(
                     f"target/image q mismatch at source row {source_row}: "
                     f"target={target_q.shape} image={image_q.shape}"
                 )
             row = {**row, "hands": target_hands}
-        row = project_row_actions(row, self._action_source)
+        row = (
+            project_row_actions(row, self._action_source, physical_dim=28)
+            if getattr(self, "_state_contract", None) == STATE56_CONTRACT_ID
+            else project_row_actions(row, self._action_source)
+        )
         if getattr(self, "_state_contract", None) == STATE54_CONTRACT_ID:
             row = self._attach_state54_window(row, row_index)
+        if getattr(self, "_state_contract", None) == STATE56_CONTRACT_ID:
+            if self._state56_sidecar_store is None:
+                raise RuntimeError("State56 sidecar store is not initialized")
+            sidecar = self._state56_sidecar_store.load(
+                source_row,
+                expected_uuid=row["index"]["uuid"],
+                expected_source_payload_sha256=row["row_payload_sha256"],
+            )
+            source_qpos = np.asarray(row["state"], dtype=np.float32)[:, :28]
+            state56 = np.asarray(sidecar["state"], dtype=np.float32)
+            if source_qpos.shape != state56[:, :28].shape or not np.array_equal(
+                source_qpos, state56[:, :28]
+            ):
+                raise ValueError(f"State56 sidecar/source qpos mismatch row {source_row}")
+            row = {**row, "state": state56, "_state56_sidecar": sidecar}
         return {
             **row,
             "prompt": format_language_prompt(
@@ -499,6 +597,34 @@ class SelectedLanceDataset(L.LanceViewpi05Dataset):
             np.asarray(obj["pos"][frame], dtype=np.float64),
             rotation,
             object_names[0],
+        )
+
+    def state56_fingertips_for_qpos(self, flat_index: int, hand_qpos: np.ndarray) -> np.ndarray:
+        """Recompute native28 object-frame tipXYZ after StateAug qpos noise."""
+        from scripts.mano_state56_contract import (
+            fingertips_in_collision_box_frame,
+            quaternion_wxyz_to_matrix,
+        )
+
+        if self._state_contract != STATE56_CONTRACT_ID:
+            raise ValueError("State56 FK requested from a non-State56 dataset")
+        local_row, frame = self._index[int(flat_index)]
+        row = self._get_row(local_row)
+        object_name = row["index"]["object"]
+        obj = row["objects"][0]
+        position = np.asarray(obj["pos"][frame], dtype=np.float64)
+        quaternion = np.asarray(obj["quat_wxyz"][frame], dtype=np.float64)
+        tip_world = self._state56_fk(
+            object_name=object_name,
+            hand_qpos=np.asarray(hand_qpos, dtype=np.float32),
+            object_position=position,
+            object_quaternion_wxyz=quaternion,
+        )
+        return fingertips_in_collision_box_frame(
+            tip_world,
+            position,
+            quaternion_wxyz_to_matrix(quaternion),
+            object_name,
         )
 
     def _get_row(self, row_index: int) -> dict[str, Any]:
@@ -688,6 +814,7 @@ def load_or_compute_norm_stats(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     extended_state = bool(getattr(dataset, "_extended_state", False))
     state54 = getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID
+    state56 = getattr(dataset, "_state_contract", None) == STATE56_CONTRACT_ID
     if norm_stats_dir is None:
         if extended_state:
             raise ValueError(
@@ -715,6 +842,14 @@ def load_or_compute_norm_stats(
                 else None
             ),
         )
+    elif state56:
+        if dataset._state56_data_contract is None:
+            raise ValueError("State56 norm requires an explicit data contract")
+        path, actual_sha = verify_locked_state56_norm_stats(
+            norm_stats_dir,
+            expected_sha256=dataset._state56_data_contract["norm_stats_sha256"],
+            data_contract_path=dataset._state56_data_contract_path,
+        )
     elif extended_state:
         path, actual_sha = verify_locked_norm_stats(norm_stats_dir)
     else:
@@ -723,7 +858,11 @@ def load_or_compute_norm_stats(
         actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
     stats = L.normalize.load(norm_stats_dir)
     expected_widths = {
-        "state": 54 if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID else 32,
+        "state": (
+            56
+            if state56
+            else 54 if state54 else 32
+        ),
         "actions": 32,
     }
     for key, width in expected_widths.items():
@@ -1337,10 +1476,11 @@ def build_batch(
                 raise ValueError(f"state augmentation noise must have shape (32,), got {state_noise.shape}")
             quantile_valid = _quantile_valid_dimensions(norm_stats, "state", state_dim)
             if getattr(dataset, "_extended_state", False):
-                # Both 32D extended and state54 perturb qpos only.  Preserve the
-                # historical non-extended profile's all-32D augmentation.
+                # Extended profiles perturb physical qpos only. State54 uses26;
+                # native28 State56 uses28. Preserve non-extended legacy behavior.
                 valid_state = np.zeros(state_dim, dtype=bool)
-                valid_state[:26] = quantile_valid[:26]
+                qpos_width = 28 if getattr(dataset, "_state_contract", None) == STATE56_CONTRACT_ID else 26
+                valid_state[:qpos_width] = quantile_valid[:qpos_width]
             else:
                 valid_state = quantile_valid
             augmented_state = clean_state.copy()
@@ -1359,6 +1499,19 @@ def build_batch(
                 raw_tips = dataset.state54_fingertips_for_qpos(key, augmented_qpos_raw).reshape(-1)
                 tip_lo, tip_hi = q01[32:47], q99[32:47]
                 augmented_state[32:47] = (
+                    (raw_tips - tip_lo) / (tip_hi - tip_lo + 1e-6) * 2.0 - 1.0
+                ).astype(np.float32)
+            elif getattr(dataset, "_state_contract", None) == STATE56_CONTRACT_ID:
+                stats = norm_stats["state"]
+                q01 = np.asarray(stats.q01, dtype=np.float32)
+                q99 = np.asarray(stats.q99, dtype=np.float32)
+                qpos_range = q99[:28] - q01[:28]
+                augmented_qpos_raw = q01[:28] + (
+                    (augmented_state[:28] + 1.0) * 0.5 * (qpos_range + 1e-6)
+                )
+                raw_tips = dataset.state56_fingertips_for_qpos(key, augmented_qpos_raw).reshape(-1)
+                tip_lo, tip_hi = q01[34:49], q99[34:49]
+                augmented_state[34:49] = (
                     (raw_tips - tip_lo) / (tip_hi - tip_lo + 1e-6) * 2.0 - 1.0
                 ).astype(np.float32)
             # Contacts, lift, force, velocity and contact age remain exact.  In
@@ -1403,12 +1556,17 @@ def build_batch(
                 _scale = np.where(_valid, _s_range / np.maximum(_a_range, 1e-8), 0.0)
                 augmented_acts = clean_acts.copy()
                 augmented_acts[:, :3] -= state_noise[:3] * _scale[:3]
-                augmented_acts[:, 6:26] -= state_noise[6:26] * _scale[6:26]
+                finger_end = 28 if getattr(dataset, "_state_contract", None) == STATE56_CONTRACT_ID else 26
+                augmented_acts[:, 6:finger_end] -= (
+                    state_noise[6:finger_end] * _scale[6:finger_end]
+                )
                 # wire format stores actions as reshape(-1).tolist()
                 datum = _replace_wire_actions(datum, augmented_acts.reshape(-1))
             causal_derived = np.zeros(state_dim, dtype=bool)
             if getattr(dataset, "_state_contract", None) == STATE54_CONTRACT_ID:
                 causal_derived[32:47] = quantile_valid[32:47]
+            elif getattr(dataset, "_state_contract", None) == STATE56_CONTRACT_ID:
+                causal_derived[34:49] = quantile_valid[34:49]
             state_diagnostic = (
                 clean_state,
                 augmented_state,
@@ -1916,7 +2074,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--state-contract",
-        choices=(STATE54_CONTRACT_ID,),
+        choices=(STATE54_CONTRACT_ID, STATE56_CONTRACT_ID),
         default=None,
         help=(
             "explicit incompatible observation contract; state54 requires the dedicated "
@@ -1944,6 +2102,34 @@ def parse_args() -> argparse.Namespace:
         "--state54-data-contract-sha256",
         default=None,
         help="exact SHA256 of --state54-data-contract",
+    )
+    parser.add_argument(
+        "--state56-sidecar-release",
+        type=Path,
+        default=None,
+        help="authenticated State56 virtual sidecar Lance",
+    )
+    parser.add_argument(
+        "--state56-sidecar-verification",
+        type=Path,
+        default=None,
+        help="State56 sidecar release_verification.json",
+    )
+    parser.add_argument(
+        "--state56-sidecar-verification-sha256",
+        default=None,
+        help="exact SHA256 of the State56 sidecar verification",
+    )
+    parser.add_argument(
+        "--state56-data-contract",
+        type=Path,
+        default=None,
+        help="accepted State56 population/norm/token/data contract",
+    )
+    parser.add_argument(
+        "--state56-data-contract-sha256",
+        default=None,
+        help="exact SHA256 of --state56-data-contract",
     )
     parser.add_argument(
         "--target-noise-std",
@@ -2164,6 +2350,15 @@ def main() -> int:
         raise ValueError(
             f"{STATE54_CONTRACT_ID} requires the dedicated state54 model identity"
         )
+    if profile.state_dim == 56 and args.state_contract != STATE56_CONTRACT_ID:
+        raise ValueError(
+            f"{profile.profile_id} requires --state-contract {STATE56_CONTRACT_ID}"
+        )
+    if args.state_contract == STATE56_CONTRACT_ID:
+        if profile.state_dim != 56 or profile.delta_mask_segments != (3, -3, 22, -4):
+            raise ValueError(f"{STATE56_CONTRACT_ID} requires the native28 State56 model identity")
+        if args.action_source != URDF_TARGET_ABSOLUTE:
+            raise ValueError("State56 requires --action-source urdf_target_absolute")
     if args.state54_replay_feature_release is not None and args.state54_data_contract is None:
         raise ValueError("replay State54 training requires --state54-data-contract")
     row_count = int(lance.dataset(str(args.lance_dataset)).count_rows())
@@ -2194,6 +2389,19 @@ def main() -> int:
         state54_data_contract_sha256=(
             args.state54_data_contract_sha256.lower()
             if args.state54_data_contract_sha256 is not None
+            else None
+        ),
+        state56_sidecar_release=args.state56_sidecar_release,
+        state56_sidecar_verification=args.state56_sidecar_verification,
+        state56_sidecar_verification_sha256=(
+            args.state56_sidecar_verification_sha256.lower()
+            if args.state56_sidecar_verification_sha256 is not None
+            else None
+        ),
+        state56_data_contract=args.state56_data_contract,
+        state56_data_contract_sha256=(
+            args.state56_data_contract_sha256.lower()
+            if args.state56_data_contract_sha256 is not None
             else None
         ),
     )

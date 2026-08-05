@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from typing import Any
 
 import numpy as np
@@ -233,6 +234,37 @@ def set_snapshot(
 
 def fingertip_world(scene: Native28Scene) -> np.ndarray:
     return state56.fingertip_world_from_mujoco(scene.model, scene.data)
+
+
+class Native28FingertipFK:
+    """Thread-local native28 snapshot FK for StateAug qpos/tip coupling."""
+
+    def __init__(self) -> None:
+        self._local = threading.local()
+
+    def __call__(
+        self,
+        *,
+        object_name: str,
+        hand_qpos: np.ndarray,
+        object_position: np.ndarray,
+        object_quaternion_wxyz: np.ndarray,
+    ) -> np.ndarray:
+        scenes = getattr(self._local, "scenes", None)
+        if scenes is None:
+            scenes = {}
+            self._local.scenes = scenes
+        if object_name not in scenes:
+            scenes[object_name] = compile_scene(object_name)
+        scene = scenes[object_name]
+        set_snapshot(
+            scene,
+            hand_qpos=hand_qpos,
+            object_position=object_position,
+            object_quaternion_wxyz=object_quaternion_wxyz,
+            target28=hand_qpos,
+        )
+        return fingertip_world(scene)
 
 
 def compiled_collision_box(scene: Native28Scene) -> state56.ObjectCollisionBox:
