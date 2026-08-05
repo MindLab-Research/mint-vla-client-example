@@ -918,7 +918,7 @@ def load_or_compute_norm_stats(
             if not np.allclose(state_q01[28:33], 0.0) or not np.allclose(state_q99[28:33], 1.0):
                 raise ValueError("state56 contact norm must use fixed 0..1")
             lift_index, force_slice, age_index = 33, slice(49, 54), 55
-            force_max = __import__("scripts.mano_state56_contract", fromlist=["FORCE_LOG1P_MAX"]).FORCE_LOG1P_MAX
+            force_max = float(np.log1p(__import__("scripts.mano_state56_contract", fromlist=["FORCE_REFERENCE_NEWTONS"]).FORCE_REFERENCE_NEWTONS))
         else:
             if not np.allclose(state_q01[26:31], 0.0):
                 raise ValueError(
