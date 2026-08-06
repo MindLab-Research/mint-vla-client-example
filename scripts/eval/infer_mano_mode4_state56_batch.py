@@ -368,7 +368,9 @@ def run(args: argparse.Namespace)->dict:
     progress_path=args.output_dir/"progress.json";headers=base.L._headers(args.api_key);session_id=None;global_batch_count=0;global_observation_count=0;global_padding_count=0;results=[];completed=[];started=time.perf_counter();records={int(x["release_row_index"]):x for x in selection["rows"]}
     _write_progress(progress_path,{"status":"running","row_count":len(args.row_indices_list),"completed_row_count":0,"policy_batch_requests":0,"elapsed_seconds":0.0})
     try:
-        session_id=base.create_session(args,headers)
+        session_args = argparse.Namespace(**vars(args))
+        session_args.model_path = str(args.model_path)
+        session_id=base.create_session(session_args,headers)
         for row_batch_index,row_start in enumerate(range(0,len(args.row_indices_list),args.row_batch_size)):
             row_indices=args.row_indices_list[row_start:row_start+args.row_batch_size];contexts=[]
             with ExitStack() as stack:
