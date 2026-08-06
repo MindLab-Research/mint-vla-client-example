@@ -38,6 +38,7 @@ import mano_action_support as chunk_helper
 import mode4_data_support as full
 import mano_physics_core as physics
 from mano_joint_limits import new_clipping_diagnostics, record_clipping
+from mode4_phase_gate import GraspProbeGateConfig, GraspProbePhaseGate
 from mode4_support import (
     acquire_action_session,
     action_session_payload,
@@ -256,6 +257,27 @@ def parse_args() -> argparse.Namespace:
         choices=("full", "none"),
         default="full",
         help="full writes the three canonical videos; none keeps policy observation rendering but skips output-video rendering/encoding",
+    )
+    parser.add_argument(
+        "--phase-gate",
+        choices=("off", "grasp-probe"),
+        default="off",
+        help="diagnostic event gate; grasp-probe holds achieved closure and tests physical lift/retention",
+    )
+    parser.add_argument("--phase-gate-min-contact-count", type=int, default=4)
+    parser.add_argument("--phase-gate-contact-persistence-frames", type=int, default=20)
+    parser.add_argument("--phase-gate-probe-lift-mm", type=float, default=5.0)
+    parser.add_argument("--phase-gate-probe-frames", type=int, default=20)
+    parser.add_argument("--phase-gate-probe-follow-min-mm", type=float, default=3.0)
+    parser.add_argument("--phase-gate-probe-min-contact-count", type=int, default=3)
+    parser.add_argument("--phase-gate-retention-lift-mm", type=float, default=50.0)
+    parser.add_argument("--phase-gate-retention-frames", type=int, default=100)
+    parser.add_argument("--phase-gate-retention-follow-min-mm", type=float, default=20.0)
+    parser.add_argument("--phase-gate-retention-min-contact-count", type=int, default=3)
+    parser.add_argument(
+        "--phase-gate-allow-floor-contact",
+        action="store_true",
+        help="diagnostic override: do not require object-floor contact to clear during probe/retention",
     )
     parser.add_argument(
         "--client-commit",
@@ -675,6 +697,15 @@ def run_variant(
     physics_contact_flags = []
     step_max_contact_forces = []
     gt_norm_steps = []
+    phase_gate = (
+        GraspProbePhaseGate(args._phase_gate_config)
+        if getattr(args, "_phase_gate_config", None) is not None
+        else None
+    )
+    phase_gate_phases = []
+    phase_gate_overrides = []
+    phase_gate_model_servo_targets = []
+    last_object_floor_contact = True
     hand_states = [np.asarray(data.qpos[hand_addrs], dtype=np.float32).copy()]
     object_positions = [
         np.asarray(data.qpos[object_addr : object_addr + 3], dtype=np.float32).copy()
@@ -849,6 +880,26 @@ def run_variant(
                     w * c["target_hand"][frame - c["start"]]
                     for w, c in zip(weights, active, strict=True)
                 )
+                if phase_gate is not None:
+                    model_servo_target, _ = physics.nearest_wrapped_position_target(
+                        current_q, absolute_target - current_q, limits
+                    )
+                    gate_step = phase_gate.step(
+                        frame_index=frame - window_start,
+                        current_q=current_q,
+                        proposed_servo_target=model_servo_target,
+                        finger_contacts=state[26:31],
+                        object_floor_contact=last_object_floor_contact,
+                        object_position=np.asarray(
+                            data.qpos[object_addr : object_addr + 3], dtype=np.float64
+                        ),
+                    )
+                    phase_gate_model_servo_targets.append(
+                        np.asarray(model_servo_target, dtype=np.float32)
+                    )
+                    phase_gate_phases.append(int(gate_step.phase))
+                    phase_gate_overrides.append(bool(gate_step.override))
+                    absolute_target = gate_step.target
                 target, clip_event = physics.nearest_wrapped_position_target(
                     current_q, absolute_target - current_q, limits
                 )
@@ -882,6 +933,7 @@ def run_variant(
                     ]
                 )
                 step_max_contact_forces.append(diagnostics["max_contact_force"])
+                last_object_floor_contact = bool(diagnostics["object_floor_contact"])
                 raw_norm_steps.append(newest["pred_norm"][local_newest])
                 raw_phys_steps.append(newest["pred_phys"][local_newest])
                 commanded = np.zeros(32, dtype=np.float32)
@@ -964,6 +1016,14 @@ def run_variant(
         "object_position_sim": out / "object_position_sim.npy",
         "object_quaternion_sim": out / "object_quaternion_sim.npy",
     }
+    if phase_gate is not None:
+        arrays.update(
+            {
+                "phase_gate_phase": out / "phase_gate_phase.npy",
+                "phase_gate_override": out / "phase_gate_override.npy",
+                "phase_gate_model_servo_target": out / "phase_gate_model_servo_target.npy",
+            }
+        )
     array_finalize_started = time.perf_counter()
     np.save(arrays["actions_raw_pred_normalized"], raw_norm_all)
     np.save(arrays["actions_raw_pred_physical"], raw_phys_all)
@@ -989,6 +1049,13 @@ def run_variant(
     np.save(arrays["hand_state_sim"], np.asarray(hand_states, dtype=np.float32))
     np.save(arrays["object_position_sim"], np.asarray(object_positions, dtype=np.float32))
     np.save(arrays["object_quaternion_sim"], np.asarray(object_quaternions, dtype=np.float32))
+    if phase_gate is not None:
+        np.save(arrays["phase_gate_phase"], np.asarray(phase_gate_phases, dtype=np.int8))
+        np.save(arrays["phase_gate_override"], np.asarray(phase_gate_overrides, dtype=np.bool_))
+        np.save(
+            arrays["phase_gate_model_servo_target"],
+            np.asarray(phase_gate_model_servo_targets, dtype=np.float32),
+        )
     phase_seconds["array_finalize"] += time.perf_counter() - array_finalize_started
     phase_seconds["rollout_wall"] = time.perf_counter() - rollout_started
     total_request_seconds = float(sum(float(t["wall_seconds"]) for t in query_timings))
@@ -1021,6 +1088,11 @@ def run_variant(
         "rollout_dynamics": "B_query_anchored_absolute_target_to_native_position_servo",
         "temporal_ensemble": True,
         "temporal_decay": args.temporal_decay,
+        "phase_gate": (
+            {"mode": "grasp-probe", **phase_gate.summary()}
+            if phase_gate is not None
+            else {"mode": "off"}
+        ),
         "chunk_horizon": HORIZON,
         "query_stride": args.chunk_stride,
         "row_index": selected_row_index,
@@ -1154,6 +1226,7 @@ def build_row_summary(
         "row_execution": getattr(args, "row_execution", "sequential"),
         "row_batch_size": getattr(args, "row_batch_size", 1),
         "max_warm_request_seconds": args.max_warm_request_seconds,
+        "phase_gate": getattr(args, "phase_gate", "off"),
         "results": results,
     }
 
@@ -1169,6 +1242,26 @@ def main() -> int:
     args.missing_contact_policy = str(getattr(args, "missing_contact_policy", "error"))
     args.row_execution = str(getattr(args, "row_execution", "sequential"))
     args.row_batch_size = int(getattr(args, "row_batch_size", 1))
+    args.phase_gate = str(getattr(args, "phase_gate", "off"))
+    args._phase_gate_config = None
+    if args.phase_gate == "grasp-probe":
+        if not args.extended_state:
+            raise ValueError("--phase-gate grasp-probe requires --extended-state")
+        if args.chunk_stride != 1:
+            raise ValueError("--phase-gate grasp-probe requires --chunk-stride 1")
+        args._phase_gate_config = GraspProbeGateConfig(
+            min_contact_count=args.phase_gate_min_contact_count,
+            contact_persistence_frames=args.phase_gate_contact_persistence_frames,
+            probe_lift_m=args.phase_gate_probe_lift_mm / 1000.0,
+            probe_frames=args.phase_gate_probe_frames,
+            probe_follow_min_m=args.phase_gate_probe_follow_min_mm / 1000.0,
+            probe_min_contact_count=args.phase_gate_probe_min_contact_count,
+            retention_lift_m=args.phase_gate_retention_lift_mm / 1000.0,
+            retention_frames=args.phase_gate_retention_frames,
+            retention_follow_min_m=args.phase_gate_retention_follow_min_mm / 1000.0,
+            retention_min_contact_count=args.phase_gate_retention_min_contact_count,
+            require_floor_clear=not args.phase_gate_allow_floor_contact,
+        )
     args._gesture_index = (
         GestureIndex.load(args.gesture_index)
         if args.language_conditioning == GESTURE_LANGUAGE
