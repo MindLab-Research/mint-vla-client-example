@@ -22,6 +22,10 @@ class OpenPIClientProfile:
     action_dim: int = 32
     action_horizon: int = 10
     max_tokens: int = 200
+    # Camera layout (mirrors mint_server model_registry.py:172) -- used to order
+    # image chunks in the train_step payload. Kept here so the client can build
+    # batches without importing mint_server.
+    camera_layout: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
 
 
 LEGACY_L_LORA_PROFILE = OpenPIClientProfile(
