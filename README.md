@@ -143,54 +143,67 @@ Keep each worktree clean. Allocate independent ports, GPUs, runtime roots, and
 checkpoint roots for concurrent users. A worktree isolates source; it does not
 isolate GPU processes or server state.
 
-### Grade-A profile and training preflight
+### State45 Grade-A profile and training preflight
 
-The internal Grade-A profile is:
+The State45 profile is derived from the immutable State41 release rows while
+adding causal phase observations and full pick/place prompts:
 
 ```text
 /vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/
 mano_28d_native_replay_state41_rgb_v1/profiles/
-grade_a_train95_object_gesture_seed42_contact_pm100_v1/profile_report.json
+grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1/
+profile_report.json
 ```
 
-It contains 4,856 Grade-A rows split deterministically by `object × gesture`
-with seed 42 into 4,613 train rows and 243 validation rows. Print and validate
-the immutable 100K training configuration without contacting the server:
+The complete Grade-A population remains 4,856 rows: 4,613 train and 243
+validation, split deterministically by `object × gesture` with seed 42. The
+current cube1 experiment filters that immutable split to 538 train rows and 27
+held-out validation rows across gestures 01/02/03/04/09/10. Its train-only
+State45 norm SHA256 is
+`558635caebc7f01172e9c2b43e0ea1c4436fb1d90ece63804bf130e44eff2554`.
+Print and validate the training configuration without contacting the server:
 
 ```bash
 cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state41-28dof
 PROFILE=/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/\
 mano_28d_native_replay_state41_rgb_v1/profiles/\
-grade_a_train95_object_gesture_seed42_contact_pm100_v1/profile_report.json
+grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1/\
+profile_report.json
+RUN_ID=state45_cube1_allgestures_gradea_fromscratch_qposaug01_bs64_4gpu_20k_v1
 
-STATE41_GRADEA_PRINT_CONFIG=1 \
-  ./scripts/remote/run_state41_gradea_100k.sh "$PROFILE"
+STATE45_STEPS=20000 \
+STATE45_CHECKPOINT_EVERY=2000 \
+STATE45_OBJECT=cube1 \
+STATE45_GESTURE= \
+STATE45_BATCH_SIZE=64 \
+STATE45_STATE_NOISE_STD=0.1 \
+STATE45_PREFETCH_BATCHES=2 \
+STATE45_EXPECTED_DEVICE_COUNT=4 \
+STATE45_PRINT_CONFIG=1 \
+  ./scripts/remote/run_state45_gradea_train.sh "$PROFILE" "$RUN_ID"
 ```
 
-The production launcher fixes global batch 64 on four GPUs, per-device batch
-16, learning rate `5e-5`, qpos-only normalized StateAug sigma 0.1, checkpoint
-interval 5,000, and no interleaved Mode4. Remove the print-only environment
-variable only after assigning a dedicated MINT server and confirming GPU
-ownership.
+Remove `STATE45_PRINT_CONFIG=1` only after assigning a dedicated MINT server and
+confirming GPU ownership. Checkpoints are sampler weights and do not contain
+optimizer state.
 
-### Acceptance evidence
+### State45 acceptance evidence
 
-The release candidate reuses completed evidence; it does not require another
-GPU smoke run:
+- The cube1 all-gesture run published a complete step16,000 sampler with loss
+  `0.043073044158518314`. Training was stopped at recorded step16,730; the 730
+  post-checkpoint updates were explicitly discarded because exact optimizer
+  continuation is unavailable.
+- The held-out cube1 validation evaluation completed all 27 rows without added
+  perturbations: 21 reached stable lift, PLACE, and DONE; 6 remained in ACQUIRE
+  and timed out. All 81 Head/Wrist/dataset-reference videos and State45/Action32
+  arrays passed validation. Report SHA256:
+  `10a4ab584b05b83c29afcd7146f41394d94e20693a834d5cedd2e66c0d8e4bc5`.
+- Successful rollouts required 328–524 controls. All failures remained phase 0,
+  localizing the observed bottleneck to grasp acquisition/lift rather than
+  post-lift phase or release logic.
 
-- Cube1/gesture03 end-to-end smoke: step4000 sampler restored; all 15 selected
-  trajectories passed strict lift-then-release; 45 videos passed validation.
-  Report SHA256: `54129d690ec5dd6191023d29f4fa7da20e3a4eff3a32ec2e5b3450d15a49c7db`.
-- Grade-A step20000 fixed matched evaluation: validation `107/243` (44.03%),
-  matched train `113/243` (46.50%), with all 486 rows finite and contract-valid.
-  Report SHA256: `07c82a816b1660672f5a8c6adf1367c0c6cd11034b90a177a63c6d84e3f8b1dc`.
-- The batch64 Grade-A 100K run has trained stably beyond step34,000. Its 5K
-  interval artifacts are sampler checkpoints and do not contain optimizer
-  state.
-
-The 243-row validation split has already been used for checkpoint evaluation;
-it is not an untouched final test set. Exact artifact paths and hashes are in
-the release manifest.
+The 27-row cube1 split is validation evidence, not an untouched final test set.
+Artifacts remain on vePFS and are not distributed through Git.
 
 ## Current MANO 32D v1 contract
 
@@ -276,20 +289,22 @@ Artifacts are under
 `validation_manifest.json` binds the population, norm, report, and three feature
 branch commits. This norm is valid only for that exact row/window population.
 
-## Current deployment map
+## Current State45 deployment map
 
 | Component | Path / branch |
 | --- | --- |
-| Formal client checkout | `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`, `main` |
-| MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16`, `action-lora-r16` |
-| OpenPI model worktree | `/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16`, `action-lora-r16` |
+| State45 Client | `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state41-28dof`, `feature/mano-state45-phase-v1` |
+| State45 MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof`, `feature/pi05-state45-phase-v1` |
+| State45 OpenPI model | `/vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof`, `feature/pi05-state45-phase-v1` |
 | Runtime | `/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl` |
-| MANO release resolver | `config/datasets/mano_dataset_release.json` |
-| Lance dataset (`training_dataset` role) | `/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance` |
-| Gesture03 v1 norm | `/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726` |
+| Source Lance release | `/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/mano_28d_native_replay_state41_rgb_v1/mano_28d_native_replay_state41_rgb_v1.lance` |
+| State45 profile | `grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1` |
+| State45 train-only norm SHA256 | `558635caebc7f01172e9c2b43e0ea1c4436fb1d90ece63804bf130e44eff2554` |
 
-Ports and GPUs are allocated per run. A different port does not imply a
-separate GPU allocation; verify both before starting a server.
+The worktree directory suffixes retain their historical State41 names; the
+branches above define the active State45 implementation. Ports and GPUs are
+allocated per run. A different port does not imply a separate GPU allocation;
+verify both before starting a server.
 
 ## What the current stack implements
 
