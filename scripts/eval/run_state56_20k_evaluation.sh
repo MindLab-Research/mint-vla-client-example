@@ -30,7 +30,7 @@ case "$TASK" in
  *) echo "unsupported task: $TASK" >&2; exit 2;;
 esac
 case "$MODE" in
- smoke) MAX_FRAMES=3;OUT=$EVAL_ROOT/integration_${TASK}_3frames_v2;;
+ smoke) MAX_FRAMES=3;OUT=$EVAL_ROOT/integration_${TASK}_3frames_v3;;
  formal) MAX_FRAMES=0;OUT=$EVAL_ROOT/$OUT_NAME;;
  *) echo "unsupported mode: $MODE" >&2;exit 2;;
 esac

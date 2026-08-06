@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-commit", required=True)
     args = parser.parse_args()
     args.base_url = args.base_url.rstrip("/")
+    args.act_mode = "batch"
     args.row_indices_list = base.parse_ordered_unique_csv(args.row_indices, option="--row-indices")
     if not args.row_indices_list:
         raise ValueError("at least one row is required")
