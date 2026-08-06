@@ -185,6 +185,18 @@ NORM_ROWS=$(seq -s, 810 994)
   --backend-commit <mint-commit> --model-commit <openpi-commit>
 ```
 
+For state44, the same launcher command must additionally select the coupled
+profile and authenticated state44 norm:
+
+```bash
+--model openpi/pi05-action-lora-r16-state44-finetune \
+--state-contract state44 \
+--norm-sha-expected <state44-norm-sha256>
+```
+
+The evaluator records the full 44D observation plus separate distance, radial
+rate, floor-support, and persistence arrays. Its action arrays remain width 32.
+
 For a dedicated server, replace `--base-url` and the two declared commits with:
 
 ```bash
@@ -406,6 +418,40 @@ receives are actually augmented. The v1 extended-state path refuses computed or
 wrong-hash norm fallback. Every new row/window population needs a freshly
 computed norm plus an explicit `--norm-sha-expected`; the gesture03 norm must
 not be reused for a broader object/action population.
+
+The state44 profile is a separate model/schema/norm identity:
+
+```text
+model        openpi/pi05-action-lora-r16-state44-finetune
+profile      pi05_action_lora_r16_state44_v1
+state        [44] mano_five_finger_contact_geom_rate_v2
+actions      [10,32] unchanged query-anchored B schema
+prefix limit 200 tokens, fail before truncation
+```
+
+Run `scripts/train/prepare_mano_state44_profile.py` on the exact training
+row/window population first. It replays qpos and object poses through the same
+MuJoCo collision geometry used by Mode4, computes state44/action32 quantile
+norms, and audits every raw prompt/state prefix. It writes `norm_stats.json`
+only when no sample exceeds 200 tokens. Use the resulting SHA with
+`--model openpi/pi05-action-lora-r16-state44-finetune --state-contract state44`.
+A state32 norm or independently selected state44 model/contract is rejected.
+
+The certified rows507–2503 contact-ctx100 audit covers 1,997 rows and
+1,160,274 samples. It found zero token overflows (maximum 182/200) and produced
+state44/action32 norm SHA
+`cd916feee01138f957ca400fad25d02ebb18029e8fc4844c8019f3814caf622a`.
+Its report and validation manifest are in
+`/vePFS-Mindverse/user/intern/wenxi/results/training/state44_profile_population_507_2503_20260730/`.
+Do not reuse this norm for a different population.
+
+State44 uses a fixed 5 ms causal clock. Radial rate compares the current
+fingertip-to-palm radius with the radius five samples earlier; persistence is
+the elapsed duration of the current at-least-two-finger contact run and resets
+below two contacts. There is no opposition/load-geometry channel. With
+StateAug, qpos noise triggers a same-frame surface-distance recomputation;
+radial-rate history remains clean because independently perturbing one frame
+cannot produce a valid 25 ms trajectory.
 
 The augmentation changes only normalized state and its derived encoded prompt;
 images, action labels, task text, and normalization statistics remain clean.

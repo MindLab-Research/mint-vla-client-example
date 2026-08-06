@@ -21,6 +21,23 @@ def safe_object_name(row: dict) -> str:
     return names[0]
 
 
+def resolve_right_hand(row: dict) -> dict:
+    """Resolve the right hand through trajectory metadata, never list position."""
+    hands = row.get("hands") or []
+    metadata = row.get("trajectory_metadata") or {}
+    slots = metadata.get("hand_slots")
+    names = metadata.get("hand_names")
+    if not isinstance(slots, list) or len(slots) != len(hands) or slots.count("right") != 1:
+        raise ValueError("trajectory_metadata.hand_slots cannot resolve one right hand")
+    if not isinstance(names, list) or "right" not in names:
+        raise ValueError("trajectory_metadata.hand_names does not contain right")
+    hand_index = slots.index("right")
+    hand = hands[hand_index]
+    if not isinstance(hand, dict) or hand.get("hand_name") != "right":
+        raise ValueError("resolved hand slot does not report hand_name='right'")
+    return hand
+
+
 def row_frame_count(row: dict) -> int:
     lengths: list[int] = []
     for key in ("state", "actions", "image", "wrist_image", "timestamp"):
@@ -62,7 +79,13 @@ def resolve_row_window(
 
 
 def build_model_config(base_model: str):
-    return L._build_model_config(HORIZON, action_dim=ACTION_DIM, base_model=base_model)
+    profile = L.resolve_profile(base_model)
+    return L._build_model_config(
+        HORIZON,
+        state_dim=profile.state_dim,
+        action_dim=ACTION_DIM,
+        base_model=base_model,
+    )
 
 
 def set_scene_state(
@@ -77,8 +100,11 @@ def set_scene_state(
 ) -> None:
     """Initialize frame 0 exactly once, then forward the fresh MuJoCo state."""
     hand = np.asarray(state, dtype=np.float64)
-    if hand.shape != (26,):
-        raise ValueError(f"expected initial hand shape (26,), got {hand.shape}")
+    expected_hand_dim = len(hand_addrs)
+    if hand.shape != (expected_hand_dim,):
+        raise ValueError(
+            f"expected initial hand shape ({expected_hand_dim},), got {hand.shape}"
+        )
     data.qpos[:] = 0
     data.qpos[object_addr : object_addr + 3] = np.asarray(object_pos, dtype=np.float64)
     data.qpos[object_addr + 3 : object_addr + 7] = action_support.axis_angle_to_wxyz(object_rot_aa)

@@ -14,12 +14,15 @@ fi
 
 : "${MINT_BASE_URL:=http://127.0.0.1:30532}"
 : "${MINT_API_KEY:=tml-dummy}"
-: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16}"
-: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16}"
+: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-state45-28dof}"
+: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-state45-28dof}"
 : "${MINT_GRB_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl}"
 : "${MINT_CPU_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu}"
 : "${MINT_EXTRA_PYDEPS:=/vePFS-Mindverse/user/intern/wenxi/mint_env/extra-pydeps}"
 : "${MINT_PI_FINETUNE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/pi-finetune}"
+: "${MANORL_REPO_ROOT:=/vePFS-Mindverse/user/intern/wenxi/manorl-native-28d}"
+: "${MANORL_EXPECTED_COMMIT:=e17f0122decddffc348ec10d0ed42552a0540e1b}"
+: "${MANORL_ALL_ASSETS_COMMIT:=e7910212e54367008ecb7484e5e9354e822de03e}"
 : "${OPENPI_DATA_HOME:=/vePFS-Mindverse/share/models/openpi}"
 : "${HF_HOME:=/vePFS-Mindverse/share/huggingface}"
 : "${MANO_DATASET_RELEASE:=${REPO_ROOT}/config/datasets/mano_dataset_release.json}"
@@ -68,6 +71,8 @@ if [[ ! -x "${PYTHON_BIN}" ]]; then
 fi
 
 ACTION_LORA_R16_MODEL=openpi/pi05-action-lora-r16-finetune
+ACTION_LORA_R16_STATE44_MODEL=openpi/pi05-action-lora-r16-state44-finetune
+ACTION_LORA_R16_STATE45_MODEL=openpi/pi05-action-lora-r16-state45-phase-28dof-finetune
 SELECTED_MODEL=""
 CLIENT_ARGS=("$@")
 for ((i = 0; i < ${#CLIENT_ARGS[@]}; i++)); do
@@ -80,12 +85,19 @@ for ((i = 0; i < ${#CLIENT_ARGS[@]}; i++)); do
     --model=*) SELECTED_MODEL=${CLIENT_ARGS[i]#--model=} ;;
   esac
 done
-if [[ "${SELECTED_MODEL}" == "${ACTION_LORA_R16_MODEL}" && -z "${MINT_OPENPI_ROOT}" ]]; then
-  echo "${ACTION_LORA_R16_MODEL} requires MINT_OPENPI_ROOT to select the isolated rank-16 OpenPI worktree" >&2
+if [[ "${SELECTED_MODEL}" == "openpi/pi05-action-lora-r16-state41-28dof-finetune" ]]; then
+  echo "State41 MANO is frozen; use ${ACTION_LORA_R16_STATE45_MODEL}" >&2
+  exit 64
+fi
+if [[ ( "${SELECTED_MODEL}" == "${ACTION_LORA_R16_MODEL}" || \
+        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE44_MODEL}" || \
+        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE45_MODEL}" ) && \
+      -z "${MINT_OPENPI_ROOT}" ]]; then
+  echo "${SELECTED_MODEL} requires MINT_OPENPI_ROOT to select the isolated rank-16 OpenPI worktree" >&2
   exit 2
 fi
 
-for required_path in "${MINT_CODE_ROOT}" "${MINT_EXTRA_PYDEPS}" ${MINT_OPENPI_ROOT:+"${MINT_OPENPI_ROOT}"}; do
+for required_path in "${MINT_CODE_ROOT}" "${MINT_EXTRA_PYDEPS}" "${MANORL_REPO_ROOT}" ${MINT_OPENPI_ROOT:+"${MINT_OPENPI_ROOT}"}; do
   if [[ ! -e "${required_path}" ]]; then
     echo "required remote path is missing: ${required_path}" >&2
     exit 2
@@ -97,11 +109,12 @@ if [[ -n "${MINT_OPENPI_ROOT}" && ! -f "${MINT_OPENPI_ROOT}/src/openpi/models/ge
 fi
 
 export MINT_BASE_URL MINT_API_KEY MINT_OPENPI_ROOT OPENPI_DATA_HOME HF_HOME
+export MANORL_REPO_ROOT MANORL_EXPECTED_COMMIT MANORL_ALL_ASSETS_COMMIT
 export MANO_DATASET_RELEASE MANO_RELEASE_ID MANO_RELEASE_SHA256
 export MINT_LANCE_DATASET MINT_CONTACT_WINDOW_MANIFEST
 export VLA_CLIENT_RESULTS_ROOT VLA_CLIENT_INFERENCE_ROOT
 export JAX_PLATFORMS=cpu
-export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/scripts/train:${REPO_ROOT}/scripts/eval:${MINT_PI_FINETUNE_ROOT}/case/01_export_video:${MINT_OPENPI_ROOT:+${MINT_OPENPI_ROOT}/src:${MINT_OPENPI_ROOT}/packages/openpi-client/src:}${MINT_CODE_ROOT}:${MINT_EXTRA_PYDEPS}:${MINT_GRB_ROOT}/site-packages:${MINT_CPU_ROOT}/site-packages:${MINT_GRB_ROOT}/src/openpi/src:${MINT_GRB_ROOT}/src/openpi/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/scripts/train:${REPO_ROOT}/scripts/eval:${MANORL_REPO_ROOT}:${MINT_PI_FINETUNE_ROOT}/case/01_export_video:${MINT_OPENPI_ROOT:+${MINT_OPENPI_ROOT}/src:${MINT_OPENPI_ROOT}/packages/openpi-client/src:}${MINT_CODE_ROOT}:${MINT_EXTRA_PYDEPS}:${MINT_GRB_ROOT}/site-packages:${MINT_CPU_ROOT}/site-packages:${MINT_GRB_ROOT}/src/openpi/src:${MINT_GRB_ROOT}/src/openpi/packages/openpi-client/src${PYTHONPATH:+:${PYTHONPATH}}"
 
 if git -C "${REPO_ROOT}" rev-parse HEAD >/dev/null 2>&1; then
   VLA_CLIENT_GIT_COMMIT=$(git -C "${REPO_ROOT}" rev-parse HEAD)

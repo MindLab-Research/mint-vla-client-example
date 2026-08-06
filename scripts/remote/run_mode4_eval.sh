@@ -33,6 +33,7 @@ MANO_RELEASE_SHA256=$(sha256sum "${MANO_DATASET_RELEASE}" | awk '{print $1}')
 
 MODEL=openpi/pi05-action-lora-r16-finetune
 MODEL_PATH=
+STATE_CONTRACT=state32
 DATASET=${MINT_LANCE_DATASET}
 ROWS=
 NORMALIZATION_ROWS=
@@ -119,6 +120,7 @@ Endpoint selection (choose exactly one):
 
 Evaluation options:
   --model NAME                model identity (default: action-LoRA rank 16)
+  --state-contract state32|state41|state44 (default: state32)
   --chunk-stride N            query stride, 1..9 (default: 5)
   --temporal-decay FLOAT      ensemble decay in (0, 1] (default: 0.4)
   --act-mode batch|single     action endpoint mode (default: batch)
@@ -150,6 +152,7 @@ Evaluation options:
   --missing-contact-policy full|skip|error (default: error)
   --language-conditioning gesture|motion_variant|object_only
   --gesture-index PATH        canonical gesture index; required for gesture
+                              except State41, which uses formal-release metadata
   --api-key KEY               MINT API key (default: MINT_API_KEY)
 
 Dedicated-server options:
@@ -182,6 +185,7 @@ while (($#)); do
   case "$1" in
     --model) MODEL=${2:?}; shift 2 ;;
     --model-path) MODEL_PATH=${2:?}; shift 2 ;;
+    --state-contract) STATE_CONTRACT=${2:?}; shift 2 ;;
     --dataset|--lance-dataset) DATASET=${2:?}; shift 2 ;;
     --rows|--row-indices) ROWS=${2:?}; shift 2 ;;
     --normalization-rows|--normalization-row-indices) NORMALIZATION_ROWS=${2:?}; shift 2 ;;
@@ -410,7 +414,7 @@ case "$LANGUAGE_CONDITIONING" in
   gesture|motion_variant|object_only) ;;
   *) fail "invalid --language-conditioning: $LANGUAGE_CONDITIONING" ;;
 esac
-if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
+if [[ "$LANGUAGE_CONDITIONING" == gesture && "$STATE_CONTRACT" != state41 ]]; then
   [[ -f "$GESTURE_INDEX" ]] || fail "gesture index does not exist: $GESTURE_INDEX"
 fi
 [[ "$SERVER_PORT" =~ ^[0-9]+$ ]] && ((10#$SERVER_PORT > 0 && 10#$SERVER_PORT < 65536)) || \
@@ -423,6 +427,18 @@ fi
 [[ "$ACT_MODE" == batch || "$ACT_MODE" == single ]] || fail "--act-mode must be batch or single"
 [[ "$ROW_EXECUTION" == lockstep || "$ROW_EXECUTION" == sequential ]] || \
   fail "--row-execution must be lockstep or sequential"
+[[ "$STATE_CONTRACT" == state32 || "$STATE_CONTRACT" == state41 || "$STATE_CONTRACT" == state44 ]] || \
+  fail "--state-contract must be state32, state41, or state44"
+if [[ "$STATE_CONTRACT" == state41 ]]; then
+  [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune ]] || \
+    fail "state41 requires model openpi/pi05-action-lora-r16-state41-28dof-finetune"
+elif [[ "$STATE_CONTRACT" == state44 ]]; then
+  [[ "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]] || \
+    fail "state44 requires model openpi/pi05-action-lora-r16-state44-finetune"
+elif [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune || \
+        "$MODEL" == openpi/pi05-action-lora-r16-state44-finetune ]]; then
+  fail "selected model identity requires its matching --state-contract"
+fi
 [[ "$VIDEO_MODE" == full || "$VIDEO_MODE" == none ]] || fail "--video-mode must be full or none"
 [[ "$PHASE_GATE" == off || "$PHASE_GATE" == grasp-probe ]] || \
   fail "--phase-gate must be off or grasp-probe"
@@ -443,8 +459,8 @@ require_positive_float --phase-gate-retention-follow-min-mm "$PHASE_GATE_RETENTI
   fail "--phase-gate grasp-probe requires --chunk-stride 1"
 require_positive_int --act-batch-size "$ACT_BATCH_SIZE"
 require_positive_int --row-batch-size "$ROW_BATCH_SIZE"
-((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
-  fail "--row-batch-size must be <= --act-batch-size"
+[[ "$STATE_CONTRACT" == state41 ]] || ((10#$ROW_BATCH_SIZE <= 10#$ACT_BATCH_SIZE)) || \
+  fail "--row-batch-size must be <= --act-batch-size outside state41"
 [[ "$ROW_EXECUTION" != lockstep || "$ACT_MODE" == batch ]] || \
   fail "--row-execution lockstep requires --act-mode batch"
 require_nonnegative_int --max-frames "$MAX_FRAMES"
@@ -559,7 +575,7 @@ from datetime import datetime, timezone
     client_commit, client_dirty, backend_commit, model_commit, mint_dirty,
     openpi_dirty, norm_sha, norm_sha_expected, release_id, release_manifest, release_sha,
     verification, endpoint_mode, endpoint_label,
-    base_url, model, model_path, dataset, rows, norm_rows, norm_dir, output_dir,
+    base_url, model, model_path, state_contract, dataset, rows, norm_rows, norm_dir, output_dir,
     owner, stride, decay, act_mode, batch_size, row_execution, row_batch_size,
     max_warm, max_frames, fps, width, height, video_mode, phase_gate_json, frame_window,
     contact_manifest, contact_context,
@@ -581,6 +597,9 @@ payload={
     'evaluation': {
         'model': model,
         'model_path': model_path,
+        'state_contract': state_contract,
+        'state_dim': 41 if state_contract == 'state41' else (44 if state_contract == 'state44' else 32),
+        'action_dim': 32,
         'lance_dataset': dataset,
         'row_indices': row_ids,
         'normalization_row_indices': normalization,
@@ -608,7 +627,16 @@ payload={
         'dataset_reference_video_window': 'full',
         'physics_comparison_video_window': frame_window,
         'language_conditioning': language,
-        'gesture_index': gesture_index if language == 'gesture' else None,
+        'language_source': (
+            'formal_release_metadata'
+            if language == 'gesture' and state_contract == 'state41'
+            else ('canonical_gesture_index' if language == 'gesture' else None)
+        ),
+        'gesture_index': (
+            gesture_index
+            if language == 'gesture' and state_contract != 'state41'
+            else None
+        ),
         'extended_state': True,
     },
     'dedicated_server': {
@@ -679,7 +707,7 @@ CONFIG_ARGS=(
   "$CLIENT_COMMIT" "$CLIENT_DIRTY" "$BACKEND_COMMIT" "$OPENPI_COMMIT" "$MINT_DIRTY"
   "$OPENPI_DIRTY" "$NORM_SHA256" "$NORM_SHA_EXPECTED" "$MANO_RELEASE_ID" "$MANO_DATASET_RELEASE"
   "$MANO_RELEASE_SHA256" "$PROVENANCE_VERIFICATION" "$ENDPOINT_MODE"
-  "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$DATASET" "$ROWS"
+  "$ENDPOINT_LABEL" "$BASE_URL" "$MODEL" "$MODEL_PATH" "$STATE_CONTRACT" "$DATASET" "$ROWS"
   "$NORMALIZATION_ROWS" "$NORM_STATS_DIR" "$OUTPUT_DIR" "$OWNER_ID" "$CHUNK_STRIDE"
   "$TEMPORAL_DECAY" "$ACT_MODE" "$ACT_BATCH_SIZE" "$ROW_EXECUTION" "$ROW_BATCH_SIZE"
   "$MAX_WARM_REQUEST_SECONDS" "$MAX_FRAMES" "$FPS" "$WIDTH" "$HEIGHT" "$VIDEO_MODE"
@@ -774,7 +802,8 @@ trap 'exit 143' TERM
 if ((OWN_SERVER)); then
   SERVER_CMD=("$SCRIPT_DIR/run_action_lora_server.sh"
     --runtime-root "$SERVER_RUNTIME_ROOT" --port "$SERVER_PORT" --gpus "$SERVER_GPUS"
-    --mint-root "$MINT_CODE_ROOT" --openpi-root "$MINT_OPENPI_ROOT" --python-bin "$MINT_PYTHON_BIN")
+    --mint-root "$MINT_CODE_ROOT" --openpi-root "$MINT_OPENPI_ROOT" --python-bin "$MINT_PYTHON_BIN"
+    --norm-stats "$NORM_STATS_DIR/norm_stats.json")
   if ((ENABLE_JAX_PERSISTENT_CACHE)); then
     SERVER_CMD+=(--enable-jax-persistent-cache)
     [[ -z "$SERVER_CACHE_DIR" ]] || SERVER_CMD+=(--cache-dir "$SERVER_CACHE_DIR")
@@ -808,7 +837,7 @@ EVAL_ARGS=(
   --base-url "$BASE_URL" --api-key "$MINT_API_KEY" --model "$MODEL"
   --model-path "$MODEL_PATH" --owner-id "$OWNER_ID" --lance-dataset "$DATASET"
   --row-indices "$ROWS" --language-conditioning "$LANGUAGE_CONDITIONING"
-  --normalization-row-indices "$NORMALIZATION_ROWS" --extended-state
+  --normalization-row-indices "$NORMALIZATION_ROWS" --state-contract "$STATE_CONTRACT"
   --norm-stats-dir "$NORM_STATS_DIR" --output-dir "$OUTPUT_DIR/artifacts"
   --chunk-stride "$CHUNK_STRIDE" --temporal-decay "$TEMPORAL_DECAY"
   --act-mode "$ACT_MODE" --act-batch-size "$ACT_BATCH_SIZE"
@@ -831,7 +860,7 @@ fi
 if [[ "$FRAME_WINDOW" == contact ]]; then
   EVAL_ARGS+=(--contact-window-manifest "$CONTACT_WINDOW_MANIFEST")
 fi
-if [[ "$LANGUAGE_CONDITIONING" == gesture ]]; then
+if [[ "$LANGUAGE_CONDITIONING" == gesture && "$STATE_CONTRACT" != state41 ]]; then
   EVAL_ARGS+=(--gesture-index "$GESTURE_INDEX")
 fi
 if [[ "$PHASE_GATE" == grasp-probe ]]; then
@@ -851,11 +880,15 @@ if [[ "$PHASE_GATE" == grasp-probe ]]; then
   ((PHASE_GATE_ALLOW_FLOOR_CONTACT == 0)) || EVAL_ARGS+=(--phase-gate-allow-floor-contact)
 fi
 
+EVAL_SCRIPT=scripts/eval/infer_mano_mode4.py
+if [[ "$STATE_CONTRACT" == state41 ]]; then
+  EVAL_SCRIPT=scripts/eval/infer_mano_mode4_state41_batch.py
+fi
 VLA_CLIENT_CONFIG=/dev/null MINT_CODE_ROOT="$MINT_CODE_ROOT" \
 MINT_OPENPI_ROOT="$MINT_OPENPI_ROOT" MINT_PYTHON_BIN="$MINT_PYTHON_BIN" \
 MINT_BASE_URL="$BASE_URL" \
 MINT_API_KEY="$MINT_API_KEY" \
-  "$SCRIPT_DIR/run_client.sh" scripts/eval/infer_mano_mode4.py "${EVAL_ARGS[@]}" \
+  "$SCRIPT_DIR/run_client.sh" "$EVAL_SCRIPT" "${EVAL_ARGS[@]}" \
   > "$OUTPUT_DIR/eval.log" 2>&1
 
 SUMMARY_PATH="$OUTPUT_DIR/artifacts/summary.json"

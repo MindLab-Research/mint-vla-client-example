@@ -506,6 +506,11 @@ def _client_commit() -> str | None:
 
 def main() -> int:
     args = parse_args(); args.base_url = args.base_url.rstrip("/")
+    profile = L.resolve_profile(getattr(args, "model", L.PI05_ACTION_LORA_R16_MODEL))
+    if profile.state_dim != ACTION_DIM:
+        raise ValueError(
+            "historical Mode3 implements only state32; use Mode4 for the state44 profile"
+        )
     args.client_commit = args.client_commit or _client_commit()
     if args.act_batch_size != 4:
         raise ValueError("Mode3 requires --act-batch-size 4")
@@ -540,7 +545,13 @@ def main() -> int:
     q01, q99 = np.asarray(norm_stats["state"].q01), np.asarray(norm_stats["state"].q99)
     if not np.allclose(q01[26:31], 0) or not np.allclose(q99[26:31], 1) or q99[31] - q01[31] < 1e-4:
         raise ValueError("locked v1 norm stats fail required contact/lift structure")
-    data_config = L._make_data_config(L._build_model_config(HORIZON, action_dim=ACTION_DIM, base_model=args.model), norm_stats, action_source=URDF_TARGET_ABSOLUTE)
+    data_config = L._make_data_config(
+        L._build_model_config(
+            HORIZON, state_dim=ACTION_DIM, action_dim=ACTION_DIM, base_model=args.model
+        ),
+        norm_stats,
+        action_source=URDF_TARGET_ABSOLUTE,
+    )
     args.output_dir.mkdir(parents=True, exist_ok=True); headers = L._headers(args.api_key)
     columns = ["state", "actions", "prompt", "objects", "trajectory_metadata", "episode_metadata", "image", "wrist_image", "index", "hands"]
     def load_row(index: int) -> dict:

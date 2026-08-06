@@ -5,6 +5,13 @@ through a MINT server. It owns client-side data projection, normalization,
 training requests, MuJoCo Mode4 rollout, and result metadata. MINT and OpenPI
 remain independent server/model repositories.
 
+**Maintained State41-derived full-task contract:** State45-Phase/Action32/28DoF
+is the only active training and evaluation surface. State41 is frozen
+historical provenance: its release manifest, source Lance name,
+first-41-coordinate ABI, and completed
+artifacts remain readable but receive no new launcher, registry, or experiment
+support.
+
 ## Architecture and ownership
 
 ```text
@@ -30,7 +37,8 @@ physics state are computed here, before the request reaches MINT.
 
 ### Source-of-truth rule
 
-- `config/datasets/mano_dataset_release.json` is the sole machine-readable source of truth for MANO data, language/contact sidecars, producer commits, assets, runtime contracts, norms, and physics evidence. Launchers resolve canonical roles through `scripts/mano_dataset_release.py`; docs and local env files cannot redefine the release.
+- `config/datasets/mano_dataset_release.json` remains the machine-readable authority for the historical MANO State32/State44 release family. Launchers for that family resolve canonical roles through `scripts/mano_dataset_release.py`; docs and local env files cannot redefine it.
+- `config/releases/state41_28dof_v1.json` binds the internal State41/Action32 release candidate to its dataset/profile hashes, three repository commits, native-physics assets, and acceptance evidence. It does not silently replace the historical release.
 - This Git repository is the source of truth for client code.
 - The checkout at `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`
   is both a real Git checkout and the supported execution directory.
@@ -42,6 +50,166 @@ physics state are computed here, before the request reaches MINT.
   receive new work.
 - Never modify the shared legacy copy
   `/vePFS-Mindverse/user/intern/wenxi/vla_mint`.
+
+## Frozen State41/Action32 28DoF release provenance
+
+`config/releases/state41_28dof_v1.json` is the integration contract for the
+internal vePFS release candidate. Its validated source tuple is:
+
+| Component | Branch | Validated commit |
+| --- | --- | --- |
+| Client | `feature/mano-state41-28dof-v1` | `f0a4b69d784586d6695c1a8f1a53b835f067f6d1` |
+| MINT | `feature/pi05-state41-28dof-v1` | `9e1d5491fade1ace61ca464754d5928c511c20cf` |
+| OpenPI | `feature/pi05-state41-28dof-v1` | `33ccdae4dc08fa2ac1c4b0d7788634b1fb6d755f` |
+| ManoRL native | — | `e17f0122decddffc348ec10d0ed42552a0540e1b` |
+| `assets/all_assets` | — | `e7910212e54367008ecb7484e5e9354e822de03e` |
+
+This is an internal release candidate: the Lance data, profile, checkpoints,
+and acceptance reports live on vePFS and are not distributed by Git. The
+OpenPI feature branch also needs an approved internal fork before users can
+fetch the complete tuple remotely. Do not substitute an OpenPI upstream branch
+or a historical State32 norm.
+
+The runtime contract is:
+
+```text
+observation: State41
+  qpos28 + contact5 + lift1 + signed surface distance5
+  + object-floor support1 + causal >=2-finger contact duration1
+policy action: [10,32]
+physical hand target: 28D
+B-mask segments: (3, -3, 22, -4)
+action horizon: 10
+prompt: pick up the {object} using gesture {gesture}
+language source: formal release index.object / index.gesture
+window: contact ±100 frames; missing contact is an error
+norm: train-only contact-window population
+norm SHA256: c276e12682dca4cd6559bd1d8c201f4cc7e488da6ebdcc2a67c8f137458f28ec
+```
+
+`frame_count` counts physics states. Control, action, and rollout-observation
+arrays therefore contain `frame_count - 1` intervals. Strict rollout success is
+maximum object lift above 5 cm followed by object-floor contact after the lift
+peak.
+
+## State45-Phase/Action32 implementation branch
+
+State45 is an additive, isolated candidate. It does not alter the historical
+State41 contract or its 200-token profile. The three implementation branches
+are `feature/mano-state45-phase-v1`, `feature/pi05-state45-phase-v1`, and
+`feature/pi05-state45-phase-v1` (Client, MINT, and OpenPI respectively).
+
+```text
+observation: State45
+  State41[0:41]
+  + peak_lift_so_far[41]
+  + stable_lift_achieved[42]
+  + filtered object vertical velocity[43]
+  + task_phase[44]  # 0=ACQUIRE, 1=PLACE, 2=DONE
+policy action: [10,32]
+physical hand target: 28D
+B-mask segments: (3, -3, 22, -4)
+prompt: pick up the {object} using gesture {gesture}, then place it back on the table
+phase source: shared causal ManoTaskPhaseTracker, never a model-predicted label
+StateAug: qpos[0:28] only; phase/history dimensions are unchanged
+persistent rollout: DONE termination, 15-second timeout, query stride 1
+```
+
+State45 uses `max_token_len=224` and fail-closed tokenization. The full Grade-A
+train audit covers 2,560,614 frames with maximum raw length 198; validation
+covers 134,518 frames with maximum 197. A legal repeated-bin audit reaches 209
+tokens, so a 200-token profile would accept the observed dataset while failing
+on reachable normalized online states. The State45 profile must retain 224
+until a narrower state representation is deliberately designed and re-audited.
+
+No State45 training, checkpoint evaluation, or GPU server launch is implicit.
+The training launcher requires an explicit `STATE45_STEPS`; the persistent
+rollout launcher only runs against an already selected server/checkpoint.
+
+### Internal checkout
+
+Until the feature branches are merged and tagged, use the dedicated State45
+worktrees:
+
+```bash
+# Client
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state45-28dof \
+  switch feature/mano-state45-phase-v1
+
+# MINT server
+git -C /vePFS-Mindverse/user/intern/wenxi/mint-state45-28dof \
+  switch feature/pi05-state45-phase-v1
+
+# OpenPI model implementation
+git -C /vePFS-Mindverse/user/intern/wenxi/openpi-state45-28dof \
+  switch feature/pi05-state45-phase-v1
+```
+
+Keep each worktree clean. Allocate independent ports, GPUs, runtime roots, and
+checkpoint roots for concurrent users. A worktree isolates source; it does not
+isolate GPU processes or server state.
+
+### State45 Grade-A profile and training preflight
+
+The State45 profile is derived from the immutable State41 release rows while
+adding causal phase observations and full pick/place prompts:
+
+```text
+/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/
+mano_28d_native_replay_state41_rgb_v1/profiles/
+grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1/
+profile_report.json
+```
+
+The complete Grade-A population remains 4,856 rows: 4,613 train and 243
+validation, split deterministically by `object × gesture` with seed 42. The
+current cube1 experiment filters that immutable split to 538 train rows and 27
+held-out validation rows across gestures 01/02/03/04/09/10. Its train-only
+State45 norm SHA256 is
+`558635caebc7f01172e9c2b43e0ea1c4436fb1d90ece63804bf130e44eff2554`.
+Print and validate the training configuration without contacting the server:
+
+```bash
+cd /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state45-28dof
+PROFILE=/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/\
+mano_28d_native_replay_state41_rgb_v1/profiles/\
+grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1/\
+profile_report.json
+RUN_ID=state45_cube1_allgestures_gradea_fromscratch_qposaug01_bs64_4gpu_20k_v1
+
+STATE45_STEPS=20000 \
+STATE45_CHECKPOINT_EVERY=2000 \
+STATE45_OBJECT=cube1 \
+STATE45_GESTURE= \
+STATE45_BATCH_SIZE=64 \
+STATE45_STATE_NOISE_STD=0.1 \
+STATE45_PREFETCH_BATCHES=2 \
+STATE45_EXPECTED_DEVICE_COUNT=4 \
+STATE45_PRINT_CONFIG=1 \
+  ./scripts/remote/run_state45_gradea_train.sh "$PROFILE" "$RUN_ID"
+```
+
+Remove `STATE45_PRINT_CONFIG=1` only after assigning a dedicated MINT server and
+confirming GPU ownership. Checkpoints are sampler weights and do not contain
+optimizer state.
+
+### State45 acceptance evidence
+
+- The cube1 all-gesture run published a complete step16,000 sampler with loss
+  `0.043073044158518314`. Training was stopped at recorded step16,730; the 730
+  post-checkpoint updates were explicitly discarded because exact optimizer
+  continuation is unavailable.
+- The held-out cube1 validation evaluation completed all 27 rows without added
+  perturbations: 21 reached stable lift, PLACE, and DONE; 6 remained in ACQUIRE
+  and timed out. All 81 Head/Wrist/dataset-reference videos and State45/Action32
+  arrays passed validation. Report SHA256:
+  `10a4ab584b05b83c29afcd7146f41394d94e20693a834d5cedd2e66c0d8e4bc5`.
+- Successful rollouts required 328–524 controls. All failures remained phase 0,
+  localizing the observed bottleneck to grasp acquisition/lift rather than
+  post-lift phase or release logic.
+
+The 27-row cube1 split is validation evidence, not an untouched final test set.
+Artifacts remain on vePFS and are not distributed through Git.
 
 ## Current MANO 32D v1 contract
 
@@ -66,31 +234,95 @@ The locked gesture03 v1 norm SHA256 is:
 507bc329fe6cd44bbc8fd49de82be3459e225e35ce6adb0310602ce1e51a432d
 ```
 
-## Current deployment map
+## MANO state44 v2 profile
+
+`openpi/pi05-action-lora-r16-state44-finetune` uses profile
+`pi05_action_lora_r16_state44_v1`. It separates a 44D observation from the
+unchanged B-schema action `[10,32]`:
+
+```text
+state[0:26]  = MANO qpos26
+state[26:31] = index / thumb / ring / middle / pinky target-object contact
+state[31]    = object lift from trajectory or rollout initialization
+state[32:37] = signed fingertip-sphere to target collision-surface distance (m)
+state[37:42] = causal 25 ms fingertip-to-palm radial rate (m/s; + closing)
+state[42]    = object-floor contact-pair presence
+state[43]    = elapsed duration of the current >=2-finger contact run (s)
+
+action[0:32] = existing query-anchored B schema; action[26:32] stays physical zero
+```
+
+Finger order is fixed to `index/thumb/ring/middle/pinky`. Training source poses
+and Mode4 both use the same MuJoCo URDF fingertip markers and target-object
+collision geoms. Source timestamps must advance by exactly 5 ms; the rate uses
+the current sample and the sample five steps in the past. Persistence resets to
+zero below two simultaneous finger contacts and has no hard physical clip; its
+authenticated population quantiles provide normalization. The profile ends at
+index 43 and contains no opposition/load-geometry score.
+
+StateAug perturbs qpos only. It recomputes the five surface distances from the
+perturbed qpos and current object pose, while preserving the clean radial-rate
+history because an independently perturbed frame does not define a valid 25 ms
+trajectory. State normalization must have width 44 and action normalization
+must have width 32; state32 norms are rejected.
+
+Build a versioned norm and perform the full raw-token audit before training:
+
+```bash
+./scripts/remote/run_client.sh scripts/train/prepare_mano_state44_profile.py \
+  --lance-dataset "$DATASET" --target-lance-dataset "$DATASET" \
+  --row-indices "$ROWS" --frame-window contact --contact-context-frames 100 \
+  --contact-window-manifest "$CONTACT_MANIFEST" \
+  --gesture-index config/datasets/new_all_generated_mano.index.json \
+  --norm-output-dir "$OUTPUT/norm" --report-json "$OUTPUT/report.json"
+```
+
+The command writes the norm only when every selected sample is at or below the
+immutable 200-token prefix limit. Training and Mode4 must pass both the output
+norm SHA and `--state-contract state44`; the state44 model identity and contract
+are rejected if selected independently.
+
+The certified rows507–2503 contact-ctx100 population contains 1,997 rows and
+1,160,274 selected frames. Its full audit had zero overflows: raw token lengths
+were min143, p50=163, p95=172, p99=175, max182. The authenticated norm is:
+
+```text
+cd916feee01138f957ca400fad25d02ebb18029e8fc4844c8019f3814caf622a
+```
+
+Artifacts are under
+`/vePFS-Mindverse/user/intern/wenxi/results/training/state44_profile_population_507_2503_20260730/`;
+`validation_manifest.json` binds the population, norm, report, and three feature
+branch commits. This norm is valid only for that exact row/window population.
+
+## Current State45 deployment map
 
 | Component | Path / branch |
 | --- | --- |
-| Formal client checkout | `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example`, `main` |
-| MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-action-lora-r16`, `action-lora-r16` |
-| OpenPI model worktree | `/vePFS-Mindverse/user/intern/wenxi/openpi-action-lora-r16`, `action-lora-r16` |
+| State45 Client | `/vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state45-28dof`, `feature/mano-state45-phase-v1` |
+| State45 MINT server | `/vePFS-Mindverse/user/intern/wenxi/mint-state45-28dof`, `feature/pi05-state45-phase-v1` |
+| State45 OpenPI model | `/vePFS-Mindverse/user/intern/wenxi/openpi-state45-28dof`, `feature/pi05-state45-phase-v1` |
 | Runtime | `/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl` |
-| MANO release resolver | `config/datasets/mano_dataset_release.json` |
-| Lance dataset (`training_dataset` role) | `/vePFS-Mindverse/user/intern/wenxi/results/datas/new_all_generated_mano_with_images.lance` |
-| Gesture03 v1 norm | `/vePFS-Mindverse/user/intern/wenxi/results/training/gesture03_32d_extended_norm_v1_20260726` |
+| Source Lance release | `/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand/release/mano_28d_native_replay_state41_rgb_v1/mano_28d_native_replay_state41_rgb_v1.lance` |
+| State45 profile | `grade_a_train95_object_gesture_seed42_contact_pm100_state45_phase_v1` |
+| State45 train-only norm SHA256 | `558635caebc7f01172e9c2b43e0ea1c4436fb1d90ece63804bf130e44eff2554` |
 
-Ports and GPUs are allocated per run. A different port does not imply a
-separate GPU allocation; verify both before starting a server.
+The former State41-named worktree paths are compatibility links for historical
+absolute paths only. Ports and GPUs are allocated per run. A different port
+does not imply a separate GPU allocation; verify both before starting a server.
 
 ## What the current stack implements
 
-The checked-in client and the paired `action-lora-r16` MINT/OpenPI worktrees
-implement the following validated path:
+The checked-in client and paired State45 MINT/OpenPI worktrees implement the
+following maintained path:
 
-- OpenPI pi0.5 action-expert LoRA, rank 16, trained through the MINT HTTP API;
+- OpenPI pi0.5 action-expert LoRA rank16, State45 observation, Action32, and
+  horizon10, trained through the MINT HTTP API;
 - B-exact `urdf_target_absolute` supervision and query-anchored action
-  reconstruction, with `action[26:32]` fixed to physical zero;
-- `mano_five_finger_contact_lift_v1` 32D observations;
-- clean and state-augmented training, with StateAug restricted to MANO qpos;
+  reconstruction, with target28 plus physical pad4;
+- qpos-only normalized StateAug with causal phase/history dimensions unchanged;
+- frozen compatibility for older state32/state44/State41 artifacts outside the
+  current State45 full-task workflow;
 - exact-byte normalization locking and state/action provenance metadata;
 - cooperative deadline checkpoint saving;
 - Mode4 closed-loop MuJoCo rollout with native position-servo control,
@@ -168,10 +400,15 @@ initialization using the canonical ctx100 manifest. `dataset_reference.mp4`
 keeps the full demonstration, while head/wrist physics-comparison videos and
 all rollout arrays cover only the synchronized contact window. Use
 `--frame-window full` only for an explicitly named full-trajectory stress test.
-Multi-row Mode4 defaults to `--row-execution lockstep --row-batch-size 4`:
-four independent MuJoCo trajectories contribute four real observations to each
-fixed-shape `act_batch`, while only the final partial group/window tail is
-padded:
+Multi-row State41 Mode4 defaults to `--row-execution lockstep
+--row-batch-size 4 --act-batch-size 4`. `row_batch_size` bounds resident native
+MuJoCo models/renderers; each completed residency group is finalized and closed
+before the next group starts, while one action session is reused for the whole
+run. Due observations inside a residency group are dispatched in independent
+`act_batch_size` groups, so large sweeps may use (for example) row batch16 with
+policy batch4 without changing the compiled policy shape. `progress.json` is
+atomically updated after each completed row group, and only the final partial
+policy group/window tail is padded:
 
 ```bash
 ./scripts/remote/run_mode4_eval.sh --help
@@ -222,9 +459,48 @@ for a copy-paste command and the low-memory fallback.
 - `scripts/eval/infer_mano_mode3.py`: dedicated historical kinematic Mode3
   diagnostic; it is intentionally not a Mode4 alternative or a generic
   numbered-mode multiplexer.
-- `scripts/eval/mano_physics_core.py`: MuJoCo scene, collision, five-finger
-  pair-presence contact, servo, and timing.
-- `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target physics-quality producer; historical result-root code is immutable provenance only.
+- `scripts/eval/mano_physics_core.py`: historical 26D MuJoCo contract retained for
+  pre-migration evidence only.
+- `scripts/eval/manorl_native_physics.py`: pinned ManoRL 28D native-model adapter.
+  Physics comes from `compile_model(...)`; render models reuse the previous Client
+  head/wrist cameras, floor, background, lights, and hand color treatment, and
+  are rejected if those visual additions change collision or dynamics arrays.
+- `scripts/eval/replay_mano_target_physics.py`: maintained recorded-target
+  physics-quality producer, migrated in place to metadata-resolved right-hand
+  28D targets while preserving object locking, resume checksums, grading,
+  multiprocessing, and Lance aggregation. Its production population is the
+  verified 5,425-row filtered Lance; startup binds every filtered UUID to the
+  accepted-row manifest and records both filtered and original merged indices.
+- `scripts/eval/build_mano_state41_release.py`: qualified Grade A/B native-trace
+  release producer. It restores full qpos/qvel, calls only `mj_forward`, and
+  extracts state41/contact/object plus current-head/wrist 640x360 JPEG from the
+  same `MjData`. Contiguous shards are balanced by measured object render cost,
+  written by independent EGL workers, resumed by UUID prefix, and concatenated
+  deterministically into one atomically published Lance release. Release rows
+  expose both `episode_metadata.frames` and `episode_metadata.total_frames` for
+  downstream index compatibility.
+- `openpi/pi05-action-lora-r16-state45-phase-28dof-finetune` is the sole
+  maintained MANO identity: State45 observation, Action32, horizon10,
+  fail-closed224-token input, and target28 mask `(3, -3, 22, -4)`. State45
+  preserves the immutable41-coordinate sensor prefix and adds causal peak lift,
+  stable-lift latch, filtered object vertical velocity, and task phase.
+- `scripts/train/prepare_mano_state45_gradea_profile.py` publishes the maintained
+  Grade-A profile atomically with the full pick/place prompt, train-only norm,
+  split-specific contact±100 manifests, and observed plus counterfactual token
+  audits. `scripts/remote/run_state45_gradea_train.sh` is the maintained training
+  launcher and requires an explicit step count.
+- `scripts/eval/infer_mano_mode4_state45.py` and
+  `scripts/remote/run_state45_mode4_eval.sh` are the maintained persistent
+  rollout path: State45/Action32, causal DONE,15-second timeout, stride1, and
+  full Head/Wrist/dataset-reference video support.
+- State41 profile builders, launchers, notifier, model identity, and tests are
+  frozen compatibility/history surfaces. They may read completed artifacts but
+  are not valid starting points for new runs.
+- `tools/render_mano_native_trace_video.py`: renders saved native traces without
+  dynamics steps and verifies the MP4 before publication. Head rendering accepts
+  `--head-camera-preset current|legacy`; `current` (elevated 65°) is the default,
+  while `legacy` preserves the original 75° view. The selected preset and its
+  expanded camera parameters are recorded in the video manifest.
 - `scripts/mano_state_contract.py`: shared v1 contract identity, contact rule,
   and norm SHA verifier.
 - `scripts/remote/run_client.sh`: client runtime and server preflight.
@@ -233,6 +509,9 @@ for a copy-paste command and the low-memory fallback.
   records effective configuration, source/normalization provenance, phase
   timings, and supports explicit `--video-mode none` diagnostic sweeps and
   retained action-session reuse through `--keep-server` / `--reuse-server-info`.
+  State41 gesture evaluation reconstructs the same canonical prompt as training
+  from formal-release `index.object` and `index.gesture`; the pre-release raw-row
+  gesture index is neither required nor accepted as the State41 language source.
 - `scripts/remote/stop_owned_mode4_server.sh`: ownership-checked retained-session
   cleanup and graceful stop for a server handed off with `--keep-server`.
 - `scripts/remote/run_action_lora_server.sh`: dedicated action-LoRA server

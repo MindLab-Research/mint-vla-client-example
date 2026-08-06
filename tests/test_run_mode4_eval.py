@@ -236,6 +236,128 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 64)
             self.assertIn("requires --chunk-stride 1", completed.stderr)
 
+    def test_state44_config_records_independent_state_and_action_widths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state44-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state44-finetune",
+                    "--state-contract",
+                    "state44",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["state_contract"], "state44")
+            self.assertEqual(evaluation["state_dim"], 44)
+            self.assertEqual(evaluation["action_dim"], 32)
+
+    def test_state41_config_records_native_28dof_state_and_action_widths(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "object_only",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["state_contract"], "state41")
+            self.assertEqual(evaluation["state_dim"], 41)
+            self.assertEqual(evaluation["action_dim"], 32)
+            self.assertEqual(evaluation["language_conditioning"], "object_only")
+
+    def test_state41_row_residency_can_exceed_policy_batch(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-residency-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "object_only",
+                    "--act-batch-size",
+                    "4",
+                    "--row-batch-size",
+                    "16",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["act_batch_size"], 4)
+            self.assertEqual(evaluation["row_batch_size"], 16)
+
+    def test_state41_gesture_uses_formal_release_metadata_not_raw_index(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state41-gesture-output",
+                    "--model",
+                    "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                    "--state-contract",
+                    "state41",
+                    "--language-conditioning",
+                    "gesture",
+                    "--gesture-index",
+                    str(root / "missing-and-intentionally-unused.json"),
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            evaluation = json.loads(completed.stdout)["evaluation"]
+            self.assertEqual(evaluation["language_conditioning"], "gesture")
+            self.assertEqual(evaluation["language_source"], "formal_release_metadata")
+            self.assertIsNone(evaluation["gesture_index"])
+
+    def test_state44_model_and_contract_must_be_selected_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            _, _, _, _, dataset, norm, _ = base_fixture(root)
+            completed = self.run_launcher(
+                root,
+                *self.common_args(
+                    dataset,
+                    norm,
+                    root / "state44-output",
+                    "--state-contract",
+                    "state44",
+                    "--print-config",
+                ),
+            )
+            self.assertEqual(completed.returncode, 64)
+            self.assertIn("state44 requires model", completed.stderr)
+
     def test_rejects_population_norm_sha_mismatch(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -540,6 +662,9 @@ class RunMode4EvalContractTests(unittest.TestCase):
             root = Path(temp)
             (root / "mint").mkdir()
             (root / "openpi").mkdir()
+            norm = root / "norm"
+            norm.mkdir()
+            (norm / "norm_stats.json").write_text('{"fixture": true}\n', encoding="utf-8")
             completed = subprocess.run(
                 [
                     "bash",
@@ -556,6 +681,8 @@ class RunMode4EvalContractTests(unittest.TestCase):
                     str(root / "openpi"),
                     "--python-bin",
                     "/bin/true",
+                    "--norm-stats",
+                    str(norm / "norm_stats.json"),
                     "--print-config",
                 ],
                 cwd=REPO_ROOT,
@@ -566,6 +693,11 @@ class RunMode4EvalContractTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn("jax_persistent_executable_cache=0", completed.stderr)
             self.assertIn("jax_compilation_cache=disabled", completed.stderr)
+            self.assertIn(
+                "model=openpi/pi05-action-lora-r16-state41-28dof-finetune",
+                completed.stderr,
+            )
+            self.assertIn("norm_stats_path=", completed.stderr)
 
 
 if __name__ == "__main__":

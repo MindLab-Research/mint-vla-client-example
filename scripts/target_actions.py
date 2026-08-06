@@ -16,17 +16,43 @@ PD_TARGET_DELTA = "pd_target_delta"
 URDF_TARGET_ABSOLUTE = "urdf_target_absolute"
 ACTION_SOURCES = (MEASURED_DELTA, PD_TARGET_DELTA, URDF_TARGET_ABSOLUTE)
 
-# The urdf_dof_target action space is [xyz3 | euler3 | finger20 | pad6] (26 valid
-# dims padded to 32). VERIFIED against the canonical Lance dataset:
-#   [0:3]  base translation xyz  (world frame, absolute)   -> delta OK
-#   [3:6]  base rotation, intrinsic XYZ Euler angles        -> NOT delta (keep absolute)
-#   [6:26] 20 finger DOF (joint angles, some fixed/mimic)   -> delta OK
-#   [26:32] padding zeros                                   -> no delta
-# Euler angles are not a vector space (non-commutative, +/-pi wrap, gimbal lock),
-# so a scalar `target - q` / `out + q` round-trip is invalid on those dims; they
-# are supervised as absolute angles instead. make_bool_mask(3, -3, 20, -6) yields
-# 11100011111111111111111111000000.
-MANO_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 20, -6)
+# B-schema masks. Euler XYZ is absolute; translation and finger joints are
+# delta-eligible; tail dimensions are physical zero padding. State32/state44
+# retain the 26D contract while state41 uses the authoritative 28D ManoRL order.
+MANO_26D_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 20, -6)
+MANO_28D_DELTA_MASK_SEGMENTS: tuple[int, ...] = (3, -3, 22, -4)
+# Compatibility name retained for existing 26D callers.
+MANO_DELTA_MASK_SEGMENTS = MANO_26D_DELTA_MASK_SEGMENTS
+
+
+def _absolute_target(
+    row: dict[str, Any], action_dim: int
+) -> tuple[np.ndarray, np.ndarray, int]:
+    state = np.asarray(row["state"], dtype=np.float32)
+    hands = row.get("hands")
+    if not isinstance(hands, list) or len(hands) != 1:
+        raise ValueError(
+            "urdf target actions require exactly one hand, got "
+            f"{type(hands).__name__}:{len(hands) if isinstance(hands, list) else 'n/a'}"
+        )
+    target = np.asarray(hands[0].get("urdf_dof_target"), dtype=np.float32)
+    if target.ndim != 2 or target.shape[1] not in (26, 28):
+        raise ValueError(f"urdf_dof_target must have shape [T,26|28], got {target.shape}")
+    active_dim = int(target.shape[1])
+    if state.ndim != 2 or target.shape[0] != state.shape[0]:
+        raise ValueError(
+            "urdf_dof_target frame count must align with state: "
+            f"target={target.shape}, state={state.shape}"
+        )
+    if state.shape[1] < active_dim:
+        raise ValueError(
+            f"state must have shape [T,>={active_dim}] aligned with target, got {state.shape}"
+        )
+    if action_dim < active_dim:
+        raise ValueError(f"action_dim must be at least {active_dim}, got {action_dim}")
+    if not np.isfinite(target).all() or not np.isfinite(state[:, :active_dim]).all():
+        raise ValueError("state/urdf target contains non-finite values")
+    return state, target, active_dim
 
 
 def urdf_target_absolute_actions(row: dict[str, Any], *, action_dim: int = 32) -> np.ndarray:
@@ -37,24 +63,9 @@ def urdf_target_absolute_actions(row: dict[str, Any], *, action_dim: int = 32) -
     ``AbsoluteActions(mask)`` inverts it at inference. Euler dims are left
     absolute by the mask. The final padding dims remain zeros.
     """
-    state = np.asarray(row["state"], dtype=np.float32)
-    hands = row.get("hands")
-    if not isinstance(hands, list) or len(hands) != 1:
-        raise ValueError(
-            f"urdf_target_absolute requires exactly one hand, got "
-            f"{type(hands).__name__}:{len(hands) if isinstance(hands, list) else 'n/a'}"
-        )
-    target = np.asarray(hands[0].get("urdf_dof_target"), dtype=np.float32)
-    if state.ndim != 2 or state.shape[1] < 26:
-        raise ValueError(f"state must have shape [T,>=26], got {state.shape}")
-    if target.shape != (state.shape[0], 26):
-        raise ValueError(
-            f"urdf_dof_target must have shape {(state.shape[0], 26)}, got {target.shape}"
-        )
-    if action_dim < 26:
-        raise ValueError(f"action_dim must be at least 26, got {action_dim}")
+    state, target, active_dim = _absolute_target(row, action_dim)
     actions = np.zeros((state.shape[0], action_dim), dtype=np.float32)
-    actions[:, :26] = target
+    actions[:, :active_dim] = target
     if not np.isfinite(actions).all():
         raise ValueError("urdf_target_absolute produced non-finite actions")
     return actions
@@ -68,21 +79,9 @@ def pd_target_delta_actions(row: dict[str, Any], *, action_dim: int = 32) -> np.
     applying the complete residual reaches the commanded PD target.  The final
     six model dimensions remain padding zeros.
     """
-    state = np.asarray(row["state"], dtype=np.float32)
-    hands = row.get("hands")
-    if not isinstance(hands, list) or len(hands) != 1:
-        raise ValueError(f"pd_target_delta requires exactly one hand, got {type(hands).__name__}:{len(hands) if isinstance(hands, list) else 'n/a'}")
-    target = np.asarray(hands[0].get("urdf_dof_target"), dtype=np.float32)
-    if state.ndim != 2 or state.shape[1] < 26:
-        raise ValueError(f"state must have shape [T,>=26], got {state.shape}")
-    if target.shape != (state.shape[0], 26):
-        raise ValueError(
-            f"urdf_dof_target must have shape {(state.shape[0], 26)}, got {target.shape}"
-        )
-    if action_dim < 26:
-        raise ValueError(f"action_dim must be at least 26, got {action_dim}")
+    state, target, active_dim = _absolute_target(row, action_dim)
     actions = np.zeros((state.shape[0], action_dim), dtype=np.float32)
-    actions[:, :26] = target - state[:, :26]
+    actions[:, :active_dim] = target - state[:, :active_dim]
     if not np.isfinite(actions).all():
         raise ValueError("pd_target_delta produced non-finite actions")
     return actions

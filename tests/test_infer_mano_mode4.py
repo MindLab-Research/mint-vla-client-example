@@ -13,6 +13,8 @@ import mujoco
 import numpy as np
 from scripts.eval import mano_physics_core as physics
 from scripts.eval import infer_mano_mode4 as mode4
+from scripts.eval import infer_mano_mode4_state41 as state41_mode4
+from scripts.eval import infer_mano_mode4_state41_batch as state41_batch_mode4
 from scripts.eval.infer_mano_mode4 import (
     MANORL_PHYSICS_SUBSTEPS,
     MANORL_PHYSICS_TIMESTEP,
@@ -106,6 +108,143 @@ class Mode4ContractTests(unittest.TestCase):
             self.assertAlmostEqual(data.time, 0.005)
         finally:
             tmp.cleanup()
+
+
+class State41LanguageContractTests(unittest.TestCase):
+    def test_gesture_prompt_uses_formal_release_metadata(self):
+        row = {
+            "prompt": "stale prompt that must not be trusted",
+            "index": {"object": "banana", "gesture": "03"},
+            "trajectory_metadata": {"object_names": ["banana"]},
+        }
+        conditioned = state41_mode4.condition_state41_language(row, "gesture")
+        self.assertEqual(
+            conditioned["prompt"], "pick up the banana using gesture 03"
+        )
+
+    def test_gesture_prompt_rejects_release_object_mismatch(self):
+        row = {
+            "prompt": "pick up the banana",
+            "index": {"object": "banana", "gesture": "03"},
+            "trajectory_metadata": {"object_names": ["cube1"]},
+        }
+        with self.assertRaisesRegex(ValueError, "object mismatch"):
+            state41_mode4.condition_state41_language(row, "gesture")
+
+    def test_object_only_preserves_existing_prompt(self):
+        row = {
+            "prompt": "pick up the cube1",
+            "index": {},
+            "trajectory_metadata": {"object_names": ["cube1"]},
+        }
+        conditioned = state41_mode4.condition_state41_language(row, "object_only")
+        self.assertEqual(conditioned["prompt"], row["prompt"])
+
+
+class State41BatchResidencyTests(unittest.TestCase):
+    def test_row_batch_size_can_bound_more_rows_than_policy_batch(self):
+        argv = [
+            "infer_mano_mode4_state41_batch.py",
+            "--base-url", "http://127.0.0.1:1",
+            "--model", state41_batch_mode4.MODEL,
+            "--model-path", "mint://model/sampler_weights/checkpoint",
+            "--owner-id", "owner",
+            "--lance-dataset", "/dataset.lance",
+            "--row-indices", "1,2",
+            "--normalization-row-indices", "0",
+            "--state-contract", "state41",
+            "--norm-stats-dir", "/norm",
+            "--norm-sha-expected", "sha",
+            "--output-dir", "/output",
+            "--language-conditioning", "gesture",
+            "--contact-window-manifest", "/contact.json",
+            "--act-batch-size", "4",
+            "--row-batch-size", "16",
+            "--video-mode", "none",
+        ]
+        with mock.patch("sys.argv", argv):
+            args = state41_batch_mode4.parse_args()
+        self.assertEqual(args.act_batch_size, 4)
+        self.assertEqual(args.row_batch_size, 16)
+
+    def test_run_bounds_native_contexts_and_reuses_one_session(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp)
+            args = types.SimpleNamespace(
+                video_mode="none",
+                model="model",
+                model_path="mint://model/sampler_weights/checkpoint",
+                norm_stats_dir=Path("/norm"),
+                norm_sha_expected="norm-sha",
+                contact_window_manifest=Path("/contact.json"),
+                lance_dataset=Path("/dataset.lance"),
+                output_dir=output,
+                row_indices_list=[1, 2, 3, 4, 5],
+                row_batch_size=2,
+                act_batch_size=4,
+                chunk_stride=5,
+                temporal_decay=0.4,
+                api_key="key",
+            )
+            live = 0
+            max_live = 0
+            closed = []
+            initialized = []
+
+            class Renderer:
+                def __init__(self, row_index):
+                    self.row_index = row_index
+
+                def close(self):
+                    nonlocal live
+                    live -= 1
+                    closed.append(self.row_index)
+
+            def initialize(_args, row_index, _config, _entries):
+                nonlocal live, max_live
+                initialized.append(row_index)
+                live += 1
+                max_live = max(max_live, live)
+                return {
+                    "row_index": row_index,
+                    "frame_count": 1,
+                    "renderer": Renderer(row_index),
+                }
+
+            def finalize(context, _output_dir, _args):
+                return {"row_index": context["row_index"]}
+
+            profile = types.SimpleNamespace(
+                state_dim=41, action_dim=32, delta_mask_segments=()
+            )
+            patches = (
+                mock.patch.object(state41_batch_mode4.base.L, "resolve_profile", return_value=profile),
+                mock.patch.object(state41_batch_mode4.base, "verify_locked_norm_stats", return_value=(object(), "norm-sha")),
+                mock.patch.object(state41_batch_mode4.base.L.normalize, "load", return_value={}),
+                mock.patch.object(state41_batch_mode4.full, "build_model_config", return_value=object()),
+                mock.patch.object(state41_batch_mode4.base.L, "_make_data_config", return_value=object()),
+                mock.patch.object(state41_batch_mode4.contact_windows, "load_manifest", return_value=({"dataset": str(args.lance_dataset)}, {})),
+                mock.patch.object(state41_batch_mode4.base.L, "_headers", return_value={}),
+                mock.patch.object(state41_batch_mode4.base, "create_session", return_value="session"),
+                mock.patch.object(state41_batch_mode4.base, "delete_session"),
+                mock.patch.object(state41_batch_mode4, "_initialize_context", side_effect=initialize),
+                mock.patch.object(state41_batch_mode4, "_finalize_context", side_effect=finalize),
+            )
+            with ExitStack() as stack:
+                entered = [stack.enter_context(patch) for patch in patches]
+                result = state41_batch_mode4.run(args)
+            self.assertEqual(initialized, [1, 2, 3, 4, 5])
+            self.assertEqual(max_live, 2)
+            self.assertEqual(live, 0)
+            self.assertCountEqual(closed, [1, 2, 3, 4, 5])
+            self.assertEqual(result["row_batch_size"], 2)
+            self.assertEqual(result["row_batch_count"], 3)
+            self.assertEqual(result["row_count"], 5)
+            entered[7].assert_called_once()
+            entered[8].assert_called_once_with(args, {}, "session")
+            progress = json.loads((output / "progress.json").read_text())
+            self.assertEqual(progress["status"], "completed")
+            self.assertEqual(progress["completed_row_indices"], [1, 2, 3, 4, 5])
 
 
 class Mode4SessionLifecycleTests(unittest.TestCase):
@@ -465,6 +604,118 @@ class Mode4LoopTests(unittest.TestCase):
             np.testing.assert_array_equal(
                 np.load(output / "step_max_contact_force.npy"), np.asarray([2.0], np.float32)
             )
+
+
+class Mode4State44LoopTests(unittest.TestCase):
+    def test_state44_live_observation_and_component_artifacts(self):
+        frame = np.zeros((8, 8, 3), dtype=np.uint8)
+        row = {
+            "state": np.zeros((2, 32), np.float32),
+            "actions": np.zeros((2, 32), np.float32),
+            "image": [b"", b""],
+            "wrist_image": [b"", b""],
+            "objects": [{"pos": [[0.3, 0, 0.1]] * 2, "rot_aa": [[0, 0, 0]] * 2}],
+            "timestamp": np.asarray([0.0, 0.005]),
+            "prompt": "pick up cube1",
+            "trajectory_metadata": {"data_fps": 100},
+            "episode_metadata": {"fps": 100},
+        }
+        window = types.SimpleNamespace(
+            start_frame=0, end_frame=1, frame_count=2, status="full",
+            first_contact_frame=None, last_contact_frame=None, context_frames=0,
+        )
+        data = types.SimpleNamespace(qpos=np.zeros(33), qvel=np.zeros(32), time=0.0)
+        data.qpos[3] = 1
+        renderer = types.SimpleNamespace(close=lambda: None)
+        scene_tmp = tempfile.TemporaryDirectory()
+        args = types.SimpleNamespace(
+            action_source="urdf_target_absolute", row_index=0, max_frames=0,
+            width=8, height=8, chunk_stride=1, output_dir=None, fps=10,
+            model="openpi/pi05-action-lora-r16-state44-finetune", act_mode="single",
+            extended_state=True, state_contract="state44", language_conditioning="gesture",
+            max_warm_request_seconds=0, temporal_decay=0.4, frame_window="full",
+            contact_context_frames=0, missing_contact_policy="error",
+            contact_window_manifest=None, base_url="x", model_path="p",
+            client_commit="client", backend_commit="backend", model_commit="model",
+            video_mode="none",
+        )
+        pred = np.zeros((10, 32), np.float32)
+        contacts = np.asarray([1, 1, 0, 0, 0], dtype=np.float32)
+        surface = np.asarray([0.01, 0.02, 0.03, 0.04, 0.05], dtype=np.float32)
+        radial = np.asarray([0.1, 0.11, 0.12, 0.13, 0.14], dtype=np.float32)
+
+        def set_scene(_model, current, **kwargs):
+            current.qpos[0:3] = kwargs["object_pos"]
+            current.qpos[3] = 1
+            current.qpos[7:33] = kwargs["state"]
+
+        def step(**kwargs):
+            current = kwargs["data"]
+            current.qpos[7:33] = kwargs["target"]
+            current.time += 0.005
+            return {
+                "hand_object_contact": True, "object_floor_contact": True,
+                "hand_floor_contact": False, "max_ncon": 2,
+                "max_contact_force": 1.0, "max_abs_actuator_force": 2.0,
+            }
+
+        output_tmp = tempfile.TemporaryDirectory()
+        out = output_tmp.name
+        with mock.patch.object(
+            mode4.full, "row_frame_count", return_value=2
+        ), mock.patch.object(
+            mode4.full, "resolve_row_window", return_value=window
+        ), mock.patch.object(
+            mode4.full, "set_scene_state", side_effect=set_scene
+        ), mock.patch.object(
+            mode4.physics, "make_scene",
+            return_value=(scene_tmp, object(), data, renderer, 0, 0, list(range(7, 33)), list(range(6, 32)), object()),
+        ), mock.patch.object(
+            mode4.physics, "resolve_keypoint_geom_ids", return_value=(object(), object(), object())
+        ), mock.patch.object(
+            mode4.physics, "resolve_state44_feature_ids", return_value=((1, 2, 3, 4, 5), (6,), 7)
+        ), mock.patch.object(
+            mode4.physics, "finger_contacts_from_mujoco", return_value=contacts
+        ), mock.patch.object(
+            mode4.physics, "state44_geometry_from_mujoco", return_value=(surface, radial, np.float32(1.0))
+        ), mock.patch.object(
+            mode4.physics, "render_current_state", return_value=(frame, frame)
+        ), mock.patch.object(
+            mode4.physics, "nearest_wrapped_position_target",
+            side_effect=lambda current, delta, limits: (current + delta, None),
+        ), mock.patch.object(
+            mode4.physics, "step_servo", side_effect=step
+        ), mock.patch.object(
+            mode4, "new_clipping_diagnostics", return_value={}
+        ), mock.patch.object(
+            mode4, "record_clipping"
+        ), mock.patch.object(
+            mode4, "build_datum", return_value={"observation": {}, "data_config": object()}
+        ), mock.patch.object(
+            mode4, "query_action", return_value=(pred, pred, pred, {"wall_seconds": 0.01, "used_data_sharding": False})
+        ), mock.patch.object(
+            mode4, "acquire_action_session", return_value=("s", False)
+        ), mock.patch.object(mode4.mujoco, "mj_forward"):
+            result = mode4.run_variant(
+                args=args, row=row, data_config=object(), mode="mode4", headers={},
+                object_name="cube1", session_id="s", output_dir=Path(out),
+            )
+        output = Path(out) / "mode4"
+        observed = np.load(output / "rollout_observation_state.npy")
+        self.assertEqual(observed.shape, (1, 44))
+        np.testing.assert_array_equal(observed[0, 26:31], contacts)
+        np.testing.assert_array_equal(observed[0, 32:37], surface)
+        np.testing.assert_array_equal(observed[0, 37:42], 0.0)
+        self.assertEqual(observed[0, 42], 1.0)
+        self.assertEqual(observed[0, 43], 0.0)
+        self.assertEqual(result["state_dim"], 44)
+        self.assertEqual(result["action_dim"], 32)
+        self.assertEqual(result["state_contract"], "mano_five_finger_contact_geom_rate_v2")
+        self.assertIn("rollout_observation_surface_distance", result["arrays"])
+        self.assertIn("rollout_observation_radial_rate", result["arrays"])
+        self.assertIn("rollout_observation_floor_support", result["arrays"])
+        self.assertIn("rollout_observation_multicontact_persistence", result["arrays"])
+        output_tmp.cleanup()
 
 
 if __name__ == "__main__":

@@ -84,6 +84,16 @@ def test_extended_state_uses_pair_presence_and_reference_lift():
     contacts.assert_called_once_with("m", "d", "cube1", keypoint_geom_ids={1}, object_geom_ids={2}, geom_id_to_finger={1: "index"})
 
 
+def test_state44_profile_is_rejected_in_historical_mode3(monkeypatch):
+    args = SimpleNamespace(
+        base_url="x",
+        model="openpi/pi05-action-lora-r16-state44-finetune",
+    )
+    monkeypatch.setattr(mode3, "parse_args", lambda: args)
+    with pytest.raises(ValueError, match="only state32"):
+        mode3.main()
+
+
 def test_norm_failure_fails_before_norm_stats_load(monkeypatch, tmp_path):
     args = SimpleNamespace(
         base_url="x", act_batch_size=4, contact_context_frames=0,

@@ -11,15 +11,20 @@ from multiprocessing import get_context
 import uuid
 import numpy as np
 
-from scripts import mano_dataset_release
 from scripts.eval import mano_action_support
-from scripts.eval import mano_physics_core as physics
-from scripts.tools import validate_mano_dataset_release as release_validator
+from scripts.eval import manorl_native_physics as physics
 
 DT=physics.DT; FRAME_DT=0.005; SUBSTEPS=physics.NATIVE_SUBSTEPS; HAND_DIM=physics.HAND_DIM
-CONTRACT='mano_target_physics_200hz_v1'
-DEFAULT_DATASET=str(mano_dataset_release.resolve_role('training_dataset'))
-DEFAULT_INDEX=str(mano_dataset_release.resolve_role('language_index'))
+CONTRACT='mano_native_target_replay_28d_200hz_v1'
+SOURCE_CONTRACT='synthetic_mano_28d_checkpoint_rollout_v2_2'
+EXPECTED_DATASET_VERSION=1; EXPECTED_ROWS=5_425; EXPECTED_FRAGMENTS=43
+RELEASE_ROOT=Path('/vePFS-Mindverse/user/intern/wenxi/results/datas/28dof_manohand')
+DEFAULT_DATASET=str(RELEASE_ROOT/'source/guangguan_all_actions_checkpoint2200_ratio5_seed42_v22.lance')
+DEFAULT_ACCEPTED_MANIFEST=str(RELEASE_ROOT/'manifests/guangguan_merged_v1_quality_rules_8cm100f_rot30deg.accepted_rows.json')
+DEFAULT_FILTER_VERIFICATION=str(RELEASE_ROOT/'manifests/source_filter_verification.json')
+EXPECTED_ACCEPTED_MANIFEST_SHA256='2ae0dbd86a4fadc25d25fbc4ea692651761119ac0a7142d205ec5921186d582c'
+EXPECTED_FILTER_VERIFICATION_SHA256='f85351f5ecb145fc720f5909e0b439e76f92d3fa43fc3321d43c772e4fe7e9c3'
+SOURCE_COLUMNS=['index','trajectory_metadata','timestamp','hands','objects','provenance']
 _SCENES={}
 
 @contextmanager
@@ -69,52 +74,77 @@ def grade_from_max_error(value):
     if not np.isfinite(value): raise ValueError('max error must be finite')
     return 'A' if value<.03 else 'B' if value<.08 else 'C'
 
-def new_clip_stats(): return {'clipped_steps':0,'clipped_values':0,'max_correction':0.0}
-def update_clip_stats(stats,event):
-    n=int(event['clipped_values']); stats['clipped_steps']+=int(n>0); stats['clipped_values']+=n
-    stats['max_correction']=max(float(stats['max_correction']),float(event['max_correction']))
-
 def object_rows(entries,object_name):
     rows=[int(e['row_index']) for e in entries if e.get('object_type')==object_name]
     if not rows: raise ValueError(f'unknown object {object_name!r}')
     return rows
 
-def validate_release_inputs(args):
-    release_path=Path(args.release_manifest).expanduser().resolve(); release=mano_dataset_release.load_release(release_path)
-    dataset_path=Path(args.dataset).expanduser().resolve(); index_path=Path(args.index).expanduser().resolve()
-    expected_dataset=mano_dataset_release.resolve_role('training_dataset',release=release,manifest_path=release_path)
-    expected_index=mano_dataset_release.resolve_role('language_index',release=release,manifest_path=release_path)
-    if dataset_path!=expected_dataset:
-        raise ValueError(f'--dataset is not release role training_dataset: {dataset_path} != {expected_dataset}')
-    if index_path!=expected_index:
-        raise ValueError(f'--index is not release role language_index: {index_path} != {expected_index}')
-    artifacts=release['artifacts']
-    release_validator.validate_lance('canonical_lance',artifacts['canonical_lance'],dataset_path,deep=False)
-    release_validator.validate_gesture_index('gesture_index',artifacts['gesture_index'],index_path)
-    asset_id=release['roles']['assets']; asset_spec=artifacts[asset_id]
-    asset_path=mano_dataset_release.resolve_artifact(asset_id,release=release,manifest_path=release_path)
-    release_validator.validate_asset_bundle(asset_id,asset_spec,asset_path,release_path)
-    generator_id=release['roles']['physics_quality_generator']; generator_spec=artifacts[generator_id]
-    generator_path=mano_dataset_release.resolve_artifact(generator_id,release=release,manifest_path=release_path)
-    if generator_path!=Path(__file__).resolve():
-        raise ValueError(f'release physics generator is {generator_path}, not {Path(__file__).resolve()}')
-    release_validator.validate_file(generator_id,generator_spec,generator_path)
-    scene_spec=artifacts['scene_camera_code']; release_validator.validate_file('scene_camera_code',scene_spec,Path(mano_action_support.__file__).resolve())
-    core_spec=artifacts['physics_contract_code']; release_validator.validate_file('physics_contract_code',core_spec,Path(physics.__file__).resolve())
-    return release
+def validate_dataset(ds,path,version):
+    rows=int(ds.count_rows()); fragments=len(ds.get_fragments()); names=list(ds.schema.names)
+    expected=['index','trajectory_metadata','timestamp','hands','objects','contact','reference','rollout','provenance']
+    if version!=EXPECTED_DATASET_VERSION or ds.version!=version: raise ValueError(f'source Lance version mismatch: requested={version} actual={ds.version}')
+    if rows!=EXPECTED_ROWS or fragments!=EXPECTED_FRAGMENTS: raise ValueError(f'source population mismatch rows={rows} fragments={fragments}')
+    if names!=expected: raise ValueError(f'source schema mismatch: {names}')
+    return {'path':str(path),'version':version,'row_count':rows,'fragment_count':fragments,'schema_names':names,'metadata_sha256':lance_fingerprint(path)}
 
 
-def make_run_identity(args,object_name):
-    release_path=Path(args.release_manifest).expanduser().resolve(); release=mano_dataset_release.load_release(release_path)
-    asset_spec=release['artifacts'][release['roles']['assets']]
-    return {'contract':CONTRACT,'object':object_name,'source_dataset':str(Path(args.dataset).resolve()),
-            'dataset_release_id':release['release_id'],'dataset_release_manifest':str(release_path),
-            'dataset_release_manifest_sha256':sha256(release_path),
-            'dataset_metadata_sha256':lance_fingerprint(Path(args.dataset)),'gesture_index':str(Path(args.index).resolve()),
-            'index_sha256':sha256(Path(args.index)),'script_sha256':sha256(Path(__file__)),
-            'physics_core_sha256':sha256(Path(physics.__file__)),'asset_bundle_sha256':asset_spec['sha256'],
-            'client_commit':os.environ.get('VLA_CLIENT_GIT_COMMIT','unknown'),
-            'target_offset':int(args.target_offset),'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS}
+def validate_filter_contract(accepted_path,verification_path,dataset_path,source_summary):
+    accepted_path=Path(accepted_path).expanduser().resolve(); verification_path=Path(verification_path).expanduser().resolve()
+    if sha256(accepted_path)!=EXPECTED_ACCEPTED_MANIFEST_SHA256: raise ValueError('accepted-row manifest SHA256 mismatch')
+    if sha256(verification_path)!=EXPECTED_FILTER_VERIFICATION_SHA256: raise ValueError('source filter verification SHA256 mismatch')
+    accepted=json.loads(accepted_path.read_text()); verification=json.loads(verification_path.read_text()); rows=accepted.get('rows')
+    selection=accepted.get('selection') or {}
+    if accepted.get('schema')!='manorl.synthetic_quality_accepted_row_manifest.v1' or not isinstance(rows,list): raise ValueError('invalid accepted-row manifest schema')
+    if len(rows)!=EXPECTED_ROWS or selection.get('rows_to_retain')!=EXPECTED_ROWS or selection.get('rows_to_reject')!=11_480: raise ValueError('accepted-row population mismatch')
+    original_indices=[int(row.get('row_index',-1)) for row in rows]
+    if original_indices!=sorted(original_indices) or len(set(original_indices))!=EXPECTED_ROWS or not all(row.get('accepted') is True for row in rows): raise ValueError('accepted-row order/identity contract mismatch')
+    if verification.get('status')!='verified_and_rejected_rows_deleted' or verification.get('rows_before')!=16_905 or verification.get('rows_retained')!=EXPECTED_ROWS or verification.get('rows_deleted')!=11_480: raise ValueError('source filter verification population mismatch')
+    if Path(verification.get('server_source_lance','')).resolve()!=Path(dataset_path).resolve() or verification.get('schema')!=source_summary['schema_names']: raise ValueError('source filter verification dataset/schema mismatch')
+    if verification.get('accepted_manifest_sha256')!=EXPECTED_ACCEPTED_MANIFEST_SHA256 or verification.get('nas_source_modified') is not False or verification.get('original_server_backup_deleted') is not True: raise ValueError('source filter verification integrity mismatch')
+    filtered_manifest=Path(verification.get('filtered_tree_manifest','')).resolve()
+    if not filtered_manifest.is_file() or sha256(filtered_manifest)!=verification.get('filtered_tree_manifest_sha256'): raise ValueError('filtered source tree manifest mismatch')
+    summary={'accepted_manifest':str(accepted_path),'accepted_manifest_sha256':EXPECTED_ACCEPTED_MANIFEST_SHA256,
+             'filter_verification':str(verification_path),'filter_verification_sha256':EXPECTED_FILTER_VERIFICATION_SHA256,
+             'filtered_tree_manifest':str(filtered_manifest),'filtered_tree_manifest_sha256':verification['filtered_tree_manifest_sha256'],
+             'rows_before':verification['rows_before'],'rows_retained':verification['rows_retained'],'rows_deleted':verification['rows_deleted'],
+             'predicate':selection.get('predicate'),'row_index_order':selection.get('row_index_order'),
+             'row_index_sha256':selection.get('row_index_sha256'),'uuid_sha256':selection.get('uuid_sha256')}
+    return rows,summary
+
+
+def build_source_index(ds,accepted_rows,batch_size=128):
+    """Stream compact IDs and bind every filtered row to its accepted lineage."""
+    if len(accepted_rows)!=EXPECTED_ROWS: raise ValueError(f'accepted identity count {len(accepted_rows)} != {EXPECTED_ROWS}')
+    entries=[]; scanner=ds.scanner(columns=['index','provenance'],batch_size=batch_size)
+    for batch in scanner.to_batches():
+        for row in batch.to_pylist():
+            i=len(entries)
+            if i>=len(accepted_rows): raise ValueError('filtered source contains rows beyond accepted manifest')
+            accepted=accepted_rows[i]; idx=row.get('index') or {}; prov=row.get('provenance') or {}
+            obj=idx.get('scene'); identity=prov.get('source_identity'); gesture=str(accepted.get('pair','')).rsplit('_',1)[-1]
+            observed=(str(idx.get('uuid')),str(obj),str(identity)); expected=(str(accepted.get('uuid')),str(accepted.get('object')),str(accepted.get('source_identity')))
+            if idx.get('is_generated') is not True or prov.get('contract')!=SOURCE_CONTRACT or observed!=expected: raise ValueError(f'filtered/accepted identity mismatch at row {i}: {observed} != {expected}')
+            if not identity.startswith(f'{obj}_{gesture}_'): raise ValueError(f'source identity/gesture mismatch at filtered row {i}')
+            entries.append({'row_index':i,'original_merged_row_index':int(accepted['row_index']),
+                            'uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),
+                            'object_type':obj,'gesture':gesture,'total_frames':int(accepted.get('frames',-1)),
+                            'source_identity':identity,'source_dataset':prov.get('dataset_path'),
+                            'source_dataset_version':prov.get('dataset_version'),'source_row_index':prov.get('row_index'),
+                            'checkpoint_update':prov.get('checkpoint_update'),'checkpoint_sha256':prov.get('checkpoint_sha256')})
+    if len(entries)!=EXPECTED_ROWS: raise ValueError(f'streamed identity count {len(entries)} != {EXPECTED_ROWS}')
+    uuids=[entry['uuid'] for entry in entries]; original=[entry['original_merged_row_index'] for entry in entries]
+    if len(set(uuids))!=len(uuids) or original!=sorted(original) or len(set(original))!=len(original): raise ValueError('filtered UUID/original-row identity is not unique and ordered')
+    return entries
+
+
+def make_run_identity(args,object_name,source_summary,filter_summary):
+    return {'contract':CONTRACT,'source_contract':SOURCE_CONTRACT,'object':object_name,
+            'source_dataset':str(Path(args.dataset).resolve()),'source_dataset_version':int(args.dataset_version),
+            'source_metadata_sha256':source_summary['metadata_sha256'],'filtered_population':filter_summary,
+            'script_sha256':sha256(Path(__file__)),
+            'physics_adapter_sha256':sha256(Path(physics.__file__)),'client_commit':os.environ.get('VLA_CLIENT_GIT_COMMIT','unknown'),
+            'manorl':physics.runtime_provenance(object_name),'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS,
+            'control_input':'hands[right].urdf_dof_target[t] absolute position target','external_target_modification':False}
 
 def ensure_manifest(out,run_id,rows):
     path=out/'manifest.json'; expected=[int(x) for x in rows]
@@ -130,92 +160,110 @@ def resume_valid(js,npz,row_index,run_id):
     if not js.exists() or not npz.exists(): return False
     try:
         r=json.loads(js.read_text())
-        if r.get('status')!='ok' or int(r.get('row_index',-1))!=row_index or r.get('provenance')!=run_id: return False
-        if r.get('trace_sha256')!=sha256(npz): return False
-        with np.load(npz) as z:
-            e=z['position_error_m']; return e.shape==(int(r['frames']),) and np.isfinite(e).all()
+        if r.get('status')!='ok' or int(r.get('row_index',-1))!=row_index or r.get('provenance')!=run_id or r.get('trace_sha256')!=sha256(npz): return False
+        T=int(r['frames']); required={'object_position_error':(T,),'simulated_full_qpos':(T,HAND_DIM+7),'simulated_hand_qpos':(T,HAND_DIM),'source_target_qpos':(T,HAND_DIM)}
+        with np.load(npz) as z: return all(name in z and z[name].shape==shape and np.isfinite(z[name]).all() for name,shape in required.items())
     except Exception: return False
 
-def validate_row(row, row_index, ident):
-    if int(ident.get('row_index',-1))!=row_index: raise ValueError('config row_index mismatch')
-    hands=row.get('hands') or []; objects=row.get('objects') or []
-    if len(hands)!=1 or len(objects)!=1: raise ValueError('requires exactly one hand and one object')
-    h,o=hands[0],objects[0]
-    arrays={'urdf_dof':h.get('urdf_dof'),'urdf_dof_target':h.get('urdf_dof_target'),
-            'object_pos':o.get('pos'),'object_rot_aa':o.get('rot_aa'),'timestamps':row.get('timestamp'),
-            'state':row.get('state'),'actions':row.get('actions')}
-    if any(v is None for v in arrays.values()): raise ValueError(f'missing arrays: {[k for k,v in arrays.items() if v is None]}')
-    lengths={k:len(v) for k,v in arrays.items()}
-    if len(set(lengths.values()))!=1: raise ValueError(f'aligned array lengths disagree: {lengths}')
-    T=next(iter(lengths.values()))
-    if T<2: raise ValueError(f'need T>=2, got {T}')
-    q=np.asarray(h['urdf_dof'],dtype=np.float64); target=np.asarray(h['urdf_dof_target'],dtype=np.float64)
-    pos=np.asarray(o['pos'],dtype=np.float64); aa=np.asarray(o['rot_aa'],dtype=np.float64); ts=np.asarray(row['timestamp'],dtype=np.float64)
-    if q.shape!=(T,HAND_DIM) or target.shape!=(T,HAND_DIM) or pos.shape!=(T,3) or aa.shape!=(T,3) or ts.shape!=(T,): raise ValueError(f'shape mismatch q={q.shape} target={target.shape} pos={pos.shape} aa={aa.shape} ts={ts.shape}')
-    if not all(np.isfinite(x).all() for x in (q,target,pos,aa,ts)): raise ValueError('non-finite source state')
-    intervals=np.diff(ts)
-    if not np.all(intervals>0) or not np.allclose(intervals,FRAME_DT,rtol=0,atol=1e-10): raise ValueError('timestamps are not exact monotonic 200Hz intervals')
-    idx=row.get('index') or {}
-    if str(ident.get('uuid'))!=str(idx.get('uuid')) or str(ident.get('seed_uuid'))!=str(idx.get('seed_uuid')): raise ValueError('config index identity mismatch')
-    obj=((row.get('trajectory_metadata') or {}).get('object_names') or [None])[0]
-    if obj != ident.get('object_type'): raise ValueError(f'config object mismatch {obj} != {ident.get("object_type")}')
+
+def _right_hand(row,meta):
+    hands=row.get('hands') or []; slots=meta.get('hand_slots'); names=meta.get('hand_names')
+    if not isinstance(slots,list) or len(slots)!=len(hands) or slots.count('right')!=1: raise ValueError('trajectory_metadata.hand_slots cannot resolve one right hand')
+    if not isinstance(names,list) or 'right' not in names: raise ValueError('trajectory_metadata.hand_names does not contain right')
+    hand=hands[slots.index('right')]
+    if not isinstance(hand,dict) or hand.get('hand_name')!='right': raise ValueError("resolved right slot does not report hand_name='right'")
+    return hand
+
+
+def _selected_object(row,meta,obj):
+    objects=row.get('objects') or []; names=meta.get('object_names')
+    if not isinstance(names,list) or len(names)!=len(objects) or names.count(obj)!=1: raise ValueError('trajectory_metadata.object_names cannot resolve selected object')
+    selected=objects[names.index(obj)]
+    if not isinstance(selected,dict): raise ValueError('selected object slot is not a mapping')
+    return selected
+
+
+def validate_row(row,row_index,ident):
+    idx=row.get('index') or {}; meta=row.get('trajectory_metadata') or {}; prov=row.get('provenance') or {}; obj=idx.get('scene')
+    if int(ident.get('row_index',-1))!=row_index or str(ident.get('uuid'))!=str(idx.get('uuid')) or str(ident.get('seed_uuid'))!=str(idx.get('seed_uuid')): raise ValueError('row/compact index identity mismatch')
+    if ident.get('object_type')!=obj or ident.get('gesture')!=meta.get('gesture') or ident.get('source_identity')!=prov.get('source_identity') or prov.get('contract')!=SOURCE_CONTRACT: raise ValueError('row/compact lineage mismatch')
+    hand=_right_hand(row,meta); selected=_selected_object(row,meta,obj); ts=np.asarray(row.get('timestamp'),dtype=np.float64); T=len(ts)
+    q=np.asarray(hand.get('urdf_dof'),dtype=np.float64); target=np.asarray(hand.get('urdf_dof_target'),dtype=np.float64)
+    pos=np.asarray(selected.get('pos'),dtype=np.float64); aa=np.asarray(selected.get('rot_aa'),dtype=np.float64)
+    arrays={'timestamp':(ts,(T,)),'urdf_dof':(q,(T,HAND_DIM)),'urdf_dof_target':(target,(T,HAND_DIM)),'object_position':(pos,(T,3)),'object_axis_angle':(aa,(T,3))}
+    if T<2 or int(meta.get('total_frames',-1))!=T: raise ValueError(f'invalid frame count {T}')
+    for name,(value,shape) in arrays.items():
+        if value.shape!=shape or not np.isfinite(value).all(): raise ValueError(f'invalid {name}: shape={value.shape}')
+    if not np.isclose(ts[0],0,rtol=0,atol=1e-12) or not np.allclose(np.diff(ts),FRAME_DT,rtol=0,atol=1e-10): raise ValueError('timestamps are not exact 200Hz intervals from zero')
     return T,q,target,pos,aa,ts,str(obj)
 
+
 def scene(object_name):
-    if object_name not in _SCENES:
-        _SCENES[object_name]=physics.make_scene(object_name,1,1,physics=True,physics_timestep=DT,create_renderer=False)
+    if object_name not in _SCENES: _SCENES[object_name]=physics.make_scene(object_name,1,1,physics=True,physics_timestep=DT,create_renderer=False)
     return _SCENES[object_name]
 
-def replay(row_index,row,ident,target_offset,run_id):
+
+def _rotation_error(first,second): return 2*np.arccos(np.clip(np.abs(np.sum(first*second,axis=-1)),-1,1))
+def _control_limits(targets,limits):
+    exceed=np.maximum(np.maximum(limits[:,0][None]-targets,targets-limits[:,1][None]),0); outside=exceed>0; frame,joint=np.unravel_index(int(np.argmax(exceed)),exceed.shape)
+    return {'external_preclipping_applied':False,'compiled_model_explains_limit_handling':True,'outside_element_count':int(outside.sum()),'outside_frame_count':int(np.any(outside,axis=1).sum()),'max_exceedance':float(exceed[frame,joint]),'max_exceedance_frame':int(frame),'max_exceedance_joint_index':int(joint)}
+
+
+def replay(row_index,row,ident,run_id):
     import mujoco
-    T,q,targets,ref_pos,ref_aa,ts,obj=validate_row(row,row_index,ident)
-    tmp,model,data,renderer,objaddr,_,handaddr,_,limits=scene(obj)
-    # Fresh MjData per row; object qpos is never written again after this initialization.
-    data=mujoco.MjData(model)
-    data.qpos[:]=0
-    data.qpos[objaddr:objaddr+3]=ref_pos[0]
-    data.qpos[objaddr+3:objaddr+7]=mano_action_support.axis_angle_to_wxyz(ref_aa[0])
-    data.qpos[handaddr]=q[0]; data.qvel[:]=0; mujoco.mj_forward(model,data)
-    sim_pos=np.empty((T,3),np.float64); sim_quat=np.empty((T,4),np.float64); err=np.empty(T,np.float64); hand_err=np.empty(T,np.float64)
-    contacts={'hand_object':0,'object_floor':0,'hand_floor':0}; first={k:None for k in contacts}; max_ncon=max_force=max_act=max_qvel=0.; wrap_events=0; clip_stats=new_clip_stats()
+    T,q,targets,ref_pos,ref_aa,ts,obj=validate_row(row,row_index,ident); _,model,_,_,objaddr,_,handaddr,_,limits=scene(obj)
+    data=mujoco.MjData(model); data.qpos[:]=0; data.qpos[objaddr:objaddr+3]=ref_pos[0]; data.qpos[objaddr+3:objaddr+7]=mano_action_support.axis_angle_to_wxyz(ref_aa[0]); data.qpos[handaddr]=q[0]; data.qvel[:]=0; mujoco.mj_forward(model,data)
+    body=physics.object_body_id(model,obj)
+    full_q=np.empty((T,model.nq)); full_v=np.empty((T,model.nv)); sim_q=np.empty((T,HAND_DIM)); sim_pos=np.empty((T,3)); sim_quat=np.empty((T,4)); sim_time=np.empty(T)
+    ref_quat=np.stack([mano_action_support.axis_angle_to_wxyz(value) for value in ref_aa]); qerr=np.empty(T); poserr=np.empty(T); roterr=np.empty(T)
+    contacts={'hand_object':0,'object_floor':0,'hand_floor':0}; first={k:None for k in contacts}; max_ncon=max_force=max_act=max_qvel=0.; warnings=[]
     for i in range(T):
-        sim_pos[i]=data.qpos[objaddr:objaddr+3]; sim_quat[i]=data.qpos[objaddr+3:objaddr+7]
-        err[i]=np.linalg.norm(sim_pos[i]-ref_pos[i]); hand_err[i]=np.linalg.norm(data.qpos[handaddr]-q[i])
+        full_q[i]=data.qpos; full_v[i]=data.qvel; sim_q[i]=data.qpos[handaddr]; sim_pos[i]=data.xpos[body]; sim_quat[i]=data.xquat[body]; sim_time[i]=data.time
+        qerr[i]=np.max(np.abs(sim_q[i]-q[i])); poserr[i]=np.linalg.norm(sim_pos[i]-ref_pos[i]); roterr[i]=_rotation_error(sim_quat[i:i+1],ref_quat[i:i+1])[0]
         if i==T-1: break
-        j=min(T-1,max(0,i+target_offset)); current=np.asarray(data.qpos[handaddr],dtype=np.float64); raw=targets[j]
-        wrapped=current[3:6]+(raw[3:6]-current[3:6]+np.pi)%(2*np.pi)-np.pi
-        wrap_events+=int(not np.allclose(raw[3:6],wrapped,atol=1e-12))
-        target,event=physics.nearest_wrapped_position_target(current,raw-current,limits); update_clip_stats(clip_stats,event)
-        d=physics.step_servo(model=model,data=data,target=target,substeps=SUBSTEPS,object_name=obj)
+        d=physics.step_servo(model=model,data=data,target=targets[i],substeps=SUBSTEPS,object_name=obj); warnings.extend(d['warnings'])
         for k in contacts:
             if d[k+'_contact']:
                 contacts[k]+=1
-                if first[k] is None:first[k]=i+1
+                if first[k] is None: first[k]=i+1
         max_ncon=max(max_ncon,d['max_ncon']); max_force=max(max_force,d['max_contact_force']); max_act=max(max_act,d['max_abs_actuator_force']); max_qvel=max(max_qvel,float(np.max(np.abs(data.qvel))))
-    expected_steps=2*(T-1); expected_time=expected_steps*DT
-    if not np.isclose(data.time,expected_time,rtol=0,atol=1e-9): raise RuntimeError(f'time {data.time} != {expected_time}')
-    if err[0]>=1e-6: raise RuntimeError(f'frame0 object error {err[0]}')
-    if not all(np.isfinite(x).all() for x in (sim_pos,sim_quat,err)): raise FloatingPointError('nonfinite simulated trajectory')
-    grade=grade_from_max_error(float(err.max()))
-    metrics={'max_position_error_m':float(err.max()),'argmax_frame':int(err.argmax()),'argmax_timestamp_s':float(ts[err.argmax()]),'mean_position_error_m':float(err.mean()),'rms_position_error_m':float(np.sqrt(np.mean(err**2))),'p95_position_error_m':float(np.percentile(err,95)),'final_position_error_m':float(err[-1]),'over_3cm':run_lengths(err>=.03),'over_8cm':run_lengths(err>=.08),'reference_path':path_metrics(ref_pos),'sim_path':path_metrics(sim_pos),'hand_tracking':{'mean_l2':float(hand_err.mean()),'max_l2':float(hand_err.max()),'final_l2':float(hand_err[-1])},'contacts':{'counts':contacts,'first_frame':first},'dynamics':{'max_contacts':int(max_ncon),'max_contact_force':float(max_force),'max_abs_actuator_force':float(max_act),'max_abs_qvel':float(max_qvel)},'diagnostics':{'target_offset':target_offset,'wrapped_wrist_commands':wrap_events,**clip_stats},'timing':{'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS,'intervals':T-1,'mj_steps':expected_steps,'sim_time':float(data.time),'object_sim_owned_after_frame0':True}}
-    result={'status':'ok','grade':grade,'qualified':grade in ('A','B'),'row_index':row_index,'row_uuid':str(row['index']['uuid']),'seed_uuid':str(row['index']['seed_uuid']),'object':obj,'gesture':ident.get('gesture'),'frames':T,'metrics':metrics,'provenance':run_id}
-    arrays={'frame_timestamp_s':ts.astype(np.float64),'reference_object_position':ref_pos.astype(np.float32),'sim_object_position':sim_pos.astype(np.float32),'sim_object_quaternion_wxyz':sim_quat.astype(np.float32),'position_error_m':err.astype(np.float32)}
+    expected_steps=SUBSTEPS*(T-1); expected_time=expected_steps*DT
+    if not np.isclose(data.time,expected_time,rtol=0,atol=1e-12): raise RuntimeError(f'time {data.time} != {expected_time}')
+    if poserr[0]>1e-6: raise RuntimeError(f'frame0 object error {poserr[0]}')
+    if warnings: raise RuntimeError(f'MuJoCo warnings: {warnings[:8]}')
+    if not all(np.isfinite(x).all() for x in (full_q,full_v,sim_pos,sim_quat,qerr,poserr,roterr)): raise FloatingPointError('nonfinite simulated trajectory')
+    qe,pe,re=qerr[1:],poserr[1:],roterr[1:]; qarg=int(qe.argmax())+1; parg=int(pe.argmax())+1; rarg=int(re.argmax())+1; grade=grade_from_max_error(float(pe.max()))
+    metrics={'max_position_error_m':float(pe.max()),'argmax_frame':parg,'argmax_timestamp_s':float(ts[parg]),'mean_position_error_m':float(pe.mean()),'rms_position_error_m':float(np.sqrt(np.mean(pe**2))),'p95_position_error_m':float(np.percentile(pe,95)),'final_position_error_m':float(poserr[-1]),
+             'max_rotation_error_rad':float(re.max()),'mean_rotation_error_rad':float(re.mean()),'rms_rotation_error_rad':float(np.sqrt(np.mean(re**2))),'rotation_argmax_frame':rarg,
+             'max_qpos_abs_error':float(qe.max()),'mean_qpos_abs_error':float(qe.mean()),'rms_qpos_abs_error':float(np.sqrt(np.mean(qe**2))),'qpos_argmax_frame':qarg,
+             'over_3cm':run_lengths(poserr>=.03),'over_8cm':run_lengths(poserr>=.08),'reference_path':path_metrics(ref_pos),'sim_path':path_metrics(sim_pos),'contacts':{'counts':contacts,'first_frame':first},
+             'dynamics':{'max_contacts':int(max_ncon),'max_contact_force':float(max_force),'max_abs_actuator_force':float(max_act),'max_abs_qvel':float(max_qvel)},'diagnostics':_control_limits(targets[:-1],limits),
+             'timing':{'source_dt':FRAME_DT,'mujoco_dt':DT,'steps_per_interval':SUBSTEPS,'intervals':T-1,'mj_steps':expected_steps,'sim_time':float(data.time),'object_sim_owned_after_frame0':True,'final_source_target_executed':False},
+             'initial_errors':{'qpos':float(qerr[0]),'position_m':float(poserr[0]),'rotation_rad':float(roterr[0])}}
+    result={'status':'ok','grade':grade,'qualified':grade in ('A','B'),'row_index':row_index,
+            'original_merged_row_index':int(ident['original_merged_row_index']),
+            'row_uuid':str(row['index']['uuid']),'seed_uuid':str(row['index']['seed_uuid']),'source_identity':ident['source_identity'],'object':obj,'gesture':ident['gesture'],'frames':T,'valid_transition_count':T-1,'metrics':metrics,'provenance':run_id}
+    arrays={'timestamp':ts.astype(np.float64),'simulated_time':sim_time.astype(np.float64),'state_producing_target_index':np.arange(-1,T-1,dtype=np.int64),'target_index':np.arange(T-1,dtype=np.int64),'target_qpos':targets[:-1].astype(np.float32),'source_target_qpos':targets.astype(np.float32),
+            'simulated_full_qpos':full_q.astype(np.float32),'simulated_full_qvel':full_v.astype(np.float32),'simulated_hand_qpos':sim_q.astype(np.float32),'recorded_hand_qpos':q.astype(np.float32),'simulated_object_position':sim_pos.astype(np.float32),'recorded_object_position':ref_pos.astype(np.float32),
+            'simulated_object_quaternion':sim_quat.astype(np.float32),'recorded_object_quaternion':ref_quat.astype(np.float32),'qpos_error':qerr.astype(np.float32),'object_position_error':poserr.astype(np.float32),'object_rotation_error':roterr.astype(np.float32)}
     return result,arrays
 
 def record_one(job):
-    row_index,row,ident,offset,out,resume,run_id=job; root=Path(out); stem=root/'records'/f'{row_index:05d}'
+    row_index,row,ident,out,resume,run_id=job; root=Path(out); stem=root/'records'/f'{row_index:05d}'
     js=stem.with_suffix('.json'); npz=stem.with_suffix('.npz')
     if resume and resume_valid(js,npz,row_index,run_id): return {'row_index':row_index,'status':'skipped'}
     js.unlink(missing_ok=True); npz.unlink(missing_ok=True)
     try:
-        result,arrays=replay(row_index,row,ident,offset,run_id)
+        result,arrays=replay(row_index,row,ident,run_id)
         npz.parent.mkdir(parents=True,exist_ok=True)
         with tempfile.NamedTemporaryFile(dir=npz.parent,delete=False,suffix='.npz') as f: np.savez_compressed(f,**arrays); temp=f.name
         os.replace(temp,npz); result['trace_npz']=str(npz); result['trace_sha256']=sha256(npz); atomic_json(js,result)
         return {'row_index':row_index,'status':'ok','grade':result['grade']}
     except Exception as e:
         idx=row.get('index') or {}
-        invalid={'status':'invalid','grade':None,'qualified':False,'row_index':row_index,'row_uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),'object':ident.get('object_type'),'gesture':ident.get('gesture'),'provenance':run_id,'error_type':type(e).__name__,'error':str(e),'traceback':traceback.format_exc(limit=10)}
+        invalid={'status':'invalid','grade':None,'qualified':False,'row_index':row_index,
+                 'original_merged_row_index':ident.get('original_merged_row_index'),
+                 'row_uuid':str(idx.get('uuid')),'seed_uuid':str(idx.get('seed_uuid')),'object':ident.get('object_type'),'gesture':ident.get('gesture'),'provenance':run_id,'error_type':type(e).__name__,'error':str(e),'traceback':traceback.format_exc(limit=10)}
         atomic_json(js,invalid); return {'row_index':row_index,'status':'invalid','error':f'{type(e).__name__}: {e}'}
 
 def validate_record_population(records,expected_rows,entries,object_name,run_id=None):
@@ -227,10 +275,12 @@ def validate_record_population(records,expected_rows,entries,object_name,run_id=
     if bad: raise ValueError(f'cannot aggregate {len(bad)} non-ok rows: {[r["row_index"] for r in bad[:20]]}')
     uuids=[r.get('row_uuid') for r in records]; expected=[str(entries[i].get('uuid')) for i in expected_rows]
     if uuids!=expected or len(set(uuids))!=len(uuids): raise ValueError('record UUID order/uniqueness mismatch')
+    original=[r.get('original_merged_row_index') for r in records]; expected_original=[entries[i].get('original_merged_row_index') for i in expected_rows]
+    if original!=expected_original: raise ValueError('record original merged-row identity mismatch')
     if any(r.get('object')!=object_name for r in records): raise ValueError('record object mismatch')
     if run_id is not None and any(r.get('provenance')!=run_id for r in records): raise ValueError('record provenance mismatch')
 
-def aggregate(out,dataset_path,target_offset,expected_rows,entries,object_name,target,overwrite,run_id):
+def aggregate(out,expected_rows,entries,object_name,target,overwrite,run_id):
     import lance,pyarrow as pa
     records=[]
     for p in sorted((out/'records').glob('*.json')):
@@ -264,52 +314,37 @@ def parse_rows(s,count):
     if bad: raise ValueError(f'rows outside [0,{count}): {bad[:20]}')
     return ans
 
-def iter_jobs(ds,rows,entries,offset,out,resume,run_id,batch_size):
-    cols=['index','trajectory_metadata','episode_metadata','hands','objects','timestamp','state','actions']
+def iter_jobs(ds,rows,entries,out,resume,run_id,batch_size):
     for start in range(0,len(rows),batch_size):
-        batch=rows[start:start+batch_size]; payload=ds.take(batch,columns=cols).to_pylist()
-        for i,r in zip(batch,payload,strict=True): yield (i,r,entries[i],offset,str(out),resume,run_id)
+        batch=rows[start:start+batch_size]; payload=ds.take(batch,columns=SOURCE_COLUMNS).to_pylist()
+        for i,r in zip(batch,payload,strict=True): yield (i,r,entries[i],str(out),resume,run_id)
 
 def main():
  p=argparse.ArgumentParser(description=__doc__)
- p.add_argument('--release-manifest',default=str(mano_dataset_release.DEFAULT_RELEASE_MANIFEST))
- p.add_argument('--dataset',default=DEFAULT_DATASET)
- p.add_argument('--output-dir',required=True,help='new result root; the historical evidence root is immutable')
- p.add_argument('--index',default=DEFAULT_INDEX)
- p.add_argument('--object',required=True)
+ p.add_argument('--dataset',default=DEFAULT_DATASET); p.add_argument('--dataset-version',type=int,default=EXPECTED_DATASET_VERSION)
+ p.add_argument('--accepted-manifest',default=DEFAULT_ACCEPTED_MANIFEST); p.add_argument('--filter-verification',default=DEFAULT_FILTER_VERIFICATION)
+ p.add_argument('--output-dir',required=True); p.add_argument('--object',required=True)
  p.add_argument('--rows',default='',help='global indices/ranges; ranges are end-exclusive and must belong to --object')
- p.add_argument('--target-offset',type=int,choices=(-1,0,1),default=0)
- p.add_argument('--workers',type=int,default=8)
- p.add_argument('--batch-size',type=int,default=8)
- p.add_argument('--resume',action='store_true')
- p.add_argument('--aggregate',action='store_true')
- p.add_argument('--aggregate-output',default='')
- p.add_argument('--overwrite-aggregate',action='store_true')
+ p.add_argument('--workers',type=int,default=8); p.add_argument('--batch-size',type=int,default=8); p.add_argument('--index-batch-size',type=int,default=128)
+ p.add_argument('--resume',action='store_true'); p.add_argument('--aggregate',action='store_true'); p.add_argument('--aggregate-output',default=''); p.add_argument('--overwrite-aggregate',action='store_true')
  a=p.parse_args()
- if a.workers<1 or a.batch_size<1: raise ValueError('workers and batch-size must be positive')
- validate_release_inputs(a)
+ if min(a.workers,a.batch_size,a.index_batch_size)<1: raise ValueError('workers and batch sizes must be positive')
  import lance
- ds=lance.dataset(a.dataset); count=ds.count_rows(); meta=json.loads(Path(a.index).read_text()); entries=meta.get('entries')
- if not isinstance(entries,list) or len(entries)!=count: raise ValueError(f'index/source count mismatch: {0 if not isinstance(entries,list) else len(entries)} != {count}')
- for i,e in enumerate(entries):
-  if int(e.get('row_index',-1))!=i: raise ValueError(f'index entry {i} has row_index={e.get("row_index")}')
- all_rows=object_rows(entries,a.object); selected=all_rows if not a.rows else parse_rows(a.rows,count)
+ dataset_path=Path(a.dataset).expanduser().resolve(); ds=lance.dataset(str(dataset_path),version=a.dataset_version)
+ source=validate_dataset(ds,dataset_path,a.dataset_version)
+ accepted_rows,filter_summary=validate_filter_contract(a.accepted_manifest,a.filter_verification,dataset_path,source)
+ entries=build_source_index(ds,accepted_rows,a.index_batch_size); all_rows=object_rows(entries,a.object); selected=all_rows if not a.rows else parse_rows(a.rows,source['row_count'])
  outside=[i for i in selected if entries[i].get('object_type')!=a.object]
  if outside: raise ValueError(f'rows not belonging to {a.object}: {outside[:20]}')
- root=Path(a.output_dir).expanduser().resolve()
- release=mano_dataset_release.load_release(a.release_manifest)
- historical=mano_dataset_release.resolve_role('physics_quality',release=release,manifest_path=a.release_manifest)
- if root==historical or historical in root.parents:
-  raise ValueError(f'historical physics evidence is immutable; choose a new --output-dir, not {root}')
- out=root/'objects'/a.object; run_id=make_run_identity(a,a.object)
+ root=Path(a.output_dir).expanduser().resolve(); out=root/'objects'/a.object; run_id=make_run_identity(a,a.object,source,filter_summary)
  with single_object_lock(root):
   ensure_manifest(out,run_id,all_rows)
   if a.aggregate:
    target=Path(a.aggregate_output) if a.aggregate_output else out/f'{a.object}.{CONTRACT}.lance'
-   print(aggregate(out,a.dataset,a.target_offset,all_rows,entries,a.object,target,a.overwrite_aggregate,run_id)); return
-  invocation={'started_at':datetime.now(timezone.utc).isoformat(),'object':a.object,'selected_rows':selected,'workers':a.workers,'batch_size':a.batch_size,'resume':a.resume,'target_offset':a.target_offset}
+   print(aggregate(out,all_rows,entries,a.object,target,a.overwrite_aggregate,run_id)); return
+  invocation={'started_at':datetime.now(timezone.utc).isoformat(),'object':a.object,'selected_rows':selected,'workers':a.workers,'batch_size':a.batch_size,'resume':a.resume}
   inv=out/'invocations'/f'{datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")}.json'; atomic_json(inv,invocation)
-  jobs=iter_jobs(ds,selected,entries,a.target_offset,out,a.resume,run_id,a.batch_size); started=time.monotonic(); counts=Counter(); grades=Counter(); invalid=[]
+  jobs=iter_jobs(ds,selected,entries,out,a.resume,run_id,a.batch_size); started=time.monotonic(); counts=Counter(); grades=Counter(); invalid=[]
   def consume(results):
    for n,r in enumerate(results,1):
     counts[r['status']]+=1

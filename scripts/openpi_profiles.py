@@ -10,6 +10,13 @@ from dataclasses import dataclass
 
 LEGACY_L_LORA_MODEL = "openpi/pi05-libero-low-mem-finetune"
 ACTION_LORA_R16_MODEL = "openpi/pi05-action-lora-r16-finetune"
+ACTION_LORA_R16_STATE44_MODEL = "openpi/pi05-action-lora-r16-state44-finetune"
+ACTION_LORA_R16_STATE41_MODEL = (
+    "openpi/pi05-action-lora-r16-state41-28dof-finetune"
+)
+ACTION_LORA_R16_STATE45_MODEL = (
+    "openpi/pi05-action-lora-r16-state45-phase-28dof-finetune"
+)
 
 
 @dataclass(frozen=True)
@@ -19,6 +26,7 @@ class OpenPIClientProfile:
     discrete_state_input: bool
     paligemma_variant: str
     action_expert_variant: str
+    state_dim: int = 32
     action_dim: int = 32
     action_horizon: int = 10
     max_tokens: int = 200
@@ -26,6 +34,9 @@ class OpenPIClientProfile:
     # image chunks in the train_step payload. Kept here so the client can build
     # batches without importing mint_server.
     camera_layout: tuple[str, ...] = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
+    fail_on_token_truncation: bool = False
+    state_contract_id: str | None = None
+    delta_mask_segments: tuple[int, ...] = (3, -3, 20, -6)
 
 
 LEGACY_L_LORA_PROFILE = OpenPIClientProfile(
@@ -41,11 +52,53 @@ ACTION_LORA_R16_PROFILE = OpenPIClientProfile(
     discrete_state_input=True,
     paligemma_variant="gemma_2b",
     action_expert_variant="gemma_300m_lora_r16",
+    state_contract_id="mano_five_finger_contact_lift_v1",
+)
+ACTION_LORA_R16_STATE44_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state44_v1",
+    base_model=ACTION_LORA_R16_STATE44_MODEL,
+    discrete_state_input=True,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    state_dim=44,
+    fail_on_token_truncation=True,
+    state_contract_id="mano_five_finger_contact_geom_rate_v2",
+)
+# Frozen compatibility descriptor for historical State41 artifacts. It is
+# intentionally excluded from MODEL_PROFILES/MODEL_CHOICES: State45 is the only
+# maintained MANO 28DoF model identity.
+ACTION_LORA_R16_STATE41_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state41_28dof_v1",
+    base_model=ACTION_LORA_R16_STATE41_MODEL,
+    discrete_state_input=True,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    state_dim=41,
+    fail_on_token_truncation=True,
+    state_contract_id="mano_state41_native_sim_28d_v1",
+    delta_mask_segments=(3, -3, 22, -4),
+)
+ACTION_LORA_R16_STATE45_PROFILE = OpenPIClientProfile(
+    profile_id="pi05_action_lora_r16_state45_phase_28dof_v1",
+    base_model=ACTION_LORA_R16_STATE45_MODEL,
+    discrete_state_input=True,
+    paligemma_variant="gemma_2b",
+    action_expert_variant="gemma_300m_lora_r16",
+    state_dim=45,
+    max_tokens=224,
+    fail_on_token_truncation=True,
+    state_contract_id="mano_state45_phase_native_sim_28d_v1",
+    delta_mask_segments=(3, -3, 22, -4),
 )
 
 MODEL_PROFILES = {
     profile.base_model: profile
-    for profile in (LEGACY_L_LORA_PROFILE, ACTION_LORA_R16_PROFILE)
+    for profile in (
+        LEGACY_L_LORA_PROFILE,
+        ACTION_LORA_R16_PROFILE,
+        ACTION_LORA_R16_STATE44_PROFILE,
+        ACTION_LORA_R16_STATE45_PROFILE,
+    )
 }
 PROFILE_IDS = {profile.profile_id: profile for profile in MODEL_PROFILES.values()}
 MODEL_CHOICES = tuple(MODEL_PROFILES)
