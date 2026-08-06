@@ -292,6 +292,19 @@ sim-owned object motion and native position-servo dynamics.
   --extended-state --norm-stats-dir "${NORM}"
 ```
 
+The default `--query-stride 10 --hand-transition instant_setpoint` preserves
+historical Mode3 by consuming a full non-overlapping action chunk and writing
+each target directly as qpos. That historical transition visualizes predicted
+setpoints; it is not a calibrated hand-speed model.
+
+`--query-stride 1 --hand-transition calibrated_servo_lag --servo-gain-file ...`
+keeps the checkpoint/model horizon at 10, queries every source frame, executes
+only `action[0]`, and advances qpos by one recorded 0.005-second response step
+toward that setpoint. The gain file is fitted from aligned
+`urdf_dof_target[t] -> urdf_dof[t+1]` trajectories with wrapped Euler errors.
+This mode fixes the target-as-achieved-state category error without enabling
+MuJoCo dynamics or temporal ensembling.
+
 The required extended state is `[predicted_hand_qpos(26), contact(index,thumb,
 ring,middle,pinky), reference_object_z[t]-reference_object_z[0]]`. Contacts are
 target-object × MANO-keypoint pair presence after the frame's forward pass;
