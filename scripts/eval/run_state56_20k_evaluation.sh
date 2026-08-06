@@ -44,7 +44,7 @@ MODEL_PATH=$MODEL_ROOT/sampler
 [[ $(git -C "$O" rev-parse HEAD) == "$OPENPI_SHA" ]]
 [[ -z $(git -C "$C" status --porcelain)$(git -C "$M" status --porcelain)$(git -C "$O" status --porcelain) ]]
 EVAL_CLIENT_SHA=$(git -C "$C" rev-parse HEAD)
-ROWS=$(/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python -c "import json;print(','.join(str(x['release_row_index']) for x in json.load(open('$D/$SELECTION'))['rows']))")
+EVAL_ROWS=$(/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python -c "import json;print(','.join(str(x['release_row_index']) for x in json.load(open('$D/$SELECTION'))['rows']))")
 sha(){ sha256sum "$1"|awk '{print $1}'; }
 SV_SHA=$(sha "$SOURCE_ROOT/release_verification.json")
 SEL_SHA=$(sha "$D/$SELECTION")
@@ -70,7 +70,7 @@ set +e
 $PY -u scripts/eval/infer_mano_mode4_state56_batch.py \
  --base-url http://127.0.0.1:30540 --api-key tml-dummy --model openpi/pi05-action-lora-r16-state56-28dof-finetune --model-path "$MODEL_PATH" --owner-id "rongenz-state56-${TASK}-20k-eval" \
  --lance-dataset "$SOURCE" --source-release-verification "$SOURCE_ROOT/release_verification.json" --source-release-verification-sha256 "$SV_SHA" \
- --row-indices "$ROWS" --selection "$D/$SELECTION" --selection-sha256 "$SEL_SHA" \
+ --row-indices "$EVAL_ROWS" --selection "$D/$SELECTION" --selection-sha256 "$SEL_SHA" \
  --norm-stats-dir "$N" --norm-sha-expected "$NORM_SHA" --state56-data-contract "$N/data_contract_v2.json" --state56-data-contract-sha256 "$DC_SHA" \
  --contact-window-manifest "$D/$WINDOWS" --contact-window-manifest-sha256 "$WIN_SHA" --contact-context-frames 100 \
  --chunk-stride 5 --temporal-decay .4 --act-batch-size 4 --row-batch-size 4 --max-warm-request-seconds 10 --max-frames "$MAX_FRAMES" --width 640 --height 360 \
