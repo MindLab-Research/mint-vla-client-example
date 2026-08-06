@@ -159,6 +159,22 @@ def test_state45_server_launcher_requires_norm_and_uses_own_cache_namespace(tmp_
     assert "pi05_action_lora_r16_state45_phase_a800_1gpu" in completed.stderr
 
 
+def test_server_launcher_rejects_frozen_state41_identity(tmp_path) -> None:
+    completed = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "scripts/remote/run_action_lora_server.sh"),
+            "--runtime-root", str(tmp_path / "runtime"),
+            "--model", "openpi/pi05-action-lora-r16-state41-28dof-finetune",
+            "--print-config",
+        ],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 64
+    assert "only the maintained State45 Action-LoRA model is supported" in completed.stderr
+
+
 def test_state45_persistent_launcher_prints_done_timeout_contract(tmp_path) -> None:
     completed = subprocess.run(
         [

@@ -14,8 +14,8 @@ fi
 
 : "${MINT_BASE_URL:=http://127.0.0.1:30532}"
 : "${MINT_API_KEY:=tml-dummy}"
-: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof}"
-: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof}"
+: "${MINT_CODE_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint-state45-28dof}"
+: "${MINT_OPENPI_ROOT:=/vePFS-Mindverse/user/intern/wenxi/openpi-state45-28dof}"
 : "${MINT_GRB_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl}"
 : "${MINT_CPU_ROOT:=/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/cpu}"
 : "${MINT_EXTRA_PYDEPS:=/vePFS-Mindverse/user/intern/wenxi/mint_env/extra-pydeps}"
@@ -72,7 +72,6 @@ fi
 
 ACTION_LORA_R16_MODEL=openpi/pi05-action-lora-r16-finetune
 ACTION_LORA_R16_STATE44_MODEL=openpi/pi05-action-lora-r16-state44-finetune
-ACTION_LORA_R16_STATE41_MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
 ACTION_LORA_R16_STATE45_MODEL=openpi/pi05-action-lora-r16-state45-phase-28dof-finetune
 SELECTED_MODEL=""
 CLIENT_ARGS=("$@")
@@ -86,9 +85,12 @@ for ((i = 0; i < ${#CLIENT_ARGS[@]}; i++)); do
     --model=*) SELECTED_MODEL=${CLIENT_ARGS[i]#--model=} ;;
   esac
 done
+if [[ "${SELECTED_MODEL}" == "openpi/pi05-action-lora-r16-state41-28dof-finetune" ]]; then
+  echo "State41 MANO is frozen; use ${ACTION_LORA_R16_STATE45_MODEL}" >&2
+  exit 64
+fi
 if [[ ( "${SELECTED_MODEL}" == "${ACTION_LORA_R16_MODEL}" || \
         "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE44_MODEL}" || \
-        "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE41_MODEL}" || \
         "${SELECTED_MODEL}" == "${ACTION_LORA_R16_STATE45_MODEL}" ) && \
       -z "${MINT_OPENPI_ROOT}" ]]; then
   echo "${SELECTED_MODEL} requires MINT_OPENPI_ROOT to select the isolated rank-16 OpenPI worktree" >&2

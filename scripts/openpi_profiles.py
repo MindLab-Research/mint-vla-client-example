@@ -60,6 +60,9 @@ ACTION_LORA_R16_STATE44_PROFILE = OpenPIClientProfile(
     fail_on_token_truncation=True,
     state_contract_id="mano_five_finger_contact_geom_rate_v2",
 )
+# Frozen compatibility descriptor for historical State41 artifacts. It is
+# intentionally excluded from MODEL_PROFILES/MODEL_CHOICES: State45 is the only
+# maintained MANO 28DoF model identity.
 ACTION_LORA_R16_STATE41_PROFILE = OpenPIClientProfile(
     profile_id="pi05_action_lora_r16_state41_28dof_v1",
     base_model=ACTION_LORA_R16_STATE41_MODEL,
@@ -90,7 +93,6 @@ MODEL_PROFILES = {
         LEGACY_L_LORA_PROFILE,
         ACTION_LORA_R16_PROFILE,
         ACTION_LORA_R16_STATE44_PROFILE,
-        ACTION_LORA_R16_STATE41_PROFILE,
         ACTION_LORA_R16_STATE45_PROFILE,
     )
 }

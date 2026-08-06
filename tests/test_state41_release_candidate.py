@@ -102,8 +102,8 @@ def test_state41_release_candidate_is_documented_without_replacing_state32_relea
     )
     assert release["runtime_contract"]["state_dim"] == 41
     assert "config/releases/state41_28dof_v1.json" in readme
-    assert "State41/Action32 28DoF release candidate" in readme
-    assert "mint-vla-client-example-state41-28dof" in readme
+    assert "Frozen State41/Action32 28DoF release provenance" in readme
+    assert "Maintained State41-derived full-task contract" in readme
     retired_width_marker = "state" + str(46) + "-28dof"
     assert retired_width_marker not in readme.lower()
     assert release["profile"]["norm_sha256"] in readme

@@ -9,8 +9,11 @@ from scripts.openpi_profiles import (
     ACTION_LORA_R16_STATE44_PROFILE,
     ACTION_LORA_R16_STATE41_MODEL,
     ACTION_LORA_R16_STATE41_PROFILE,
+    ACTION_LORA_R16_STATE45_MODEL,
+    ACTION_LORA_R16_STATE45_PROFILE,
     LEGACY_L_LORA_MODEL,
     LEGACY_L_LORA_PROFILE,
+    MODEL_PROFILES,
     resolve_profile,
 )
 from scripts.eval.mode4_support import action_session_payload
@@ -42,15 +45,14 @@ class OpenPIProfileTests(unittest.TestCase):
         self.assertTrue(profile.fail_on_token_truncation)
         self.assertEqual(profile.state_contract_id, "mano_five_finger_contact_geom_rate_v2")
 
-    def test_state41_profile_separates_28d_state_and_action_widths(self) -> None:
-        profile = resolve_profile(ACTION_LORA_R16_STATE41_MODEL)
-        self.assertEqual(profile, ACTION_LORA_R16_STATE41_PROFILE)
-        self.assertEqual((profile.state_dim, profile.action_dim), (41, 32))
-        self.assertEqual(profile.action_horizon, 10)
-        self.assertEqual(profile.max_tokens, 200)
-        self.assertTrue(profile.fail_on_token_truncation)
-        self.assertEqual(profile.state_contract_id, "mano_state41_native_sim_28d_v1")
-        self.assertEqual(profile.delta_mask_segments, (3, -3, 22, -4))
+    def test_state45_is_the_only_maintained_mano_28dof_profile(self) -> None:
+        profile = resolve_profile(ACTION_LORA_R16_STATE45_MODEL)
+        self.assertEqual(profile, ACTION_LORA_R16_STATE45_PROFILE)
+        self.assertEqual((profile.state_dim, profile.action_dim), (45, 32))
+        self.assertEqual(profile.max_tokens, 224)
+        self.assertNotIn(ACTION_LORA_R16_STATE41_MODEL, MODEL_PROFILES)
+        with self.assertRaisesRegex(ValueError, "unsupported OpenPI client profile"):
+            resolve_profile(ACTION_LORA_R16_STATE41_MODEL, profile=ACTION_LORA_R16_STATE41_PROFILE)
 
     def test_rejects_conflicting_model_and_profile(self) -> None:
         with self.assertRaisesRegex(ValueError, "does not match profile"):

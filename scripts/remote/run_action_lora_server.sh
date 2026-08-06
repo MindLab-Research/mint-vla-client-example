@@ -5,10 +5,10 @@ PORT=30532
 GPU_IDS=0,1,2,3,4,5,6,7
 RUNTIME_ROOT=
 CACHE_DIR=
-MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof}
-OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof}
+MINT_ROOT=${MINT_CODE_ROOT:-/vePFS-Mindverse/user/intern/wenxi/mint-state45-28dof}
+OPENPI_ROOT=${MINT_OPENPI_ROOT:-/vePFS-Mindverse/user/intern/wenxi/openpi-state45-28dof}
 PYTHON_BIN=${MINT_PYTHON_BIN:-/vePFS-Mindverse/user/intern/wenxi/mint_env/runtime/gpu_rl/host-venv/bin/python}
-MODEL=openpi/pi05-action-lora-r16-state41-28dof-finetune
+MODEL=openpi/pi05-action-lora-r16-state45-phase-28dof-finetune
 NORM_STATS_PATH=${MINT_OPENPI_PI05_NORM_STATS:-}
 ENABLE_JAX_PERSISTENT_CACHE=0
 PRINT_CONFIG=0
@@ -36,7 +36,7 @@ Options:
   --mint-root PATH     MINT checkout (default: MINT_CODE_ROOT or project path)
   --openpi-root PATH   paired OpenPI checkout (default: MINT_OPENPI_ROOT or project path)
   --python-bin PATH    GPU runtime Python (default: MINT_PYTHON_BIN or project path)
-  --model ID           enabled Action-LoRA model identity (default: state41 28DoF)
+  --model ID           enabled Action-LoRA model identity (State45 only)
   --norm-stats PATH    locked norm_stats.json used for checkpoint assets
   --enable-jax-persistent-cache
                      opt in to JAX persistent executable serialization
@@ -58,12 +58,12 @@ done
 }
 GPU_COMMAS=${GPU_IDS//[^,]/}
 GPU_COUNT=$((1 + ${#GPU_COMMAS}))
+[[ "$MODEL" == openpi/pi05-action-lora-r16-state45-phase-28dof-finetune ]] || {
+  echo "only the maintained State45 Action-LoRA model is supported: $MODEL" >&2
+  exit 64
+}
 if [[ -z "$CACHE_DIR" ]]; then
-  CACHE_PROFILE=state41
-  if [[ "$MODEL" == openpi/pi05-action-lora-r16-state45-phase-28dof-finetune ]]; then
-    CACHE_PROFILE=state45_phase
-  fi
-  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_${CACHE_PROFILE}_a800_${GPU_COUNT}gpu"
+  CACHE_DIR="/vePFS-Mindverse/user/intern/wenxi/results/runtime/jax_compilation_cache/pi05_action_lora_r16_state45_phase_a800_${GPU_COUNT}gpu"
 fi
 [[ "$CACHE_DIR" = /* ]] || { echo "--cache-dir must be absolute" >&2; exit 64; }
 
@@ -76,13 +76,10 @@ done
 [[ -x "$PYTHON_BIN" ]] || { echo "runtime Python is not executable: $PYTHON_BIN" >&2; exit 2; }
 mkdir -p "$RUNTIME_ROOT"/{openpi_checkpoint_base,runtime_checkpoints,tmp,action_state}
 ASSETS_BASE_DIR=${MINT_OPENPI_PI05_ASSETS_BASE_DIR:-/vePFS-Mindverse/share/code/conley/openpi/assets}
-if [[ "$MODEL" == openpi/pi05-action-lora-r16-state41-28dof-finetune || \
-      "$MODEL" == openpi/pi05-action-lora-r16-state45-phase-28dof-finetune ]]; then
-  [[ -n "$NORM_STATS_PATH" ]] || {
-    echo "--norm-stats is required for State41/State45 Action-LoRA servers" >&2
-    exit 64
-  }
-fi
+[[ -n "$NORM_STATS_PATH" ]] || {
+  echo "--norm-stats is required for the State45 Action-LoRA server" >&2
+  exit 64
+}
 if [[ -n "$NORM_STATS_PATH" ]]; then
   [[ "$NORM_STATS_PATH" = /* ]] || { echo "--norm-stats must be absolute" >&2; exit 64; }
   [[ -f "$NORM_STATS_PATH" ]] || { echo "norm stats file missing: $NORM_STATS_PATH" >&2; exit 2; }
