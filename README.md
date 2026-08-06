@@ -121,21 +121,22 @@ rollout launcher only runs against an already selected server/checkpoint.
 
 ### Internal checkout
 
-Until the feature branches are merged and tagged, use dedicated worktrees at
-the pinned commits:
+Until the feature branches are merged and tagged, use the dedicated worktrees
+on the State45 branches. The `state41-28dof` suffixes below are historical
+worktree directory names; branch identity is authoritative.
 
 ```bash
 # Client
 git -C /vePFS-Mindverse/user/intern/wenxi/mint-vla-client-example-state41-28dof \
-  switch feature/mano-state41-28dof-v1
+  switch feature/mano-state45-phase-v1
 
 # MINT server
 git -C /vePFS-Mindverse/user/intern/wenxi/mint-state41-28dof \
-  switch feature/pi05-state41-28dof-v1
+  switch feature/pi05-state45-phase-v1
 
 # OpenPI model implementation
 git -C /vePFS-Mindverse/user/intern/wenxi/openpi-state41-28dof \
-  switch feature/pi05-state41-28dof-v1
+  switch feature/pi05-state45-phase-v1
 ```
 
 Keep each worktree clean. Allocate independent ports, GPUs, runtime roots, and
